@@ -5,16 +5,21 @@ description = "Construct neural network models and training workflows by structc
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "structcast>=1.0.0",
+    # "structcast>=1.0.0",
+    "structcast",
     "jinja2>=3.1.6",
     "pydantic>=2.12.5",
     "ruamel-yaml[jinja2]>=0.19.1",
     "typing-extensions>=4.15.0",
+    "numpy>=2.4.2",
 ]
 
 [dependency-groups]
 dev = ["mypy>=1.19.1", "pytest>=8.4.2", "pytest-cov>=7.0.0", "ruff>=0.14.14"]
 tox = ["tox>=4.0.0", "tox-uv>=1.0.0"]
+
+[tool.uv.sources]
+structcast = { git = "https://github.com/f6ra07nk14/structcast", branch = "dev" }
 
 
 [tool.pytest.ini_options]
