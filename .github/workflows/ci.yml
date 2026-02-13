@@ -142,7 +142,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            PY_VERSION=3.13
+            PY_VERSION=3.11
           cache-from: type=gha,scope=dev-image
           cache-to: type=gha,mode=max,scope=dev-image
 
