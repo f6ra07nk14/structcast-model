@@ -23,7 +23,7 @@ jobs:
       sanitized-branch: ${{ steps.branch-name.outputs.sanitized }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -89,15 +89,6 @@ jobs:
           if docker manifest inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
             echo "✓ Docker image ${IMAGE_TAG} exists"
-            
-            # Extract and display manifest information
-            DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest // .manifests[0].digest // "unknown"')
-            SIZE=$(echo "$MANIFEST" | jq -r '.config.size // .manifests[0].size // 0' | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "unknown")
-            PLATFORM=$(echo "$MANIFEST" | jq -r '.manifests[0].platform // {os: .os, architecture: .architecture} | "\(.os // "unknown")/\(.architecture // "unknown")"')
-            
-            echo "  Digest: ${DIGEST}"
-            echo "  Size: ${SIZE}"
-            echo "  Platform: ${PLATFORM}"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
             echo "✗ Docker image ${IMAGE_TAG} does not exist"
@@ -187,7 +178,7 @@ jobs:
       options: --user root
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run tox for all environments
         run: |
@@ -252,19 +243,30 @@ jobs:
       packages: read
       pull-requests: write
       issues: write
-    container:
-      image: ghcr.io/${{ github.repository }}-ci:${{ needs.build-docker.outputs.sanitized-branch }}-latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --user root
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release@23 \
+            @semantic-release/changelog@6 \
+            @semantic-release/git@10 \
+            @semantic-release/github@10 \
+            @semantic-release/exec@6 \
+            conventional-changelog-conventionalcommits@7
+          
       - name: Configure Git
         run: |
           git config --global user.name "github-actions[bot]"
@@ -273,10 +275,8 @@ jobs:
       - name: Run Semantic Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_PATH: /app/node_modules
         run: |
-          export HOME="$(pwd)"
-          semantic-release
+          npx semantic-release
 
       - name: Check if release was created
         id: check-release
@@ -338,7 +338,7 @@ jobs:
   #     url: https://pypi.org/p/structcast-model
   #   permissions:
   #     contents: read
-  #     id-token: write  # IMPORTANT: mandatory for trusted publishing
+  #     id-token: write # IMPORTANT: mandatory for trusted publishing
   #   steps:
   #     - name: Get latest release
   #       id: get-release
@@ -349,10 +349,10 @@ jobs:
   #         RELEASE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
   #                             -H "Accept: application/vnd.github+json" \
   #                             "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-          
+
   #         RELEASE_TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
   #         RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id')
-          
+
   #         if [ "$RELEASE_TAG" = "null" ] || [ -z "$RELEASE_TAG" ]; then
   #           echo "No release found, skipping publish"
   #           echo "has_release=false" >> $GITHUB_OUTPUT
@@ -367,31 +367,31 @@ jobs:
   #       if: steps.get-release.outputs.has_release == 'true'
   #       run: |
   #         RELEASE_TAG="${{ steps.get-release.outputs.tag }}"
-          
+
   #         # Get release assets
   #         ASSETS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
   #                       -H "Accept: application/vnd.github+json" \
   #                       "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")
-          
+
   #         # Find the wheel file (.whl)
   #         WHEEL_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .browser_download_url' | head -n 1)
   #         WHEEL_NAME=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .name' | head -n 1)
-          
+
   #         if [ -z "$WHEEL_URL" ] || [ "$WHEEL_URL" = "null" ]; then
   #           echo "No wheel file found in release"
   #           exit 1
   #         fi
-          
+
   #         echo "Downloading wheel: $WHEEL_NAME"
   #         echo "From: $WHEEL_URL"
-          
+
   #         # Create dist directory and download the wheel
   #         mkdir -p dist
   #         curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
   #              -H "Accept: application/octet-stream" \
   #              -o "dist/$WHEEL_NAME" \
   #              "$WHEEL_URL"
-          
+
   #         echo "✓ Successfully downloaded: dist/$WHEEL_NAME"
   #         ls -lh dist/
 

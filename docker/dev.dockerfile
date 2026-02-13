@@ -6,9 +6,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     curl \
-    git \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Define Python versions variable
@@ -33,12 +30,8 @@ RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --dev --group tox
 
-# Install Node.js dependencies for semantic-release
-RUN --mount=type=bind,source=package.json,target=package.json \
-    npm install --prefix /app
-
 # Activate virtual environment and set up PATH to use installed tools
-ENV PATH="/app/.venv/bin:/app/node_modules/.bin:${PATH}"
+ENV PATH="/app/.venv/bin:${PATH}"
 
 # Set Python path
 ENV PYTHONPATH=/app/src
