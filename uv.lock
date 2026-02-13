@@ -642,7 +642,7 @@ wheels = [
 
 [[package]]
 name = "structcast-model"
-version = "0.1.0"
+version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
@@ -667,7 +667,7 @@ tox = [
 [package.metadata]
 requires-dist = [
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "pydantic", specifier = ">=2.11.0" },
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "ruamel-yaml", extras = ["jinja2"], specifier = ">=0.19.1" },
     { name = "structcast", specifier = ">=1.0.0" },
     { name = "typing-extensions", specifier = ">=4.15.0" },
