@@ -1,0 +1,194 @@
+{
+  "branches": [
+    "main"
+  ],
+  "plugins": [
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "preset": "conventionalcommits",
+        "releaseRules": [
+          {
+            "breaking": true,
+            "release": "major"
+          },
+          {
+            "type": "breaking",
+            "release": "major"
+          },
+          {
+            "type": "build",
+            "release": "patch"
+          },
+          {
+            "type": "chore",
+            "release": false
+          },
+          {
+            "type": "ci",
+            "release": false
+          },
+          {
+            "type": "docs",
+            "release": false
+          },
+          {
+            "type": "feat",
+            "release": "minor"
+          },
+          {
+            "type": "fix",
+            "release": "patch"
+          },
+          {
+            "type": "perf",
+            "release": "patch"
+          },
+          {
+            "type": "refactor",
+            "release": false
+          },
+          {
+            "type": "revert",
+            "release": "patch"
+          },
+          {
+            "type": "style",
+            "release": false
+          },
+          {
+            "type": "test",
+            "release": false
+          }
+        ]
+      }
+    ],
+    [
+      "@semantic-release/release-notes-generator",
+      {
+        "preset": "conventionalcommits",
+        "presetConfig": {
+          "types": [
+            {
+              "type": "breaking",
+              "section": "💥 Breaking Changes",
+              "hidden": false
+            },
+            {
+              "type": "build",
+              "section": "👷 Build",
+              "hidden": false
+            },
+            {
+              "type": "chore",
+              "section": "📦 Other",
+              "hidden": false
+            },
+            {
+              "type": "ci",
+              "section": "🦊 CI/CD",
+              "hidden": false
+            },
+            {
+              "type": "docs",
+              "section": "📔 Docs",
+              "hidden": false
+            },
+            {
+              "type": "example",
+              "section": "📝 Examples",
+              "hidden": false
+            },
+            {
+              "type": "feat",
+              "section": "💎 Features",
+              "hidden": false
+            },
+            {
+              "type": "fix",
+              "section": "🔧 Fixes",
+              "hidden": false
+            },
+            {
+              "type": "perf",
+              "section": "🚀 Performance",
+              "hidden": false
+            },
+            {
+              "type": "refactor",
+              "section": "🔨 Refactor",
+              "hidden": false
+            },
+            {
+              "type": "revert",
+              "section": "🔙 Reverts",
+              "hidden": false
+            },
+            {
+              "type": "style",
+              "section": "✨ Style",
+              "hidden": false
+            },
+            {
+              "type": "test",
+              "section": "🚨 Tests",
+              "hidden": false
+            }
+          ]
+        }
+      }
+    ],
+    [
+      "@semantic-release/changelog",
+      {
+        "changelogFile": "CHANGELOG.md"
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i 's/^version = \".*\"/version = \"${nextRelease.version}\"/' pyproject.toml"
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i 's/^__version__ = \".*\"/__version__ = \"${nextRelease.version}\"/' src/structcast_model/__init__.py"
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "uv sync && uv build && test -d dist && test -n \"$(ls -A dist)\""
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": [
+          "CHANGELOG.md",
+          "pyproject.toml",
+          "uv.lock",
+          "src/structcast_model/__init__.py"
+        ],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "successComment": false,
+        "assets": [
+          {
+            "path": "dist/*.tar.gz"
+          },
+          {
+            "path": "dist/*.whl"
+          }
+        ],
+        "releasedLabels": false,
+        "addReleases": false
+      }
+    ]
+  ]
+}
