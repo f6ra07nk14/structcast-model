@@ -28,7 +28,7 @@ def load_json(path: PathLike) -> Any:
         The loaded data.
     """
     with check_path(path).open("r", encoding="utf-8") as f:
-        return from_json(f)
+        return from_json(f.read())
 
 
 def load_any(path: PathLike) -> Any:
@@ -46,7 +46,7 @@ def load_any(path: PathLike) -> Any:
         return load_yaml(path)
     if suffix == ".json":
         with path.open("r", encoding="utf-8") as f:
-            return from_json(f)
+            return from_json(f.read())
     if suffix == ".jsonl":
         with path.open("r", encoding="utf-8") as f:
             return [from_json(line) for line in f]
