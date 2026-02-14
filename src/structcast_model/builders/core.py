@@ -352,15 +352,16 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         if first not in self.user_defined_layers:
             raise SpecError(f'User-defined layer with key "{first}" not found in the template.')
         current_parts = self.from_references.get(self.current_path, None) or []
-        if first in current_parts:
-            current = ".".join(current_parts + [first])
-            raise SpecError(f"Circular reference detected for user-defined layer: {current}")
+        circular_detected = first in current_parts
+        current_parts = current_parts + [first]
+        if circular_detected:
+            raise SpecError(f"Circular reference detected for user-defined layer: {'.'.join(current_parts)}")
         return type(self)(
             raw=self.user_defined_layers[first],
             training=self.training,
             predefined_user_defined_layers=self.user_defined_layers,
             current_path=self.current_path,
-            from_references={**self.from_references, self.current_path: current_parts + [first]},
+            from_references={**self.from_references, self.current_path: current_parts},
         ).get_user_defined_layer(parts, parameters, classname)
 
     def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> LayerIntermediateT:
@@ -395,18 +396,24 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                     subinst, subclassname = unit.LAYER, split_attribute(ptn.address)[-1]
                 else:
                     if unit.LAYER.CFG is not None:
+                        current_path = str(unit.LAYER.CFG)
+                        current_parts = self.from_references.get(current_path, None) or []
                         subclassname = to_pascal(unit.LAYER.CFG.stem)
                         if unit.LAYER.TYPE:
                             subclassname = f"{subclassname}{to_pascal(unit.LAYER.TYPE)}"
                             parts = split_attribute(unit.LAYER.TYPE)
                         else:
                             parts = []
+                            if "__root__" in current_parts:
+                                msg = f"Circular reference detected for layer configuration: {self.from_references}"
+                                raise SpecError(msg)
+                            current_parts = current_parts + ["__root__"]
                         builder = type(self)(
                             raw=load_any(unit.LAYER.CFG),
                             training=self.training,
                             predefined_user_defined_layers=self.user_defined_layers,
-                            current_path=str(unit.LAYER.CFG),
-                            from_references=self.from_references,
+                            current_path=current_path,
+                            from_references={**self.from_references, current_path: current_parts},
                         )
                     elif unit.LAYER.TYPE is not None:
                         subclassname, parts = to_pascal(unit.LAYER.TYPE), split_attribute(unit.LAYER.TYPE)
