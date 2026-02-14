@@ -61,11 +61,11 @@ class Parameters(WithExtra):
     @model_validator(mode="after")
     def _validate_parameters(self) -> Self:
         if "default" in self.model_extra:
-            logger.warning(
-                'The default parameters should be defined in the "DEFAULT" field, '
-                'not in the "default" key of extra fields. '
-                'The "default" key in extra fields will be merged into the "DEFAULT" field.'
-            )
+            # logger.warning(
+            #     'The default parameters should be defined in the "DEFAULT" field, '
+            #     'not in the "default" key of extra fields. '
+            #     'The "default" key in extra fields will be merged into the "DEFAULT" field.'
+            # )
             self.DEFAULT.update(self.model_extra.pop("default"))
         for key, value in self.model_extra.items():
             if key in _TEMPLATE_ALIASES:
@@ -307,7 +307,7 @@ class LayerIntermediate(Serializable):
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
 
 
-@dataclass(kw_only=True, slots=True, frozen=True)
+@dataclass(kw_only=True, slots=True)
 class BaseBuilder(Generic[LayerIntermediateT]):
     """Base builder for building layers from templates."""
 
@@ -390,10 +390,10 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                 name = unit.NAME
             else:
                 if isinstance(unit.LAYER, ObjectPattern):
-                    if not isinstance((ptn := unit.LAYER.object[0]), AddressPattern):
+                    if not isinstance((ptn := unit.LAYER.patterns[0]), AddressPattern):
                         raise SpecError(
-                            "First element of LAYER.object must be an AddressPattern to infer the layer name"
-                            f" but got: {unit.LAYER.model_dump()}"
+                            "If LAYER is an ObjectPattern, the first pattern must be an AddressPattern "
+                            f"but got: {unit.LAYER.model_dump()}"
                         )
                     subinst, subclassname = unit.LAYER, split_attribute(ptn.address)[-1]
                 else:
