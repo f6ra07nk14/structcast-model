@@ -1,5 +1,7 @@
 """Core functionality for StructCast-Model builders."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from functools import cached_property
 from logging import getLogger
@@ -81,7 +83,7 @@ class Parameters(WithExtra):
         res["default"] = {**self.DEFAULT, **self.SHARED}
         return res
 
-    def merge(self, other: dict[str, Any] | "Parameters") -> "Parameters":
+    def merge(self, other: dict[str, Any] | Parameters) -> Parameters:
         """Merge the given template keyword arguments with the parameters.
 
         Args:
@@ -287,7 +289,7 @@ class LayerIntermediate(Serializable):
     outputs: list[str]
     """The names of the output layers."""
 
-    layers: dict[str, ObjectPattern | "LayerIntermediate"]
+    layers: dict[str, ObjectPattern | LayerIntermediate]
     """The sub-layers of the layer."""
 
     flow: list[tuple[Any, Any, str | None]]
