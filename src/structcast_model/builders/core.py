@@ -12,7 +12,7 @@ from pydantic.alias_generators import to_pascal, to_snake
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, ObjectPattern
-from structcast.core.specifier import FlexSpec, SpecIntermediate, register_resolver
+from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.security import split_attribute
@@ -22,7 +22,7 @@ from structcast_model.utils.base import Cache, load_any, unique
 
 logger = getLogger(__name__)
 
-register_resolver("eval", lambda x: x)
+SPEC_EVAL = register_resolver("eval", lambda x: x)
 
 
 class Serializable(BaseModel):
@@ -153,13 +153,13 @@ def _resolve_inputs(inputs: FlexSpec) -> list[str]:
     def _resolve(spec: Any) -> list[str]:
         if isinstance(spec, SpecIntermediate):
             if spec.identifier == SPEC_SOURCE:
-                indices: tuple[str | int, ...] = spec.value
-                if indices:
-                    if isinstance(indices[0], str):
-                        return [indices[0]]
-                    msg = f"First index of source identifier must be a string but got: {inputs.model_dump()}"
-                    raise SpecError(msg)
-            return []
+                if spec.value and isinstance(spec.value[0], str):
+                    return [spec.value[0]]
+                msg = f"First element of source identifier must be a string index but got: {inputs.model_dump()}"
+                raise SpecError(msg)
+            if spec.identifier in (SPEC_EVAL, SPEC_CONSTANT):
+                return []
+            raise SpecError(f"Unsupported spec identifier: {spec.identifier}")
         if isinstance(spec, dict):
             return [n for v in spec.values() for n in _resolve(v)]
         if isinstance(spec, list):
