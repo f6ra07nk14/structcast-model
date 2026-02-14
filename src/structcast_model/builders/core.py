@@ -317,18 +317,15 @@ class BaseBuilder(Generic[LayerIntermediateT]):
     training: bool = False
     predefined_user_defined_layers: dict[str, Any] = field(default_factory=dict)
     current_path: str = ""
-    current_parts: list[str] = field(default_factory=list)
-    from_references: list[str] = field(default_factory=list)  # format like [ "path:xxx", ...]
+    from_references: dict[str, list[str]] = field(default_factory=dict)
 
     template: TemplateLayer = field(init=False)
     user_defined_layers: dict[str, Any] = field(init=False)
-    reference: str = field(init=False)
 
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateLayer.model_validate(self.raw)
         self.user_defined_layers = {**self.predefined_user_defined_layers, **self.template.user_defined_layers}
-        self.reference = ":".join([self.current_path] + self.current_parts)
 
     @Cache()
     def get_user_defined_layer(
@@ -354,13 +351,16 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         first, *parts = parts
         if first not in self.user_defined_layers:
             raise SpecError(f'User-defined layer with key "{first}" not found in the template.')
+        current_parts = self.from_references.get(self.current_path, None) or []
+        if first in current_parts:
+            current = ".".join(current_parts + [first])
+            raise SpecError(f"Circular reference detected for user-defined layer: {current}")
         return type(self)(
             raw=self.user_defined_layers[first],
             training=self.training,
             predefined_user_defined_layers=self.user_defined_layers,
             current_path=self.current_path,
-            current_parts=self.current_parts + [first],
-            from_references=self.from_references,
+            from_references={**self.from_references, self.current_path: current_parts + [first]},
         ).get_user_defined_layer(parts, parameters, classname)
 
     def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> LayerIntermediateT:
@@ -375,9 +375,6 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         Returns:
             LayerIntermediateT: The built layer as a `LayerIntermediateT` instance.
         """
-        if self.reference in self.from_references:
-            raise SpecError(f"Circular reference detected for user-defined layer: {self.reference}")
-        self.from_references.append(self.reference)
         parameters = Parameters(SHARED={"training": self.training}).merge(parameters)
         layer = self.template.format(parameters)
         sublayers: dict[str, ObjectPattern | LayerIntermediate] = {}
@@ -424,8 +421,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                 if name in sublayers:
                     raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                 sublayers[name] = subinst
-            flow.append((unit.INPUTS.spec, unit.OUTPUTS.spec, name))
-        self.from_references.remove(self.reference)
+            flow.append((unit.INPUTS.spec if unit.INPUTS else None, unit.OUTPUTS.spec if unit.OUTPUTS else None, name))
         return self.user_defined_layer_type(
             classname=classname,
             inputs=layer.INPUTS,
