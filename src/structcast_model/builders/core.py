@@ -8,7 +8,7 @@ from logging import getLogger
 from typing import Any, ClassVar, Generic, Self, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FilePath, field_validator, model_validator
-from pydantic.alias_generators import to_camel, to_pascal, to_snake
+from pydantic.alias_generators import to_pascal, to_snake
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, ObjectPattern
@@ -388,8 +388,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         layer = self.template.format(parameters)
         sublayers: dict[str, ObjectPattern | LayerIntermediate] = {}
         flow: list[tuple[Any, Any, str | None]] = []
-        class_naming, value_naming = AutoName(), AutoName("_")
-        classname = class_naming(to_camel(classname))
+        value_naming = AutoName("_")
         for unit in layer.FLOW:
             if unit.LAYER is None:
                 if unit.NAME and unit.NAME not in sublayers:
