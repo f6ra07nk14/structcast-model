@@ -1,11 +1,14 @@
 """Test core builders functionality."""
 
+from typing import Any
+
 from pydantic import ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
 
 from structcast_model.builders.core import (
     BaseBuilder,
+    FlexSpec,
     LayerBehavior,
     LayerIntermediate,
     Parameters,
@@ -14,6 +17,8 @@ from structcast_model.builders.core import (
     UserDefinedLayer,
     UserLayer,
     WithExtra,
+    _resolve_inputs,
+    _resolve_outputs,
     load_any,
 )
 
@@ -200,6 +205,136 @@ def test_layer_behavior_from_list() -> None:
     assert behavior.NAME == "layer_name"
     assert behavior.INPUTS is not None
     assert behavior.OUTPUTS is not None
+
+
+# Test _resolve_inputs unit tests
+def test_resolve_inputs_with_simple_list() -> None:
+    """Test _resolve_inputs with a simple list input."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": ["output1"]})
+    assert behavior.INPUTS is not None
+    assert _resolve_inputs(behavior.INPUTS) == ["input1"]
+
+
+def test_resolve_inputs_with_multiple_inputs() -> None:
+    """Test _resolve_inputs with multiple inputs in a list."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1", "input2", "input3"], "OUTPUTS": ["output1"]})
+    assert behavior.INPUTS is not None
+    assert _resolve_inputs(behavior.INPUTS) == ["input1", "input2", "input3"]
+
+
+def test_resolve_inputs_with_dict_of_inputs() -> None:
+    """Test _resolve_inputs with a dictionary containing inputs."""
+    raw = {"INPUTS": {"key1": ["input1"], "key2": ["input2"]}, "OUTPUTS": ["output1"]}
+    behavior = LayerBehavior.model_validate(raw)
+    assert behavior.INPUTS is not None
+    assert set(_resolve_inputs(behavior.INPUTS)) == {"input1", "input2"}
+
+
+def test_resolve_inputs_with_nested_list() -> None:
+    """Test _resolve_inputs with nested lists of inputs."""
+    behavior = LayerBehavior.model_validate({"INPUTS": [["input1", "input2"], ["input3"]], "OUTPUTS": ["output1"]})
+    assert behavior.INPUTS is not None
+    assert _resolve_inputs(behavior.INPUTS) == ["input1", "input2", "input3"]
+
+
+def test_resolve_inputs_with_complex_nested_structure() -> None:
+    """Test _resolve_inputs with complex nested structures."""
+    raw = {"INPUTS": {"layer1": ["a", "b"], "layer2": [["c"], ["d"]]}, "OUTPUTS": ["output1"]}
+    behavior = LayerBehavior.model_validate(raw)
+    assert behavior.INPUTS is not None
+    assert set(_resolve_inputs(behavior.INPUTS)) == {"a", "b", "c", "d"}
+
+
+# Test _resolve_outputs unit tests
+def test_resolve_outputs_with_simple_list() -> None:
+    """Test _resolve_outputs with a simple list output."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": ["output1"]})
+    assert behavior.OUTPUTS is not None
+    assert _resolve_outputs(behavior.OUTPUTS) == ["output1"]
+
+
+def test_resolve_outputs_with_dict_at_top_level() -> None:
+    """Test _resolve_outputs with dictionary at top level returns keys."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": {"output1": ["a"], "output2": ["b"]}})
+    assert behavior.OUTPUTS is not None
+    assert _resolve_outputs(behavior.OUTPUTS) == ["output1", "output2"]
+
+
+def test_resolve_outputs_with_multiple_outputs() -> None:
+    """Test _resolve_outputs with multiple outputs in a list."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": ["output1", "output2", "output3"]})
+    assert behavior.OUTPUTS is not None
+    assert _resolve_outputs(behavior.OUTPUTS) == ["output1", "output2", "output3"]
+
+
+def test_resolve_outputs_with_nested_list() -> None:
+    """Test _resolve_outputs with nested lists of outputs."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": [["output1"], ["output2", "output3"]]})
+    assert behavior.OUTPUTS is not None
+    assert _resolve_outputs(behavior.OUTPUTS) == ["output1", "output2", "output3"]
+
+
+def test_resolve_outputs_with_dict_in_list_raises_error() -> None:
+    """Test _resolve_outputs with dictionary in list form raises SpecError."""
+    behavior = LayerBehavior.model_validate({"INPUTS": ["input1"], "OUTPUTS": [{"key": ["output1"]}]})
+    assert behavior.OUTPUTS is not None
+    with pytest.raises(SpecError, match="Outputs cannot be a dictionary in list form"):
+        _resolve_outputs(behavior.OUTPUTS)
+
+
+# Test _resolve_inputs error cases (raise SpecError)
+def test_resolve_inputs_with_non_string_source_index_raises_error() -> None:
+    """Test _resolve_inputs with non-string index in source identifier raises SpecError."""
+    with pytest.raises(SpecError, match="First element of source identifier must be a string index"):
+        _resolve_inputs(FlexSpec.model_validate("123"))
+
+
+def test_resolve_inputs_with_unsupported_identifier_raises_error() -> None:
+    """Test _resolve_inputs with unsupported identifier raises SpecError."""
+    with pytest.raises(SpecError, match="Unsupported spec identifier"):
+        _resolve_inputs(FlexSpec.model_validate("skip:"))
+
+
+def test_resolve_inputs_with_unsupported_spec_type_raises_error() -> None:
+    """Test _resolve_inputs with unsupported spec type raises SpecError."""
+
+    class FakeFlexSpec:
+        def __init__(self, spec: Any) -> None:
+            self.spec = spec
+
+        def model_dump(self) -> dict[str, Any]:
+            return {"spec": self.spec}
+
+    with pytest.raises(SpecError, match="Unsupported spec type"):
+        _resolve_inputs(FakeFlexSpec("invalid_string"))
+
+
+# Test _resolve_outputs error cases (raise SpecError)
+def test_resolve_outputs_with_non_source_identifier_raises_error() -> None:
+    """Test _resolve_outputs with non-source identifier raises SpecError."""
+    with pytest.raises(SpecError, match="Outputs must be consist of source identifier"):
+        _resolve_outputs(FlexSpec.model_validate([0]))
+
+
+def test_resolve_outputs_with_multiple_indices_raises_error() -> None:
+    """Test _resolve_outputs with source having multiple indices raises SpecError."""
+    with pytest.raises(SpecError, match="Outputs must be a source identifier with a single string index"):
+        _resolve_outputs(FlexSpec.model_validate(["output1.output2"]))
+
+
+def test_resolve_outputs_with_unsupported_type_raises_error() -> None:
+    """Test _resolve_outputs with unsupported type raises SpecError."""
+
+    class FakeFlexSpec:
+        def __init__(self, spec: Any) -> None:
+            self.spec = spec
+
+        def model_dump(self) -> dict[str, Any]:
+            return {"spec": self.spec}
+
+    fake_spec = FakeFlexSpec("invalid_string")
+    with pytest.raises(SpecError, match="Outputs must be a dictionary or consist of a source identifier"):
+        _resolve_outputs(fake_spec)
 
 
 # Test _resolve_inputs and _resolve_outputs through integration tests
