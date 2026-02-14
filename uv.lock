@@ -721,7 +721,7 @@ wheels = [
 [[package]]
 name = "structcast"
 version = "1.1.0"
-source = { git = "https://github.com/f6ra07nk14/structcast?branch=dev#9f5661a0dd729892c20644ad62e173fe3c8a4935" }
+source = { git = "https://github.com/f6ra07nk14/structcast?branch=dev#58c8d07f2ac282ae4aa97b5fe1f25eff90da3ed9" }
 dependencies = [
     { name = "jinja2" },
     { name = "pydantic" },
