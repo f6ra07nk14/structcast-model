@@ -14,6 +14,7 @@ from structcast_model.builders.core import (
     UserDefinedLayer,
     UserLayer,
     WithExtra,
+    load_any,
 )
 
 
@@ -516,3 +517,100 @@ def test_base_builder_flow_layer_without_cfg_or_type() -> None:
 def test_base_builder_injects_training_parameter() -> None:
     """Test that BaseBuilder injects training parameter."""
     assert isinstance(BaseBuilder(raw={"FLOW": []}, training=True)({}, "TestLayer"), LayerIntermediate)
+
+
+def test_base_builder_circular_reference_with_cfg() -> None:
+    """Test that circular references via CFG cause errors."""
+    with pytest.raises(SpecError, match="Circular reference detected"):
+        BaseBuilder(raw=load_any("tests/fixtures/circular.yaml"))({}, "TestLayer")
+
+
+def test_template_layer_jinja_yaml_basic() -> None:
+    """Test TemplateLayer with _jinja_yaml_ template."""
+    raw = {
+        "PARAMETERS": {"DEFAULT": {"count": 2}},
+        "_jinja_yaml_": """
+INPUTS: [input1]
+FLOW:
+{% for i in range(count) %}
+  - - {% if i == 0 %}[input1]{% else %}[out{{ i - 1 }}]{% endif +%}
+    - [out{{ i }}]
+    - {_obj_: [[_addr_, torch.nn.Identity]]}
+{% endfor %}
+""",
+    }
+    result = TemplateLayer.model_validate(raw).format({})
+    assert isinstance(result, UserDefinedLayer)
+    assert result.INPUTS == ["input1"]
+    assert result.OUTPUTS == ["out0", "out1"]
+    assert len(result.FLOW) == 2
+
+
+def test_template_layer_jinja_yaml_with_parameters() -> None:
+    """Test TemplateLayer _jinja_yaml_ with custom parameters."""
+    raw = {
+        "PARAMETERS": {"DEFAULT": {"layer_count": 1}},
+        "_jinja_yaml_": """
+INPUTS: [x]
+FLOW:
+{% for i in range(layer_count) %}
+  - - [x]
+    - [layer_{{ i }}_out]
+    - {_obj_: [[_addr_, torch.nn.ReLU]]}
+{% endfor %}
+""",
+    }
+    result = TemplateLayer.model_validate(raw).format({"default": {"layer_count": 3}})
+    assert isinstance(result, UserDefinedLayer)
+    assert len(result.FLOW) == 3
+
+
+def test_template_layer_jinja_yaml_with_groups() -> None:
+    """Test TemplateLayer _jinja_yaml_ with parameter groups."""
+    raw = {
+        "PARAMETERS": {"DEFAULT": {"depth": 2}, "group1": {"depth": 4}},
+        "_jinja_yaml_": """
+INPUTS: [input]
+OUTPUTS: [output]
+FLOW:
+{% for i in range(depth) %}
+  - - {% if i == 0 %}[input]{% else %}[hidden{{ i - 1 }}]{% endif +%}
+    - {% if i == depth - 1 %}[output]{% else %}[hidden{{ i }}]{% endif +%}
+    - {_obj_: [[_addr_, torch.nn.Linear]]}
+{% endfor %}
+""",
+    }
+    template = TemplateLayer.model_validate(raw)
+    result_default = template.format(Parameters(DEFAULT={"depth": 2}))
+    assert len(result_default.FLOW) == 2
+    result_custom = template.format(Parameters(DEFAULT={"depth": 5}))
+    assert len(result_custom.FLOW) == 5
+
+
+def test_template_layer_jinja_yaml_complex_structure() -> None:
+    """Test TemplateLayer _jinja_yaml_ with complex nested structures."""
+    raw = {
+        "PARAMETERS": {"DEFAULT": {"units": [64, 32], "activation": "ReLU"}},
+        "_jinja_yaml_": """
+INPUTS: [input]
+OUTPUTS: [output]
+FLOW:
+{% for i in range(units|length) %}
+  - - {% if i == 0 %}[input]{% else %}[layer{{ i - 1 }}_out]{% endif +%}
+    - [layer{{ i }}_out]
+    - {_obj_: [[_addr_, torch.nn.Linear]]}
+  {% if i < units|length - 1 %}
+  - - [layer{{ i }}_out]
+    - [act{{ i }}_out]
+    - {_obj_: [[_addr_, torch.nn.{{ activation }}]]}
+  {% endif %}
+{% endfor %}
+  - - [act{{ units|length - 2 }}_out]
+    - [output]
+    - {_obj_: [[_addr_, torch.nn.Identity]]}
+""",
+    }
+    result = TemplateLayer.model_validate(raw).format({})
+    assert isinstance(result, UserDefinedLayer)
+    # Should have 2 linear layers + 1 activation (between them) + 1 identity to connect to output
+    assert len(result.FLOW) == 4
