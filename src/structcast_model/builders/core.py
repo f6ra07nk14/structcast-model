@@ -181,9 +181,8 @@ def _resolve_outputs(outputs: FlexSpec) -> list[str]:
         if isinstance(spec, SpecIntermediate):
             if spec.identifier != SPEC_SOURCE:
                 raise SpecError(f"Outputs must be consist of source identifier but got: {outputs.model_dump()}")
-            indices: tuple[str | int, ...] = spec.value
-            if indices and len(indices) == 1 and isinstance(indices[0], str):
-                return [indices[0]]
+            if spec.value and len(spec.value) == 1 and isinstance(spec.value[0], str):
+                return [spec.value[0]]
             msg = f"Outputs must be a source identifier with a single string index but got: {outputs.model_dump()}"
             raise SpecError(msg)
         msg = f"Outputs must be a dictionary or consist of a source identifier but got: {outputs.model_dump()}"
@@ -220,7 +219,7 @@ class UserDefinedLayer(Serializable):
         for unit in self.FLOW:
             if unit.INPUTS is not None:
                 f_inputs += [n for n in _resolve_inputs(unit.INPUTS) if n not in f_outputs]
-            f_outputs += [] if unit.OUTPUTS is None else _resolve_outputs(unit.OUTPUTS.structure)
+            f_outputs += [] if unit.OUTPUTS is None else _resolve_outputs(unit.OUTPUTS)
         if self.INPUTS:
             if unknown := set(self.INPUTS) - set(f_inputs):
                 raise SpecError(f"Unknown inputs found: {unknown}.")
@@ -308,7 +307,7 @@ class LayerIntermediate(Serializable):
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class BaseBuilder(Generic[LayerIntermediateT]):
     """Base builder for building layers from templates."""
 
@@ -321,20 +320,15 @@ class BaseBuilder(Generic[LayerIntermediateT]):
     current_parts: list[str] = field(default_factory=list)
     from_references: list[str] = field(default_factory=list)  # format like [ "path:xxx", ...]
 
-    @cached_property
-    def template(self) -> TemplateLayer:
-        """Get the template from the raw data."""
-        return TemplateLayer.model_validate(self.raw)
+    template: TemplateLayer = field(init=False)
+    user_defined_layers: dict[str, Any] = field(init=False)
+    reference: str = field(init=False)
 
-    @cached_property
-    def user_defined_layers(self) -> dict[str, Any]:
-        """Get the user-defined layers from the raw data."""
-        return {**self.predefined_user_defined_layers, **self.template.user_defined_layers}
-
-    @cached_property
-    def reference(self) -> str:
-        """Get the reference of the current layer."""
-        return ":".join([self.current_path] + self.current_parts)
+    def __post_init__(self) -> None:
+        """Post-initialization to set up the template."""
+        self.template = TemplateLayer.model_validate(self.raw)
+        self.user_defined_layers = {**self.predefined_user_defined_layers, **self.template.user_defined_layers}
+        self.reference = ":".join([self.current_path] + self.current_parts)
 
     @Cache()
     def get_user_defined_layer(
@@ -430,7 +424,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                 if name in sublayers:
                     raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                 sublayers[name] = subinst
-            flow.append((unit.INPUTS, unit.OUTPUTS, name))
+            flow.append((unit.INPUTS.spec, unit.OUTPUTS.spec, name))
         self.from_references.remove(self.reference)
         return self.user_defined_layer_type(
             classname=classname,
