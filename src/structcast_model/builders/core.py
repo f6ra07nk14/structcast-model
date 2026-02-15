@@ -7,7 +7,16 @@ from functools import cached_property
 from logging import getLogger
 from typing import Any, ClassVar, Generic, Self, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, Field, FilePath, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FilePath,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic.alias_generators import to_pascal, to_snake
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
@@ -147,6 +156,16 @@ class LayerBehavior(Serializable):
                 raise SpecError("LayerBehavior tuple/list must have 3 or 4 elements.")
             return {"INPUTS": inp, "OUTPUTS": out, "NAME": name, "LAYER": layer}
         return raw
+
+    @model_serializer(mode="wrap")
+    def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
+        """Serialize the model."""
+        res = [handler(self.INPUTS), handler(self.OUTPUTS)]
+        if self.NAME:
+            res.append(self.NAME)
+        if self.LAYER is not None:
+            res.append(handler(self.LAYER))
+        return res
 
 
 def resolve_inputs(inputs: FlexSpec) -> list[str]:
@@ -321,7 +340,7 @@ class LayerIntermediate(Serializable):
     layers: dict[str, ObjectPattern | LayerIntermediate]
     """The sub-layers of the layer."""
 
-    flow: list[tuple[Any, Any, str | None]]
+    flow: list[tuple[FlexSpec, FlexSpec, str | None]]
     """The flow of the layer."""
 
     structured_output: bool
@@ -452,7 +471,11 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                 if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
                     raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                 sublayers[name] = subinst
-            flow.append((unit.INPUTS.spec if unit.INPUTS else None, unit.OUTPUTS.spec if unit.OUTPUTS else None, name))
+            if (has_inputs := unit.INPUTS is not None) and (has_outputs := unit.OUTPUTS is not None):
+                flow.append((unit.INPUTS, unit.OUTPUTS, name))
+            elif has_inputs or has_outputs:
+                msg = f"Both INPUTS and OUTPUTS must be specified together in the flow but got: {unit.model_dump()}"
+                raise SpecError(msg)
         return self.user_defined_layer_type(
             classname=classname,
             inputs=layer.INPUTS,
