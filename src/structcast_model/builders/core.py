@@ -18,7 +18,7 @@ from structcast.utils.base import check_elements
 from structcast.utils.security import split_attribute
 
 from structcast_model.builders.auto_name import AutoName
-from structcast_model.utils.base import Cache, load_any, unique
+from structcast_model.utils.base import load_any, unique
 
 logger = getLogger(__name__)
 
@@ -149,7 +149,23 @@ class LayerBehavior(Serializable):
         return raw
 
 
-def _resolve_inputs(inputs: FlexSpec) -> list[str]:
+def resolve_inputs(inputs: FlexSpec) -> list[str]:
+    """Resolve the input layer names from the given inputs specification.
+
+    The inputs specification can be in the following forms:
+    - A dictionary mapping input names to specifications,
+      where the input names are resolved from the specifications in the dictionary values.
+    - A list of specifications, where the input names are resolved from the specifications in the list.
+    - A source identifier specification, where the input name is resolved from the value of the source identifier.
+      The source identifier must have a single string index as its value, which is used as the input name.
+
+    Args:
+        inputs (FlexSpec): The inputs specification to resolve.
+
+    Returns:
+        list[str]: A list of resolved input layer names.
+    """
+
     def _resolve(spec: Any) -> list[str]:
         if isinstance(spec, SpecIntermediate):
             if spec.identifier == SPEC_SOURCE:
@@ -169,7 +185,21 @@ def _resolve_inputs(inputs: FlexSpec) -> list[str]:
     return _resolve(inputs.spec)
 
 
-def _resolve_outputs(outputs: FlexSpec) -> list[str]:
+def resolve_outputs(outputs: FlexSpec) -> list[str]:
+    """Resolve the output layer names from the given outputs specification.
+
+    The outputs specification can be in the following forms:
+    - A dictionary mapping output names to specifications, where the output names are the keys of the dictionary.
+    - A list of specifications, where the output names are resolved from the specifications in the list.
+    - A source identifier specification, where the output name is resolved from the value of the source identifier.
+      The source identifier must have a single string index as its value, which is used as the output name.
+
+    Args:
+        outputs (FlexSpec): The outputs specification to resolve.
+
+    Returns:
+        list[str]: A list of resolved output layer names.
+    """
     if isinstance(outputs.spec, dict):
         return list(outputs.spec)
 
@@ -218,8 +248,8 @@ class UserDefinedLayer(Serializable):
         f_inputs, f_outputs = [], []
         for unit in self.FLOW:
             if unit.INPUTS is not None:
-                f_inputs += [n for n in _resolve_inputs(unit.INPUTS) if n not in f_outputs]
-            f_outputs += [] if unit.OUTPUTS is None else _resolve_outputs(unit.OUTPUTS)
+                f_inputs += [n for n in resolve_inputs(unit.INPUTS) if n not in f_outputs]
+            f_outputs += [] if unit.OUTPUTS is None else resolve_outputs(unit.OUTPUTS)
         if self.INPUTS:
             if unknown := set(self.INPUTS) - set(f_inputs):
                 raise SpecError(f"Unknown inputs found: {unknown}.")
@@ -327,13 +357,12 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         self.template = TemplateLayer.model_validate(self.raw)
         self.user_defined_layers = {**self.predefined_user_defined_layers, **self.template.user_defined_layers}
 
-    @Cache()
     def get_user_defined_layer(
         self,
         parts: list[str],
         parameters: dict[str, dict[str, Any]] | Parameters,
         classname: str,
-    ) -> LayerIntermediate:
+    ) -> LayerIntermediateT:
         """Get the user-defined layer with the given parts and parameters.
 
         Args:
@@ -344,7 +373,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
             classname (str): The name of the layer class to use for the user-defined layer.
 
         Returns:
-            LayerIntermediate: The resolved user-defined layer as a `LayerIntermediate` instance.
+            LayerIntermediateT: The user-defined layer as a `LayerIntermediateT` instance.
         """
         if not parts:
             return self(parameters, classname)
@@ -364,6 +393,30 @@ class BaseBuilder(Generic[LayerIntermediateT]):
             from_references={**self.from_references, self.current_path: current_parts},
         ).get_user_defined_layer(parts, parameters, classname)
 
+    def _get_sublayer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
+        if unit.LAYER.CFG is not None:
+            current_path = str(unit.LAYER.CFG)
+            current_parts = self.from_references.get(current_path, None) or []
+            subclassname = to_pascal(unit.LAYER.CFG.stem)
+            if unit.LAYER.TYPE:
+                subclassname, parts = f"{subclassname}{to_pascal(unit.LAYER.TYPE)}", split_attribute(unit.LAYER.TYPE)
+            else:
+                if "__root__" in current_parts:
+                    raise SpecError(f"Circular reference detected for layer configuration: {self.from_references}")
+                current_parts, parts = (current_parts + ["__root__"]), []
+            builder = type(self)(
+                raw=load_any(unit.LAYER.CFG),
+                training=self.training,
+                predefined_user_defined_layers=self.user_defined_layers,
+                current_path=current_path,
+                from_references={**self.from_references, current_path: current_parts},
+            )
+        elif unit.LAYER.TYPE is not None:
+            subclassname, parts, builder = to_pascal(unit.LAYER.TYPE), split_attribute(unit.LAYER.TYPE), self
+        else:
+            raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
+        return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.LAYER.PARAM), subclassname)
+
     def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> LayerIntermediateT:
         """Build the layer from the template with the given parameters and class name.
 
@@ -380,7 +433,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         layer = self.template.format(parameters)
         sublayers: dict[str, ObjectPattern | LayerIntermediate] = {}
         flow: list[tuple[Any, Any, str | None]] = []
-        value_naming = AutoName("_")
+        naming = AutoName("_")
         for unit in layer.FLOW:
             if unit.LAYER is None:
                 if unit.NAME and unit.NAME not in sublayers:
@@ -393,39 +446,10 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                             "If LAYER is an ObjectPattern, the first pattern must be an AddressPattern "
                             f"but got: {unit.LAYER.model_dump()}"
                         )
-                    subinst, subclassname = unit.LAYER, split_attribute(ptn.address)[-1]
+                    subclassname, subinst = split_attribute(ptn.address)[-1], unit.LAYER
                 else:
-                    if unit.LAYER.CFG is not None:
-                        current_path = str(unit.LAYER.CFG)
-                        current_parts = self.from_references.get(current_path, None) or []
-                        subclassname = to_pascal(unit.LAYER.CFG.stem)
-                        if unit.LAYER.TYPE:
-                            subclassname = f"{subclassname}{to_pascal(unit.LAYER.TYPE)}"
-                            parts = split_attribute(unit.LAYER.TYPE)
-                        else:
-                            parts = []
-                            if "__root__" in current_parts:
-                                msg = f"Circular reference detected for layer configuration: {self.from_references}"
-                                raise SpecError(msg)
-                            current_parts = current_parts + ["__root__"]
-                        builder = type(self)(
-                            raw=load_any(unit.LAYER.CFG),
-                            training=self.training,
-                            predefined_user_defined_layers=self.user_defined_layers,
-                            current_path=current_path,
-                            from_references={**self.from_references, current_path: current_parts},
-                        )
-                    elif unit.LAYER.TYPE is not None:
-                        subclassname, parts = to_pascal(unit.LAYER.TYPE), split_attribute(unit.LAYER.TYPE)
-                        builder = self
-                    else:
-                        raise SpecError(
-                            "LAYER must have either CFG or TYPE defined to infer the layer name"
-                            f" but got: {unit.LAYER.model_dump()}"
-                        )
-                    subinst = builder.get_user_defined_layer(parts, parameters.merge(unit.LAYER.PARAM), subclassname)
-                name = unit.NAME if unit.NAME else value_naming(to_snake(subclassname))
-                if name in sublayers:
+                    subclassname, subinst = self._get_sublayer(parameters, unit)
+                if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
                     raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                 sublayers[name] = subinst
             flow.append((unit.INPUTS.spec if unit.INPUTS else None, unit.OUTPUTS.spec if unit.OUTPUTS else None, name))
