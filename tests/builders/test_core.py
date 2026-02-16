@@ -481,6 +481,7 @@ def test_layer_intermediate_basic() -> None:
         "outputs": ["output1"],
         "layers": {},
         "flow": [],
+        "inference_flow": [],
         "structured_output": False,
     }
     intermediate = LayerIntermediate.model_validate(raw)
@@ -489,6 +490,7 @@ def test_layer_intermediate_basic() -> None:
     assert intermediate.outputs == ["output1"]
     assert intermediate.layers == {}
     assert intermediate.flow == []
+    assert intermediate.inference_flow == []
     assert intermediate.structured_output is False
 
 
@@ -500,6 +502,7 @@ def test_layer_intermediate_with_layers() -> None:
         "outputs": ["b"],
         "layers": {},
         "flow": [],
+        "inference_flow": [],
         "structured_output": False,
     }
     raw2 = {
@@ -508,26 +511,12 @@ def test_layer_intermediate_with_layers() -> None:
         "outputs": ["output1"],
         "layers": {"sub": raw1},
         "flow": [],
+        "inference_flow": [],
         "structured_output": False,
     }
     intermediate = LayerIntermediate.model_validate(raw2)
     assert "sub" in intermediate.layers
     assert intermediate.layers["sub"].model_dump() == raw1
-
-
-# Test BaseBuilder
-def test_base_builder_basic() -> None:
-    """Test basic BaseBuilder functionality."""
-    raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": []}
-    builder = BaseBuilder(raw=raw)
-    assert isinstance(builder.template, TemplateLayer)
-    assert builder.training is False
-    assert builder.current_path == ""
-
-
-def test_base_builder_with_training_flag() -> None:
-    """Test BaseBuilder with training flag."""
-    assert BaseBuilder(raw={"INPUTS": ["input1"], "OUTPUTS": ["output1"], "FLOW": []}, training=True).training
 
 
 def test_base_builder_user_defined_layers() -> None:
@@ -647,11 +636,6 @@ def test_base_builder_flow_layer_without_cfg_or_type() -> None:
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": [[["input1"], ["output1"], {}]]}
     with pytest.raises(SpecError, match="LAYER must have either CFG or TYPE specified"):
         BaseBuilder(raw=raw)({}, "TestLayer")
-
-
-def test_base_builder_injects_training_parameter() -> None:
-    """Test that BaseBuilder injects training parameter."""
-    assert isinstance(BaseBuilder(raw={"FLOW": []}, training=True)({}, "TestLayer"), LayerIntermediate)
 
 
 def test_base_builder_circular_reference_with_cfg() -> None:

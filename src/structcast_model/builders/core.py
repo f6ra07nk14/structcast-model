@@ -240,6 +240,23 @@ def resolve_outputs(outputs: FlexSpec) -> list[str]:
     return _resolve(outputs.spec)
 
 
+def resolve_flow(flow: list[LayerBehavior]) -> tuple[list[str], list[str]]:
+    """Resolve the input and output layer names from the given flow.
+
+    Args:
+        flow (list[LayerBehavior]): The flow to resolve.
+
+    Returns:
+        tuple[list[str], list[str]]: A tuple containing the list of resolved input/output names.
+    """
+    inputs, outputs = [], []
+    for unit in flow:
+        if unit.INPUTS is not None:
+            inputs += [n for n in resolve_inputs(unit.INPUTS) if n not in outputs]
+        outputs += [] if unit.OUTPUTS is None else resolve_outputs(unit.OUTPUTS)
+    return unique(inputs), unique(outputs)
+
+
 class UserDefinedLayer(Serializable):
     """User defined layer configuration."""
 
@@ -251,6 +268,9 @@ class UserDefinedLayer(Serializable):
 
     FLOW: list[LayerBehavior] = Field(default_factory=list)
     """Flow of the layer."""
+
+    INFERENCE_FLOW: list[LayerBehavior] = Field(default_factory=list)
+    """Inference flow of the layer. If not specified, the inference flow will be the same as the flow."""
 
     STRUCTURED_OUTPUT: bool = False
     """Whether the output is structured."""
@@ -264,23 +284,25 @@ class UserDefinedLayer(Serializable):
     @model_validator(mode="after")
     def _validate_user_defined_layer(self) -> Self:
         """Validate the user-defined layer."""
-        f_inputs, f_outputs = [], []
-        for unit in self.FLOW:
-            if unit.INPUTS is not None:
-                f_inputs += [n for n in resolve_inputs(unit.INPUTS) if n not in f_outputs]
-            f_outputs += [] if unit.OUTPUTS is None else resolve_outputs(unit.OUTPUTS)
-        if self.INPUTS:
-            if unknown := set(self.INPUTS) - set(f_inputs):
-                raise SpecError(f"Unknown inputs found: {unknown}.")
-            if missing := set(f_inputs) - set(self.INPUTS):
-                raise SpecError(f"Missing inputs found: {missing}.")
-        else:
-            self.INPUTS.extend(unique(f_inputs))
-        if self.OUTPUTS:
-            if unknown := set(self.OUTPUTS) - set(f_outputs):
-                raise SpecError(f"Unknown outputs found: {unknown}.")
-        else:
-            self.OUTPUTS.extend(unique(f_outputs))
+        train_inputs, train_outputs = resolve_flow(self.FLOW)
+        if not self.INPUTS:
+            self.INPUTS.extend(train_inputs)
+        if not self.OUTPUTS:
+            self.OUTPUTS.extend(train_outputs)
+        if unknown := set(self.INPUTS) - set(train_inputs):
+            raise SpecError(f"Unknown inputs found: {unknown}.")
+        if missing := set(train_inputs) - set(self.INPUTS):
+            raise SpecError(f"Missing inputs found: {missing}.")
+        if unknown := set(self.OUTPUTS) - set(train_outputs):
+            raise SpecError(f"Unknown outputs found: {unknown}.")
+        if self.INFERENCE_FLOW:
+            infer_inputs, infer_outputs = resolve_flow(self.INFERENCE_FLOW)
+            if unknown := set(self.INPUTS) - set(infer_inputs):
+                raise SpecError(f"Unknown inputs found in INFERENCE_FLOW: {unknown}.")
+            if missing := set(infer_inputs) - set(self.INPUTS):
+                raise SpecError(f"Missing inputs found in INFERENCE_FLOW: {missing}.")
+            if unknown := set(self.OUTPUTS) - set(infer_outputs):
+                raise SpecError(f"Unknown outputs found in INFERENCE_FLOW: {unknown}.")
         return self
 
 
@@ -343,14 +365,23 @@ class LayerIntermediate(Serializable):
     flow: list[tuple[FlexSpec, FlexSpec, str | None]]
     """The flow of the layer."""
 
+    inference_flow: list[tuple[FlexSpec, FlexSpec, str | None]]
+    """The inference flow of the layer."""
+
     structured_output: bool
     """Whether the output is structured."""
 
-    layer_type: ClassVar[type[Any]] = dict
-    """The type of the layer instance."""
-
     layer_call_name: ClassVar[str | None] = None
     """The name of the method to call the layer, if applicable."""
+
+    def _get_script(self) -> str:
+        """Implement the method to get the script for the layer."""
+        raise NotImplementedError("The _get_script method must be implemented in the subclass.")
+
+    @cached_property
+    def script(self) -> str:
+        """Get the script for the layer."""
+        return self._get_script()
 
 
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
@@ -363,7 +394,6 @@ class BaseBuilder(Generic[LayerIntermediateT]):
     user_defined_layer_type: ClassVar[type[LayerIntermediateT]] = LayerIntermediate
 
     raw: Any
-    training: bool = False
     predefined_user_defined_layers: dict[str, Any] = field(default_factory=dict)
     current_path: str = ""
     from_references: dict[str, list[str]] = field(default_factory=dict)
@@ -406,7 +436,6 @@ class BaseBuilder(Generic[LayerIntermediateT]):
             raise SpecError(f"Circular reference detected for user-defined layer: {'.'.join(current_parts)}")
         return type(self)(
             raw=self.user_defined_layers[first],
-            training=self.training,
             predefined_user_defined_layers=self.user_defined_layers,
             current_path=self.current_path,
             from_references={**self.from_references, self.current_path: current_parts},
@@ -425,7 +454,6 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                 current_parts, parts = (current_parts + ["__root__"]), []
             builder = type(self)(
                 raw=load_any(unit.LAYER.CFG),
-                training=self.training,
                 predefined_user_defined_layers=self.user_defined_layers,
                 current_path=current_path,
                 from_references={**self.from_references, current_path: current_parts},
@@ -448,39 +476,50 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         Returns:
             LayerIntermediateT: The built layer as a `LayerIntermediateT` instance.
         """
-        parameters = Parameters(SHARED={"training": self.training}).merge(parameters)
+        if not isinstance(parameters, Parameters):
+            parameters = Parameters.model_validate(parameters)
         layer = self.template.format(parameters)
         sublayers: dict[str, ObjectPattern | LayerIntermediate] = {}
-        flow: list[tuple[Any, Any, str | None]] = []
         naming = AutoName("_")
-        for unit in layer.FLOW:
-            if unit.LAYER is None:
-                if unit.NAME and unit.NAME not in sublayers:
-                    raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
-                name = unit.NAME
-            else:
-                if isinstance(unit.LAYER, ObjectPattern):
-                    if not isinstance((ptn := unit.LAYER.patterns[0]), AddressPattern):
-                        raise SpecError(
-                            "If LAYER is an ObjectPattern, the first pattern must be an AddressPattern "
-                            f"but got: {unit.LAYER.model_dump()}"
-                        )
-                    subclassname, subinst = split_attribute(ptn.address)[-1], unit.LAYER
+
+        def _create_flow(units: list[LayerBehavior]) -> list[tuple[FlexSpec, FlexSpec, str | None]]:
+            flow: list[tuple[FlexSpec, FlexSpec, str | None]] = []
+            for unit in units:
+                if unit.LAYER is None:
+                    if unit.NAME and unit.NAME not in sublayers:
+                        raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
+                    name = unit.NAME
                 else:
-                    subclassname, subinst = self._get_sublayer(parameters, unit)
-                if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
-                    raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
-                sublayers[name] = subinst
-            if (has_inputs := unit.INPUTS is not None) and (has_outputs := unit.OUTPUTS is not None):
-                flow.append((unit.INPUTS, unit.OUTPUTS, name))
-            elif has_inputs or has_outputs:
-                msg = f"Both INPUTS and OUTPUTS must be specified together in the flow but got: {unit.model_dump()}"
-                raise SpecError(msg)
+                    if isinstance(unit.LAYER, ObjectPattern):
+                        if not isinstance((ptn := unit.LAYER.patterns[0]), AddressPattern):
+                            raise SpecError(
+                                "If LAYER is an ObjectPattern, the first pattern must be an AddressPattern "
+                                f"but got: {unit.LAYER.model_dump()}"
+                            )
+                        subclassname, subinst = split_attribute(ptn.address)[-1], unit.LAYER
+                    else:
+                        subclassname, subinst = self._get_sublayer(parameters, unit)  # type: ignore[arg-type]
+                    if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
+                        raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
+                    sublayers[name] = subinst
+                if (has_inputs := unit.INPUTS is not None) and (has_outputs := unit.OUTPUTS is not None):
+                    flow.append((unit.INPUTS, unit.OUTPUTS, name))
+                elif has_inputs or has_outputs:
+                    raise SpecError(
+                        f"Both INPUTS and OUTPUTS must be specified together in the training/inference flow "
+                        f"but got: {unit.model_dump()}"
+                    )
+            return flow
+
         return self.user_defined_layer_type(
             classname=classname,
             inputs=layer.INPUTS,
             outputs=layer.OUTPUTS,
             layers=sublayers,
-            flow=flow,
+            flow=_create_flow(layer.FLOW),
+            inference_flow=_create_flow(layer.INFERENCE_FLOW),
             structured_output=layer.STRUCTURED_OUTPUT,
         )
+
+
+# todo: custom script for object pattern
