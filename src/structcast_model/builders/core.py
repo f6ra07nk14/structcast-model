@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import cached_property
+from hashlib import sha256
+from json import dumps as json_dumps
 from logging import getLogger
 from typing import Any, ClassVar, Generic, Self, TypeVar, cast
 
@@ -13,20 +16,22 @@ from pydantic import (
     Field,
     FilePath,
     SerializerFunctionWrapHandler,
+    ValidationError,
     field_validator,
     model_serializer,
     model_validator,
 )
 from pydantic.alias_generators import to_pascal, to_snake
+from pydantic_core import to_jsonable_python
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
-from structcast.core.instantiator import AddressPattern, ObjectPattern
+from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import extend_structure
 from structcast.utils.base import check_elements
-from structcast.utils.security import split_attribute
+from structcast.utils.security import resolve_address, split_attribute
 
-from structcast_model.builders.auto_name import AutoName
+from structcast_model.builders.auto_name import AutoName, defaultdict
 from structcast_model.utils.base import load_any, unique
 
 logger = getLogger(__name__)
@@ -347,8 +352,98 @@ class TemplateLayer(WithExtra):
         return UserDefinedLayer.model_validate(raw)
 
 
+def resolve_object(pattern: ObjectPattern, imports: defaultdict[str, set]) -> tuple[str, str]:
+    """Resolve the object pattern to a string representation and collect the required imports.
+
+    The object pattern is resolved by processing its patterns in order.
+    The first pattern must be an `AddressPattern` or an `ObjectPattern`, which is resolved to a string representation.
+    The subsequent patterns are applied to the resolved string representation in order,
+    where an `AttributePattern` is resolved to an attribute access, a `CallPattern` is resolved to a function call,
+    and a `BindPattern` is resolved to a function call with the bound arguments.
+    The required imports are collected from the `AddressPattern`s encountered during the resolution process.
+
+    Args:
+        pattern (ObjectPattern): The pattern to resolve.
+        imports (defaultdict[str, set]): A dictionary to collect the required imports,
+            where the keys are module names and the values are sets of imported names from the corresponding modules.
+
+    Returns:
+        tuple[str, str]: A tuple containing the resolved string representation of the object pattern and
+            the name of the top-level class or function.
+    """
+    classes: list[str] = []
+
+    def _repr(raw: Any) -> str:
+        if isinstance(raw, (int, float, bool, bytes, type(None))):
+            return repr(raw)
+        try:
+            return _resolve(ObjectPattern.model_validate(raw))
+        except ValidationError:
+            pass
+        if isinstance(raw, str):
+            if raw.startswith("eval:"):
+                return raw[5:].strip()
+            return repr(raw)
+        if isinstance(raw, dict):
+            return f"{{{', '.join(f'{_repr(k)}: {_repr(v)}' for k, v in raw.items())}}}"
+        if isinstance(raw, (list, tuple)):
+            return f"[{', '.join(_repr(item) for item in raw)}]"
+        raise SpecError(f"Unsupported type for validation: {type(raw)}")
+
+    def _args(raw: Any) -> str:
+        if isinstance(raw, dict):
+            return ", ".join(f"{k}={_repr(v)}" for k, v in raw.items())
+        if isinstance(raw, (list, tuple)):
+            return ", ".join(_repr(v) for v in raw)
+        return _repr(raw)
+
+    def _resolve(obj: ObjectPattern) -> str:
+        first, rest = obj.patterns[0], obj.patterns[1:]
+        if isinstance(first, AddressPattern):
+            module, res = resolve_address(first.address)
+            classes.append(res)
+            if module:
+                imports[module].add(res)
+        elif isinstance(first, ObjectPattern):
+            res = _resolve(first)
+        else:
+            raise SpecError(
+                "First pattern of an ObjectPattern must be an AddressPattern or ObjectPattern "
+                f"but got: {to_jsonable_python(pattern)}"
+            )
+        for ptn in rest:
+            if isinstance(ptn, (AddressPattern, ObjectPattern)):
+                raise SpecError(
+                    "Only the first pattern of an ObjectPattern can be an AddressPattern or ObjectPattern "
+                    f"but got: {to_jsonable_python(pattern)}"
+                )
+            if isinstance(ptn, AttributePattern):
+                res = f"{res}.{ptn.attribute}"
+            elif isinstance(ptn, CallPattern):
+                res = f"{res}({_args(ptn.call)})"
+            elif isinstance(ptn, BindPattern):
+                pid = str(id(ptn))[1:4]
+                aname, kwname = f"_arg{pid}", f"_kw{pid}"
+                args = _args(ptn.bind)
+                if isinstance(ptn.bind, dict):
+                    res = f"(lambda *{aname}, **{kwname}: {res}(*{aname}, {args}, **{kwname}))"
+                else:
+                    res = f"(lambda *{aname}, **{kwname}: {res}({args}, *{aname}, **{kwname}))"
+            else:
+                raise SpecError(
+                    "Patterns after the first pattern of an ObjectPattern must be AttributePattern, CallPattern, "
+                    f"or BindPattern but got: {to_jsonable_python(pattern)}"
+                )
+        return res
+
+    return _resolve(pattern), (classes[0] if classes else "_Class")
+
+
 class LayerIntermediate(Serializable):
     """Intermediate representation of a layer during the building process."""
+
+    imports: dict[str, set]
+    """The imports required for the layer."""
 
     classname: str
     """The name of the layer class."""
@@ -359,13 +454,13 @@ class LayerIntermediate(Serializable):
     outputs: list[str]
     """The names of the output layers."""
 
-    layers: dict[str, ObjectPattern | LayerIntermediate]
+    layers: dict[str, LayerIntermediate | str]
     """The sub-layers of the layer."""
 
-    flow: list[tuple[FlexSpec, FlexSpec, str | None]]
+    flow: list[tuple[str, str, str | None]]
     """The flow of the layer."""
 
-    inference_flow: list[tuple[FlexSpec, FlexSpec, str | None]]
+    inference_flow: list[tuple[str, str, str | None]]
     """The inference flow of the layer."""
 
     structured_output: bool
@@ -374,14 +469,75 @@ class LayerIntermediate(Serializable):
     layer_call_name: ClassVar[str | None] = None
     """The name of the method to call the layer, if applicable."""
 
-    def _get_script(self) -> str:
+    @cached_property
+    def collected_imports(self) -> dict[str, set[str]]:
+        """Collect the required imports from the layer and its sub-layers."""
+        imports: dict[str, set[str]] = defaultdict(set)
+        imports.update(self.imports)
+        for sub in self.layers.values():
+            if isinstance(sub, LayerIntermediate):
+                for module, names in sub.collected_imports.items():
+                    imports[module].update(names)
+        return imports
+
+    @cached_property
+    def _forward_inputs(self) -> str:
+        """Get the input arguments for calling the layer in the forward method."""
+        return ", ".join(self.inputs)
+
+    @cached_property
+    def _forward_outputs(self) -> str:
+        """Get the output arguments for calling the layer in the forward method."""
+        if self.structured_output:
+            return f"{{{','.join(f'{repr(k)}: {k}' for k in self.OUTPUTS)}}}"
+        return ", ".join(self.OUTPUTS)
+
+    def _get_layer(self, layername: str) -> str:
+        """Get the sub-layer with the given name."""
+        return layername
+
+    def _forward_flow(self, flow: list[tuple[str, str, str | None]]) -> list[str]:
+        """Get the code for the flow in the forward method."""
+        return [f"{o} = {self._get_layer(L)}({i})" if L else f"{o} = {i}" for i, o, L in flow]
+
+    @cached_property
+    def _forward_training_flow(self) -> list[str]:
+        """Get the code for the training flow in the forward method."""
+        return self._forward_flow(self.flow)
+
+    @cached_property
+    def _forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return self._forward_flow(self.inference_flow)
+
+    def _get_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Implement the method to get the script for the layer."""
         raise NotImplementedError("The _get_script method must be implemented in the subclass.")
 
+    @classmethod
+    def _get_scripts(cls, cfg: LayerIntermediate) -> list[str]:
+        naming = AutoName("")
+        classnames: OrderedDict[str, str] = OrderedDict()
+        scripts: list[str] = []
+
+        def _hash(raw: Any) -> str:
+            return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
+
+        def _scripts(sub: LayerIntermediate) -> str:
+            if (hash_id := _hash(sub)) in classnames:
+                return f"{classnames[hash_id]}()"
+            classnames[hash_id] = (classname := naming(sub.classname))
+            layers: list[str] = [f"{k} = {v if isinstance(v, str) else _scripts(v)}" for k, v in sub.layers.items()]
+            scripts.append(sub._get_script(classname, layers))
+            return f"{classname}()"
+
+        _scripts(cfg)
+        return scripts
+
     @cached_property
-    def script(self) -> str:
-        """Get the script for the layer."""
-        return self._get_script()
+    def scripts(self) -> list[str]:
+        """Get the scripts for the layer and its sub-layers."""
+        return self._get_scripts(self)
 
 
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
@@ -479,11 +635,45 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         if not isinstance(parameters, Parameters):
             parameters = Parameters.model_validate(parameters)
         layer = self.template.format(parameters)
-        sublayers: dict[str, ObjectPattern | LayerIntermediate] = {}
+        imports: defaultdict[str, set] = defaultdict(set)
+        sublayers: dict[str, LayerIntermediate | str] = {}
         naming = AutoName("_")
 
-        def _create_flow(units: list[LayerBehavior]) -> list[tuple[FlexSpec, FlexSpec, str | None]]:
-            flow: list[tuple[FlexSpec, FlexSpec, str | None]] = []
+        def _getter(raw: Any, var_name: str | None = None) -> str:
+            try:
+                return resolve_object(ObjectPattern.model_validate(raw), imports)[0]
+            except ValidationError:
+                pass
+            if isinstance(raw, dict):
+                return f"{{{', '.join(f'{repr(k)}: {_getter(s, var_name)}' for k, s in raw.items())}}}"
+            if isinstance(raw, list):
+                return f"[{', '.join(_getter(s, var_name) for s in raw)}]"
+            if isinstance(raw, tuple):
+                return f"({', '.join(_getter(s, var_name) for s in raw)})"
+            if not isinstance(raw, str):
+                return repr(raw)
+            spec = SpecIntermediate.convert_spec(raw)
+            if spec.identifier == SPEC_SOURCE:
+                var_name, attr = (var_name, spec.value) if var_name else (spec.value[0], spec.value[1:])
+                return f"{var_name}{''.join(f'[{repr(s)}]' for s in attr)}"
+            if spec.identifier in SPEC_EVAL:
+                return spec.value
+            if spec.identifier == SPEC_CONSTANT:
+                return repr(spec.value)
+            raise SpecError(f"Unsupported spec identifier: {spec.identifier}")
+
+        def _inputs(raw: Any) -> str:
+            if isinstance(raw, dict):
+                return ", ".join(f"{k}={_getter(v)}" for k, v in raw.items())
+            if isinstance(raw, (list, tuple)):
+                return ", ".join(_getter(v) for v in raw)
+            return _getter(raw)
+
+        def _outputs(raw: SpecIntermediate | list[SpecIntermediate]) -> str:
+            return raw.value[0] if isinstance(raw, SpecIntermediate) else f"({', '.join(_outputs(r) for r in raw)})"
+
+        def _create_flow(units: list[LayerBehavior]) -> list[tuple[str, str, str | None]]:
+            flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
                     if unit.NAME and unit.NAME not in sublayers:
@@ -491,19 +681,20 @@ class BaseBuilder(Generic[LayerIntermediateT]):
                     name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
-                        if not isinstance((ptn := unit.LAYER.patterns[0]), AddressPattern):
-                            raise SpecError(
-                                "If LAYER is an ObjectPattern, the first pattern must be an AddressPattern "
-                                f"but got: {unit.LAYER.model_dump()}"
-                            )
-                        subclassname, subinst = split_attribute(ptn.address)[-1], unit.LAYER
+                        subinst, subclassname = resolve_object(unit.LAYER, imports)
                     else:
                         subclassname, subinst = self._get_sublayer(parameters, unit)  # type: ignore[arg-type]
                     if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                     sublayers[name] = subinst
                 if (has_inputs := unit.INPUTS is not None) and (has_outputs := unit.OUTPUTS is not None):
-                    flow.append((unit.INPUTS, unit.OUTPUTS, name))
+                    inp = _inputs(unit.INPUTS.model_dump())
+                    if isinstance(unit.OUTPUTS.spec, dict):
+                        flow.append((inp, (tmpname := f"{name or naming('tmp')}_output"), name))
+                        for key, value in unit.OUTPUTS.model_dump().items():
+                            flow.append((key, _getter(value, tmpname), None))
+                    else:
+                        flow.append((inp, _outputs(unit.OUTPUTS.spec), name))
                 elif has_inputs or has_outputs:
                     raise SpecError(
                         f"Both INPUTS and OUTPUTS must be specified together in the training/inference flow "
@@ -512,6 +703,7 @@ class BaseBuilder(Generic[LayerIntermediateT]):
             return flow
 
         return self.user_defined_layer_type(
+            imports=imports,
             classname=classname,
             inputs=layer.INPUTS,
             outputs=layer.OUTPUTS,
@@ -520,6 +712,3 @@ class BaseBuilder(Generic[LayerIntermediateT]):
             inference_flow=_create_flow(layer.INFERENCE_FLOW),
             structured_output=layer.STRUCTURED_OUTPUT,
         )
-
-
-# todo: custom script for object pattern

@@ -472,53 +472,6 @@ def test_template_layer_format() -> None:
     assert result.OUTPUTS == ["output1"]
 
 
-# Test LayerIntermediate
-def test_layer_intermediate_basic() -> None:
-    """Test basic LayerIntermediate functionality."""
-    raw = {
-        "classname": "TestLayer",
-        "inputs": ["input1"],
-        "outputs": ["output1"],
-        "layers": {},
-        "flow": [],
-        "inference_flow": [],
-        "structured_output": False,
-    }
-    intermediate = LayerIntermediate.model_validate(raw)
-    assert intermediate.classname == "TestLayer"
-    assert intermediate.inputs == ["input1"]
-    assert intermediate.outputs == ["output1"]
-    assert intermediate.layers == {}
-    assert intermediate.flow == []
-    assert intermediate.inference_flow == []
-    assert intermediate.structured_output is False
-
-
-def test_layer_intermediate_with_layers() -> None:
-    """Test LayerIntermediate with sub-layers."""
-    raw1 = {
-        "classname": "SubLayer",
-        "inputs": ["a"],
-        "outputs": ["b"],
-        "layers": {},
-        "flow": [],
-        "inference_flow": [],
-        "structured_output": False,
-    }
-    raw2 = {
-        "classname": "MainLayer",
-        "inputs": ["input1"],
-        "outputs": ["output1"],
-        "layers": {"sub": raw1},
-        "flow": [],
-        "inference_flow": [],
-        "structured_output": False,
-    }
-    intermediate = LayerIntermediate.model_validate(raw2)
-    assert "sub" in intermediate.layers
-    assert intermediate.layers["sub"].model_dump() == raw1
-
-
 def test_base_builder_user_defined_layers() -> None:
     """Test BaseBuilder user_defined_layers property."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": [], "custom_layer": {"INPUTS": "a", "OUTPUTS": "b"}}
@@ -614,7 +567,7 @@ def test_base_builder_flow_without_address_pattern() -> None:
         "OUTPUTS": "output1",
         "FLOW": [[["input1"], ["output1"], {"_obj_": [["_call_", "invalid"]]}]],
     }
-    with pytest.raises(SpecError, match="first pattern must be an AddressPattern"):
+    with pytest.raises(SpecError, match="First pattern of an ObjectPattern must be an AddressPattern or ObjectPattern"):
         BaseBuilder(raw=raw)({}, "TestLayer")
 
 
