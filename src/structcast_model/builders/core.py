@@ -29,7 +29,8 @@ from structcast.core.instantiator import AddressPattern, AttributePattern, BindP
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import extend_structure
 from structcast.utils.base import check_elements
-from structcast.utils.security import resolve_address, split_attribute
+from structcast.utils.security import check_path, resolve_address, split_attribute
+from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName, defaultdict
 from structcast_model.utils.base import load_any, unique
@@ -538,6 +539,14 @@ class LayerIntermediate(Serializable):
     def scripts(self) -> list[str]:
         """Get the scripts for the layer and its sub-layers."""
         return self._get_scripts(self)
+
+    def __call__(self, module_path: PathLike) -> None:
+        """Save the script for the layer to the given path."""
+        from_imports = "\n".join([f"from {p} import {', '.join(m)}" for p, m in self.collected_imports.items()])
+        code = "\n\n".join([s for s in [from_imports, *self.scripts] if s])
+        module_path = check_path(module_path)
+        module_path.parent.mkdir(parents=True, exist_ok=True)
+        module_path.write_text(code, encoding="utf-8")
 
 
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
