@@ -39,6 +39,7 @@ keras-torch-cu128 = ["keras>=3.13.2", "structcast-model[torch-cu128]"]
 keras-torch-cu130 = ["keras>=3.13.2", "structcast-model[torch-cu130]"]
 keras-tf-cpu = ["keras>=3.13.2", "structcast-model[tf-cpu]"]
 keras-tf-cu12 = ["keras>=3.13.2", "structcast-model[tf-cu12]"]
+mlflow = ["mlflow>=3.10.0"]
 
 [tool.uv]
 conflicts = [
