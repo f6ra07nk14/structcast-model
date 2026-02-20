@@ -1,3 +1,5 @@
+"""Base builder for building layers or backward operators from templates."""
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -22,7 +24,6 @@ from structcast.utils.types import PathLike
 from structcast_model.builders.auto_name import AutoName, defaultdict
 from structcast_model.builders.schema import (
     SPEC_EVAL,
-    BackwardBehavior,
     LayerBehavior,
     Parameters,
     Serializable,
@@ -453,8 +454,12 @@ class BackwardIntermediate(_Intermediate):
     classname: str
     """The name of the backward layer class."""
 
-    mixed_precision: bool
-    """Whether to use mixed precision during backward pass."""
+    mixed_precision: str | None
+    """The mixed precision configuration for the backward layer, or `None` if mixed precision is not used."""
+
+    accumulate_gradients: int | None
+    """The number of steps to accumulate gradients for before performing an optimizer step,
+    or `None` if not applicable."""
 
     losses: list[str]
     """The loss expressions for the backward layer."""
@@ -462,14 +467,20 @@ class BackwardIntermediate(_Intermediate):
     models: list[str]
     """The models used in the backward layer."""
 
-    backwards: list[str]
-    """The backward scripts for the backward layer."""
+    optimizers: dict[str, tuple[str, list[str], str | None]]
+    """The optimizers defined in the backward layer, where the keys are the optimizer names and the values are
+    tuples of the form (optimizer, trainable_layers, clip_grad)."""
+
+    backwards: list[tuple[str, str, list[str]]]
+    """The backward steps in the backward layer,
+    where each element is a tuple of the form (loss, backward_kwargs, optimizers)."""
 
     @cached_property
     def _backward_losses(self) -> str:
         """Get the loss expressions for the backward method."""
         return ", ".join(self.losses)
 
+    @cached_property
     def _backward_models(self) -> str:
         """Get the models used in the backward method."""
         return ", ".join(self.models)
@@ -484,14 +495,19 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
 
     user_defined_backward_layer_type: ClassVar[type[BackwardIntermediateT]] = BackwardIntermediate
 
+    raw: Any
     template: TemplateBackward = field(init=False)
 
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateBackward.model_validate(self.raw)
 
-    def _get_backward_script(self, behavior: BackwardBehavior, mixed_precision: bool) -> str:
-        raise NotImplementedError("The _get_backward_script method must be implemented in the subclass.")
+    def _get_mixed_precision(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        mixed_precision: bool | dict[str, Any],
+    ) -> str | None:
+        raise NotImplementedError("The _get_mixed_precision method must be implemented in the subclass.")
 
     def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> BackwardIntermediateT:
         """Build the backward layer from the template with the given parameters and class name.
@@ -506,11 +522,32 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             BackwardIntermediateT: The built backward layer as a `BackwardIntermediateT` instance.
         """
         backward = self.template.format(parameters)
+        imports: defaultdict[str, set[str | None]] = defaultdict(set)
+        imports.update(backward.IMPORTS)
+        naming = AutoName("_")
+        opts: dict[str, tuple[str, list[str], str | None]] = {}
+        backwards: OrderedDict[str, tuple[str, str, list[str]]] = OrderedDict()
+        for unit in backward.BACKWARDS:
+            backward_name = unit.NAME or naming("backward")
+            if backward_name in backwards:
+                raise SpecError(f'Duplicate backward name "{backward_name}" found in the backwards.')
+            repr_backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in unit.model_extra.items())
+            backwards[backward_name] = (unit.LOSS, repr_backward_kw, [])
+            for opt in unit.OPTIMIZERS:
+                optinst, optclassname = resolve_object(imports, opt.OPTIMIZER)
+                optname = opt.NAME or naming(optclassname)
+                if optname in opts:
+                    raise SpecError(f'Duplicate optimizer name "{optname}" found in the backwards.')
+                opt_clip = resolve_object(imports, opt.OPTIMIZER)[0] if opt.CLIP else None
+                opts[optname] = (optinst, opt.LAYERS, opt_clip)
+                backwards[backward_name][-1].append(optname)
         return self.user_defined_backward_layer_type(
-            imports=backward.IMPORTS,
+            imports=imports,
             classname=classname,
-            mixed_precision=backward.MIXED_PRECISION,
+            mixed_precision=self._get_mixed_precision(imports, backward.MIXED_PRECISION),
+            accumulate_gradients=backward.ACCUMULATE_GRADIENTS,
             losses=backward.LOSSES,
             models=backward.MODELS,
-            backwards=[self._get_backward_script(b, backward.MIXED_PRECISION) for b in backward.BEHAVIOR],
+            optimizers=opts,
+            backwards=backwards,
         )

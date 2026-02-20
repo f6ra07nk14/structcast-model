@@ -339,12 +339,12 @@ class OptimizerBehavior(Serializable):
     OPTIMIZER: ObjectPattern
     """The name of the optimizer class or an instance of the optimizer."""
 
-    TRAINABLE_LAYERS: list[str] = Field(default_factory=list, min_length=1)
-    """The layers to apply the optimizer to."""
+    LAYERS: list[str] = Field(default_factory=list, min_length=1)
+    """The trainable layers to apply the optimizer to."""
 
-    ACCUMULATE_GRADIENTS: PositiveInt | None = None
-    """Whether to accumulate gradients for multiple steps before updating the parameters,
-    and the number of steps to accumulate for."""
+    CLIP: ObjectPattern | None = None
+    """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
+    or a pattern to instantiate the gradient clipping configuration."""
 
     @model_validator(mode="before")
     @classmethod
@@ -354,23 +354,23 @@ class OptimizerBehavior(Serializable):
             return raw
         if isinstance(raw, (list, tuple)):
             if len(raw) == 4:
-                name, opt, layers, acc_grad = raw
+                name, opt, layers, clip = raw
             elif len(raw) == 3:
                 if isinstance(raw[0], str) or raw[0] is None:
                     name, opt, layers = raw
-                    acc_grad = None
+                    clip = None
                 else:
-                    opt, layers, acc_grad = raw
+                    opt, layers, clip = raw
                     name = None
             elif len(raw) == 2:
                 opt, layers = raw
-                name, acc_grad = None, None
+                name, clip = None, None
             else:
                 raise SpecError(f"The tuple/list for OptimizerBehavior must have 2, 3, or 4 elements but got: {raw}.")
-            return {"NAME": name, "OPTIMIZER": opt, "TRAINABLE_LAYERS": layers, "ACCUMULATE_GRADIENTS": acc_grad}
+            return {"NAME": name, "OPTIMIZER": opt, "LAYERS": layers, "CLIP": clip}
         return raw
 
-    @field_validator("TRAINABLE_LAYERS", mode="after")
+    @field_validator("LAYERS", mode="after")
     @classmethod
     def _validate_trainable_layers(cls, data: list[str]) -> list[str]:
         """Validate the trainable layers."""
@@ -381,17 +381,17 @@ class OptimizerBehavior(Serializable):
     @model_serializer(mode="wrap")
     def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
         """Serialize the model."""
-        res = [handler(self.OPTIMIZER), handler(self.TRAINABLE_LAYERS)]
+        res = [handler(self.OPTIMIZER), handler(self.LAYERS)]
+        if self.CLIP:
+            res.append(handler(self.CLIP))
         if self.NAME:
             res = [self.NAME] + res
-        if self.ACCUMULATE_GRADIENTS is not None:
-            res.append(self.ACCUMULATE_GRADIENTS)
         return res
 
     @cached_property
     def models(self) -> set[str]:
         """Get the models to apply the optimizer behavior to."""
-        return {split_attribute(L)[0] for L in self.TRAINABLE_LAYERS}
+        return {split_attribute(L)[0] for L in self.LAYERS}
 
 
 class BackwardBehavior(WithExtra):
@@ -426,7 +426,7 @@ class BackwardBehavior(WithExtra):
                 loss, opts = raw
                 name, others = None, {}
             else:
-                raise SpecError(f"The tuple/list for BackwardBehavior must have 2 or 3 elements but got: {raw}.")
+                raise SpecError(f"The tuple/list for BackwardBehavior must have 2, 3, or 4 elements but got: {raw}.")
             return {"NAME": name, "LOSS": loss, "OPTIMIZERS": opts, **others}
         return raw
 
@@ -473,8 +473,12 @@ class UserDefinedBackward(Serializable):
     If not specified, the backward behavior will be applied to all models involved in the flows of the layers
     defined in the same user-defined layer configuration."""
 
-    MIXED_PRECISION: bool = False
+    MIXED_PRECISION: bool | dict[str, Any] = False
     """Whether to use mixed precision during backward pass."""
+
+    ACCUMULATE_GRADIENTS: PositiveInt | None = None
+    """Whether to accumulate gradients for multiple steps before updating the parameters,
+    and the number of steps to accumulate for."""
 
     @field_validator("IMPORTS", mode="before")
     @classmethod
