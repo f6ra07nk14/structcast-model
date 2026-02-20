@@ -94,6 +94,20 @@ class {self.classname}:
     def __call__(self, step, {self._backward_losses}, **kwargs):
         {sep.join(flow)}
         return should_update
+
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        def _get_lr(opt):
+            return opt.param_groups[0]["lr"]
+
+        return {{{", ".join([f'"{n}_lr": _get_lr(self.{n})' for n in self.optimizers])}}}
+
+    @property
+    def param_group_names(self) -> dict[str, list[dict[str, Any]]]:
+        def _get_param_groups(opt):
+            return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
+
+        return {{{", ".join([f'"{n}": _get_param_groups(self.{n})' for n in self.optimizers])}}}
 """
         return [res]
 
