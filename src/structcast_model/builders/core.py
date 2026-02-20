@@ -16,6 +16,7 @@ from pydantic import (
     Field,
     FilePath,
     SerializerFunctionWrapHandler,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_serializer,
@@ -27,7 +28,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
-from structcast.core.template import extend_structure
+from structcast.core.template import Sequence, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.security import check_path, resolve_address, split_attribute
 from structcast.utils.types import PathLike
@@ -266,6 +267,13 @@ def resolve_flow(flow: list[LayerBehavior]) -> tuple[list[str], list[str]]:
 class UserDefinedLayer(Serializable):
     """User defined layer configuration."""
 
+    IMPORTS: dict[str, set[str | None]] = Field(default_factory=dict)
+    """Imports required for the layer, where the keys are module names and the values are sets of imported names
+    from the corresponding modules.
+
+    The imported names can be `None`, which indicates that the entire module is imported.
+    """
+
     INPUTS: list[str] = Field(default_factory=list)
     """Inputs of the layer."""
 
@@ -280,6 +288,19 @@ class UserDefinedLayer(Serializable):
 
     STRUCTURED_OUTPUT: bool = False
     """Whether the output is structured."""
+
+    @field_validator("IMPORTS", mode="before")
+    @classmethod
+    def _validate_imports(cls, data: Any) -> Any:
+        """Validate the imports."""
+        if isinstance(data, dict):
+            return {k: set(check_elements(v)) for k, v in data.items()}
+        try:
+            data = check_elements(TypeAdapter(str | set[str] | Sequence[str]).validate_python(data))
+            return {k: {None} for k in data}
+        except ValidationError:
+            pass
+        return data
 
     @field_validator("INPUTS", "OUTPUTS", mode="before")
     @classmethod
@@ -443,7 +464,7 @@ def resolve_object(pattern: ObjectPattern, imports: defaultdict[str, set]) -> tu
 class LayerIntermediate(Serializable):
     """Intermediate representation of a layer during the building process."""
 
-    imports: dict[str, set]
+    imports: dict[str, set[str | None]]
     """The imports required for the layer."""
 
     classname: str
@@ -471,9 +492,9 @@ class LayerIntermediate(Serializable):
     """The name of the method to call the layer, if applicable."""
 
     @cached_property
-    def collected_imports(self) -> dict[str, set[str]]:
+    def collected_imports(self) -> dict[str, set[str | None]]:
         """Collect the required imports from the layer and its sub-layers."""
-        imports: dict[str, set[str]] = defaultdict(set)
+        imports: dict[str, set[str | None]] = defaultdict(set)
         imports.update(self.imports)
         for sub in self.layers.values():
             if isinstance(sub, LayerIntermediate):
@@ -542,8 +563,11 @@ class LayerIntermediate(Serializable):
 
     def __call__(self, module_path: PathLike) -> None:
         """Save the script for the layer to the given path."""
-        from_imports = "\n".join([f"from {p} import {', '.join(m)}" for p, m in self.collected_imports.items()])
-        code = "\n\n".join([s for s in [from_imports, *self.scripts] if s])
+        imports = "\n".join(
+            [f"from {p} import {', '.join([m for m in i if m])}" for p, i in self.collected_imports.items()]
+            + [f"import {p}" for p, i in self.collected_imports.items() if None in i]
+        )
+        code = "\n\n".join([s for s in [imports, *self.scripts] if s])
         module_path = check_path(module_path)
         module_path.parent.mkdir(parents=True, exist_ok=True)
         module_path.write_text(code, encoding="utf-8")
@@ -644,7 +668,8 @@ class BaseBuilder(Generic[LayerIntermediateT]):
         if not isinstance(parameters, Parameters):
             parameters = Parameters.model_validate(parameters)
         layer = self.template.format(parameters)
-        imports: defaultdict[str, set] = defaultdict(set)
+        imports: defaultdict[str, set[str | None]] = defaultdict(set)
+        imports.update(layer.IMPORTS)
         sublayers: dict[str, LayerIntermediate | str] = {}
         naming = AutoName("_")
 
