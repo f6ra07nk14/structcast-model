@@ -199,6 +199,7 @@ class _DeferredImportExceptionContextManager:
             return True
         return None
 
+    @property
     def is_successful(self) -> bool:
         """Return whether the context manager has caught any exceptions.
 
