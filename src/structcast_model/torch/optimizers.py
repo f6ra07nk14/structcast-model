@@ -3,13 +3,16 @@
 from re import Pattern as RePattern, compile as re_compile
 from typing import Any
 
-import timm.optim
-import timm.scheduler
 from torch.nn import Parameter
 from torch.optim import Optimizer, lr_scheduler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS
 from structcast_model.torch.types import Tensor
+from structcast_model.utils.lazy_import import try_import
+
+with try_import() as _import_timm:
+    from timm.optim import create_optimizer_v2
+    from timm.scheduler.scheduler_factory import create_scheduler_v2
 
 
 def _match_no_weight_decay(
@@ -110,6 +113,7 @@ def _create_opt(
     **kwargs: Any,
 ) -> tuple[bool, Optimizer]:
     """Create an optimizer with optional layer-wise learning rate decay and weight decay handling."""
+    _import_timm.check()
     wd_regexes = [re_compile(r) for r in weight_decay_regexes or []]
     nwd_regexes = [re_compile(r) for r in no_weight_decay_regexes or []]
     has_lr_scale = False
@@ -135,7 +139,7 @@ def _create_opt(
         weight_decay = 0.0
     else:
         parameters = params
-    return has_lr_scale, timm.optim.create_optimizer_v2(parameters, weight_decay=weight_decay, **kwargs)
+    return has_lr_scale, create_optimizer_v2(parameters, weight_decay=weight_decay, **kwargs)
 
 
 def _get_native_scheduler(optimizer: Optimizer, name: str, **kwargs: Any) -> lr_scheduler.LRScheduler:
@@ -178,7 +182,8 @@ def _create_native_scheduler(
 
 def _create_timm_scheduler(optimizer: Optimizer, criterion: str, name: str, **kwargs: Any) -> None:
     """Create the timm scheduler."""
-    scheduler, epochs = timm.scheduler.scheduler_factory.create_scheduler_v2(optimizer, sched=name, **kwargs)
+    _import_timm.check()
+    scheduler, epochs = create_scheduler_v2(optimizer, sched=name, **kwargs)
     print(f"Scheduled epochs: {epochs}. LR stepped per {'epoch' if scheduler.t_in_epochs else 'update'}.")
     GLOBAL_CALLBACKS.on_update.append(lambda i: scheduler.step_update(i.update, i.logs()[criterion]))  # type: ignore[arg-type]
     GLOBAL_CALLBACKS.on_epoch_end.append(lambda i: scheduler.step(i.epoch, i.logs()[criterion]))  # type: ignore[arg-type]
