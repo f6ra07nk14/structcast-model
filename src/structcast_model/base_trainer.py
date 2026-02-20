@@ -144,7 +144,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     backward: Backward
     """The backward pass configuration."""
 
-    logger: Callable[..., dict[str, Any]]
+    logger: Callable[..., dict[str, float]]
     """The logger to log training and validation information."""
 
     inference_wrapper: InferenceWrapper[ModelT_contra] | None = None
