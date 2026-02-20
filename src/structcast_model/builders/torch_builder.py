@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 from structcast_model.builders.base_builder import (
     BackwardIntermediate,
@@ -15,9 +15,6 @@ from structcast_model.builders.base_builder import (
 
 class TorchLayerIntermediate(LayerIntermediate):
     """Intermediate representation of a PyTorch layer."""
-
-    layer_call_name: ClassVar[Literal["forward"]] = "forward"
-    """The name of the method to call the layer, if applicable."""
 
     def _get_layer(self, layername: str) -> str:
         """Get the sub-layer with the given name."""

@@ -230,9 +230,6 @@ class LayerIntermediate(_Intermediate):
     structured_output: bool
     """Whether the output is structured."""
 
-    layer_call_name: ClassVar[str | None] = None
-    """The name of the method to call the layer, if applicable."""
-
     @cached_property
     def _forward_inputs(self) -> str:
         """Get the input arguments for calling the layer in the forward method."""
