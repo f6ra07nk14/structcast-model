@@ -10,7 +10,7 @@ from typing import Any
 from torch.autograd import Function
 from torch.jit import unused
 
-from structcast_model.torch.layers.types import Tensor
+from structcast_model.torch.types import Tensor
 from torch import legacy_contiguous_format, multinomial, zeros_like
 
 

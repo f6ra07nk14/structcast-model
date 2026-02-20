@@ -2,7 +2,7 @@
 
 from torch.nn import Module
 
-from structcast_model.torch.layers.types import Tensor
+from structcast_model.torch.types import Tensor
 
 
 class Add(Module):

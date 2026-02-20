@@ -4,7 +4,7 @@ from typing import Any
 
 from torch.nn import Module, Parameter
 
-from structcast_model.torch.layers.types import DeviceLike, DType, Tensor
+from structcast_model.torch.types import DeviceLike, DType, Tensor
 from torch import tensor
 
 

@@ -5,7 +5,7 @@ from typing import Any
 from torch.nn import LayerNorm, RMSNorm, UninitializedParameter
 from torch.nn.modules.lazy import LazyModuleMixin
 
-from structcast_model.torch.layers.types import DeviceLike, DType, Tensor
+from structcast_model.torch.types import DeviceLike, DType, Tensor
 from torch import no_grad
 
 

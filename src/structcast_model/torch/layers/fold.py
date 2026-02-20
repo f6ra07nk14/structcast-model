@@ -3,7 +3,7 @@
 from torch.nn import Fold, Unfold
 from torch.nn.modules.lazy import LazyModuleMixin
 
-from structcast_model.torch.layers.types import Tensor
+from structcast_model.torch.types import Tensor
 
 
 def _compute_spatial_shape(
