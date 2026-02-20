@@ -2,8 +2,10 @@
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from math import inf
+from operator import gt, lt
 from time import time
-from typing import Any, Generic, Protocol, TypeAlias, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar
 
 ModelT_contra = TypeVar("ModelT_contra", contravariant=True)
 
@@ -77,10 +79,17 @@ class Callback(Protocol, Generic[ModelT_contra]):
         """Call the callback with the given information."""
 
 
-def invoke_callback(callbacks: list[Callback[ModelT_contra]], info: BaseInfo, **models: ModelT_contra) -> None:
+class BestCallback(Protocol[ModelT_contra]):
+    """Protocol for best criterion callback."""
+
+    def __call__(self, info: BaseInfo, target: str, best: float, **models: ModelT_contra) -> None:
+        """Call the callback with the given info, target criterion, and best value."""
+
+
+def invoke_callback(callbacks: list[Callable[..., None]], info: BaseInfo, *args: Any, **models: ModelT_contra) -> None:
     """Invoke callback."""
     for callback in callbacks:
-        callback(info, **models)
+        callback(info, *args, **models)
 
 
 @dataclass(kw_only=True)
@@ -268,3 +277,33 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
                 self.evaluate(validation_dataset, **models)
             invoke_callback(self.on_epoch_end, self, **models)
         return self.history
+
+
+@dataclass(kw_only=True, slots=True)
+class BestCriterion(Generic[ModelT_contra]):
+    """Save the best criterion."""
+
+    target: str
+    """The target criterion to monitor."""
+
+    mode: Literal["min", "max"] = "min"
+    """The mode to monitor the criterion. Either 'min' or 'max'."""
+
+    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=list)
+    """Callbacks to be called when a new best criterion is found."""
+
+    _best: float = field(init=False, repr=False)
+    _compare: Callable[[float, float], bool] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Post initialization."""
+        self._compare = lt if self.mode == "min" else gt
+        self._best = inf if self.mode == "min" else -inf
+
+    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> None:
+        """Check and update the best criterion."""
+        current: float | None = info.logs().get(self.target, None)
+        if current is not None:
+            if self._compare(current, self._best):
+                self._best = current
+            invoke_callback(self.on_best, info, self.target, self._best, **models)
