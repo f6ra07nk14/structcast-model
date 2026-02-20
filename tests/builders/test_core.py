@@ -6,21 +6,20 @@ from pydantic import ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
 
-from structcast_model.builders.core import (
-    BaseBuilder,
+from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
+from structcast_model.builders.schema import (
     FlexSpec,
     LayerBehavior,
-    LayerIntermediate,
     Parameters,
     Serializable,
     TemplateLayer,
     UserDefinedLayer,
     UserLayer,
     WithExtra,
-    load_any,
     resolve_inputs,
     resolve_outputs,
 )
+from structcast_model.utils.base import load_any
 
 
 def test_serializable_frozen() -> None:
@@ -445,7 +444,7 @@ def test_template_layer_basic() -> None:
     template = TemplateLayer()
     assert isinstance(template.PARAMETERS, Parameters)
     assert template.raw == {}
-    assert template.user_defined_layers == {}
+    assert template.others == {}
 
 
 def test_template_layer_with_parameters() -> None:
@@ -460,7 +459,7 @@ def test_template_layer_raw_and_user_defined_layers() -> None:
     template = TemplateLayer.model_validate(raw)
     assert "INPUTS" in template.raw
     assert "OUTPUTS" in template.raw
-    assert "custom_layer" in template.user_defined_layers
+    assert "custom_layer" in template.others
 
 
 def test_template_layer_format() -> None:
@@ -475,19 +474,20 @@ def test_template_layer_format() -> None:
 def test_base_builder_user_defined_layers() -> None:
     """Test BaseBuilder user_defined_layers property."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": [], "custom_layer": {"INPUTS": "a", "OUTPUTS": "b"}}
-    assert "custom_layer" in BaseBuilder(raw=raw).user_defined_layers
+    assert "custom_layer" in BaseModelBuilder(raw=raw).user_defined_layers
 
 
 def test_base_builder_with_predefined_layers() -> None:
     """Test BaseBuilder with predefined user-defined layers."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": []}
     predefined = {"predefined_layer": {"INPUTS": "x", "OUTPUTS": "y"}}
-    assert "predefined_layer" in BaseBuilder(raw=raw, predefined_user_defined_layers=predefined).user_defined_layers
+    builder = BaseModelBuilder(raw=raw, predefined_user_defined_layers=predefined)
+    assert "predefined_layer" in builder.user_defined_layers
 
 
 def test_base_builder_call_simple() -> None:
     """Test BaseBuilder __call__ method with simple layer."""
-    result = BaseBuilder(raw={"FLOW": []})({}, "TestLayer")
+    result = BaseModelBuilder(raw={"FLOW": []})({}, "TestLayer")
     assert isinstance(result, LayerIntermediate)
     assert result.classname == "TestLayer"
     assert result.inputs == []
@@ -502,14 +502,14 @@ def test_base_builder_circular_reference_detection() -> None:
         "layer_b": {"FLOW": [[["input1"], ["output1"], {"TYPE": "layer_b"}]]},
     }
     with pytest.raises(SpecError, match="Circular reference detected"):
-        BaseBuilder(raw=raw).get_user_defined_layer(["layer_a"], {}, "LayerA")
+        BaseModelBuilder(raw=raw).get_user_defined_layer(["layer_a"], {}, "LayerA")
 
 
 def test_base_builder_layer_not_found() -> None:
     """Test that missing user-defined layer raises error."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": []}
     with pytest.raises(SpecError, match='User-defined layer with key "nonexistent" not found'):
-        BaseBuilder(raw=raw).get_user_defined_layer(["nonexistent"], {}, "TestLayer")
+        BaseModelBuilder(raw=raw).get_user_defined_layer(["nonexistent"], {}, "TestLayer")
 
 
 def test_base_builder_flow_with_name_reference() -> None:
@@ -522,7 +522,7 @@ def test_base_builder_flow_with_name_reference() -> None:
             [["output1"], ["output2"], "my_layer"],  # Reference to the same layer by NAME
         ],
     }
-    result = BaseBuilder(raw=raw)({}, "TestLayer")
+    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "my_layer" in result.layers
 
@@ -531,7 +531,7 @@ def test_base_builder_flow_with_undefined_name() -> None:
     """Test that referencing undefined NAME raises error."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": [[["input1"], ["output1"], "undefined_layer"]]}
     with pytest.raises(SpecError, match='Layer with name "undefined_layer" not defined'):
-        BaseBuilder(raw=raw)({}, "TestLayer")
+        BaseModelBuilder(raw=raw)({}, "TestLayer")
 
 
 def test_base_builder_flow_duplicate_name() -> None:
@@ -545,7 +545,7 @@ def test_base_builder_flow_duplicate_name() -> None:
         ],
     }
     with pytest.raises(SpecError, match='Duplicate layer name "my_layer"'):
-        BaseBuilder(raw=raw)({}, "TestLayer")
+        BaseModelBuilder(raw=raw)({}, "TestLayer")
 
 
 def test_base_builder_flow_with_object_pattern() -> None:
@@ -555,7 +555,7 @@ def test_base_builder_flow_with_object_pattern() -> None:
         "OUTPUTS": "output1",
         "FLOW": [[["input1"], ["output1"], {"_obj_": [["_addr_", "torch.nn.Linear"]]}]],
     }
-    result = BaseBuilder(raw=raw)({}, "TestLayer")
+    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "linear" in result.layers  # Auto-named based on class name
 
@@ -568,7 +568,7 @@ def test_base_builder_flow_without_address_pattern() -> None:
         "FLOW": [[["input1"], ["output1"], {"_obj_": [["_call_", "invalid"]]}]],
     }
     with pytest.raises(SpecError, match="First pattern of an ObjectPattern must be an AddressPattern or ObjectPattern"):
-        BaseBuilder(raw=raw)({}, "TestLayer")
+        BaseModelBuilder(raw=raw)({}, "TestLayer")
 
 
 def test_base_builder_flow_with_user_layer_type() -> None:
@@ -579,7 +579,7 @@ def test_base_builder_flow_with_user_layer_type() -> None:
         "FLOW": [[["input1"], ["output1"], {"TYPE": "custom_layer"}]],
         "custom_layer": {"FLOW": [[["input1"], ["output1"], {"_obj_": [["_addr_", "torch.nn.Identity"]]}]]},
     }
-    result = BaseBuilder(raw=raw)({}, "TestLayer")
+    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "custom_layer" in result.layers
 
@@ -588,13 +588,13 @@ def test_base_builder_flow_layer_without_cfg_or_type() -> None:
     """Test that LAYER without CFG or TYPE raises error."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": [[["input1"], ["output1"], {}]]}
     with pytest.raises(SpecError, match="LAYER must have either CFG or TYPE specified"):
-        BaseBuilder(raw=raw)({}, "TestLayer")
+        BaseModelBuilder(raw=raw)({}, "TestLayer")
 
 
 def test_base_builder_circular_reference_with_cfg() -> None:
     """Test that circular references via CFG cause errors."""
     with pytest.raises(SpecError, match="Circular reference detected"):
-        BaseBuilder(raw=load_any("tests/fixtures/circular.yaml"))({}, "TestLayer")
+        BaseModelBuilder(raw=load_any("tests/fixtures/circular.yaml"))({}, "TestLayer")
 
 
 def test_template_layer_jinja_yaml_basic() -> None:

@@ -3,7 +3,8 @@
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
-from structcast_model.builders.core import BaseBuilder, LayerIntermediate
+from structcast_model.builders.base_builder import BackwardIntermediate, BaseModelBuilder, LayerIntermediate
+from structcast_model.builders.schema import BackwardBehavior
 
 
 class TorchLayerIntermediate(LayerIntermediate):
@@ -16,7 +17,7 @@ class TorchLayerIntermediate(LayerIntermediate):
         """Get the sub-layer with the given name."""
         return f"self.{layername}"
 
-    def _get_script(self, class_name: str, initialized_layers: list[str]) -> str:
+    def _get_layer_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Implement the method to get the script for the layer."""
         indent = " " * 4
         sep = "\n" + indent * 2
@@ -43,10 +44,26 @@ class {class_name}(torch.nn.Module):
 
 
 @dataclass(kw_only=True, slots=True)
-class TorchBuilder(BaseBuilder[TorchLayerIntermediate]):
+class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
     """Builder for PyTorch models."""
 
     user_defined_layer_type: ClassVar[type[TorchLayerIntermediate]] = TorchLayerIntermediate
 
 
-# todo: implement backward
+class TorchBackwardIntermediate(BackwardIntermediate):
+    """Intermediate representation of a PyTorch backward layer."""
+
+    def _get_scripts(self) -> list[str]:
+        # todo
+        pass
+
+
+@dataclass(kw_only=True, slots=True)
+class TorchBackwardBuilder(BaseModelBuilder[TorchBackwardIntermediate]):
+    """Builder for PyTorch backward layers."""
+
+    user_defined_backward_layer_type: ClassVar[type[TorchBackwardIntermediate]] = TorchBackwardIntermediate
+
+    def _get_backward_script(self, behavior: BackwardBehavior, mixed_precision: bool) -> str:
+        # todo
+        pass
