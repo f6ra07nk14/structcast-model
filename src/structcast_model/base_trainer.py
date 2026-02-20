@@ -162,7 +162,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     history: dict[int, dict[str, Any]] = field(default_factory=dict)
     """History of training and validation logs."""
 
-    add_global_callbacks: bool = False
+    add_global_callbacks: bool = True
     """Whether to add global callbacks."""
 
     def __post_init__(self) -> None:
