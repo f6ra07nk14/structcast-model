@@ -1,6 +1,5 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from typer import Argument, Option, Typer
@@ -33,8 +32,8 @@ output_script_path = Option(None, "--output", "-o", help="Output script path (Py
 
 @creator.command(name="model")
 def create_model(
-    cfg_path: Path = Argument(..., help="Path to the model configuration file."),
-    output: Path | None = output_script_path,
+    cfg_path: str = Argument(..., help="Path to the model configuration file."),
+    output: str | None = output_script_path,
     param: list[dict] | None = param,
     class_name: str = Option("Model", "--class-name", "-c", help="Name the model class."),
     structured_output: bool = Option(True, help="Enable structured output for the model."),
@@ -49,8 +48,8 @@ def create_model(
 
 @creator.command(name="backward")
 def create_backward(
-    cfg_path: Path = Argument(..., help="Path to the backward configuration file."),
-    output: Path | None = output_script_path,
+    cfg_path: str = Argument(..., help="Path to the backward configuration file."),
+    output: str | None = output_script_path,
     param: list[dict] | None = param,
     class_name: str = Option("Backward", "--class-name", "-c", help="Name the backward class."),
 ) -> None:
