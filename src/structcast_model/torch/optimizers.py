@@ -1,14 +1,21 @@
 """Build optimizers."""
 
-from re import Pattern as RePattern, compile as re_compile
-from typing import Any
+from re import compile as re_compile
+from typing import TYPE_CHECKING, Any
 
-from torch.nn import Parameter
-from torch.optim import Optimizer, lr_scheduler
+from torch.optim import lr_scheduler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS
-from structcast_model.torch.types import Tensor
 from structcast_model.utils.lazy_import import try_import
+from torch import Tensor
+
+if TYPE_CHECKING:
+    from re import Pattern as RePattern
+
+    from torch.nn import Parameter
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
+
 
 with try_import() as _import_timm:
     from timm.optim import create_optimizer_v2
@@ -142,7 +149,7 @@ def _create_opt(
     return has_lr_scale, create_optimizer_v2(parameters, weight_decay=weight_decay, **kwargs)
 
 
-def _get_native_scheduler(optimizer: Optimizer, name: str, **kwargs: Any) -> lr_scheduler.LRScheduler:
+def _get_native_scheduler(optimizer: Optimizer, name: str, **kwargs: Any) -> LRScheduler:
     """Get the native scheduler."""
     # process "schedulers" key for SequentialLR, ChainedScheduler
     if "schedulers" in kwargs:
