@@ -1,14 +1,28 @@
 """Types for torch module."""
 
-from typing import TypeAlias
+from typing import TYPE_CHECKING
 
-from torch import Tensor as _Tensor, device as _device, dtype as _dtype
+if TYPE_CHECKING:
+    from typing import TypeAlias
 
-DeviceLike: TypeAlias = _device | str
-"""Device like type."""
+    from torch import Tensor as _Tensor, device as _device, dtype as _dtype
 
-DType = _dtype
-"""Data type."""
+    DeviceLike: TypeAlias = _device | str
+    """Device like type."""
 
-Tensor = _Tensor
-"""Tensor type."""
+    DType = _dtype
+    """Data type."""
+
+    Tensor = _Tensor
+    """Tensor type."""
+else:
+    from typing import Any
+
+    DeviceLike = Any
+    """Device like type."""
+
+    DType = Any
+    """Data type."""
+
+    Tensor = Any
+    """Tensor type."""
