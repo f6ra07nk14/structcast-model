@@ -306,6 +306,12 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
     template: TemplateLayer = field(init=False)
     user_defined_layers: dict[str, Any] = field(init=False)
 
+    @classmethod
+    def from_path(cls, path: PathLike) -> BaseModelBuilder:
+        """Create a model builder from the given configuration file path."""
+        curr_path = str(path)
+        return cls(raw=load_any(path), current_path=curr_path, from_references={curr_path: ["__root__"]})
+
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateLayer.model_validate(self.raw)
@@ -369,19 +375,28 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
         return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.LAYER.PARAM), subclassname)
 
-    def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> LayerIntermediateT:
+    def __call__(
+        self,
+        parameters: dict[str, dict[str, Any]] | Parameters | None = None,
+        classname: str = "Model",
+        forced_structured_output: bool | None = None,
+    ) -> LayerIntermediateT:
         """Build the layer from the template with the given parameters and class name.
 
         Args:
-            parameters (dict[str, dict[str, Any]] | Parameters):
+            parameters (dict[str, dict[str, Any]] | Parameters | None):
                 The template keyword arguments to format the template with,
                 or a `Parameters` instance containing the template keyword arguments.
-            classname (str): The name of the layer class to use for the built layer.
+            classname (str): The name of the layer class to use for the built layer. Default is "Model".
+            forced_structured_output (bool | None): Whether to force the output to be structured
+                regardless of the template specification.
 
         Returns:
             LayerIntermediateT: The built layer as a `LayerIntermediateT` instance.
         """
-        if not isinstance(parameters, Parameters):
+        if parameters is None:
+            parameters = Parameters()
+        elif not isinstance(parameters, Parameters):
             parameters = Parameters.model_validate(parameters)
         layer = self.template.format(parameters)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
@@ -437,7 +452,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             layers=sublayers,
             flow=_create_flow(layer.FLOW),
             inference_flow=_create_flow(layer.INFERENCE_FLOW),
-            structured_output=layer.STRUCTURED_OUTPUT,
+            structured_output=layer.STRUCTURED_OUTPUT if forced_structured_output is None else forced_structured_output,
         )
 
 
@@ -495,6 +510,11 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     raw: Any
     template: TemplateBackward = field(init=False)
 
+    @classmethod
+    def from_path(cls, path: PathLike) -> BaseBackwardBuilder:
+        """Create a backward builder from the given configuration file path."""
+        return cls(raw=load_any(path))
+
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateBackward.model_validate(self.raw)
@@ -506,17 +526,22 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     ) -> str | None:
         raise NotImplementedError("The _get_mixed_precision method must be implemented in the subclass.")
 
-    def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters, classname: str) -> BackwardIntermediateT:
-        """Build the backward layer from the template with the given parameters and class name.
+    def __call__(
+        self,
+        parameters: dict[str, dict[str, Any]] | Parameters | None = None,
+        classname: str = "Backward",
+    ) -> BackwardIntermediateT:
+        """Build the backward class from the template with the given parameters and class name.
 
         Args:
-            parameters (dict[str, dict[str, Any]] | Parameters):
+            parameters (dict[str, dict[str, Any]] | Parameters | None):
                 The template keyword arguments to format the template with,
                 or a `Parameters` instance containing the template keyword arguments.
-            classname (str): The name of the backward layer class to use for the built backward operator.
+            classname (str): The name of the backward class to use for the built backward operator.
+                Default is "Backward".
 
         Returns:
-            BackwardIntermediateT: The built backward layer as a `BackwardIntermediateT` instance.
+            BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
         """
         backward = self.template.format(parameters)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
