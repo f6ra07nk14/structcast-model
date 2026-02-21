@@ -38,6 +38,7 @@ class {class_name}(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
+        self.outputs = {self.outputs}
         {sep.join([f"self.{v}" for v in initialized_layers])}
 
     def forward(self, {self._forward_inputs}, **kwargs):
