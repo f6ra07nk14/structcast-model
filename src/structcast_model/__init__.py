@@ -11,14 +11,14 @@ if TYPE_CHECKING:
 else:
     import sys
 
-    import structcast_model.utils.lazy_import
+    from structcast_model.utils.lazy_import import LazySelectedImporter
 
     _import_structure = {}
     _skip_modules = list(_import_structure)
     _import_structure["builders"] = []
     _import_structure["torch"] = []
     _import_structure["utils"] = []
-    sys.modules[__name__] = structcast_model.utils.lazy_import.LazySelectedImporter(
+    sys.modules[__name__] = LazySelectedImporter(
         __name__,
         globals()["__file__"],
         _import_structure,

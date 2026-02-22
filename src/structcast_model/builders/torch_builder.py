@@ -4,6 +4,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from structcast.utils.security import get_default_dir
+
 from structcast_model.builders.base_builder import (
     BackwardIntermediate,
     BaseBackwardBuilder,
@@ -131,3 +133,10 @@ class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
         imports["torch.amp"].add(None)
         repr_mp_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
         return f"torch.amp.GradScaler({repr_mp_kw})"
+
+
+__all__ = ["TorchBackwardBuilder", "TorchBackwardIntermediate", "TorchBuilder", "TorchLayerIntermediate"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

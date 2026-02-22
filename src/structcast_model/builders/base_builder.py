@@ -18,7 +18,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
-from structcast.utils.security import check_path, resolve_address, split_attribute
+from structcast.utils.security import check_path, get_default_dir, resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName, defaultdict
@@ -573,3 +573,17 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             optimizers=opts,
             backwards=backwards,
         )
+
+
+__all__ = [
+    "BackwardIntermediate",
+    "BaseBackwardBuilder",
+    "BaseModelBuilder",
+    "LayerIntermediate",
+    "resolve_getter",
+    "resolve_object",
+]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

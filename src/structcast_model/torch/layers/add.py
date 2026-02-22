@@ -1,5 +1,6 @@
 """Add layer for PyTorch."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -14,3 +15,10 @@ class Add(Module):
         for inp in inputs[1:]:
             out = out.add(inp)
         return out
+
+
+__all__ = ["Add"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

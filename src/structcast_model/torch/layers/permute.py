@@ -1,5 +1,6 @@
 """Permute layer for PyTorch."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 from torch.nn.modules.lazy import LazyModuleMixin
 
@@ -70,3 +71,10 @@ class ToChannelFirst(LazyModuleMixin, Permute):
         if self.dims[0] == 0:
             size = len(input.shape[1:-1]) + 1
             self.dims = (size, *range(1, size))
+
+
+__all__ = ["Permute", "ToChannelFirst", "ToChannelLast"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

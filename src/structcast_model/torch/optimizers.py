@@ -1,21 +1,16 @@
 """Build optimizers."""
 
-from re import compile as re_compile
-from typing import TYPE_CHECKING, Any
+from re import Pattern as RePattern, compile as re_compile
+from typing import Any
 
-from torch.optim import lr_scheduler
+from structcast.utils.security import get_default_dir
+from torch.nn import Parameter
+from torch.optim import Optimizer, lr_scheduler
+from torch.optim.lr_scheduler import LRScheduler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS
 from structcast_model.utils.lazy_import import try_import
 from torch import Tensor
-
-if TYPE_CHECKING:
-    from re import Pattern as RePattern
-
-    from torch.nn import Parameter
-    from torch.optim import Optimizer
-    from torch.optim.lr_scheduler import LRScheduler
-
 
 with try_import() as _import_timm:
     from timm.optim import create_optimizer_v2
@@ -248,3 +243,10 @@ def create_with_scheduler(
     has_lr_scale, opt = _create_opt(params, **optimizer_kwargs)
     _create_scheduler(opt, has_lr_scale=has_lr_scale, **scheduler_kwargs)
     return opt
+
+
+__all__ = ["create", "create_with_scheduler"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

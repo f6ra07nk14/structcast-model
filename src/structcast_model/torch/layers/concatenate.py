@@ -1,5 +1,6 @@
 """Concatenate layer for PyTorch."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -43,3 +44,9 @@ class Concatenate(Module):
 
 Concat = Concatenate
 """Alias for Concatenate."""
+
+__all__ = ["Concat", "Concatenate"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

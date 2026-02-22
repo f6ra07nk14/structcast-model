@@ -12,6 +12,8 @@ import os
 from types import ModuleType, TracebackType
 from typing import Any
 
+from structcast.utils.security import get_default_dir
+
 
 class LazySelectedImporter(ModuleType):
     """Do lazy imports."""
@@ -227,3 +229,10 @@ def try_import() -> _DeferredImportExceptionContextManager:
         Deferred import context manager.
     """
     return _DeferredImportExceptionContextManager()
+
+
+__all__ = ["LazyModuleImporter", "LazySelectedImporter", "try_import"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

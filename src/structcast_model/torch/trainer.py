@@ -4,25 +4,30 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer
+from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
+from structcast_model.torch.types import Tensor
+from structcast_model.utils.lazy_import import try_import
 from torch import bfloat16, cuda, float16, float32, no_grad, rand
 
-if TYPE_CHECKING:
+with try_import() as _import_timm:
     from timm.data import Mixup
     from timm.utils import ModelEmaV3
-    from torch.utils.data import DataLoader, Dataset, Sampler
 
-    from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
-    from structcast_model.torch.types import Tensor
+if _import_timm.is_successful:
+    Mixup = object
+    ModelEmaV3 = object
 
 logger = getLogger(__name__)
 
-DTYPE = {
+DTYPES = {
     "float32": float32,
     "float16": float16,
     "bfloat16": bfloat16,
@@ -200,7 +205,7 @@ class TimmLoaderWrapper(_LoaderWrapper):
 
     def __iter__(self) -> Iterable[dict[str, Any]]:
         """Iterate over the data loader and yield the data with the corresponding names."""
-        device, dtype, mixup = get_torch_device(self.device), DTYPE[self.dtype], self.mixup
+        device, dtype, mixup = get_torch_device(self.device), DTYPES[self.dtype], self.mixup
         for input, target in self.loader:
             input, target = input.to(device=device, dtype=dtype), target.to(device=device)
             yield mixup(input, target)
@@ -217,3 +222,21 @@ class NamedData(_LoaderWrapper):
         """Iterate over the data loader and yield the data with the corresponding names."""
         for data in self.loader:
             yield dict(zip(self.names, data, strict=True))
+
+
+__all__ = [
+    "NamedData",
+    "TimmEmaUpdater",
+    "TimmEmaWrapper",
+    "TimmLoaderWrapper",
+    "TorchLogger",
+    "TorchTrainer",
+    "TrainingStep",
+    "ValidationStep",
+    "create_torch_inputs",
+    "get_torch_device",
+]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

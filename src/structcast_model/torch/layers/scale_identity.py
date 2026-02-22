@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module, Parameter
 
 from structcast_model.torch.types import DeviceLike, DType, Tensor
@@ -28,3 +29,10 @@ class ScaleIdentity(Module):
     def forward(self, input: Tensor) -> Tensor:
         """Forward method."""
         return input.mul(self.scale)
+
+
+__all__ = ["ScaleIdentity"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

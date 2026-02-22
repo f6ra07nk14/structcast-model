@@ -6,7 +6,7 @@ from typing import Any, TypeVar
 
 from pydantic_core import from_json
 from structcast.utils.base import load_yaml
-from structcast.utils.security import check_path
+from structcast.utils.security import check_path, get_default_dir
 from structcast.utils.types import PathLike
 
 T = TypeVar("T")
@@ -66,3 +66,10 @@ def unique(values: Sequence[T]) -> list[T]:
         The unique values.
     """
     return list(OrderedDict.fromkeys(values))
+
+
+__all__ = ["load_any", "load_json", "unique"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

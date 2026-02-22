@@ -1,5 +1,6 @@
 """Split layer for PyTorch."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -41,3 +42,10 @@ class Split(Module):
             str: The extra representation.
         """
         return f"split_size_or_sections={self.split_size_or_sections}, dim={self.dim}"
+
+
+__all__ = ["Split"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

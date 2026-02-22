@@ -1,5 +1,6 @@
 """Channel shuffle layer."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -25,3 +26,10 @@ class ChannelLastShuffle(Module):
     def extra_repr(self) -> str:
         """Extra representation of the layer."""
         return f"groups={self.groups}"
+
+
+__all__ = ["ChannelLastShuffle"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

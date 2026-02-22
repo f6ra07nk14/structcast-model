@@ -1,12 +1,13 @@
 """Fold and Unfold Layers."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Fold, Unfold
 from torch.nn.modules.lazy import LazyModuleMixin
 
 from structcast_model.torch.types import Tensor
 
 
-def _compute_spatial_shape(
+def compute_spatial_shape(
     spatial_shape: tuple[int, ...],
     kernel_size: int | tuple[int, ...],
     dilation: int | tuple[int, ...],
@@ -28,7 +29,7 @@ def _compute_spatial_shape(
     )
 
 
-def _compute_transposed_spatial_shape(
+def compute_transposed_spatial_shape(
     spatial_shape: tuple[int, ...],
     kernel_size: int | tuple[int, ...],
     dilation: int | tuple[int, ...],
@@ -75,7 +76,7 @@ class UnfoldExt(LazyModuleMixin, Unfold):
         """Initialize parameters based on input tensor shape."""
         if self.input_size[0] == 0:
             self.input_size = input.shape[2:]
-            self.output_size = _compute_spatial_shape(
+            self.output_size = compute_spatial_shape(
                 self.input_size,
                 kernel_size=self.kernel_size,
                 dilation=self.dilation,
@@ -108,7 +109,7 @@ class FoldExt(LazyModuleMixin, Fold):
         """Initialize parameters based on input tensor shape."""
         if self.input_size[0] == 0:
             self.input_size = input.shape[2:]
-            self.output_size = _compute_transposed_spatial_shape(
+            self.output_size = compute_transposed_spatial_shape(
                 self.input_size,
                 kernel_size=self.kernel_size,
                 dilation=self.dilation,
@@ -116,3 +117,10 @@ class FoldExt(LazyModuleMixin, Fold):
                 stride=self.stride,
                 output_padding=self.output_padding,
             )
+
+
+__all__ = ["FoldExt", "UnfoldExt", "compute_spatial_shape", "compute_transposed_spatial_shape"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

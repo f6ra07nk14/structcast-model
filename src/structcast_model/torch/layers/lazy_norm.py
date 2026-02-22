@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from structcast.utils.security import get_default_dir
 from torch.nn import LayerNorm, RMSNorm, UninitializedParameter
 from torch.nn.modules.lazy import LazyModuleMixin
 
@@ -95,3 +96,10 @@ class LazyLayerNorm(LazyModuleMixin, LayerNorm):
                     if self.bias is not None:
                         self.bias.materialize(self.normalized_shape)
                 self.reset_parameters()
+
+
+__all__ = ["LazyLayerNorm", "LazyRMSNorm"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

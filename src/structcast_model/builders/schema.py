@@ -25,7 +25,7 @@ from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import Sequence, extend_structure
 from structcast.utils.base import check_elements
-from structcast.utils.security import split_attribute, validate_attribute
+from structcast.utils.security import get_default_dir, split_attribute, validate_attribute
 
 from structcast_model.utils.base import unique
 
@@ -572,3 +572,26 @@ class TemplateBackward(_Template[UserDefinedBackward]):
     """Template for user-defined backwards."""
 
     target_type: ClassVar[type[UserDefinedBackward]] = UserDefinedBackward
+
+
+__all__ = [
+    "SPEC_EVAL",
+    "BackwardBehavior",
+    "LayerBehavior",
+    "OptimizerBehavior",
+    "Parameters",
+    "Serializable",
+    "TemplateBackward",
+    "TemplateLayer",
+    "UserDefinedBackward",
+    "UserDefinedLayer",
+    "UserLayer",
+    "WithExtra",
+    "resolve_flow",
+    "resolve_inputs",
+    "resolve_outputs",
+]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 from structcast.utils.base import load_yaml_from_string
+from structcast.utils.security import get_default_dir
 
 
 def reduce_dict(params: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -31,3 +32,10 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
         raise ValueError(f"Invalid tensor shape: {shape}")
 
     return _check(TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
+
+
+__all__ = ["dict_parser", "reduce_dict", "tensor_shape_parser"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

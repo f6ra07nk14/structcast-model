@@ -7,11 +7,12 @@ References:
 
 from typing import Any
 
+from structcast.utils.security import get_default_dir
 from torch.autograd import Function
 from torch.jit import unused
 
 from structcast_model.torch.types import Tensor
-from torch import legacy_contiguous_format, multinomial, zeros_like
+import torch
 
 
 class ReinMaxCore(Function):
@@ -21,10 +22,10 @@ class ReinMaxCore(Function):
     def forward(ctx: Any, logits: Tensor, tau: Tensor) -> tuple[Tensor, Tensor]:
         """Forward method."""
         y_soft = logits.softmax(dim=-1)
-        sample = multinomial(y_soft, num_samples=1, replacement=True)
-        one_hot_sample = zeros_like(y_soft, memory_format=legacy_contiguous_format).scatter_(-1, sample, 1.0)
-        ctx.save_for_backward(one_hot_sample, logits, y_soft, tau)
-        return one_hot_sample, y_soft
+        sample = torch.multinomial(y_soft, num_samples=1, replacement=True)
+        one_hot = torch.zeros_like(y_soft, memory_format=torch.legacy_contiguous_format).scatter_(-1, sample, 1.0)
+        ctx.save_for_backward(one_hot, logits, y_soft, tau)
+        return one_hot, y_soft
 
     @staticmethod
     def backward(ctx: Any, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:  # type: ignore[override]
@@ -63,3 +64,10 @@ def reinmax(logits: Tensor, tau: float = 1.0) -> tuple[Tensor, Tensor]:
     logits = logits.view(-1, shape[-1])
     grad_sample, y_soft = ReinMaxCore.apply(logits, logits.new_empty(1).fill_(tau))
     return grad_sample.view(shape), y_soft.view(shape)
+
+
+__all__ = ["reinmax"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

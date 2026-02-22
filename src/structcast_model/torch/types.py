@@ -2,6 +2,8 @@
 
 from typing import TYPE_CHECKING
 
+from structcast.utils.security import get_default_dir
+
 if TYPE_CHECKING:
     from typing import TypeAlias
 
@@ -26,3 +28,9 @@ else:
 
     Tensor = Any
     """Tensor type."""
+
+__all__ = ["DType", "DeviceLike", "Tensor"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

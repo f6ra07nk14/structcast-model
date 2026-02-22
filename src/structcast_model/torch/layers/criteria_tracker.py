@@ -1,5 +1,6 @@
 """A tracker for multiple criteria."""
 
+from structcast.utils.security import get_default_dir
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -33,3 +34,10 @@ class CriteriaTracker(Module):
         for tracker in self.trackers.values():
             tracker.zero_()
         self.total.zero_()
+
+
+__all__ = ["CriteriaTracker"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())

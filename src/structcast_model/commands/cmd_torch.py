@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING, Literal
 
+from structcast.utils.security import get_default_dir
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
@@ -161,3 +162,10 @@ def call_calflops(
     print(f"FLOPs: {flops}")
     print(f"MACs: {macs}")
     print(f"Parameters: {params}")
+
+
+__all__ = ["app"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())
