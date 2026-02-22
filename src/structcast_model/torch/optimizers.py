@@ -4,17 +4,14 @@ from re import Pattern as RePattern, compile as re_compile
 from typing import Any
 
 from structcast.utils.security import get_default_dir
+from timm.optim import create_optimizer_v2
+from timm.scheduler.scheduler_factory import create_scheduler_v2
 from torch.nn import Parameter
 from torch.optim import Optimizer, lr_scheduler
 from torch.optim.lr_scheduler import LRScheduler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS
-from structcast_model.utils.lazy_import import try_import
 from torch import Tensor
-
-with try_import() as _import_timm:
-    from timm.optim import create_optimizer_v2
-    from timm.scheduler.scheduler_factory import create_scheduler_v2
 
 
 def _match_no_weight_decay(
@@ -115,7 +112,6 @@ def _create_opt(
     **kwargs: Any,
 ) -> tuple[bool, Optimizer]:
     """Create an optimizer with optional layer-wise learning rate decay and weight decay handling."""
-    _import_timm.check()
     wd_regexes = [re_compile(r) for r in weight_decay_regexes or []]
     nwd_regexes = [re_compile(r) for r in no_weight_decay_regexes or []]
     has_lr_scale = False
@@ -184,7 +180,6 @@ def _create_native_scheduler(
 
 def _create_timm_scheduler(optimizer: Optimizer, criterion: str, name: str, **kwargs: Any) -> None:
     """Create the timm scheduler."""
-    _import_timm.check()
     scheduler, epochs = create_scheduler_v2(optimizer, sched=name, **kwargs)
     print(f"Scheduled epochs: {epochs}. LR stepped per {'epoch' if scheduler.t_in_epochs else 'update'}.")
     GLOBAL_CALLBACKS.on_update.append(lambda i: scheduler.step_update(i.update, i.logs()[criterion]))  # type: ignore[arg-type]

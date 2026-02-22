@@ -8,22 +8,15 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 from structcast.utils.security import get_default_dir
+from timm.data import Mixup
+from timm.utils import ModelEmaV3
 from torch.nn import Module
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
-from structcast_model.utils.lazy_import import try_import
 from torch import bfloat16, cuda, float16, float32, no_grad, rand
-
-with try_import() as _import_timm:
-    from timm.data import Mixup
-    from timm.utils import ModelEmaV3
-
-if _import_timm.is_successful:
-    Mixup = object
-    ModelEmaV3 = object
 
 logger = getLogger(__name__)
 
