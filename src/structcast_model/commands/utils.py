@@ -1,10 +1,16 @@
 """Utility functions for the commands package."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic import TypeAdapter, ValidationError
 from structcast.utils.base import load_yaml_from_string
 from structcast.utils.security import get_default_dir
+
+if TYPE_CHECKING:
+    import pydantic
+else:
+    from structcast_model.utils.lazy_import import LazyModuleImporter
+
+    pydantic = LazyModuleImporter("pydantic")
 
 
 def reduce_dict(params: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -14,7 +20,7 @@ def reduce_dict(params: list[dict[str, Any]] | None) -> dict[str, Any]:
 
 def dict_parser(value: str) -> dict[str, Any]:
     """Parse a YAML string into a dictionary."""
-    return TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value)) if value else {}
+    return pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value)) if value else {}
 
 
 def tensor_shape_parser(value: str) -> dict[str, Any]:
@@ -22,8 +28,8 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
 
     def _check(shape: Any) -> Any:
         try:
-            return TypeAdapter(tuple[int, ...]).validate_python(shape)
-        except ValidationError:
+            return pydantic.TypeAdapter(tuple[int, ...]).validate_python(shape)
+        except pydantic.ValidationError:
             pass
         if isinstance(shape, dict):
             return {k: _check(v) for k, v in shape.items()}
@@ -31,7 +37,7 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
             return [_check(v) for v in shape]
         raise ValueError(f"Invalid tensor shape: {shape}")
 
-    return _check(TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
+    return _check(pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
 
 
 __all__ = ["dict_parser", "reduce_dict", "tensor_shape_parser"]

@@ -6,7 +6,6 @@ from structcast.utils.security import get_default_dir
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
-from structcast_model.utils.lazy_import import LazyModuleImporter
 
 if TYPE_CHECKING:
     import calflops
@@ -17,6 +16,8 @@ if TYPE_CHECKING:
     from structcast_model.torch import trainer as torch_trainer
     import torch
 else:
+    from structcast_model.utils.lazy_import import LazyModuleImporter
+
     calflops = LazyModuleImporter("calflops")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
