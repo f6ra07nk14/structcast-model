@@ -463,7 +463,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     if isinstance(unit.OUTPUTS.spec, dict):
                         flow.append((inp, (tmpname := f"{name or naming('tmp')}_output"), name))
                         for key, value in unit.OUTPUTS.model_dump().items():
-                            flow.append((key, resolve_getter(imports, value, tmpname), None))
+                            flow.append((resolve_getter(imports, value, tmpname), key, None))
                     else:
                         flow.append((inp, _outputs(unit.OUTPUTS.spec), name))
                 elif unit.INPUTS is not None or unit.OUTPUTS is not None:
