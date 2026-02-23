@@ -147,13 +147,16 @@ class LayerBehavior(Serializable):
         if isinstance(raw, LayerBehavior):
             return raw
         if isinstance(raw, (list, tuple)):
-            if len(raw) == 3:
+            if len(raw) == 2:
+                inp, out = raw
+                name, layer = None, None
+            elif len(raw) == 3:
                 inp, out, name_or_layer = raw
                 name, layer = (name_or_layer, None) if isinstance(name_or_layer, str) else (None, name_or_layer)
             elif len(raw) == 4:
                 inp, out, name, layer = raw
             else:
-                raise SpecError(f"LayerBehavior tuple/list must have 3 or 4 elements but got: {raw}.")
+                raise SpecError(f"LayerBehavior tuple/list must have 2, 3, or 4 elements but got: {raw}.")
             return {"INPUTS": inp, "OUTPUTS": out, "NAME": name, "LAYER": layer}
         return raw
 

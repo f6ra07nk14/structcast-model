@@ -194,8 +194,8 @@ def test_layer_behavior_from_tuple_4_elements() -> None:
 
 def test_layer_behavior_from_tuple_wrong_length() -> None:
     """Test LayerBehavior from tuple with wrong length."""
-    with pytest.raises(SpecError, match="must have 3 or 4 elements"):
-        LayerBehavior.model_validate((1, 2))
+    with pytest.raises(SpecError, match="must have 2, 3, or 4 elements"):
+        LayerBehavior.model_validate(("a",))
 
 
 def test_layer_behavior_from_list() -> None:
