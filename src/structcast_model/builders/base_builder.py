@@ -206,7 +206,7 @@ class _Intermediate(Serializable):
             [f"from {p} import {', '.join([m for m in i if m])}" for p, i in from_imports.items() if i]
             + [f"import {p}" for p, i in self.collected_imports.items() if None in i]
         ).strip()
-        code = "\n\n".join([s for s in [imported_code, *self.scripts] if s])
+        code = "\n\n".join([s for s in [(imported_code + "\n"), *self.scripts] if s])
         if module_path is None:
             module_path = Path(f"{to_snake(self.classname)}.py")
         elif not isinstance(module_path, Path):
