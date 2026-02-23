@@ -546,7 +546,7 @@ class _Template(WithExtra, Generic[SerializableT]):
         """Get the other fields that are not in the target type."""
         return self._raw_and_others[1]
 
-    def format(self, parameters: dict[str, dict[str, Any]] | Parameters) -> SerializableT:
+    def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters) -> SerializableT:
         """Format the template with the given parameters.
 
         Args:

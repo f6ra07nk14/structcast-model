@@ -465,7 +465,7 @@ def test_template_layer_raw_and_user_defined_layers() -> None:
 def test_template_layer_format() -> None:
     """Test TemplateLayer format method."""
     raw = {"INPUTS": ["input1"], "OUTPUTS": ["output1"], "FLOW": [[["input1"], ["output1"], "layer1"]]}
-    result = TemplateLayer.model_validate(raw).format({})
+    result = TemplateLayer.model_validate(raw)({})
     assert isinstance(result, UserDefinedLayer)
     assert result.INPUTS == ["input1"]
     assert result.OUTPUTS == ["output1"]
@@ -611,7 +611,7 @@ FLOW:
 {% endfor %}
 """,
     }
-    result = TemplateLayer.model_validate(raw).format({})
+    result = TemplateLayer.model_validate(raw)({})
     assert isinstance(result, UserDefinedLayer)
     assert result.INPUTS == ["input1"]
     assert result.OUTPUTS == ["out0", "out1"]
@@ -632,7 +632,7 @@ FLOW:
 {% endfor %}
 """,
     }
-    result = TemplateLayer.model_validate(raw).format({"default": {"layer_count": 3}})
+    result = TemplateLayer.model_validate(raw)({"default": {"layer_count": 3}})
     assert isinstance(result, UserDefinedLayer)
     assert len(result.FLOW) == 3
 
@@ -653,9 +653,9 @@ FLOW:
 """,
     }
     template = TemplateLayer.model_validate(raw)
-    result_default = template.format(Parameters(DEFAULT={"depth": 2}))
+    result_default = template(Parameters(DEFAULT={"depth": 2}))
     assert len(result_default.FLOW) == 2
-    result_custom = template.format(Parameters(DEFAULT={"depth": 5}))
+    result_custom = template(Parameters(DEFAULT={"depth": 5}))
     assert len(result_custom.FLOW) == 5
 
 
@@ -682,7 +682,7 @@ FLOW:
     - {_obj_: [[_addr_, torch.nn.Identity]]}
 """,
     }
-    result = TemplateLayer.model_validate(raw).format({})
+    result = TemplateLayer.model_validate(raw)({})
     assert isinstance(result, UserDefinedLayer)
     # Should have 2 linear layers + 1 activation (between them) + 1 identity to connect to output
     assert len(result.FLOW) == 4

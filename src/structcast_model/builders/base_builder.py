@@ -412,7 +412,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             parameters = Parameters()
         elif not isinstance(parameters, Parameters):
             parameters = Parameters.model_validate(parameters)
-        layer = self.template.format(parameters)
+        layer = self.template(parameters)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(layer.IMPORTS)
         sublayers: dict[str, LayerIntermediate | str] = {}
@@ -557,7 +557,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         Returns:
             BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
         """
-        backward = self.template.format(parameters or Parameters())
+        backward = self.template(parameters or Parameters())
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(backward.IMPORTS)
         naming = AutoName("_")
