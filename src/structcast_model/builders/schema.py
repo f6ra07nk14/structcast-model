@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from itertools import accumulate
 from logging import getLogger
 from typing import Any, ClassVar, Generic, Self, TypeVar, cast
 
@@ -23,13 +24,15 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
-from structcast.core.template import Sequence, extend_structure
+from structcast.core.template import Sequence, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.security import get_default_dir, split_attribute, validate_attribute
 
 from structcast_model.utils.base import unique
 
 logger = getLogger(__name__)
+
+configure_jinja(filters={"cumsum": lambda x: list(accumulate(x))})
 
 SPEC_EVAL = register_resolver("eval", lambda x: x)
 
