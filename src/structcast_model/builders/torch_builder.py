@@ -18,6 +18,9 @@ from structcast_model.builders.base_builder import (
 class TorchLayerIntermediate(LayerIntermediate):
     """Intermediate representation of a PyTorch layer."""
 
+    default_imports: ClassVar[dict[str, set[str | None]]] = {"torch": {None}}
+    """Default imports for PyTorch layers."""
+
     def _get_layer(self, layername: str) -> str:
         """Get the sub-layer with the given name."""
         return f"self.{layername}"
