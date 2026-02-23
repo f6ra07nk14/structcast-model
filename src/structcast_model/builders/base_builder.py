@@ -164,19 +164,20 @@ def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variab
 
 
 class _Intermediate(Serializable):
+    """Intermediate representation of an operator during the building process."""
+
     classname: str
+    """The name of the class."""
 
     imports: dict[str, set[str | None]]
+    """The imports required for the operator and its sub-operators,
+    where the keys are module names and the values are sets of imported names from the corresponding modules."""
 
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
         """Collect the required imports from the layer and its sub-layers."""
         imports: dict[str, set[str | None]] = defaultdict(set)
         imports.update(self.imports)
-        for sub in self.layers.values():
-            if isinstance(sub, LayerIntermediate):
-                for module, names in sub.collected_imports.items():
-                    imports[module].update(names)
         return imports
 
     def _get_scripts(self) -> list[str]:
@@ -188,14 +189,14 @@ class _Intermediate(Serializable):
         """Get the scripts for the layer and its sub-layers."""
         return self._get_scripts()
 
-    def __call__(self, module_path: PathLike) -> None:
+    def __call__(self, module_path: PathLike | None = None) -> None:
         """Save the script for the layer to the given path."""
         imports = "\n".join(
             [f"from {p} import {', '.join([m for m in i if m])}" for p, i in self.collected_imports.items()]
             + [f"import {p}" for p, i in self.collected_imports.items() if None in i]
         )
         code = "\n\n".join([s for s in [imports, *self.scripts] if s])
-        module_path = check_path(module_path)
+        module_path = check_path(module_path or f"{to_snake(self.classname)}.py")
         module_path.parent.mkdir(parents=True, exist_ok=True)
         module_path.write_text(code, encoding="utf-8")
 
@@ -229,6 +230,17 @@ class LayerIntermediate(_Intermediate):
 
     structured_output: bool
     """Whether the output is structured."""
+
+    @cached_property
+    def collected_imports(self) -> dict[str, set[str | None]]:
+        """Collect the required imports from the layer and its sub-layers."""
+        imports: dict[str, set[str | None]] = defaultdict(set)
+        imports.update(self.imports)
+        for sub in self.layers.values():
+            if isinstance(sub, LayerIntermediate):
+                for module, names in sub.collected_imports.items():
+                    imports[module].update(names)
+        return imports
 
     @cached_property
     def _forward_inputs(self) -> str:
@@ -269,6 +281,8 @@ class LayerIntermediate(_Intermediate):
         naming = AutoName("")
         classnames: OrderedDict[str, str] = OrderedDict()
         scripts: list[str] = []
+        for name in [n for v in cfg.collected_imports.values() for n in v if n]:
+            naming(name)
 
         def _hash(raw: Any) -> str:
             return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
@@ -353,27 +367,27 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         ).get_user_defined_layer(parts, parameters, classname)
 
     def _get_sublayer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
-        if unit.LAYER.CFG is not None:
-            current_path = str(unit.LAYER.CFG)
+        if unit.CFG is not None:
+            current_path = str(unit.CFG)
             current_parts = self.from_references.get(current_path, None) or []
-            subclassname = to_pascal(unit.LAYER.CFG.stem)
-            if unit.LAYER.TYPE:
-                subclassname, parts = f"{subclassname}{to_pascal(unit.LAYER.TYPE)}", split_attribute(unit.LAYER.TYPE)
+            subclassname = to_pascal(unit.CFG.stem)
+            if unit.TYPE:
+                subclassname, parts = f"{subclassname}{to_pascal(unit.TYPE)}", split_attribute(unit.TYPE)
             else:
                 if "__root__" in current_parts:
                     raise SpecError(f"Circular reference detected for layer configuration: {self.from_references}")
                 current_parts, parts = (current_parts + ["__root__"]), []
             builder = type(self)(
-                raw=load_any(unit.LAYER.CFG),
+                raw=load_any(unit.CFG),
                 predefined_user_defined_layers=self.user_defined_layers,
                 current_path=current_path,
                 from_references={**self.from_references, current_path: current_parts},
             )
-        elif unit.LAYER.TYPE is not None:
-            subclassname, parts, builder = to_pascal(unit.LAYER.TYPE), split_attribute(unit.LAYER.TYPE), self
+        elif unit.TYPE is not None:
+            subclassname, parts, builder = to_pascal(unit.TYPE), split_attribute(unit.TYPE), self
         else:
             raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
-        return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.LAYER.PARAM), subclassname)
+        return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.PARAM), subclassname)
 
     def __call__(
         self,
@@ -425,11 +439,11 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
-                        subclassname, subinst = self._get_sublayer(parameters, unit)  # type: ignore[arg-type]
+                        subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)  # type: ignore[arg-type]
                     if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                     sublayers[name] = subinst
-                if (has_inputs := unit.INPUTS is not None) and (has_outputs := unit.OUTPUTS is not None):
+                if unit.INPUTS is not None and unit.OUTPUTS is not None:
                     inp = _inputs(unit.INPUTS.model_dump())
                     if isinstance(unit.OUTPUTS.spec, dict):
                         flow.append((inp, (tmpname := f"{name or naming('tmp')}_output"), name))
@@ -437,7 +451,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                             flow.append((key, resolve_getter(imports, value, tmpname), None))
                     else:
                         flow.append((inp, _outputs(unit.OUTPUTS.spec), name))
-                elif has_inputs or has_outputs:
+                elif unit.INPUTS is not None or unit.OUTPUTS is not None:
                     raise SpecError(
                         f"Both INPUTS and OUTPUTS must be specified together in the training/inference flow "
                         f"but got: {unit.model_dump()}"
