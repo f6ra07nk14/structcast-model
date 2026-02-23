@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
-from typing import Any, ClassVar, Generic, TypeVar
+from pathlib import Path
+from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from pydantic import (
     ValidationError,
@@ -18,7 +19,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
-from structcast.utils.security import check_path, get_default_dir, resolve_address, split_attribute
+from structcast.utils.security import get_default_dir, resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName, defaultdict
@@ -163,6 +164,14 @@ def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variab
     return _getter(spec, variable)
 
 
+def _merge_imports(*imports_list: dict[str, set[str | None]]) -> dict[str, set[str | None]]:
+    merged: dict[str, set[str | None]] = defaultdict(set)
+    for imports in imports_list:
+        for module, names in imports.items():
+            merged[module].update(names)
+    return merged
+
+
 class _Intermediate(Serializable):
     """Intermediate representation of an operator during the building process."""
 
@@ -173,12 +182,13 @@ class _Intermediate(Serializable):
     """The imports required for the operator and its sub-operators,
     where the keys are module names and the values are sets of imported names from the corresponding modules."""
 
+    default_imports: ClassVar[dict[str, set[str | None]]] = {}
+    """Default imports that are always included for all operators."""
+
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
         """Collect the required imports from the layer and its sub-layers."""
-        imports: dict[str, set[str | None]] = defaultdict(set)
-        imports.update(self.imports)
-        return imports
+        return _merge_imports(self.default_imports, self.imports)
 
     def _get_scripts(self) -> list[str]:
         """Implement the method to get the scripts for the layer."""
@@ -191,12 +201,16 @@ class _Intermediate(Serializable):
 
     def __call__(self, module_path: PathLike | None = None) -> None:
         """Save the script for the layer to the given path."""
-        imports = "\n".join(
-            [f"from {p} import {', '.join([m for m in i if m])}" for p, i in self.collected_imports.items()]
+        from_imports = {p: {m for m in i if m} for p, i in self.collected_imports.items()}
+        imported_code = "\n".join(
+            [f"from {p} import {', '.join([m for m in i if m])}" for p, i in from_imports.items() if i]
             + [f"import {p}" for p, i in self.collected_imports.items() if None in i]
-        )
-        code = "\n\n".join([s for s in [imports, *self.scripts] if s])
-        module_path = check_path(module_path or f"{to_snake(self.classname)}.py")
+        ).strip()
+        code = "\n\n".join([s for s in [imported_code, *self.scripts] if s])
+        if module_path is None:
+            module_path = Path(f"{to_snake(self.classname)}.py")
+        elif not isinstance(module_path, Path):
+            module_path = Path(module_path)
         module_path.parent.mkdir(parents=True, exist_ok=True)
         module_path.write_text(code, encoding="utf-8")
 
@@ -234,13 +248,8 @@ class LayerIntermediate(_Intermediate):
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
         """Collect the required imports from the layer and its sub-layers."""
-        imports: dict[str, set[str | None]] = defaultdict(set)
-        imports.update(self.imports)
-        for sub in self.layers.values():
-            if isinstance(sub, LayerIntermediate):
-                for module, names in sub.collected_imports.items():
-                    imports[module].update(names)
-        return imports
+        sub_imports = (s.collected_imports for s in self.layers.values() if isinstance(s, LayerIntermediate))
+        return _merge_imports(super().collected_imports, *sub_imports)
 
     @cached_property
     def _forward_inputs(self) -> str:
@@ -251,8 +260,8 @@ class LayerIntermediate(_Intermediate):
     def _forward_outputs(self) -> str:
         """Get the output arguments for calling the layer in the forward method."""
         if self.structured_output:
-            return f"{{{','.join(f'{repr(k)}: {k}' for k in self.OUTPUTS)}}}"
-        return ", ".join(self.OUTPUTS)
+            return f"{{{','.join(f'{repr(k)}: {k}' for k in self.outputs)}}}"
+        return ", ".join(self.outputs)
 
     def _get_layer(self, layername: str) -> str:
         """Get the sub-layer with the given name."""
@@ -412,7 +421,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             parameters = Parameters()
         elif not isinstance(parameters, Parameters):
             parameters = Parameters.model_validate(parameters)
+        parameters = cast(Parameters, parameters)
         layer = self.template(parameters)
+        parameters = parameters.merge(self.template.PARAMETERS)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(layer.IMPORTS)
         sublayers: dict[str, LayerIntermediate | str] = {}
@@ -439,7 +450,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
-                        subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)  # type: ignore[arg-type]
+                        subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)
                     if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                     sublayers[name] = subinst
