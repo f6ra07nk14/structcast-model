@@ -315,6 +315,10 @@ class LayerIntermediate(_Intermediate):
 LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
 
 
+def _to_pascal(val: str) -> str:
+    return to_pascal(to_snake(val))
+
+
 @dataclass(kw_only=True, slots=True)
 class BaseModelBuilder(Generic[LayerIntermediateT]):
     """Base model builder for building layers from templates."""
@@ -379,9 +383,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         if unit.CFG is not None:
             current_path = str(unit.CFG)
             current_parts = self.from_references.get(current_path, None) or []
-            subclassname = to_pascal(unit.CFG.stem)
+            subclassname = _to_pascal(unit.CFG.stem)
             if unit.TYPE:
-                subclassname, parts = f"{subclassname}{to_pascal(unit.TYPE)}", split_attribute(unit.TYPE)
+                subclassname, parts = f"{subclassname}{_to_pascal(unit.TYPE)}", split_attribute(unit.TYPE)
             else:
                 if "__root__" in current_parts:
                     raise SpecError(f"Circular reference detected for layer configuration: {self.from_references}")
@@ -393,7 +397,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                 from_references={**self.from_references, current_path: current_parts},
             )
         elif unit.TYPE is not None:
-            subclassname, parts, builder = to_pascal(unit.TYPE), split_attribute(unit.TYPE), self
+            subclassname, parts, builder = _to_pascal(unit.TYPE), split_attribute(unit.TYPE), self
         else:
             raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
         return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.PARAM), subclassname)
