@@ -1,25 +1,33 @@
 PARAMETERS:
   DEFAULT:
-    backend: atto
-    num_classes: 1000
-    # backend model parameters
+    backbone: femto
+  SHARED: 
     stem_kernel_size: 4
     kernel_size: 7
-    dims: [40, 80, 160, 320]
-    depths: [2, 2, 6, 2]
     drop_path_rate: 0.
     norm_eps: 1.0e-6
     activation: GELU
     mlp_ratio: 4
-  SHARED: {}
+    num_classes: 1000
+  # backbone model parameters
+  atto:
+    dims: [40, 80, 160, 320]
+    depths: [2, 2, 6, 2]
+  femto:
+    dims: [48, 96, 192, 384]
+    depths: [2, 2, 6, 2]
 IMPORTS: {}
 INPUTS: [image]
 OUTPUTS: [cls]
 STRUCTURED_OUTPUT: true
 FLOW:
   - _jinja_yaml_: |-
-      - [image, {feature: feat4}, backend, {CFG: cfg/models/ConvNeXtV2/{{backend}}.yaml}]
-      - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
-      - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
-      - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{dims[-1]}}, eps: {{norm_eps}}}}]]
-      - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+      - _jinja_group_: {{backbone}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [image, {feature: feat4}, backbone, {CFG: cfg/models/ConvNeXtV2/backbone.yaml, PARAM: {DEFAULT: {dims: {{dims}}, depths: {{depths}}}}}]
+          - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+          - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
+          - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{dims[-1]}}, eps: {{norm_eps}}}}]]
+          - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+      {% endraw %}
