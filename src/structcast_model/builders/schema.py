@@ -24,7 +24,16 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
-from structcast.core.template import Sequence, configure_jinja, extend_structure
+from structcast.core.template import (
+    ALIAS_JINJA,
+    ALIAS_JINJA_GROUP,
+    ALIAS_JINJA_JSON,
+    ALIAS_JINJA_PIPE,
+    ALIAS_JINJA_YAML,
+    Sequence,
+    configure_jinja,
+    extend_structure,
+)
 from structcast.utils.base import check_elements
 from structcast.utils.security import get_default_dir, split_attribute, validate_attribute
 
@@ -58,7 +67,7 @@ class WithExtra(Serializable):
         return cast(dict[str, Any], self.__pydantic_extra__)
 
 
-_TEMPLATE_ALIASES = ["_jinja_", "_jinja_pipe_", "_jinja_yaml_", "_jinja_json_", "_jinja_group_"]
+_TEMPLATE_ALIASES = [ALIAS_JINJA, ALIAS_JINJA_GROUP, ALIAS_JINJA_JSON, ALIAS_JINJA_PIPE, ALIAS_JINJA_YAML]
 
 
 class Parameters(WithExtra):
