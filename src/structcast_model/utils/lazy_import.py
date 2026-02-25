@@ -39,8 +39,7 @@ class LazySelectedImporter(ModuleType):
         self._import_structure = import_structure
         self._extra = extra
 
-    # Needed for autocompletion in an IDE
-    def __dir__(self) -> list[str]:
+    def __dir__(self) -> tuple[str, ...]:
         """Return the directory.
 
         Returns:
