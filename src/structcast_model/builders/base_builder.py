@@ -8,7 +8,7 @@ from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
 from pathlib import Path
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from pydantic import (
     ValidationError,
@@ -425,7 +425,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         Returns:
             LayerIntermediateT: The built layer as a `LayerIntermediateT` instance.
         """
-        parameters = Parameters.create(self.template.PARAMETERS, parameters)
+        parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
         if user_defined_layer:
             return self.get_user_defined_layer(split_attribute(user_defined_layer), parameters, classname)
         layer = self.template(parameters, merged=False)
