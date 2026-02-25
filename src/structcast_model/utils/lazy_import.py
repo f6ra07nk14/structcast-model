@@ -8,7 +8,6 @@ The implementation is based on the following:
 from __future__ import annotations
 
 import importlib
-import os
 from types import ModuleType, TracebackType
 from typing import Any
 
@@ -25,28 +24,20 @@ class LazySelectedImporter(ModuleType):
         name: str,
         module_file: str,
         import_structure: dict[str, list[str]],
-        extra_objects: dict[str, Any] | None = None,
-        skip_modules: list[str] | None = None,
-    ):
+        extra: dict[str, Any],
+    ) -> None:
         """Initialize a lazy selected importer.
 
         Args:
             name: Name of the module.
             module_file: Path to the module file.
             import_structure: Dictionary of the import structure.
-            extra_objects: Extra objects to add to the module.
-            skip_modules: Modules to skip.
+            extra: Dictionary of extra objects to be added to the module.
         """
         super().__init__(name)
-        skip_modules = skip_modules or []
-        self._modules = {k for k in import_structure if k not in skip_modules}
         self._class_to_module = {v: k for k, values in import_structure.items() for v in values}
-        self._objects = extra_objects or {}
         self._import_structure = import_structure
-        # Needed for autocompletion in an IDE
-        self.__all__ = list(self._modules) + sum(import_structure.values(), []) + list(self._objects)
-        self.__file__ = module_file
-        self.__path__ = [os.path.dirname(module_file)]
+        self._extra = extra
 
     # Needed for autocompletion in an IDE
     def __dir__(self) -> list[str]:
@@ -55,8 +46,25 @@ class LazySelectedImporter(ModuleType):
         Returns:
             The directory.
         """
-        exclude = {"_modules", "_class_to_module", "_objects", "_name", "_import_structure"}
-        return list(set(super().__dir__()) - exclude) + self.__all__
+        return tuple(self._extra)
+
+    def __getattribute__(self, name: str) -> Any:
+        """Get an attribute."""
+        if name in (
+            "_class_to_module",
+            "_import_structure",
+            "_extra",
+            "_get_module",
+            "__spec__",
+            "__firstlineno__",
+            "__reduce__",
+            "__dir__",
+            "__getattribute__",
+        ):
+            return super().__getattribute__(name)
+        if name in super().__getattribute__("_extra"):
+            return super().__getattribute__(name)
+        raise AttributeError(f'Module "{super().__getattribute__("__name__")}" has no attribute "{name}".')
 
     def __getattr__(self, name: str) -> Any:
         """Get an attribute.
@@ -67,16 +75,14 @@ class LazySelectedImporter(ModuleType):
         Returns:
             The attribute.
         """
-        if name in self._objects:
-            return self._objects[name]
-        if name in self._modules:
+        if name not in self._extra:
+            raise AttributeError(f'Module "{self.__name__}" has no attribute "{name}".')
+        if name in self._class_to_module:
+            value = getattr(self._get_module(self._class_to_module[name]), name)
+        elif name in self._import_structure:
             value = self._get_module(name)
-        elif name in self._class_to_module:
-            module = self._get_module(self._class_to_module[name])
-            value = getattr(module, name)
         else:
-            raise AttributeError(f"module {self.__name__} has no attribute {name}")
-
+            return self._extra[name]
         setattr(self, name, value)
         return value
 
