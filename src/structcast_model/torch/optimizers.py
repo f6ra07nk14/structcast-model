@@ -1,17 +1,24 @@
 """Build optimizers."""
 
 from re import Pattern as RePattern, compile as re_compile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from structcast.utils.security import get_default_dir
 from timm.optim import create_optimizer_v2
 from timm.scheduler.scheduler_factory import create_scheduler_v2
-from torch.nn import Parameter
-from torch.optim import Optimizer, lr_scheduler
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim import lr_scheduler
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS
-from torch import Tensor
+import torch
+
+if TYPE_CHECKING:
+    from torch.nn import Parameter
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
+else:
+    Parameter = Any
+    Optimizer = Any
+    LRScheduler = Any
 
 
 def _match_no_weight_decay(
@@ -196,7 +203,7 @@ def _create_scheduler(optimizer: Optimizer, name: str, has_lr_scale: bool, **kwa
 def _set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
     for group in optimizer.param_groups:
         if "lr_scale" in group:
-            if isinstance(group["lr"], Tensor):
+            if isinstance(group["lr"], torch.Tensor):
                 group["lr"].mul_(group["lr_scale"])
             else:
                 group["lr"] = group["lr"] * group["lr_scale"]
