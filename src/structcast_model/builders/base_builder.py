@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
@@ -23,7 +23,7 @@ from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
 from structcast.utils.security import get_default_dir, resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
-from structcast_model.builders.auto_name import AutoName, defaultdict
+from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.schema import (
     SPEC_EVAL,
     LayerBehavior,
@@ -288,7 +288,7 @@ class LayerIntermediate(_Intermediate):
     @classmethod
     def _get_layer_scripts(cls, cfg: LayerIntermediate) -> list[str]:
         naming = AutoName("")
-        classnames: OrderedDict[str, str] = OrderedDict()
+        classnames: dict[str, str] = {}
         scripts: list[str] = []
         for name in [n for v in cfg.collected_imports.values() for n in v if n]:
             naming(name)
@@ -578,13 +578,14 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         imports.update(backward.IMPORTS)
         naming = AutoName("_")
         opts: dict[str, tuple[str, list[str], str | None]] = {}
-        backwards: OrderedDict[str, tuple[str, str, list[str]]] = OrderedDict()
+        backward_names = set()
+        backwards: list[tuple[str, str, list[str]]] = []
         for unit in backward.BACKWARDS:
-            backward_name = unit.NAME or naming("backward")
-            if backward_name in backwards:
+            if (backward_name := unit.NAME or naming("backward")) in backward_names:
                 raise SpecError(f'Duplicate backward name "{backward_name}" found in the backwards.')
+            backward_names.add(backward_name)
             repr_backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in unit.model_extra.items())
-            backwards[backward_name] = (unit.LOSS, repr_backward_kw, [])
+            backwards.append((unit.LOSS, repr_backward_kw, []))
             for opt in unit.OPTIMIZERS:
                 optinst, optclassname = resolve_object(imports, opt.OPTIMIZER)
                 optname = opt.NAME or naming(optclassname)
@@ -592,7 +593,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
                     raise SpecError(f'Duplicate optimizer name "{optname}" found in the backwards.')
                 opt_clip = resolve_object(imports, opt.OPTIMIZER)[0] if opt.CLIP else None
                 opts[optname] = (optinst, opt.LAYERS, opt_clip)
-                backwards[backward_name][-1].append(optname)
+                backwards[-1][-1].append(optname)
         return self.user_defined_backward_layer_type(
             imports=imports,
             classname=classname,
