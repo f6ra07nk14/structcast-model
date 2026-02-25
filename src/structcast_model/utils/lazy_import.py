@@ -60,6 +60,7 @@ class LazySelectedImporter(ModuleType):
             "__reduce__",
             "__dir__",
             "__getattribute__",
+            "__dict__",
         ):
             return super().__getattribute__(name)
         if name in super().__getattribute__("_extra"):
