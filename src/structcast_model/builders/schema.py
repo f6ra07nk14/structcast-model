@@ -5,11 +5,9 @@ from __future__ import annotations
 from functools import cached_property
 from itertools import accumulate
 from logging import getLogger
-from typing import Any, ClassVar, Generic, Self, TypeVar, cast
+from typing import Any, ClassVar, Generic, Self, TypeVar
 
 from pydantic import (
-    BaseModel,
-    ConfigDict,
     Field,
     FilePath,
     PositiveInt,
@@ -20,16 +18,14 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from structcast.core.base import Serializable, WithExtra
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import (
-    ALIAS_JINJA,
-    ALIAS_JINJA_GROUP,
-    ALIAS_JINJA_JSON,
-    ALIAS_JINJA_PIPE,
-    ALIAS_JINJA_YAML,
+    ALIAS_ALL,
+    Parameters as BaseParameters,
     Sequence,
     configure_jinja,
     extend_structure,
@@ -46,99 +42,14 @@ configure_jinja(filters={"cumsum": lambda x: list(accumulate(x))})
 SPEC_EVAL = register_resolver("eval", lambda x: x)
 
 
-class Serializable(BaseModel):
-    """Base configuration."""
-
-    model_config = ConfigDict(frozen=True, validate_default=True, extra="forbid", serialize_by_alias=True)
-
-
-class WithExtra(Serializable):
-    """Base class for configurations with extra fields allowed."""
-
-    model_config = ConfigDict(extra="allow")
-
-    @property
-    def model_extra(self) -> dict[str, Any]:
-        """Get extra fields set during validation.
-
-        Returns:
-            A dictionary of extra fields, or `None` if `config.extra` is not set to `"allow"`.
-        """
-        return cast(dict[str, Any], self.__pydantic_extra__)
-
-
-_TEMPLATE_ALIASES = [ALIAS_JINJA, ALIAS_JINJA_GROUP, ALIAS_JINJA_JSON, ALIAS_JINJA_PIPE, ALIAS_JINJA_YAML]
-
-
-class Parameters(WithExtra):
+class Parameters(BaseParameters):
     """Parameters for template formatting."""
 
-    SHARED: dict[str, Any] = Field(default_factory=dict)
+    shared: dict[str, Any] = Field(default_factory=dict, alias="SHARED")
     """Shared parameters for all groups."""
 
-    DEFAULT: dict[str, Any] = Field(default_factory=dict)
+    default: dict[str, Any] = Field(default_factory=dict, alias="DEFAULT")
     """Default parameters for the default group."""
-
-    @model_validator(mode="after")
-    def _validate_parameters(self) -> Self:
-        if "default" in self.model_extra:
-            # logger.warning(
-            #     'The default parameters should be defined in the "DEFAULT" field, '
-            #     'not in the "default" key of extra fields. '
-            #     'The "default" key in extra fields will be merged into the "DEFAULT" field.'
-            # )
-            self.DEFAULT.update(self.model_extra.pop("default"))
-        for key, value in self.model_extra.items():
-            if key in _TEMPLATE_ALIASES:
-                raise SpecError(f'Key "{key}" is reserved for template aliases and cannot be used in parameters.')
-            if not isinstance(value, dict):
-                raise SpecError(f'Parameters for group "{key}" must be a dictionary but got: {value}')
-        if duplicate_keys := set(self.DEFAULT) & set(self.SHARED):
-            raise ValueError(f"Duplicate keys found between DEFAULT and SHARED parameters: {duplicate_keys}")
-        return self
-
-    @cached_property
-    def template_kwargs(self) -> dict[str, dict[str, Any]]:
-        """Get the template keyword arguments for formatting."""
-        res = {k: {**v, **self.SHARED} for k, v in self.model_extra.items()}
-        res["default"] = {**self.DEFAULT, **self.SHARED}
-        return res
-
-    def merge(self, other: dict[str, Any] | Parameters) -> Parameters:
-        """Merge the given template keyword arguments with the parameters.
-
-        Args:
-            other (dict[str, Any] | Parameters): The template keyword arguments to merge, or another
-                `Parameters` instance to merge with.
-
-        Returns:
-            A new `Parameters` instance with the merged template keyword arguments.
-        """
-
-        def _get(group: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
-            return group.get(name, None) or {}
-
-        if isinstance(other, Parameters):
-            other = other.template_kwargs
-        owner = self.template_kwargs
-        return Parameters.model_validate({k: {**_get(owner, k), **_get(other, k)} for k in set(owner) | set(other)})
-
-    @classmethod
-    def create(cls, *param: dict[str, dict[str, Any]] | Parameters | None) -> Parameters:
-        """Create a `Parameters` instance from the given template keyword arguments.
-
-        Args:
-            *param (dict[str, dict[str, Any]] | Parameters | None): The template keyword arguments to create the
-                `Parameters` instance with. Can be specified multiple times, and will be merged together.
-
-        Returns:
-            A `Parameters` instance created from the given template keyword arguments.
-        """
-        parameters = Parameters()
-        for data in param:
-            if data:
-                parameters = parameters.merge(data)
-        return parameters
 
 
 class UserLayer(Serializable):
@@ -561,7 +472,7 @@ class _Template(WithExtra, Generic[SerializableT]):
 
     @cached_property
     def _raw_and_others(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        target_fields = list(self.target_type.model_fields) + _TEMPLATE_ALIASES
+        target_fields = list(self.target_type.model_fields) + ALIAS_ALL
         raw: dict[str, Any] = {}
         others: dict[str, Any] = {}
         for key, value in self.model_extra.items():
@@ -624,13 +535,11 @@ __all__ = [
     "LayerBehavior",
     "OptimizerBehavior",
     "Parameters",
-    "Serializable",
     "TemplateBackward",
     "TemplateLayer",
     "UserDefinedBackward",
     "UserDefinedLayer",
     "UserLayer",
-    "WithExtra",
     "resolve_flow",
     "resolve_inputs",
     "resolve_outputs",

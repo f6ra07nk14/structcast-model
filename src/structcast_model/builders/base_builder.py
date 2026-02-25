@@ -15,6 +15,7 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_pascal, to_snake
 from pydantic_core import to_jsonable_python
+from structcast.core.base import Serializable
 from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
@@ -27,7 +28,6 @@ from structcast_model.builders.schema import (
     SPEC_EVAL,
     LayerBehavior,
     Parameters,
-    Serializable,
     TemplateBackward,
     TemplateLayer,
     UserLayer,

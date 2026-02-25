@@ -64,90 +64,6 @@ def test_with_extra_model_extra_property() -> None:
     assert config.model_extra["custom_field"] == "test"
 
 
-# Test Parameters
-def test_parameters_basic() -> None:
-    """Test basic Parameters functionality."""
-    params = Parameters()
-    assert params.SHARED == {}
-    assert params.DEFAULT == {}
-    assert params.model_extra == {}
-
-
-def test_parameters_with_shared_and_default() -> None:
-    """Test Parameters with SHARED and DEFAULT fields."""
-    params = Parameters.model_validate({"SHARED": {"key1": "value1"}, "DEFAULT": {"key2": "value2"}})
-    assert params.SHARED == {"key1": "value1"}
-    assert params.DEFAULT == {"key2": "value2"}
-
-
-def test_parameters_with_groups() -> None:
-    """Test Parameters with custom groups."""
-    raw = {
-        "SHARED": {"shared_key": "shared_value"},
-        "DEFAULT": {"default_key": "default_value"},
-        "group1": {"g1_key": "g1_value"},
-        "group2": {"g2_key": "g2_value"},
-    }
-    params = Parameters.model_validate(raw)
-    assert params.model_extra["group1"] == {"g1_key": "g1_value"}
-    assert params.model_extra["group2"] == {"g2_key": "g2_value"}
-
-
-def test_parameters_default_lowercase_merges_to_uppercase() -> None:
-    """Test that lowercase 'default' merges into 'DEFAULT'."""
-    params = Parameters.model_validate({"DEFAULT": {"key1": "value1"}, "default": {"key2": "value2"}})
-    assert params.DEFAULT == {"key1": "value1", "key2": "value2"}
-    assert "default" not in params.model_extra
-
-
-def test_parameters_template_aliases_forbidden() -> None:
-    """Test that template aliases are forbidden in parameters."""
-    with pytest.raises(SpecError, match="reserved for template aliases"):
-        Parameters.model_validate({"_jinja_": {"key": "value"}})
-
-
-def test_parameters_group_must_be_dict() -> None:
-    """Test that parameter groups must be dictionaries."""
-    with pytest.raises(SpecError, match="must be a dictionary"):
-        Parameters.model_validate({"group1": "not a dict"})
-
-
-def test_parameters_duplicate_keys_between_default_and_shared() -> None:
-    """Test that duplicate keys between DEFAULT and SHARED raise error."""
-    with pytest.raises(ValueError, match="Duplicate keys found"):
-        Parameters.model_validate({"SHARED": {"key": "shared"}, "DEFAULT": {"key": "default"}})
-
-
-def test_parameters_template_kwargs() -> None:
-    """Test template_kwargs property."""
-    raw = {
-        "SHARED": {"shared_key": "shared_value"},
-        "DEFAULT": {"default_key": "default_value"},
-        "group1": {"g1_key": "g1_value"},
-    }
-    kwargs = Parameters.model_validate(raw).template_kwargs
-    assert kwargs["default"] == {"default_key": "default_value", "shared_key": "shared_value"}
-    assert kwargs["group1"] == {"g1_key": "g1_value", "shared_key": "shared_value"}
-
-
-def test_parameters_merge_with_dict() -> None:
-    """Test merging parameters with a dictionary."""
-    params1 = Parameters.model_validate({"DEFAULT": {"key1": "value1"}, "group1": {"g1": "v1"}})
-    result = params1.merge({"default": {"key2": "value2"}, "group2": {"g2": "v2"}}).template_kwargs
-    assert result["default"]["key1"] == "value1"
-    assert result["default"]["key2"] == "value2"
-    assert "group1" in result
-    assert "group2" in result
-
-
-def test_parameters_merge_with_parameters() -> None:
-    """Test merging parameters with another Parameters instance."""
-    param = Parameters.model_validate({"DEFAULT": {"key2": "value2"}})
-    result = param.merge(Parameters.model_validate({"DEFAULT": {"key1": "value1"}})).template_kwargs
-    assert result["default"]["key1"] == "value1"
-    assert result["default"]["key2"] == "value2"
-
-
 # Test UserLayer
 def test_user_layer_basic() -> None:
     """Test basic UserLayer functionality."""
@@ -161,7 +77,7 @@ def test_user_layer_with_values() -> None:
     """Test UserLayer with values."""
     layer = UserLayer.model_validate({"TYPE": "conv", "PARAM": {"DEFAULT": {"key": "value"}}})
     assert layer.TYPE == "conv"
-    assert layer.PARAM.DEFAULT == {"key": "value"}
+    assert layer.PARAM.default == {"key": "value"}
 
 
 # Test LayerBehavior
@@ -450,7 +366,7 @@ def test_template_layer_basic() -> None:
 def test_template_layer_with_parameters() -> None:
     """Test TemplateLayer with parameters."""
     template = TemplateLayer.model_validate({"PARAMETERS": {"DEFAULT": {"key": "value"}}})
-    assert template.PARAMETERS.DEFAULT == {"key": "value"}
+    assert template.PARAMETERS.default == {"key": "value"}
 
 
 def test_template_layer_raw_and_user_defined_layers() -> None:
