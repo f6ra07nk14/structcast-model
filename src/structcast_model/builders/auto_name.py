@@ -2,6 +2,8 @@
 
 from collections import defaultdict
 
+from structcast.utils.security import get_default_dir
+
 
 class AutoName:
     """Auto Name."""
@@ -23,3 +25,10 @@ class AutoName:
     def reset(self) -> None:
         """Reset the name counter."""
         self._object_name_uids.clear()
+
+
+__all__ = ["AutoName"]
+
+
+def __dir__() -> list[str]:
+    return get_default_dir(globals())
