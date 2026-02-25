@@ -123,6 +123,23 @@ class Parameters(WithExtra):
         owner = self.template_kwargs
         return Parameters.model_validate({k: {**_get(owner, k), **_get(other, k)} for k in set(owner) | set(other)})
 
+    @classmethod
+    def create(cls, *param: dict[str, dict[str, Any]] | Parameters | None) -> Parameters:
+        """Create a `Parameters` instance from the given template keyword arguments.
+
+        Args:
+            *param (dict[str, dict[str, Any]] | Parameters | None): The template keyword arguments to create the
+                `Parameters` instance with. Can be specified multiple times, and will be merged together.
+
+        Returns:
+            A `Parameters` instance created from the given template keyword arguments.
+        """
+        parameters = Parameters()
+        for data in param:
+            if data:
+                parameters = parameters.merge(data)
+        return parameters
+
 
 class UserLayer(Serializable):
     """User layer configuration."""
@@ -561,18 +578,30 @@ class _Template(WithExtra, Generic[SerializableT]):
         """Get the other fields that are not in the target type."""
         return self._raw_and_others[1]
 
-    def __call__(self, parameters: dict[str, dict[str, Any]] | Parameters) -> SerializableT:
+    def __call__(
+        self,
+        parameters: dict[str, dict[str, Any]] | Parameters | None = None,
+        *,
+        merged: bool = True,
+    ) -> SerializableT:
         """Format the template with the given parameters.
 
         Args:
-            parameters (dict[str, dict[str, Any]] | Parameters):
+            parameters (dict[str, dict[str, Any]] | Parameters | None):
                 The template keyword arguments to format the template with,
                 or a `Parameters` instance containing the template keyword arguments.
+            merged (bool, optional): Whether to merge the given parameters with the template's own `PARAMETERS`
+                before formatting. Defaults to `True`.
 
         Returns:
             An instance of the target type created from the formatted template.
         """
-        template_kwargs = self.PARAMETERS.merge(parameters).template_kwargs
+        if merged:
+            template_kwargs = Parameters.create(self.PARAMETERS, parameters).template_kwargs
+        elif parameters is None:
+            template_kwargs = self.PARAMETERS.template_kwargs
+        else:
+            template_kwargs = Parameters.create(parameters).template_kwargs
         raw = extend_structure(self.raw, template_kwargs=template_kwargs, default="default")
         return self.target_type.model_validate(raw)
 

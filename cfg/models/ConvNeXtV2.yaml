@@ -1,37 +1,63 @@
 PARAMETERS:
   DEFAULT:
+    backbone: femto
+  SHARED:
     stem_kernel_size: 4
     kernel_size: 7
-    dims: [40, 80, 160, 320]
-    depths: [ 2, 2, 6, 2 ]
     drop_path_rate: 0.
     norm_eps: 1.0e-6
     activation: GELU
     mlp_ratio: 4
-  SHARED: {}
+    num_classes: 1000
+  # backbone model parameters
+  atto:
+    dims: [40, 80, 160, 320]
+    depths: [2, 2, 6, 2]
+  femto:
+    dims: [48, 96, 192, 384]
+    depths: [2, 2, 6, 2]
 IMPORTS: {}
 INPUTS: [image]
-OUTPUTS: [ feat1, feat2, feat3, feat4 ]
+OUTPUTS: [cls]
 STRUCTURED_OUTPUT: true
 FLOW:
+  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+  - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
   - _jinja_yaml_: |-
-      {% set cum_depths = [0] + depths | cumsum %}
-      - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fout: {{dims[0]}}}}}]
-      {% for i in range(cum_depths[0], cum_depths[1]) %}
-      - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
-      {% endfor %}
-      - [feat1, feat2, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
-      {% for i in range(cum_depths[1], cum_depths[2]) %}
-      - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
-      {% endfor %}
-      - [feat2, feat3, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
-      {% for i in range(cum_depths[2], cum_depths[3]) %}
-      - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
-      {% endfor %}
-      - [feat3, feat4, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
-      {% for i in range(cum_depths[3], cum_depths[4]) %}
-      - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
-      {% endfor %}
+      - _jinja_group_: {{backbone}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{dims[-1]}}, eps: {{norm_eps}}}}]]
+      {% endraw %}
+      - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+Backbone:
+  INPUTS: [image]
+  OUTPUTS: [feat1, feat2, feat3, feat4]
+  STRUCTURED_OUTPUT: true
+  FLOW:
+    - _jinja_yaml_: |-
+        - _jinja_group_: {{backbone}}
+        {% raw %}
+          _jinja_yaml_: |-
+            {% set cum_depths = [0] + depths | cumsum %}
+            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fout: {{dims[0]}}}}}]
+            {% for i in range(cum_depths[0], cum_depths[1]) %}
+            - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat1, feat2, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
+            {% for i in range(cum_depths[1], cum_depths[2]) %}
+            - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat2, feat3, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
+            {% for i in range(cum_depths[2], cum_depths[3]) %}
+            - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat3, feat4, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
+            {% for i in range(cum_depths[3], cum_depths[4]) %}
+            - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+        {% endraw %}
 Stem:
   OUTPUTS: [out]
   FLOW:

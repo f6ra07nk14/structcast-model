@@ -8,7 +8,7 @@ from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
 from pathlib import Path
-from typing import Any, ClassVar, Generic, TypeVar, cast
+from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import (
     ValidationError,
@@ -407,6 +407,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         parameters: dict[str, dict[str, Any]] | Parameters | None = None,
         classname: str = "Model",
         forced_structured_output: bool | None = None,
+        user_defined_layer: str | None = None,
     ) -> LayerIntermediateT:
         """Build the layer from the template with the given parameters and class name.
 
@@ -417,17 +418,17 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             classname (str): The name of the layer class to use for the built layer. Default is "Model".
             forced_structured_output (bool | None): Whether to force the output to be structured
                 regardless of the template specification.
+            user_defined_layer (str | None): The reference to a user-defined layer to build instead of the root layer
+                defined in the template. If specified, the reference should be in the format of "key1.key2...keyN",
+                where each key is a key defined in the user-defined layers.
 
         Returns:
             LayerIntermediateT: The built layer as a `LayerIntermediateT` instance.
         """
-        if parameters is None:
-            parameters = Parameters()
-        elif not isinstance(parameters, Parameters):
-            parameters = Parameters.model_validate(parameters)
-        parameters = cast(Parameters, parameters)
-        layer = self.template(parameters)
-        parameters = parameters.merge(self.template.PARAMETERS)
+        parameters = Parameters.create(self.template.PARAMETERS, parameters)
+        if user_defined_layer:
+            return self.get_user_defined_layer(split_attribute(user_defined_layer), parameters, classname)
+        layer = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(layer.IMPORTS)
         sublayers: dict[str, LayerIntermediate | str] = {}

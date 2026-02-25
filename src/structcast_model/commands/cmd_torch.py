@@ -70,14 +70,18 @@ def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    class_name: str = Option("Model", "--class-name", "-c", help="Name the model class."),
+    classname: str = Option("Model", "--classname", "-c", help="Name the model class."),
     structured_output: bool = Option(True, help="Enable structured output for the model."),
+    sublayer: str | None = Option(
+        None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
+    ),
 ) -> None:
     """Create a PyTorch model from the given configuration file and parameters."""
     torch_builder.TorchBuilder.from_path(cfg_path)(
         parameters=reduce_dict(parameters),
-        classname=class_name,
+        classname=classname,
         forced_structured_output=structured_output,
+        user_defined_layer=sublayer,
     )(output)
 
 
@@ -86,13 +90,11 @@ def create_backward(
     cfg_path: str = Argument(..., help="Path to the backward configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    class_name: str = Option("Backward", "--class-name", "-c", help="Name the backward class."),
+    classname: str = Option("Backward", "--classname", "-c", help="Name the backward class."),
 ) -> None:
     """Create a PyTorch backward class from the given configuration file and parameters."""
-    torch_builder.TorchBackwardBuilder.from_path(cfg_path)(
-        parameters=reduce_dict(parameters),
-        classname=class_name,
-    )(output)
+    builder = torch_builder.TorchBackwardBuilder.from_path(cfg_path)
+    builder(parameters=reduce_dict(parameters), classname=classname)(output)
 
 
 @app.command(name="ptflops")
