@@ -1,14 +1,12 @@
 """Base builder for building layers or backward operators from templates."""
 
-from __future__ import annotations
-
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
 from pathlib import Path
-from typing import Any, ClassVar, Generic, TypeVar, cast
+from typing import Any, ClassVar, Generic, TypeVar, Union, cast
 
 from pydantic import ValidationError
 from pydantic.alias_generators import to_pascal, to_snake
@@ -222,7 +220,7 @@ class LayerIntermediate(_Intermediate):
     outputs: list[str]
     """The names of the output layers."""
 
-    layers: dict[str, LayerIntermediate | str]
+    layers: dict[str, Union["LayerIntermediate", str]]
     """The sub-layers used in the layer, where the keys are the layer names and the values are either the sub-layer
     as a `LayerIntermediate` instance or a string representation of the sub-layer to be used directly in the script."""
 
@@ -284,7 +282,7 @@ class LayerIntermediate(_Intermediate):
         raise NotImplementedError("The _get_layer_script method must be implemented in the subclass.")
 
     @classmethod
-    def _get_layer_scripts(cls, cfg: LayerIntermediate) -> list[str]:
+    def _get_layer_scripts(cls, cfg: "LayerIntermediate") -> list[str]:
         naming = AutoName("")
         classnames: dict[str, str] = {}
         scripts: list[str] = []
@@ -332,7 +330,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
     user_defined_layers: dict[str, Any] = field(init=False)
 
     @classmethod
-    def from_path(cls, path: PathLike) -> BaseModelBuilder:
+    def from_path(cls, path: PathLike) -> "BaseModelBuilder[LayerIntermediateT]":
         """Create a model builder from the given configuration file path."""
         curr_path = str(path)
         return cls(raw=load_any(path), current_path=curr_path, from_references={curr_path: ["__root__"]})
@@ -539,7 +537,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     template: TemplateBackward = field(init=False)
 
     @classmethod
-    def from_path(cls, path: PathLike) -> BaseBackwardBuilder:
+    def from_path(cls, path: PathLike) -> "BaseBackwardBuilder[BackwardIntermediateT]":
         """Create a backward builder from the given configuration file path."""
         return cls(raw=load_any(path))
 
