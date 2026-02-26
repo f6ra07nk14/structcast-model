@@ -16,6 +16,27 @@ PARAMETERS:
   femto:
     dims: [48, 96, 192, 384]
     depths: [2, 2, 6, 2]
+  pico:
+    dims: [64, 128, 256, 512]
+    depths: [2, 2, 6, 2]
+  nano:
+    dims: [80, 160, 320, 640]
+    depths: [2, 2, 8, 2]
+  tiny:
+    dims: [96, 192, 384, 768]
+    depths: [3, 3, 9, 3]
+  small:
+    dims: [96, 192, 384, 768]
+    depths: [3, 3, 27, 3]
+  base:
+    dims: [128, 256, 512, 1024]
+    depths: [3, 3, 27, 3]
+  large:
+    dims: [192, 384, 768, 1536]
+    depths: [3, 3, 27, 3]
+  huge:
+    dims: [352, 704, 1408, 2816]
+    depths: [3, 3, 27, 3]
 IMPORTS: {}
 INPUTS: [image]
 OUTPUTS: [cls]
