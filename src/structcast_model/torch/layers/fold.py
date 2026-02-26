@@ -1,6 +1,7 @@
 """Fold and Unfold Layers."""
 
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING
+
 from torch.nn import Fold, Unfold
 from torch.nn.modules.lazy import LazyModuleMixin
 
@@ -122,5 +123,9 @@ class FoldExt(LazyModuleMixin, Fold):
 __all__ = ["FoldExt", "UnfoldExt", "compute_spatial_shape", "compute_transposed_spatial_shape"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

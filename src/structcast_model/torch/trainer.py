@@ -4,10 +4,9 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter, ValidationError
-from structcast.utils.security import get_default_dir
 from timm.data import Mixup
 from timm.utils import ModelEmaV3
 from torch.nn import Module
@@ -231,5 +230,9 @@ __all__ = [
 ]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

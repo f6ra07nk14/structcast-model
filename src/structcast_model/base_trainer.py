@@ -5,9 +5,7 @@ from dataclasses import dataclass, field
 from math import inf
 from operator import gt, lt
 from time import time
-from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar
-
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar
 
 ModelT_contra = TypeVar("ModelT_contra", contravariant=True)
 
@@ -329,5 +327,9 @@ __all__ = [
 ]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

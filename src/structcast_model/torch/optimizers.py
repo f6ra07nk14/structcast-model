@@ -3,7 +3,6 @@
 from re import Pattern as RePattern, compile as re_compile
 from typing import TYPE_CHECKING, Any
 
-from structcast.utils.security import get_default_dir
 from timm.optim import create_optimizer_v2
 from timm.scheduler.scheduler_factory import create_scheduler_v2
 from torch.optim import lr_scheduler
@@ -250,5 +249,9 @@ def create_with_scheduler(
 __all__ = ["create", "create_with_scheduler"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

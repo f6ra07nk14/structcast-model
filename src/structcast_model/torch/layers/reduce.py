@@ -1,6 +1,7 @@
 """Reduce layers for PyTorch backend."""
 
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING
+
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -27,6 +28,9 @@ class ReduceSum(Module):
 
 __all__ = ["ReduceSum"]
 
+if not TYPE_CHECKING:
+    import sys
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

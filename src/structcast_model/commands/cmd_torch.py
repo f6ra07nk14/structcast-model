@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from structcast_model.torch import trainer as torch_trainer
     import torch
 else:
-    from structcast_model.utils.lazy_import import LazyModuleImporter
+    from structcast.utils.lazy_import import LazyModuleImporter
 
     calflops = LazyModuleImporter("calflops")
     ptflops = LazyModuleImporter("ptflops")

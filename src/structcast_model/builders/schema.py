@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import cached_property
 from itertools import accumulate
 from logging import getLogger
@@ -26,7 +27,6 @@ from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate,
 from structcast.core.template import (
     ALIAS_ALL,
     Parameters as BaseParameters,
-    Sequence,
     configure_jinja,
     extend_structure,
 )

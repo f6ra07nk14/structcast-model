@@ -5,9 +5,8 @@ References:
     - `ReinMax GitHub <https://github.com/microsoft/ReinMax>`_
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from structcast.utils.security import get_default_dir
 from torch.autograd import Function
 from torch.jit import unused
 
@@ -48,15 +47,17 @@ def reinmax(logits: Tensor, tau: float = 1.0) -> tuple[Tensor, Tensor]:
     """ReinMax.
 
     Example:
-        ```python
-        >>> data = torch.randn((3, 4))
-        >>> y_hard, y_soft = reinmax(data, tau=1.0)
-        >>> y_hard.shape == data.shape
-        True
-        >>> y_soft.shape == data.shape
-        True
 
-        ```
+    .. code-block:: python
+
+    >>> import torch
+    >>> data = torch.randn((3, 4))
+    >>> y_hard, y_soft = reinmax(data, tau=1.0)
+    >>> y_hard.shape == data.shape
+    True
+    >>> y_soft.shape == data.shape
+    True
+
     """
     if tau < 1:
         raise ValueError("ReinMax prefers to set the temperature (tau) larger or equal to 1.")
@@ -69,5 +70,9 @@ def reinmax(logits: Tensor, tau: float = 1.0) -> tuple[Tensor, Tensor]:
 __all__ = ["reinmax"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

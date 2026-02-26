@@ -10,17 +10,11 @@ if TYPE_CHECKING:
 else:
     import sys
 
-    from structcast.utils.security import get_default_dir
+    from structcast.utils.lazy_import import LazySelectedImporter
 
-    from structcast_model.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(
-        name=__name__,
-        module_file=globals()["__file__"],
-        import_structure={
-            "builders": [],
-            "torch": [],
-            "utils": [],
-        },
-        extra={k: globals().get(k) for k in get_default_dir(globals())},
-    )
+    import_structure = {
+        "builders": [],
+        "torch": [],
+        "utils": [],
+    }
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

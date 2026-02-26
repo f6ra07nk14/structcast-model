@@ -1,6 +1,6 @@
 """Accuracy."""
 
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -30,6 +30,9 @@ def sparse_top_k_categorical_accuracy(y_true: torch.Tensor, y_pred: torch.Tensor
 
 __all__ = ["sparse_categorical_accuracy", "sparse_top_k_categorical_accuracy"]
 
+if not TYPE_CHECKING:
+    import sys
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

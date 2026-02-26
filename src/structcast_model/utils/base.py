@@ -2,11 +2,11 @@
 
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic_core import from_json
 from structcast.utils.base import load_yaml
-from structcast.utils.security import check_path, get_default_dir
+from structcast.utils.security import check_path
 from structcast.utils.types import PathLike
 
 T = TypeVar("T")
@@ -71,5 +71,9 @@ def unique(values: Sequence[T]) -> list[T]:
 __all__ = ["load_any", "load_json", "unique"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

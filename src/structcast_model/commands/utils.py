@@ -8,7 +8,7 @@ from structcast.utils.security import get_default_dir
 if TYPE_CHECKING:
     import pydantic
 else:
-    from structcast_model.utils.lazy_import import LazyModuleImporter
+    from structcast.utils.lazy_import import LazyModuleImporter
 
     pydantic = LazyModuleImporter("pydantic")
 
