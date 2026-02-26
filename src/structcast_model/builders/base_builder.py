@@ -10,9 +10,7 @@ from json import dumps as json_dumps
 from pathlib import Path
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
-from pydantic import (
-    ValidationError,
-)
+from pydantic import ValidationError
 from pydantic.alias_generators import to_pascal, to_snake
 from pydantic_core import to_jsonable_python
 from structcast.core.base import Serializable

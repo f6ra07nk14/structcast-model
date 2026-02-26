@@ -24,12 +24,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
-from structcast.core.template import (
-    ALIAS_ALL,
-    Parameters as BaseParameters,
-    configure_jinja,
-    extend_structure,
-)
+from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.security import get_default_dir, split_attribute, validate_attribute
 
