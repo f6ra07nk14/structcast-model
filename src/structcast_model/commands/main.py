@@ -1,6 +1,7 @@
 """Main entry point for the StructCast Model CLI application."""
 
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING
+
 from typer import Typer
 
 from structcast_model.commands import cmd_torch
@@ -14,5 +15,9 @@ app.add_typer(cmd_torch.app, name="torch", help="PyTorch related commands.")
 __all__ = ["app"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

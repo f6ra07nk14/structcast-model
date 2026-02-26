@@ -4,18 +4,17 @@ from typing import Any
 
 from pydantic import ValidationError
 import pytest
+from structcast.core.base import Serializable, WithExtra
 from structcast.core.exceptions import SpecError
+from structcast.core.specifier import FlexSpec
 
 from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
 from structcast_model.builders.schema import (
-    FlexSpec,
     LayerBehavior,
     Parameters,
-    Serializable,
     TemplateLayer,
     UserDefinedLayer,
     UserLayer,
-    WithExtra,
     resolve_inputs,
     resolve_outputs,
 )

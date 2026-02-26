@@ -2,9 +2,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar
-
-from structcast.utils.security import get_default_dir
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from structcast_model.builders.base_builder import (
     BackwardIntermediate,
@@ -141,5 +139,9 @@ class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
 __all__ = ["TorchBackwardBuilder", "TorchBackwardIntermediate", "TorchBuilder", "TorchLayerIntermediate"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

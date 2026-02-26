@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from functools import cached_property
 from itertools import accumulate
 from logging import getLogger
-from typing import Any, ClassVar, Generic, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Self, TypeVar
 
 from pydantic import (
     Field,
@@ -24,7 +24,7 @@ from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
-from structcast.utils.security import get_default_dir, split_attribute, validate_attribute
+from structcast.utils.security import split_attribute, validate_attribute
 
 from structcast_model.utils.base import unique
 
@@ -539,5 +539,9 @@ __all__ = [
 ]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

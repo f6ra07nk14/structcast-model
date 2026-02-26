@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Literal
 
-from structcast.utils.security import get_default_dir, import_from_address
+from structcast.utils.security import import_from_address
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
@@ -176,5 +176,9 @@ def call_calflops(
 __all__ = ["app"]
 
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

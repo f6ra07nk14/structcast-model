@@ -6,7 +6,7 @@ from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
 from pathlib import Path
-from typing import Any, ClassVar, Generic, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, Union, cast
 
 from pydantic import ValidationError
 from pydantic.alias_generators import to_pascal, to_snake
@@ -16,7 +16,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
-from structcast.utils.security import get_default_dir, resolve_address, split_attribute
+from structcast.utils.security import resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName
@@ -611,6 +611,9 @@ __all__ = [
     "resolve_object",
 ]
 
+if not TYPE_CHECKING:
+    import sys
 
-def __dir__() -> list[str]:
-    return get_default_dir(globals())
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())
