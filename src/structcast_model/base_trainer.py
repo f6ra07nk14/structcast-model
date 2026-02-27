@@ -129,8 +129,26 @@ class Callbacks(Generic[ModelT_contra]):
     on_epoch_end: list[Callback[ModelT_contra]] = field(default_factory=list)
     """Callbacks to be called at the end of each epoch."""
 
+    add_global_callbacks: bool = True
+    """Whether to add global callbacks."""
 
-GLOBAL_CALLBACKS = Callbacks[Any]()
+    def __post_init__(self) -> None:
+        """Post initialization."""
+        if self.add_global_callbacks:
+            self.on_update.extend(GLOBAL_CALLBACKS.on_update)
+            self.on_training_begin.extend(GLOBAL_CALLBACKS.on_training_begin)
+            self.on_training_end.extend(GLOBAL_CALLBACKS.on_training_end)
+            self.on_training_step_begin.extend(GLOBAL_CALLBACKS.on_training_step_begin)
+            self.on_training_step_end.extend(GLOBAL_CALLBACKS.on_training_step_end)
+            self.on_validation_begin.extend(GLOBAL_CALLBACKS.on_validation_begin)
+            self.on_validation_end.extend(GLOBAL_CALLBACKS.on_validation_end)
+            self.on_validation_step_begin.extend(GLOBAL_CALLBACKS.on_validation_step_begin)
+            self.on_validation_step_end.extend(GLOBAL_CALLBACKS.on_validation_step_end)
+            self.on_epoch_begin.extend(GLOBAL_CALLBACKS.on_epoch_begin)
+            self.on_epoch_end.extend(GLOBAL_CALLBACKS.on_epoch_end)
+
+
+GLOBAL_CALLBACKS = Callbacks[Any](add_global_callbacks=False)
 """Global callbacks."""
 
 
@@ -161,24 +179,6 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
 
     history: dict[int, dict[str, Any]] = field(default_factory=dict)
     """History of training and validation logs."""
-
-    add_global_callbacks: bool = True
-    """Whether to add global callbacks."""
-
-    def __post_init__(self) -> None:
-        """Post initialization."""
-        if self.add_global_callbacks:
-            self.on_update.extend(GLOBAL_CALLBACKS.on_update)
-            self.on_training_begin.extend(GLOBAL_CALLBACKS.on_training_begin)
-            self.on_training_end.extend(GLOBAL_CALLBACKS.on_training_end)
-            self.on_training_step_begin.extend(GLOBAL_CALLBACKS.on_training_step_begin)
-            self.on_training_step_end.extend(GLOBAL_CALLBACKS.on_training_step_end)
-            self.on_validation_begin.extend(GLOBAL_CALLBACKS.on_validation_begin)
-            self.on_validation_end.extend(GLOBAL_CALLBACKS.on_validation_end)
-            self.on_validation_step_begin.extend(GLOBAL_CALLBACKS.on_validation_step_begin)
-            self.on_validation_step_end.extend(GLOBAL_CALLBACKS.on_validation_step_end)
-            self.on_epoch_begin.extend(GLOBAL_CALLBACKS.on_epoch_begin)
-            self.on_epoch_end.extend(GLOBAL_CALLBACKS.on_epoch_end)
 
     def train(self, dataset: DatasetLike | Callable[[], DatasetLike], **models: ModelT_contra) -> Mapping[str, Any]:
         """Train the model on the given dataset.
