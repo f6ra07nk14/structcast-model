@@ -67,10 +67,12 @@ class TorchBackwardIntermediate(BackwardIntermediate):
         flow = []
         if self.accumulate_gradients:
             flow.extend([f"({L} / {self.accumulate_gradients}).backward({kw})" for L, kw, _ in self.backwards])
-            flow.append(f"if (step + 1) % {self.accumulate_gradients} == 0:")
+            flow += [f"should_update = (step + 1) % {self.accumulate_gradients} == 0", "if should_update:"]
+            should_update = "should_update"
             flow_indent = indent
         else:
             flow += [f"{L}.backward({kw})" for L, kw, _ in self.backwards]
+            should_update = "True"
             flow_indent = ""
         for name in [n for _, _, opts in self.backwards for n in opts]:
             if has_mp := self.mixed_precision is not None:
@@ -97,17 +99,17 @@ class {self.classname}:
 
     def __call__(self, step, {self._backward_losses}, **kwargs):
         {sep.join(flow)}
-        return should_update
+        return {should_update}
 
     @property
-    def learning_rates(self) -> dict[str, float]:
+    def learning_rates(self):
         def _get_lr(opt):
             return opt.param_groups[0]["lr"]
 
         return {{{", ".join([f'"{n}_lr": _get_lr(self.{n})' for n in self.optimizers])}}}
 
     @property
-    def param_group_names(self) -> dict[str, list[dict[str, Any]]]:
+    def param_group_names(self):
         def _get_param_groups(opt):
             return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
 
