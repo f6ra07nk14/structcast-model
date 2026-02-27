@@ -64,6 +64,7 @@ class TrainingStep:
     """A module that computes the metrics for the model."""
 
     autocast: Callable[[], AbstractContextManager[None]] = suppress
+    """A context manager for automatic mixed precision (AMP). By default, it does nothing."""
 
     def __call__(self, inputs: dict[str, Any], **models: Module) -> dict[str, Tensor]:
         """Perform the forward pass for the given inputs and return the outputs and any additional information."""
@@ -98,8 +99,8 @@ class ValidationStep(TrainingStep):
 
 
 @dataclass(kw_only=True, slots=True)
-class TorchLogger:
-    """A logger for PyTorch models."""
+class TorchTracker:
+    """A tracker for PyTorch models."""
 
     losses_tracker: CriteriaTracker
     """A tracker for the losses of the model."""
@@ -221,7 +222,7 @@ __all__ = [
     "TimmEmaUpdater",
     "TimmEmaWrapper",
     "TimmLoaderWrapper",
-    "TorchLogger",
+    "TorchTracker",
     "TorchTrainer",
     "TrainingStep",
     "ValidationStep",
