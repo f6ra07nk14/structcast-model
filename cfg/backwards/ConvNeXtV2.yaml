@@ -8,6 +8,7 @@ PARAMETERS:
     weight_decay: 0.001
     layer_decay_type: null # set to null, "single" or "group"
     clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
   SHARED:
     layer_decay: 0.9
   # backbone model parameters
@@ -31,7 +32,12 @@ MIXED_PRECISION:
   enabled: True
 # "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
 # specify the number of steps to accumulate gradients before updating parameters.
-ACCUMULATE_GRADIENTS: null
+_jinja_yaml_: |- 
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
 # "BACKWARDS" can be set to a backwards configuration or a list of backwards configurations
 # to specify the backward pass(es) to perform during training.
 # Each backwards configuration should specify the name of the backwards configuration,
