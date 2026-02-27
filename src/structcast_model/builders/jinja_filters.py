@@ -1,3 +1,5 @@
+"""Jinja filters for structcast model builders."""
+
 from collections.abc import Sequence
 from functools import reduce
 from itertools import accumulate
@@ -41,7 +43,12 @@ def regex_search(value: str, pattern: str, flags: Any = None) -> str | None:
     return match.group(0) if match else None
 
 
-__all__ = ["cumsum", "regex_escape", "regex_findall", "regex_replace", "regex_search"]
+def raise_error(message: str) -> None:
+    """Raise an error with the given message."""
+    raise ValueError(message)
+
+
+__all__: list[str] = ["cumsum", "raise_error", "regex_escape", "regex_findall", "regex_replace", "regex_search"]
 
 if not TYPE_CHECKING:
     import sys
