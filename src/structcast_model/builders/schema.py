@@ -2,7 +2,6 @@
 
 from collections.abc import Sequence
 from functools import cached_property
-from itertools import accumulate
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Self, TypeVar
 
@@ -26,11 +25,12 @@ from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, co
 from structcast.utils.base import check_elements
 from structcast.utils.security import split_attribute, validate_attribute
 
+from structcast_model.builders import jinja_filters
 from structcast_model.utils.base import unique
 
 logger = getLogger(__name__)
 
-configure_jinja(filters={"cumsum": lambda x: list(accumulate(x))})
+configure_jinja(filters={k: getattr(jinja_filters, k) for k in jinja_filters.__all__})
 
 SPEC_EVAL = register_resolver("eval", lambda x: x)
 
