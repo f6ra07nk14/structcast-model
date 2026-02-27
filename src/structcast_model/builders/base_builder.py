@@ -569,7 +569,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         Returns:
             BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
         """
-        backward = self.template(parameters or Parameters())
+        backward = self.template(parameters)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(backward.IMPORTS)
         naming = AutoName("_")
