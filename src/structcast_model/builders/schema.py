@@ -498,13 +498,12 @@ class _Template(WithExtra, Generic[SerializableT]):
             An instance of the target type created from the formatted template.
         """
         if merged:
-            template_kwargs = Parameters.create(self.PARAMETERS, parameters).template_kwargs
+            parameters = Parameters.create(self.PARAMETERS, parameters)
         elif parameters is None:
-            template_kwargs = self.PARAMETERS.template_kwargs
+            parameters = self.PARAMETERS
         else:
-            template_kwargs = Parameters.create(parameters).template_kwargs
-        raw = extend_structure(self.raw, template_kwargs=template_kwargs, default="default")
-        return self.target_type.model_validate(raw)
+            parameters = Parameters.create(parameters)
+        return self.target_type.model_validate(extend_structure(self.raw, template_kwargs=parameters))
 
 
 class TemplateLayer(_Template[UserDefinedLayer]):
