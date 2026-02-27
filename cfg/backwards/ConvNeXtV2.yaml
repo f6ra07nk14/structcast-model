@@ -1,0 +1,130 @@
+PARAMETERS:
+  DEFAULT:
+    backbone: atto
+    layer_decay_type: null # set to null, "single" or "group"
+    target_loss: ce_loss
+    epochs: 300
+    warmup_epochs: 1
+    lr: 4.0e-3
+    weight_decay: 0.001
+  SHARED:
+    layer_decay: 0.9
+  # backbone model parameters
+  atto: {depths: [2, 2, 6, 2], group: 2}
+  femto: {depths: [2, 2, 6, 2], group: 2}
+  pico: {depths: [2, 2, 6, 2], group: 2}
+  nano: {depths: [2, 2, 8, 2], group: 2}
+  tiny: {depths: [3, 3, 9, 3], group: 3}
+  small: {depths: [3, 3, 27, 3], group: 3}
+  base: {depths: [3, 3, 27, 3], group: 3}
+  large: {depths: [3, 3, 27, 3], group: 3}
+  huge: {depths: [3, 3, 27, 3], group: 3}
+IMPORTS: {}
+# "MIXED_PRECISION" can be set to a boolean or a dictionary of keyword arguments for
+# configuring Torch's automatic mixed precision ("torch.amp.GradScaler").
+MIXED_PRECISION:
+  init_scale: "eval: 2.0**16"
+  growth_factor: 2.0
+  backoff_factor: 0.5
+  growth_interval: 2000
+  enabled: True
+# "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
+# specify the number of steps to accumulate gradients before updating parameters.
+ACCUMULATE_GRADIENTS: null
+# "BACKWARDS" can be set to a backwards configuration or a list of backwards configurations
+# to specify the backward pass(es) to perform during training.
+# Each backwards configuration should specify the name of the backwards configuration,
+# the loss to backward, and the optimizers to use for updating parameters.
+BACKWARDS:
+  NAME: backward
+  _jinja_yaml_: |-
+    LOSS: {{target_loss}}
+  OPTIMIZERS:
+    NMAE: optimizer
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _bind_:
+          optimizer_kwargs:
+            opt: adamw
+            betas: [0.9, 0.999]
+            weight_decay_regexes: []
+            no_weight_decay_regexes:
+              - ^(?:\w+\.)*bias*$
+            _jinja_yaml_: |-
+              lr: {{lr}}
+              weight_decay: {{weight_decay}}
+              layer_decay: {{layer_decay}}
+              _jinja_group_: {{backbone}}
+              {% if layer_decay_type is none %}
+              layer_group_regexes: []
+              {% elif layer_decay_type == "single" %}
+              {% raw %}
+              _jinja_yaml_: |-
+                {% set cum_depths = [0] + depths | cumsum %}
+                layer_group_regexes:
+                  - ^(?:\w+\.)*stem(?:\.\w+)*$
+                  {% for i in range(cum_depths[0], cum_depths[1]) %}
+                  - ^(?:\w+\.)*block{{i}}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample1(?:\.\w+)*$
+                  {% for i in range(cum_depths[1], cum_depths[2]) %}
+                  - ^(?:\w+\.)*block{{i}}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample2(?:\.\w+)*$
+                  {% for i in range(cum_depths[2], cum_depths[3]) %}
+                  - ^(?:\w+\.)*block{{i}}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample3(?:\.\w+)*$
+                  {% for i in range(cum_depths[3], cum_depths[4]) %}
+                  - ^(?:\w+\.)*block{{i}}(?:\.\w+)*$
+                  {% endfor %}
+              {% endraw %}
+              {% elif layer_decay_type == "group" %}
+              {% raw %}
+              _jinja_yaml_: |-
+                {% set cum_depths = [0] + depths | cumsum %}
+                layer_group_regexes:
+                  - ^(?:\w+\.)*stem(?:\.\w+)*$
+                  {% for i in range(cum_depths[0], cum_depths[1], group) %}
+                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample1(?:\.\w+)*$
+                  {% for i in range(cum_depths[1], cum_depths[2], group) %}
+                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample2(?:\.\w+)*$
+                  {% for i in range(cum_depths[2], cum_depths[3], group) %}
+                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  {% endfor %}
+                  - ^(?:\w+\.)*downsample3(?:\.\w+)*$
+                  {% for i in range(cum_depths[3], cum_depths[4], group) %}
+                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  {% endfor %}
+              {% endraw %}
+              {% else %}
+              {{ "Invalid layer_decay_type: {}".format(layer_decay_type) | raise_error }}
+              {% endif %}
+          scheduler_kwargs:
+            name: cosine
+            min_lr: 1.0e-6
+            warmup_lr: 1.0e-5
+            warmup_prefix: false
+            step_on_epochs: true
+            k_decay: 1.0
+            _jinja_yaml_: |-
+              criterion: {{target_loss}}
+              warmup_epochs: {{warmup_epochs}}
+              num_epochs: {{epochs}}
+    LAYERS: model
+    # CLIP: null
+    CLIP:
+      - _obj_
+      - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+      - _bind_: {value: 1.0, mode: norm, norm_type: 2.0}
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "BACKWARDS" configurations,
+# but can also be manually specified here if needed.
+# LOSSES: []
+# MODELS: []

@@ -1,6 +1,6 @@
 PARAMETERS:
   DEFAULT:
-    backbone: femto
+    backbone: atto
   SHARED:
     stem_kernel_size: 4
     kernel_size: 7
@@ -66,15 +66,15 @@ Backbone:
             {% for i in range(cum_depths[0], cum_depths[1]) %}
             - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
             {% endfor %}
-            - [feat1, feat2, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
+            - [feat1, feat2, "downsample1", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
             {% for i in range(cum_depths[1], cum_depths[2]) %}
             - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
             {% endfor %}
-            - [feat2, feat3, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
+            - [feat2, feat3, "downsample2", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
             {% for i in range(cum_depths[2], cum_depths[3]) %}
             - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
             {% endfor %}
-            - [feat3, feat4, {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
+            - [feat3, feat4, "downsample3", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
             {% for i in range(cum_depths[3], cum_depths[4]) %}
             - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
             {% endfor %}
