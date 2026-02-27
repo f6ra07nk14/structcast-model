@@ -81,3 +81,15 @@ def test_torch_backward_builder_renders_accumulation_script() -> None:
     assert "self.optimizer_scaler.unscale_(self.optimizer)" in script
     assert "self.optimizer_clip(" in script
     assert "return should_update" in script
+
+
+def test_torch_backward_builder_renders_non_accumulation_without_mixed_precision() -> None:
+    """Render direct backward/step branch when accumulation and AMP are disabled."""
+    raw = {
+        "MIXED_PRECISION": False,
+        "BACKWARDS": [["ce_loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]],
+    }
+    script = TorchBackwardBuilder(raw=raw)(classname="BackwardNoAmp").scripts[0]
+    assert "ce_loss.backward(" in script
+    assert "return True" in script
+    assert "self.SGD.step()" in script
