@@ -306,10 +306,16 @@ class OptimizerBehavior(Serializable):
             return {"NAME": name, "OPTIMIZER": opt, "LAYERS": layers, "CLIP": clip}
         return raw
 
+    @field_validator("LAYERS", mode="before")
+    @classmethod
+    def _validate_trainable_layers(cls, data: Any) -> Any:
+        """Validate the trainable layers."""
+        return check_elements(data)
+
     @field_validator("LAYERS", mode="after")
     @classmethod
-    def _validate_trainable_layers(cls, data: list[str]) -> list[str]:
-        """Validate the trainable layers."""
+    def _validate_trainable_layers_legal(cls, data: list[str]) -> list[str]:
+        """Validate that the trainable layers are legal."""
         for layer in data:
             validate_attribute(layer)
         return data
@@ -410,7 +416,10 @@ class UserDefinedBackward(Serializable):
     defined in the same user-defined layer configuration."""
 
     MIXED_PRECISION: bool | dict[str, Any] = False
-    """Whether to use mixed precision during backward pass."""
+    """Whether to use mixed precision during backward pass.
+
+    If the value is a dictionary, it will be used as the keyword arguments for configuring mixed precision context.
+    """
 
     ACCUMULATE_GRADIENTS: PositiveInt | None = None
     """Whether to accumulate gradients for multiple steps before updating the parameters,
