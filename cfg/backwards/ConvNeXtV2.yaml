@@ -1,12 +1,13 @@
 PARAMETERS:
   DEFAULT:
     backbone: atto
-    layer_decay_type: null # set to null, "single" or "group"
     target_loss: ce_loss
     epochs: 300
     warmup_epochs: 1
     lr: 4.0e-3
     weight_decay: 0.001
+    layer_decay_type: null # set to null, "single" or "group"
+    clip_grad_norm: null # set to null or a positive float
   SHARED:
     layer_decay: 0.9
   # backbone model parameters
@@ -89,17 +90,14 @@ BACKWARDS:
                   {% for i in range(cum_depths[0], cum_depths[1], group) %}
                   - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
                   {% endfor %}
-                  - ^(?:\w+\.)*downsample1(?:\.\w+)*$
                   {% for i in range(cum_depths[1], cum_depths[2], group) %}
-                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  - ^(?:\w+\.)*downsample1{% for g in range(group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
                   {% endfor %}
-                  - ^(?:\w+\.)*downsample2(?:\.\w+)*$
                   {% for i in range(cum_depths[2], cum_depths[3], group) %}
-                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  - ^(?:\w+\.)*downsample2{% for g in range(group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
                   {% endfor %}
-                  - ^(?:\w+\.)*downsample3(?:\.\w+)*$
                   {% for i in range(cum_depths[3], cum_depths[4], group) %}
-                  - ^(?:\w+\.)*block{{i}}{% for g in range(1, group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
+                  - ^(?:\w+\.)*downsample3{% for g in range(group) %}|block{{i + g}}{% endfor %}(?:\.\w+)*$
                   {% endfor %}
               {% endraw %}
               {% else %}
@@ -117,14 +115,18 @@ BACKWARDS:
               warmup_epochs: {{warmup_epochs}}
               num_epochs: {{epochs}}
     LAYERS: model
-    # CLIP: null
-    CLIP:
-      - _obj_
-      - _addr_: timm.utils.clip_grad.dispatch_clip_grad
-      - _bind_: {value: 1.0, mode: norm, norm_type: 2.0}
+    _jinja_yaml_: |-
+      {% if clip_grad_norm is none %}
+      CLIP: null
+      {% else %}
+      CLIP:
+        - _obj_
+        - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+      {% endif %}
 # "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
 # to specify the losses and models to be used during training.
 # These will be automatically aggregated from the "BACKWARDS" configurations,
 # but can also be manually specified here if needed.
-# LOSSES: []
-# MODELS: []
+LOSSES: []
+MODELS: []
