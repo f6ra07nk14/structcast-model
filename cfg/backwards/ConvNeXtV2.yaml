@@ -1,6 +1,7 @@
 PARAMETERS:
   DEFAULT:
     backbone: atto
+    model_name: model
     target_loss: ce_loss
     epochs: 300
     warmup_epochs: 1
@@ -120,8 +121,8 @@ BACKWARDS:
                   criterion: {{target_loss}}
                   warmup_epochs: {{warmup_epochs}}
                   num_epochs: {{epochs}}
-        LAYERS: model
         _jinja_yaml_: |-
+          LAYERS: {{model_name}}
           {% if clip_grad_norm is none %}
           CLIP: null
           {% else %}
