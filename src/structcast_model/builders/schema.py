@@ -372,12 +372,6 @@ class BackwardBehavior(WithExtra):
             return {"NAME": name, "LOSS": loss, "OPTIMIZERS": opts, **others}
         return raw
 
-    @field_validator("OPTIMIZERS", mode="before")
-    @classmethod
-    def _validate_optimizers(cls, data: Any) -> Any:
-        """Validate the optimizers."""
-        return check_elements(TypeAdapter(OptimizerBehavior | Sequence[OptimizerBehavior]).validate_python(data))
-
     @model_serializer(mode="wrap")
     def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
         """Serialize the model."""
@@ -430,12 +424,6 @@ class UserDefinedBackward(Serializable):
     def _validate_imports(cls, data: Any) -> Any:
         """Validate the imports."""
         return _validate_imports(data)
-
-    @field_validator("BACKWARDS", mode="before")
-    @classmethod
-    def _validate_backwards(cls, data: Any) -> Any:
-        """Validate the backwards."""
-        return check_elements(TypeAdapter(BackwardBehavior | Sequence[BackwardBehavior]).validate_python(data))
 
     @field_validator("LOSSES", "MODELS", mode="before")
     @classmethod
