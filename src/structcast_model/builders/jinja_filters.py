@@ -48,7 +48,21 @@ def raise_error(message: str) -> None:
     raise ValueError(message)
 
 
-__all__: list[str] = ["cumsum", "raise_error", "regex_escape", "regex_findall", "regex_replace", "regex_search"]
+def print_value(value: Any) -> str:
+    """Print the value and return it."""
+    print(value)
+    return value
+
+
+__all__: list[str] = [
+    "cumsum",
+    "print_value",
+    "raise_error",
+    "regex_escape",
+    "regex_findall",
+    "regex_replace",
+    "regex_search",
+]
 
 if not TYPE_CHECKING:
     import sys
