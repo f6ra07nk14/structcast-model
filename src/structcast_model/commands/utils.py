@@ -22,6 +22,14 @@ def dict_parser(value: str) -> dict[str, Any]:
     return pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value)) if value else {}
 
 
+def bool_or_dict_parser(value: str) -> dict[str, Any] | None:
+    """Parse a YAML string into a boolean or a dictionary."""
+    if not value:
+        return None
+    data = pydantic.TypeAdapter(bool | dict[str, Any]).validate_python(load_yaml_from_string(value))
+    return ({} if data else None) if isinstance(data, bool) else data
+
+
 def tensor_shape_parser(value: str) -> dict[str, Any]:
     """Parse a YAML string into a dictionary of tensor shapes."""
 
@@ -39,7 +47,7 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
     return _check(pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
 
 
-__all__ = ["dict_parser", "reduce_dict", "tensor_shape_parser"]
+__all__ = ["bool_or_dict_parser", "dict_parser", "reduce_dict", "tensor_shape_parser"]
 
 
 if not TYPE_CHECKING:

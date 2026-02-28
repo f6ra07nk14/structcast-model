@@ -6,12 +6,16 @@ from structcast.utils.base import load_yaml_from_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
+from structcast_model.base_trainer import BaseInfo
+from structcast_model.commands.utils import bool_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
 
 if TYPE_CHECKING:
     import calflops
+    import mlflow
+    import numpy as np
     import ptflops
     from structcast.core import instantiator
+    import tqdm
 
     from structcast_model.builders import torch_builder
     from structcast_model.torch import trainer as torch_trainer
@@ -20,8 +24,11 @@ else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     calflops = LazyModuleImporter("calflops")
+    mlflow = LazyModuleImporter("mlflow")
+    np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
+    tqdm = LazyModuleImporter("tqdm")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
     torch = LazyModuleImporter("torch")
@@ -173,6 +180,116 @@ def call_calflops(
     print(f"FLOPs: {flops}")
     print(f"MACs: {macs}")
     print(f"Parameters: {params}")
+
+
+def _init_models(patterns: list[dict[str, Any]], shapes: dict[str, Any] | None) -> list[tuple[str, "torch.nn.Module"]]:
+    models = []
+    inputs = None if shapes is None else torch_trainer.create_torch_inputs(shapes)
+    for raw in patterns:
+        if len(raw) != 1:
+            raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+        model_name, ptn = list(raw.items())[0]
+        model: torch.nn.Module = _instantiate(ptn)
+        if inputs is not None:
+            model(**inputs)  # forward first to make sure the model is built
+        models.append((model_name, model))
+    return models
+
+
+@app.command()
+def train(
+    model_patterns: list[dict] = Argument(
+        parser=dict_parser,
+        help="The object patterns used to instantiate models. "
+        "For example, if the model is defined as `model_name = my_package.MyModel(...)`, then the pattern should be "
+        '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+    ),
+    shapes: list[dict] | None = shapes,
+    loss_pattern: dict = Option(
+        ...,
+        "--loss",
+        "-l",
+        parser=dict_parser,
+        help="The object pattern used to instantiate the loss module. "
+        "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyLoss, my_package.py], {_call_: {...}}]".',
+    ),
+    metric_pattern: dict | None = Option(
+        None,
+        "--metric",
+        "-m",
+        parser=dict_parser,
+        help="The object pattern used to instantiate the metric module. "
+        "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyMetric, my_package.py], {_call_: {...}}]".',
+    ),
+    backward_pattern: dict = Option(
+        ...,
+        "--backward",
+        "-b",
+        parser=dict_parser,
+        help="The object pattern used to instantiate the backward class. "
+        "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyBackward, my_package.py], {_call_: {...}}]".',
+    ),
+    compile_pattern: dict[str, Any] | None = Option(
+        None,
+        "--compile",
+        "-c",
+        parser=bool_or_dict_parser,
+        help='Whether to compile the model using "torch.compile". '
+        'Can be set to true/false or a dictionary of keyword arguments for "torch.compile".',
+    ),
+    epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
+    start_epoch: int = Option(1, help="Starting epoch number."),
+    device: str | None = device,
+    seed: int = Option(0, help="Random seed for reproducibility."),
+    matmul_precision: Literal["highest", "high", "medium"] = Option("high", help="Matrix multiplication precision."),
+    experiment: str = Option("experiment", "--experiment", "-x", help="Experiment name for MLflow logging."),
+    ci: bool = Option(
+        False,
+        help="Whether to run in CI mode. "
+        "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
+    ),
+) -> None:
+    if not model_patterns:
+        raise ValueError("At least one model pattern must be provided.")
+    configure_security(allowed_modules_check=False)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision(matmul_precision)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    input_shapes = reduce_dict(shapes)
+    compile_kw = instantiator.instantiate(compile_pattern)
+    mlflow.set_experiment(experiment)
+    with mlflow.start_run():
+        with torch.device(torch_trainer.get_torch_device(device)):
+            models = _init_models(model_patterns, input_shapes)
+            loss: torch.nn.Module = _instantiate(loss_pattern)
+            metric: torch.nn.Module | None = _instantiate(metric_pattern) if metric_pattern else None
+            if compile_kw is not None:
+                models = [(n, torch.compile(m, **compile_kw)) for n, m in models]
+                loss = torch.compile(loss, **compile_kw)
+                if metric is not None:
+                    metric = torch.compile(metric, **compile_kw)
+            backward = _instantiate(backward_pattern)(**dict(models))
+            trainer = torch_trainer.TorchTrainer()
+
+            def _log_criteria(info: BaseInfo) -> str:
+                """Format the criteria."""
+                lrs, logs = backward.learning_rates, info.logs()
+                values = "\n\t".join([f"{k}: {v:.4e}" for k, v in {**logs, **lrs}.items()])
+                mlflow.log_metrics({**logs, **lrs}, step=info.epoch)
+                return f"Epoch {info.epoch}:\n\t{values}"
+
+            if ci:
+                trainer.on_epoch_end.append(lambda i: print(_log_criteria(i)))
+            else:
+                pbar = tqdm.tqdm(unit="batch")
 
 
 __all__ = ["app"]
