@@ -146,40 +146,42 @@ def _make_torch_mock() -> MagicMock:
     return torch_mock
 
 
-def test_ptflops_calls_import_from_address(cli_runner: CliRunner) -> None:
-    """'ptflops' should call import_from_address to load the model class."""
-    mock_import = MagicMock(return_value=MagicMock(return_value=MagicMock()))
+MODEL_PATTERN_ARG = "{_obj_: [[_addr_, some.module.Model], _call_]}"
+
+
+def test_ptflops_calls_instantiate(cli_runner: CliRunner) -> None:
+    """'ptflops' should call _instantiate to build the model instance."""
+    mock_instantiate = MagicMock(return_value=MagicMock())
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = ("1.0 GMac", "1.0 M")
     with patch_cmd_globals(
-        import_from_address=mock_import,
+        _instantiate=mock_instantiate,
         torch=_make_torch_mock(),
         torch_trainer=mock_torch_trainer,
         ptflops=mock_ptflops,
     ):
-        assert cli_runner.invoke(app, ["ptflops", "some.module.Model"]).exit_code == 0
-    mock_import.assert_called_once()
-    assert mock_import.call_args[0][0] == "some.module.Model"
+        assert cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG]).exit_code == 0
+    mock_instantiate.assert_called_once()
 
 
 def test_ptflops_prints_flops_and_params(cli_runner: CliRunner) -> None:
     """'ptflops' should print FLOPs and parameter counts to stdout."""
-    mock_import = MagicMock(return_value=MagicMock(return_value=MagicMock()))
+    mock_instantiate = MagicMock(return_value=MagicMock())
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = ("2.5 GMac", "3.0 M")
     with patch_cmd_globals(
-        import_from_address=mock_import,
+        _instantiate=mock_instantiate,
         torch=_make_torch_mock(),
         torch_trainer=mock_torch_trainer,
         ptflops=mock_ptflops,
     ):
-        result = cli_runner.invoke(app, ["ptflops", "some.module.Model"])
+        result = cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG])
         assert result.exit_code == 0
     assert "2.5 GMac" in result.output
     assert "3.0 M" in result.output
@@ -187,19 +189,19 @@ def test_ptflops_prints_flops_and_params(cli_runner: CliRunner) -> None:
 
 def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
     """'ptflops' should not error when flops/params are None."""
-    mock_import = MagicMock(return_value=MagicMock(return_value=MagicMock()))
+    mock_instantiate = MagicMock(return_value=MagicMock())
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = (None, None)
     with patch_cmd_globals(
-        import_from_address=mock_import,
+        _instantiate=mock_instantiate,
         torch=_make_torch_mock(),
         torch_trainer=mock_torch_trainer,
         ptflops=mock_ptflops,
     ):
-        assert cli_runner.invoke(app, ["ptflops", "some.module.Model"]).exit_code == 0
+        assert cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG]).exit_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -207,40 +209,39 @@ def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_calflops_calls_import_from_address(cli_runner: CliRunner) -> None:
-    """'calflops' should call import_from_address to load the model class."""
-    mock_import = MagicMock(return_value=MagicMock(return_value=MagicMock()))
+def test_calflops_calls_instantiate(cli_runner: CliRunner) -> None:
+    """'calflops' should call _instantiate to build the model instance."""
+    mock_instantiate = MagicMock(return_value=MagicMock())
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("1.0 GFLOPs", "500 MMac", "1.0 M")
     with patch_cmd_globals(
-        import_from_address=mock_import,
+        _instantiate=mock_instantiate,
         torch=_make_torch_mock(),
         torch_trainer=mock_torch_trainer,
         calflops=mock_calflops,
     ):
-        assert cli_runner.invoke(app, ["calflops", "some.module.Model"]).exit_code == 0
-    mock_import.assert_called_once()
-    assert mock_import.call_args[0][0] == "some.module.Model"
+        assert cli_runner.invoke(app, ["calflops", MODEL_PATTERN_ARG]).exit_code == 0
+    mock_instantiate.assert_called_once()
 
 
 def test_calflops_prints_flops_macs_params(cli_runner: CliRunner) -> None:
     """'calflops' should print FLOPs, MACs, and parameter counts."""
-    mock_import = MagicMock(return_value=MagicMock(return_value=MagicMock()))
+    mock_instantiate = MagicMock(return_value=MagicMock())
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("4.2 GFLOPs", "2.1 GMac", "5.0 M")
     with patch_cmd_globals(
-        import_from_address=mock_import,
+        _instantiate=mock_instantiate,
         torch=_make_torch_mock(),
         torch_trainer=mock_torch_trainer,
         calflops=mock_calflops,
     ):
-        result = cli_runner.invoke(app, ["calflops", "some.module.Model"])
+        result = cli_runner.invoke(app, ["calflops", MODEL_PATTERN_ARG])
         assert result.exit_code == 0
     assert "4.2 GFLOPs" in result.output
     assert "2.1 GMac" in result.output

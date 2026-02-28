@@ -1,8 +1,9 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from structcast.utils.security import import_from_address
+from structcast.utils.base import load_yaml_from_string
+from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
@@ -10,6 +11,7 @@ from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_sha
 if TYPE_CHECKING:
     import calflops
     import ptflops
+    from structcast.core import instantiator
 
     from structcast_model.builders import torch_builder
     from structcast_model.torch import trainer as torch_trainer
@@ -19,6 +21,7 @@ else:
 
     calflops = LazyModuleImporter("calflops")
     ptflops = LazyModuleImporter("ptflops")
+    instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
     torch = LazyModuleImporter("torch")
@@ -39,22 +42,12 @@ template_param = Option(
     'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
 )
 output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
-model_address: str = Argument(help="Address of the model to analyze, e.g., 'my.package.MyModel'.")
-module_file = Option(
-    None,
-    "--file",
-    "-f",
-    help="Path to the Python file containing the model definition. Required if the model is not in the Python path.",
-)
-param = Option(
-    None,
-    "--parameter",
-    "-p",
-    parser=dict_parser,
-    help="Parameters to instantiate the class with. Can be specified multiple times. "
-    'Each parameter should be in the format of "key: value", where `key` is the name of the parameter, '
-    "and the value is the value for instantiating the class. "
-    'For example: --parameter "input_size: 128" --parameter "output_size: 10"',
+model_pattern = Argument(
+    parser=load_yaml_from_string,
+    help="The object pattern used to instantiate models. "
+    "For example, if the model is defined as `my_package.MyModel(...)`, "
+    'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
+    '"[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
 )
 shapes = Option(
     None,
@@ -62,6 +55,13 @@ shapes = Option(
     "-s",
     parser=tensor_shape_parser,
     help="Input tensor shapes as a dictionary, e.g., 'image: [3, 224, 224]'.",
+)
+device = Option(
+    None,
+    "--device",
+    "-d",
+    help='Computation device to use, either "cpu" or "cuda". '
+    'If not specified, it will use "cuda" if available, otherwise "cpu".',
 )
 
 
@@ -97,11 +97,13 @@ def create_backward(
     builder(parameters=reduce_dict(parameters), classname=classname)(output)
 
 
+def _instantiate(raw: Any) -> Any:
+    return instantiator.ObjectPattern.model_validate(raw).build().runs[0]
+
+
 @app.command(name="ptflops")
 def call_ptflops(
-    address: str = model_address,
-    module_file: str | None = module_file,
-    parameters: list[dict] | None = param,
+    model_pattern: Any = model_pattern,
     shapes: list[dict] | None = shapes,
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
     flops_units: Literal["GMac", "MMac", "KMac"] = Option("GMac", help="Units for FLOPs: GMac, MMac, or KMac."),
@@ -111,12 +113,13 @@ def call_ptflops(
     backend: Literal["pytorch", "aten"] = Option(
         "aten", help='Backend for FLOPs computation. Note: Don\'t use "pytorch" backend for transformer architectures.'
     ),
+    device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    obj_t = import_from_address(address, module_file=module_file, allowed_modules_check=False)
-    with torch.device(torch_trainer.get_torch_device()):
+    configure_security(allowed_modules_check=False)
+    with torch.device(torch_trainer.get_torch_device(device)):
         inputs = torch_trainer.create_torch_inputs(reduce_dict(shapes))
-        model: torch.nn.Module = obj_t(**reduce_dict(parameters))
+        model: torch.nn.Module = _instantiate(model_pattern)
         model(**inputs)  # forward first to make sure the model is built
         flops, params = ptflops.get_model_complexity_info(
             model=model,
@@ -139,19 +142,18 @@ def call_ptflops(
 
 @app.command(name="calflops")
 def call_calflops(
-    address: str = model_address,
-    module_file: str | None = module_file,
-    parameters: list[dict] | None = param,
+    model_pattern: Any = model_pattern,
     shapes: list[dict] | None = shapes,
     include_bp: bool = Option(False, help="Whether to include backpropagation in FLOPs computation."),
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
     bp_factor: float = Option(2.0, help="Factor to multiply the forward FLOPs by to estimate backpropagation FLOPs."),
+    device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    obj_t = import_from_address(address, module_file=module_file, allowed_modules_check=False)
-    with torch.device(torch_trainer.get_torch_device()):
+    configure_security(allowed_modules_check=False)
+    with torch.device(torch_trainer.get_torch_device(device)):
         inputs = torch_trainer.create_torch_inputs(reduce_dict(shapes))
-        model: torch.nn.Module = obj_t(**reduce_dict(parameters))
+        model: torch.nn.Module = _instantiate(model_pattern)
         model(**inputs)  # forward first to make sure the model is built
         flops, macs, params = calflops.calculate_flops(
             model=model,
