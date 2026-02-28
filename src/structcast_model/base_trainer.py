@@ -162,8 +162,8 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     backward: Backward
     """The backward pass configuration."""
 
-    logger: Callable[..., dict[str, float]]
-    """The logger to log training and validation information."""
+    tracker: Callable[..., dict[str, float]]
+    """The tracker to log training and validation information."""
 
     inference_wrapper: InferenceWrapper[ModelT_contra] | None = None
     """An optional wrapper to apply to the model during inference, e.g., for quantization or ONNX export."""
@@ -192,7 +192,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             Mapping[str, Any]: The logs from training, which may include metrics and other information.
         """
         invoke_callback(self.on_training_begin, self, **models)
-        logger, training_step, backward, elapsed_time = self.logger, self.training_step, self.backward, 0.0
+        tracker, training_step, backward, elapsed_time = self.tracker, self.training_step, self.backward, 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
             self.step += 1
             invoke_callback(self.on_training_step_begin, self, **models)
@@ -200,7 +200,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             criteria = training_step(inputs, **models)
             should_update = backward(self.step, **criteria)
             elapsed_time += time()
-            logs = logger(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.training_prefix:
                 logs = {f"{self.training_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
@@ -225,14 +225,14 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         if self.inference_wrapper is not None:
             models = self.inference_wrapper(**models)
         invoke_callback(self.on_validation_begin, self, **models)
-        logger, elapsed_time = self.logger, 0.0
+        tracker, elapsed_time = self.tracker, 0.0
         validation_step = self.training_step if self.validation_step is None else self.validation_step
         for index, data in enumerate(get_dataset(dataset), start=1):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
             criteria = validation_step(data, **models)
             elapsed_time += time()
-            logs = logger(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.validation_prefix:
                 logs = {f"{self.validation_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
