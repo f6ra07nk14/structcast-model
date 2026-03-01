@@ -1,21 +1,22 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
+from functools import partial
 from logging import getLogger
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 from timm.data import Mixup
 from timm.utils import ModelEmaV3
 from torch.nn import Module
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
-from torch import bfloat16, cuda, float16, float32, no_grad, rand
+from torch import autocast, bfloat16, cuda, float16, float32, no_grad, rand
 
 logger = getLogger(__name__)
 
@@ -24,6 +25,8 @@ DTYPES = {
     "float16": float16,
     "bfloat16": bfloat16,
 }
+
+T = TypeVar("T")
 
 
 def create_torch_inputs(shape: Any) -> Any:
@@ -49,6 +52,57 @@ def get_torch_device(device: str | None = None) -> str:
         logger.warning("CUDA is not available. Using CPU instead.")
         return "cpu"
     return device
+
+
+def initial_model(
+    model: T,
+    shapes: dict[str, Any] | None = None,
+    compile_fn: Callable[[Module], Module] | None = None,
+) -> tuple[T, Any, Any]:
+    """Initialize the model by creating dummy inputs based on the provided shapes and running a forward pass.
+
+    Args:
+        model (T): The model to initialize. Can be any nested structure containing PyTorch modules.
+        shapes (dict[str, Any] | None): A dictionary mapping module names to their input shapes.
+            If None, the model will not be initialized with dummy inputs.
+        compile_fn (Callable[[Module], Module] | None): An optional function to compile the model after initialization.
+            If None, the model will not be compiled.
+
+    Returns:
+        A tuple containing the initialized (and optionally compiled) model, the dummy inputs used for initialization,
+            and the outputs of the forward pass.
+    """
+    inputs = None if shapes is None else create_torch_inputs(shapes)
+    outputs = {}
+
+    def _init(raw: T) -> T:
+        if isinstance(raw, Module):
+            outputs[raw] = None if inputs is None else raw(**inputs)
+            return raw if compile_fn is None else compile_fn(raw)
+        if isinstance(raw, Mapping):
+            res = {k: _init(v) for k, v in raw.items()}
+            return res if (cls := type(raw)) is dict else cls(**res)
+        if isinstance(raw, (list, tuple)):
+            return type(raw)(_init(v) for v in raw)
+        return raw
+
+    def _construct_outputs(raw: T) -> Any:
+        if isinstance(raw, Module):
+            return outputs[raw]
+        if isinstance(raw, Mapping):
+            return {k: _construct_outputs(v) for k, v in raw.items()}
+        if isinstance(raw, (list, tuple)):
+            return type(raw)(_construct_outputs(v) for v in raw)
+        return raw
+
+    return _init(model), inputs, _construct_outputs(model)
+
+
+def get_autocast(mixed_precision_type: str | None, device: str | None) -> Callable[[], AbstractContextManager[None]]:
+    """Get the appropriate autocast context manager based on the device and mixed precision type."""
+    if mixed_precision_type is None:
+        return suppress
+    return partial(autocast, device_type=get_torch_device(device), dtype=DTYPES[mixed_precision_type])
 
 
 @dataclass(kw_only=True, slots=True)
@@ -121,6 +175,31 @@ class TorchTracker:
             res.update(self.metrics_tracker({k: criteria[k] for k in self.metrics_tracker.criteria}))
         return {k: v.item() for k, v in res.items()}
 
+    @classmethod
+    def from_criteria(
+        cls,
+        loss_outputs: list[str],
+        metric_outputs: list[str] | None = None,
+        compile_fn: Callable[[Module], Module] | None = None,
+    ) -> "TorchTracker":
+        """Create a tracker from the given loss and metric modules.
+
+        Args:
+            loss_outputs (list[str]): The outputs to track for the loss module.
+            metric_outputs (list[str] | None): The outputs to track for the metric module.
+            compile_fn (Callable[[Module], Module] | None): An optional function to compile the loss and metric modules.
+
+        Returns:
+            A TorchTracker instance with the specified loss and metric trackers.
+        """
+        losses_tracker = CriteriaTracker(loss_outputs)
+        metrics_tracker = None if metric_outputs is None else CriteriaTracker(metric_outputs)
+        if compile_fn is not None:
+            losses_tracker = compile_fn(losses_tracker)
+            if metrics_tracker is not None:
+                metrics_tracker = compile_fn(metrics_tracker)
+        return cls(losses_tracker=losses_tracker, metrics_tracker=metrics_tracker)
+
 
 @dataclass(kw_only=True, slots=True)
 class TimmEmaUpdater:
@@ -172,15 +251,9 @@ class _LoaderWrapper:
         """Return the number of batches in the data loader."""
         return len(self.loader)
 
-    @property
-    def sampler(self) -> Sampler | Iterable:
-        """Return the sampler of the data loader."""
-        return self.loader.sampler
-
-    @property
-    def dataset(self) -> Dataset:
-        """Return the dataset of the data loader."""
-        return self.loader.dataset
+    def __getattribute__(self, name) -> Any:
+        loader = super(_LoaderWrapper, self).__getattribute__("loader")
+        return loader if name == "loader" else loader.__getattribute__(name)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -218,6 +291,7 @@ class NamedData(_LoaderWrapper):
 
 
 __all__ = [
+    "CriteriaTracker",
     "NamedData",
     "TimmEmaUpdater",
     "TimmEmaWrapper",
@@ -227,7 +301,9 @@ __all__ = [
     "TrainingStep",
     "ValidationStep",
     "create_torch_inputs",
+    "get_autocast",
     "get_torch_device",
+    "initial_model",
 ]
 
 
