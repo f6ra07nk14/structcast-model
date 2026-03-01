@@ -1,12 +1,13 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
-from typing import TYPE_CHECKING, Any, Literal
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from structcast.utils.base import load_yaml_from_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo
+from structcast_model.base_trainer import BaseInfo, get_dataset_size
 from structcast_model.commands.utils import bool_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
 
 if TYPE_CHECKING:
@@ -125,9 +126,7 @@ def call_ptflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        inputs = torch_trainer.create_torch_inputs(reduce_dict(shapes))
-        model: torch.nn.Module = _instantiate(model_pattern)
-        model(**inputs)  # forward first to make sure the model is built
+        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), reduce_dict(shapes))
         flops, params = ptflops.get_model_complexity_info(
             model=model,
             input_res=(1,),
@@ -159,9 +158,7 @@ def call_calflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        inputs = torch_trainer.create_torch_inputs(reduce_dict(shapes))
-        model: torch.nn.Module = _instantiate(model_pattern)
-        model(**inputs)  # forward first to make sure the model is built
+        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), reduce_dict(shapes))
         flops, macs, params = calflops.calculate_flops(
             model=model,
             input_shape=None,
@@ -182,22 +179,44 @@ def call_calflops(
     print(f"Parameters: {params}")
 
 
-def _init_models(patterns: list[dict[str, Any]], shapes: dict[str, Any] | None) -> list[tuple[str, "torch.nn.Module"]]:
+def _compile_fn(module: "torch.nn.Module", compile_kw: dict[str, Any] | None) -> "torch.nn.Module":
+    return module if compile_kw is None else torch.compile(module, **compile_kw)
+
+
+def _init_models(patterns: list[dict[str, Any]]) -> list[tuple[str, "torch.nn.Module"]]:
     models = []
-    inputs = None if shapes is None else torch_trainer.create_torch_inputs(shapes)
     for raw in patterns:
         if len(raw) != 1:
             raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
         model_name, ptn = list(raw.items())[0]
-        model: torch.nn.Module = _instantiate(ptn)
-        if inputs is not None:
-            model(**inputs)  # forward first to make sure the model is built
-        models.append((model_name, model))
+        models.append((model_name, _instantiate(ptn)))
     return models
 
 
+def _check_module_outputs(module: "torch.nn.Module", default: list[str] | None, name: str) -> "list[str]":
+    if hasattr(module, "outputs"):
+        return module.outputs
+    if default:
+        return default
+    raise ValueError(
+        f'Module "{name}" does not have an "outputs" attribute. '
+        f'Please provide default outputs using the "--{name}-outputs" option.'
+    )
+
+
+def _to_numpy(value: Any, device: str) -> Any:
+    if isinstance(value, dict):
+        return {k: _to_numpy(v, device) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_numpy(v, device) for v in value]
+    if torch.is_tensor(value):
+        value = value.detach().numpy() if device == "cpu" else value.detach().cpu().numpy()
+        return value if value.shape else value.reshape(1)
+    return value
+
+
 @app.command()
-def train(
+def train(  # noqa: PLR0915
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help="The object patterns used to instantiate models. "
@@ -216,6 +235,12 @@ def train(
         '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyLoss, my_package.py], {_call_: {...}}]".',
     ),
+    loss_outputs: list[str] | None = Option(
+        None,
+        "--loss-outputs",
+        "-L",
+        help="Default outputs for the loss module if it doesn't have an 'outputs' attribute.",
+    ),
     metric_pattern: dict | None = Option(
         None,
         "--metric",
@@ -226,6 +251,12 @@ def train(
         '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyMetric, my_package.py], {_call_: {...}}]".',
     ),
+    metric_outputs: list[str] | None = Option(
+        None,
+        "--metric-outputs",
+        "-M",
+        help="Default outputs for the metric module if it doesn't have an 'outputs' attribute.",
+    ),
     backward_pattern: dict = Option(
         ...,
         "--backward",
@@ -235,6 +266,11 @@ def train(
         "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyBackward, my_package.py], {_call_: {...}}]".',
+    ),
+    mixed_precision_type: Literal["bfloat16", "float16"] | None = Option(
+        None,
+        help="Default mixed precision type to use during training when mixed precision is enabled. "
+        "This can be overridden by the backward class if it has its own mixed precision type specified.",
     ),
     compile_pattern: dict[str, Any] | None = Option(
         None,
@@ -264,32 +300,70 @@ def train(
     torch.manual_seed(seed)
     np.random.seed(seed)
     input_shapes = reduce_dict(shapes)
-    compile_kw = instantiator.instantiate(compile_pattern)
+    device = torch_trainer.get_torch_device(device)
+    compile_fn = partial(_compile_fn, compile_kw=instantiator.instantiate(compile_pattern))
+
+    def _log_criteria(info: BaseInfo) -> str:
+        """Format the criteria."""
+        lrs = getattr(cast(torch_trainer.TorchTrainer, info).backward, "learning_rates", None) or {}
+        logs = info.logs()
+        values = "\n\t".join([f"{k}: {v:.4e}" for k, v in {**logs, **lrs}.items()])
+        mlflow.log_metrics({**logs, **lrs}, step=info.epoch)
+        return f"Epoch {info.epoch}:\n\t{values}"
+
     mlflow.set_experiment(experiment)
     with mlflow.start_run():
-        with torch.device(torch_trainer.get_torch_device(device)):
-            models = _init_models(model_patterns, input_shapes)
-            loss: torch.nn.Module = _instantiate(loss_pattern)
-            metric: torch.nn.Module | None = _instantiate(metric_pattern) if metric_pattern else None
-            if compile_kw is not None:
-                models = [(n, torch.compile(m, **compile_kw)) for n, m in models]
-                loss = torch.compile(loss, **compile_kw)
-                if metric is not None:
-                    metric = torch.compile(metric, **compile_kw)
+        with torch.device(device):
+            models, inputs, outputs = torch_trainer.initial_model(_init_models(model_patterns), input_shapes)
+            loss = compile_fn(_instantiate(loss_pattern))
+            metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
             backward = _instantiate(backward_pattern)(**dict(models))
-            trainer = torch_trainer.TorchTrainer()
+            loss_outputs = _check_module_outputs(loss, loss_outputs, "loss")
+            metric_outputs = _check_module_outputs(metric, metric_outputs, "metric") if metric else None
+            tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
+            # todo: ema
+        # create mlflow signatures for models from inputs and outputs
+        mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
+        step_kw = {
+            "models": [n for n, _ in models],
+            "loss": loss,
+            "metric": metric,
+            "autocast": torch_trainer.get_autocast(mixed_precision_type, device),
+        }
+        trainer = torch_trainer.TorchTrainer(
+            training_step=torch_trainer.TrainingStep(**step_kw),
+            validation_step=torch_trainer.ValidationStep(**step_kw),
+            backward=backward,
+            tracker=tracker,
+        )
+        # todo: create dataset & dataloader
+        print("Count the dataset sizes...")
+        steps_per_epoch = get_dataset_size(training_dataset)
+        validation_steps = 0 if validation_dataset is None else get_dataset_size(validation_dataset)
+        print(f"Training dataset size: {steps_per_epoch} steps.")
+        print(f"Validation dataset size: {validation_steps} steps.")
+        if ci:
+            trainer.on_epoch_end.append(lambda i: print(_log_criteria(i)))  # type: ignore[arg-type]
+        else:
+            pbar = tqdm.tqdm(unit="batch")
 
-            def _log_criteria(info: BaseInfo) -> str:
-                """Format the criteria."""
-                lrs, logs = backward.learning_rates, info.logs()
-                values = "\n\t".join([f"{k}: {v:.4e}" for k, v in {**logs, **lrs}.items()])
-                mlflow.log_metrics({**logs, **lrs}, step=info.epoch)
-                return f"Epoch {info.epoch}:\n\t{values}"
+            def _update_criteria(info: BaseInfo, criteria: list[str]) -> None:
+                logs = info.logs()
+                pbar.update()
+                pbar.set_postfix([(n, logs[n]) for n in criteria])
 
-            if ci:
-                trainer.on_epoch_end.append(lambda i: print(_log_criteria(i)))
-            else:
-                pbar = tqdm.tqdm(unit="batch")
+            trainer.on_training_begin.append(lambda _: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
+            train_losses = [f"{trainer.training_prefix}{n}" for n in loss_outputs]
+            trainer.on_training_step_end.append(partial(_update_criteria, criteria=train_losses))  # type: ignore[arg-type]
+            trainer.on_training_end.append(lambda _: pbar.refresh())  # type: ignore[arg-type]
+            trainer.on_validation_begin.append(lambda _: pbar.reset(validation_steps))  # type: ignore[arg-type]
+            valid_losses = [f"{trainer.validation_prefix}{n}" for n in loss_outputs]
+            trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
+            trainer.on_validation_end.append(lambda _: pbar.refresh())  # type: ignore[arg-type]
+            trainer.on_epoch_end.append(lambda t: pbar.write(_log_criteria(t)))  # type: ignore[arg-type]
+
+        # todo: mlflow logging
+        # todo: model fit
 
 
 __all__ = ["app"]
