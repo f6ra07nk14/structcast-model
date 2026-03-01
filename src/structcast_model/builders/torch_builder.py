@@ -97,6 +97,7 @@ class {self.classname}:
             return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
 
         {sep.join(init_opts)}
+        self.mixed_precision_type = {self.mixed_precision_type}
 
     def __call__(self, step, {self._backward_losses}, **kwargs):
         {sep.join(flow)}

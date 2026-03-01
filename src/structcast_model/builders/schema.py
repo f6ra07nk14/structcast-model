@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from functools import cached_property
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     Field,
@@ -415,6 +415,9 @@ class UserDefinedBackward(Serializable):
     If the value is a dictionary, it will be used as the keyword arguments for configuring mixed precision context.
     """
 
+    MIXED_PRECISION_TYPE: Literal["bfloat16", "float16"] | None = None
+    """The mixed precision type to use during backward pass when mixed precision is enabled."""
+
     ACCUMULATE_GRADIENTS: PositiveInt | None = None
     """Whether to accumulate gradients for multiple steps before updating the parameters,
     and the number of steps to accumulate for."""
@@ -448,6 +451,8 @@ class UserDefinedBackward(Serializable):
             raise SpecError(f"Unknown models found in MODELS: {unknown}.")
         if missing := models - set(self.MODELS):
             raise SpecError(f"Missing models found in MODELS: {missing}.")
+        if (isinstance(self.MIXED_PRECISION, dict) or self.MIXED_PRECISION) and self.MIXED_PRECISION_TYPE is None:
+            raise SpecError("MIXED_PRECISION_TYPE must be specified when MIXED_PRECISION is enabled.")
         return self
 
 

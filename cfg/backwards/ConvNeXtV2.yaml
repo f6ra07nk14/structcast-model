@@ -31,6 +31,7 @@ MIXED_PRECISION:
   backoff_factor: 0.5
   growth_interval: 2000
   enabled: True
+MIXED_PRECISION_TYPE: bfloat16
 # "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
 # specify the number of steps to accumulate gradients before updating parameters.
 _jinja_yaml_: |- 

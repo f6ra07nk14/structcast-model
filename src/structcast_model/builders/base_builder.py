@@ -495,6 +495,9 @@ class BackwardIntermediate(_Intermediate):
     mixed_precision: str | None
     """The mixed precision configuration for the backward layer, or `None` if mixed precision is not used."""
 
+    mixed_precision_type: str | None
+    """The mixed precision type for the backward layer, or `None` if mixed precision is not used."""
+
     accumulate_gradients: int | None
     """The number of steps to accumulate gradients for before performing an optimizer step,
     or `None` if not applicable."""
@@ -594,6 +597,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             imports=imports,
             classname=classname,
             mixed_precision=self._get_mixed_precision(imports, backward.MIXED_PRECISION),
+            mixed_precision_type=backward.MIXED_PRECISION_TYPE,
             accumulate_gradients=backward.ACCUMULATE_GRADIENTS,
             losses=backward.LOSSES,
             models=backward.MODELS,
