@@ -222,11 +222,12 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         Returns:
             Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
         """
+        if self.validation_step is None:
+            return {}
         if self.inference_wrapper is not None:
             models = self.inference_wrapper(**models)
         invoke_callback(self.on_validation_begin, self, **models)
-        tracker, elapsed_time = self.tracker, 0.0
-        validation_step = self.training_step if self.validation_step is None else self.validation_step
+        tracker, validation_step, elapsed_time = self.tracker, self.validation_step, 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
