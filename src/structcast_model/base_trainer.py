@@ -2,10 +2,13 @@
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from logging import getLogger
 from math import inf
 from operator import gt, lt
 from time import time
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar
+
+logger = getLogger(__name__)
 
 ModelT_contra = TypeVar("ModelT_contra", contravariant=True)
 
@@ -223,6 +226,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
         """
         if self.validation_step is None:
+            logger.warning("Validation step is not defined. Skipping evaluation.")
             return {}
         if self.inference_wrapper is not None:
             models = self.inference_wrapper(**models)
