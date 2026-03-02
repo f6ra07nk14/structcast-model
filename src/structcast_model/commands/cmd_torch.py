@@ -311,6 +311,26 @@ def train(  # noqa: PLR0915
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
+    training_dataset_pattern: dict[str, Any] = Option(
+        ...,
+        "--training-dataset",
+        "-t",
+        parser=dict_parser,
+        help="The object pattern used to instantiate the training dataset. "
+        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
+    ),
+    validation_dataset_pattern: dict[str, Any] | None = Option(
+        None,
+        "--validation-dataset",
+        "-v",
+        parser=dict_parser,
+        help="The object pattern used to instantiate the validation dataset. "
+        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
+    ),
     validation_frequency: int = Option(1, "--validation-frequency", "-f", help="Frequency of validation (in epochs)."),
     lower_criteria: list[str] = Option(
         ...,
@@ -336,7 +356,7 @@ def train(  # noqa: PLR0915
     ),
     seed: int = Option(0, help="Random seed for reproducibility."),
     matmul_precision: Literal["highest", "high", "medium"] = Option("high", help="Matrix multiplication precision."),
-    experiment: str = Option("experiment", "--experiment", "-x", help="Experiment name for MLflow logging."),
+    experiment: str = Option("experiment", "--experiment", "-E", help="Experiment name for MLflow logging."),
     log_arguments: list[dict] | None = Option(
         None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log in MLflow."
     ),
@@ -423,7 +443,8 @@ def train(  # noqa: PLR0915
             tracker=tracker,
             on_epoch_end=on_epoch_end,
         )
-        # todo: create dataset & dataloader
+        training_dataset = _instantiate(training_dataset_pattern)
+        validation_dataset = _instantiate(validation_dataset_pattern) if validation_dataset_pattern else None
         print("Count the dataset sizes...")
         steps_per_epoch = get_dataset_size(training_dataset)
         validation_steps = 0 if validation_dataset is None else get_dataset_size(validation_dataset)
@@ -451,7 +472,6 @@ def train(  # noqa: PLR0915
         mlflow.log_param("cuda_version", torch.version.cuda)
         mlflow.log_param("torch_version", torch.__version__)
         mlflow.log_param("timm_version", timm.__version__)
-        mlflow.log_param("batch_size", batchsize)
         mlflow.log_param("epochs", epochs)
         mlflow.log_param("steps_per_epoch", steps_per_epoch)
         mlflow.log_param("validation_steps", validation_steps)
@@ -475,13 +495,12 @@ def train(  # noqa: PLR0915
                 "compile": compile_pattern,
                 "epochs": epochs,
                 "start_epoch": start_epoch,
+                "training_dataset": training_dataset_pattern,
+                "validation_dataset": validation_dataset_pattern,
                 "validation_frequency": validation_frequency,
                 "lower_criteria": lower_criteria,
                 "higher_criteria": higher_criteria,
                 "save_criteria": save_criteria,
-                "batchsize": batchsize,
-                # "training_dataset": training_dataset_address_w_cfg_or_path,
-                # "validation_dataset": validation_dataset_address_w_cfg_or_path,
                 "seed": seed,
                 "matmul_precision": matmul_precision,
                 "experiment": experiment,
