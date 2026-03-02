@@ -395,30 +395,14 @@ def train(  # noqa: PLR0913,PLR0915
         for name, signature in signatures.items():
             mlflow.pytorch.log_model(kwargs[name], name=f"{name}{suffix}", step=info.epoch, signature=signature)
 
-    step_kw = {
-        "models": list(models),
-        "loss": loss,
-        "metric": metric,
-        "autocast": torch_trainer.get_autocast(mixed_precision_type, device),
-    }
-    on_epoch_end: list[Callback[torch.nn.Module]] = [partial(_save_fn, suffix="")]
-    on_epoch_end += [
-        BestCriterion[torch.nn.Module](
-            target=n,
-            mode="max",
-            on_best=[lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
-            + ([lambda i, t, v, **m: _save_fn(i, suffix="_best", **m)] if n in save_criteria else []),
-        )
-        for n in higher_criteria
-    ] + [
-        BestCriterion[torch.nn.Module](
-            target=n,
-            mode="min",
-            on_best=[lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
-            + ([lambda i, t, v, **m: _save_fn(i, suffix="_best", **m)] if n in save_criteria else []),
-        )
-        for n in lower_criteria
-    ]
+    def _create_criterion_callback(name: str, mode: Literal["min", "max"]) -> Callback[torch.nn.Module]:
+        on_best: list[Any] = [lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
+        if name in save_criteria:
+            on_best.append(lambda i, t, v, **m: _save_fn(i, suffix="_best", **m))  # type: ignore[arg-type]
+        return BestCriterion[torch.nn.Module](target=name, mode=mode, on_best=on_best)
+
+    autocast = torch_trainer.get_autocast(mixed_precision_type, device)
+    step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
     trainer = torch_trainer.TorchTrainer(
         inference_wrapper=None
         if ema is None
@@ -432,7 +416,6 @@ def train(  # noqa: PLR0913,PLR0915
         validation_step=torch_trainer.ValidationStep(**step_kw),
         backward=backward,
         tracker=tracker,
-        on_epoch_end=on_epoch_end,
     )
     if ci:
         trainer.on_epoch_end.append(lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
@@ -453,6 +436,37 @@ def train(  # noqa: PLR0913,PLR0915
         trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
         trainer.on_validation_end.append(lambda **_: pbar.refresh())  # type: ignore[arg-type]
         trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
+    trainer.on_epoch_end.append(partial(_save_fn, suffix=""))
+    trainer.on_epoch_end += [_create_criterion_callback(n, mode="max") for n in higher_criteria]
+    trainer.on_epoch_end += [_create_criterion_callback(n, mode="min") for n in lower_criteria]
+    model_parameters = {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()}
+    arguments = {
+        **reduce_dict(log_arguments),
+        "models": model_patterns,
+        "shapes": input_shapes,
+        "device": device,
+        "ema": ema,
+        "ema_device": ema_device,
+        "loss": loss_pattern,
+        "loss_outputs": loss_outputs,
+        "metric": metric_pattern,
+        "metric_outputs": metric_outputs,
+        "backward": backward_pattern,
+        "mixed_precision_type": mixed_precision_type,
+        "compile": compile_pattern,
+        "epochs": epochs,
+        "start_epoch": start_epoch,
+        "training_dataset": training_dataset_pattern,
+        "validation_dataset": validation_dataset_pattern,
+        "validation_frequency": validation_frequency,
+        "lower_criteria": lower_criteria,
+        "higher_criteria": higher_criteria,
+        "save_criteria": save_criteria,
+        "seed": seed,
+        "matmul_precision": matmul_precision,
+        "experiment": experiment,
+        "ci": ci,
+    }
     mlflow.set_experiment(experiment)
     with mlflow.start_run():
         mlflow.log_param("cuda_version", torch.version.cuda)
@@ -461,41 +475,20 @@ def train(  # noqa: PLR0913,PLR0915
         mlflow.log_param("epochs", epochs)
         mlflow.log_param("steps_per_epoch", steps_per_epoch)
         mlflow.log_param("validation_steps", validation_steps)
-        model_parameters = {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()}
         mlflow.log_param("parameters", model_parameters)
         if hasattr(backward, "param_group_names"):
             mlflow.log_dict(backward.param_group_names, "param_groups.yaml")
-        arguments = {
-            **reduce_dict(log_arguments),
-            "models": model_patterns,
-            "shapes": input_shapes,
-            "device": device,
-            "ema": ema,
-            "ema_device": ema_device,
-            "loss": loss_pattern,
-            "loss_outputs": loss_outputs,
-            "metric": metric_pattern,
-            "metric_outputs": metric_outputs,
-            "backward": backward_pattern,
-            "mixed_precision_type": mixed_precision_type,
-            "compile": compile_pattern,
-            "epochs": epochs,
-            "start_epoch": start_epoch,
-            "training_dataset": training_dataset_pattern,
-            "validation_dataset": validation_dataset_pattern,
-            "validation_frequency": validation_frequency,
-            "lower_criteria": lower_criteria,
-            "higher_criteria": higher_criteria,
-            "save_criteria": save_criteria,
-            "seed": seed,
-            "matmul_precision": matmul_precision,
-            "experiment": experiment,
-            "ci": ci,
-        }
         mlflow.log_dict(arguments, "arguments.yaml")
         for artifact in log_artifacts or []:
             mlflow.log_artifact(str(artifact))
-        # todo: model fit
+        trainer.fit(
+            epochs=epochs,
+            training_dataset=training_dataset,
+            validation_dataset=validation_dataset,
+            start_epoch=start_epoch,
+            validation_frequency=validation_frequency,
+            **models,
+        )
 
 
 __all__ = ["app"]
