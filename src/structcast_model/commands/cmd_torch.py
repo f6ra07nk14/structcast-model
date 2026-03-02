@@ -383,17 +383,10 @@ def train(  # noqa: PLR0913,PLR0915
         metric_outputs = _check_module_outputs(metric, metric_outputs, "metric") if metric else None
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
-    signatures = {
-        n: mlflow.models.infer_signature(
-            _to_numpy({k: inputs[k] for k in getattr(models[n], "inputs", list(inputs))}),
-            _to_numpy(o),
-        )
-        for n, o in outputs.items()
-    }
 
     def _save_fn(info: BaseInfo, suffix: str, **kwargs: torch.nn.Module) -> None:
-        for name, signature in signatures.items():
-            mlflow.pytorch.log_model(kwargs[name], name=f"{name}{suffix}", step=info.epoch, signature=signature)
+        for name, model in kwargs.items():
+            mlflow.pytorch.log_state_dict(model.state_dict(), artifact_path=f"{name}{suffix}")
 
     def _create_criterion_callback(name: str, mode: Literal["min", "max"]) -> Callback[torch.nn.Module]:
         on_best: list[Any] = [lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
@@ -436,7 +429,16 @@ def train(  # noqa: PLR0913,PLR0915
         trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
         trainer.on_validation_end.append(lambda **_: pbar.refresh())  # type: ignore[arg-type]
         trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
-    trainer.on_epoch_end.append(partial(_save_fn, suffix=""))
+
+    def _save_training_state(info: BaseInfo, **kwargs: torch.nn.Module) -> None:
+        states: dict[str, Any] = {"models": {n: m.state_dict() for n, m in kwargs.items()}}
+        backward = cast(torch_trainer.TorchTrainer, info).backward
+        states["optimizers"] = getattr(backward, "optimizer_state_dicts", None) or {}
+        states["grad_scalers"] = getattr(backward, "grad_scaler_state_dicts", None) or {}
+        states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
+        mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
+
+    trainer.on_epoch_end.append(_save_training_state)
     trainer.on_epoch_end += [_create_criterion_callback(n, mode="max") for n in higher_criteria]
     trainer.on_epoch_end += [_create_criterion_callback(n, mode="min") for n in lower_criteria]
     model_parameters = {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()}
