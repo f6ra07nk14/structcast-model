@@ -75,7 +75,7 @@ def initial_model(
     inputs = None if shapes is None else create_torch_inputs(shapes)
     outputs = {}
 
-    def _init(raw: T) -> T:
+    def _init(raw: Any) -> Any:
         if isinstance(raw, Module):
             outputs[raw] = None if inputs is None else raw(**inputs)
             return raw if compile_fn is None else compile_fn(raw)
@@ -86,7 +86,7 @@ def initial_model(
             return type(raw)(_init(v) for v in raw)
         return raw
 
-    def _construct_outputs(raw: T) -> Any:
+    def _construct_outputs(raw: Any) -> Any:
         if isinstance(raw, Module):
             return outputs[raw]
         if isinstance(raw, Mapping):
