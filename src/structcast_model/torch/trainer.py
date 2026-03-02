@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, Callback, invoke_callback
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
-from torch import autocast, bfloat16, cuda, float16, float32, no_grad, rand
+from torch import autocast, bfloat16, cuda, device, float16, float32, no_grad, rand
 
 logger = getLogger(__name__)
 
@@ -90,7 +90,8 @@ def initial_model(
         if isinstance(raw, Module):
             return outputs[raw]
         if isinstance(raw, Mapping):
-            return {k: _construct_outputs(v) for k, v in raw.items()}
+            res = {k: _construct_outputs(v) for k, v in raw.items()}
+            return res if (cls := type(raw)) is dict else cls(**res)
         if isinstance(raw, (list, tuple)):
             return type(raw)(_construct_outputs(v) for v in raw)
         return raw
@@ -237,6 +238,29 @@ class TimmEmaWrapper:
         }
         invoke_callback(self.callbacks, info, **models)
         return models
+
+    @classmethod
+    def from_models(
+        cls,
+        models: dict[str, Module],
+        callbacks: list[Callback[Module]] | None = None,
+        device: device | None = None,
+        **kwargs: Any,
+    ) -> "TimmEmaWrapper":
+        """Create a TimmEmaWrapper from the given models.
+
+        Args:
+            models (dict[str, Module]): The models to create the EMA wrapper for.
+            callbacks (list[Callback[Module]] | None): The callbacks to invoke when the wrapper is called.
+                If None, no callbacks will be invoked.
+            device (device | None): The device to move the EMA models to. If None, the EMA models will not be moved.
+            **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
+
+        Returns:
+            A TimmEmaWrapper instance with the specified EMA models and callbacks.
+        """
+        ema = {n: ModelEmaV3(m, device=device, **kwargs) for n, m in models.items()}
+        return cls(ema=ema, callbacks=callbacks or [])
 
 
 @dataclass(kw_only=True)
