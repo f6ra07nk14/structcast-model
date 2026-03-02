@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -13,7 +13,7 @@ from timm.utils import ModelEmaV3
 from torch.nn import Module
 from torch.utils.data import DataLoader
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer
+from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, Callback, invoke_callback
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
 from torch import autocast, bfloat16, cuda, float16, float32, no_grad, rand
@@ -218,21 +218,25 @@ class TimmEmaUpdater:
 
 @dataclass(kw_only=True, slots=True)
 class TimmEmaWrapper:
-    """A wrapper for the EMA model from the timm library."""
-
-    ema_on_cpu: bool
-    """Whether the EMA model is on CPU or not."""
+    """An inference wrapper that returns the EMA model from the timm library."""
 
     ema: dict[str, ModelEmaV3]
     """The EMA model."""
+
+    callbacks: list[Callback[Module]] = field(default_factory=list)
+    """The callbacks to invoke when the wrapper is called."""
 
     def __post_init__(self) -> None:
         """Post-initialization."""
         GLOBAL_CALLBACKS.on_update += [TimmEmaUpdater(name=n, ema=e) for n, e in self.ema.items()]
 
-    def __call__(self, **models: Module) -> dict[str, Any]:
+    def __call__(self, info: BaseInfo, **models: Module) -> dict[str, Any]:
         """Return the EMA model."""
-        return models if self.ema_on_cpu else {k: self.ema[k].module for k in models}
+        models = {
+            n: o.module if n in self.ema and (o := self.ema[n]).device == m.device else m for n, m in models.items()
+        }
+        invoke_callback(self.callbacks, info, **models)
+        return models
 
 
 @dataclass(kw_only=True)

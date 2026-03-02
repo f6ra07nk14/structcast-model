@@ -43,13 +43,6 @@ class Backward(Protocol):
         """Perform the backward pass for the given step and losses, and return whether the model has been updated."""
 
 
-class InferenceWrapper(Protocol[ModelT_contra]):
-    """Protocol for inference wrapper."""
-
-    def __call__(self, **models: ModelT_contra) -> dict[str, Any]:
-        """Wrap the model for inference, e.g., for quantization or ONNX export."""
-
-
 @dataclass(kw_only=True)
 class BaseInfo:
     """Base information for building a model."""
@@ -155,6 +148,13 @@ GLOBAL_CALLBACKS = Callbacks[Any](add_global_callbacks=False)
 """Global callbacks."""
 
 
+class InferenceWrapper(Protocol[ModelT_contra]):
+    """Protocol for inference wrapper."""
+
+    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> dict[str, ModelT_contra]:
+        """Wrap the model for inference, e.g., for quantization or ONNX export."""
+
+
 @dataclass(kw_only=True)
 class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     """Base trainer for training a model."""
@@ -229,7 +229,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             logger.warning("Validation step is not defined. Skipping evaluation.")
             return {}
         if self.inference_wrapper is not None:
-            models = self.inference_wrapper(**models)
+            models = self.inference_wrapper(self, **models)
         invoke_callback(self.on_validation_begin, self, **models)
         tracker, validation_step, elapsed_time = self.tracker, self.validation_step, 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):
