@@ -475,7 +475,8 @@ def train(  # noqa: PLR0915
         mlflow.log_param("epochs", epochs)
         mlflow.log_param("steps_per_epoch", steps_per_epoch)
         mlflow.log_param("validation_steps", validation_steps)
-        mlflow.log_param("parameters", sum(p.numel() for p in trainer.model.parameters() if p.requires_grad))
+        model_parameters = {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()}
+        mlflow.log_param("parameters", model_parameters)
         if hasattr(backward, "param_group_names"):
             mlflow.log_dict(backward.param_group_names, "param_groups.yaml")
         mlflow.log_dict(
