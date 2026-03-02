@@ -24,9 +24,10 @@ from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate,
 from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.security import split_attribute, validate_attribute
+from structcast.utils.types import PathLike
 
 from structcast_model.builders import jinja_filters
-from structcast_model.utils.base import unique
+from structcast_model.utils.base import load_any, unique
 
 logger = getLogger(__name__)
 
@@ -459,11 +460,18 @@ class UserDefinedBackward(Serializable):
 SerializableT = TypeVar("SerializableT", bound=Serializable)
 
 
-class _Template(WithExtra, Generic[SerializableT]):
+class Template(WithExtra, Generic[SerializableT]):
+    """Template for formatting the configuration of a target type from raw fields and parameters."""
+
     PARAMETERS: Parameters = Field(default_factory=Parameters)
     """Parameters for template formatting."""
 
-    target_type: ClassVar[type[SerializableT]] = Serializable
+    target_type: ClassVar[type[SerializableT]] = WithExtra
+
+    @classmethod
+    def from_path(cls, path: PathLike) -> Self:
+        """Create a template from a configuration file."""
+        return cls.model_validate_file(load_any(path))
 
     @cached_property
     def _raw_and_others(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -511,13 +519,13 @@ class _Template(WithExtra, Generic[SerializableT]):
         return self.target_type.model_validate(extend_structure(self.raw, template_kwargs=parameters))
 
 
-class TemplateLayer(_Template[UserDefinedLayer]):
+class TemplateLayer(Template[UserDefinedLayer]):
     """Template for user-defined layers."""
 
     target_type: ClassVar[type[UserDefinedLayer]] = UserDefinedLayer
 
 
-class TemplateBackward(_Template[UserDefinedBackward]):
+class TemplateBackward(Template[UserDefinedBackward]):
     """Template for user-defined backwards."""
 
     target_type: ClassVar[type[UserDefinedBackward]] = UserDefinedBackward
@@ -529,6 +537,7 @@ __all__ = [
     "LayerBehavior",
     "OptimizerBehavior",
     "Parameters",
+    "Template",
     "TemplateBackward",
     "TemplateLayer",
     "UserDefinedBackward",
