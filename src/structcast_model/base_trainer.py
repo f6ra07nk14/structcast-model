@@ -151,7 +151,7 @@ GLOBAL_CALLBACKS = Callbacks[Any](add_global_callbacks=False)
 class InferenceWrapper(Protocol[ModelT_contra]):
     """Protocol for inference wrapper."""
 
-    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> dict[str, ModelT_contra]:
+    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> dict[str, Any]:
         """Wrap the model for inference, e.g., for quantization or ONNX export."""
 
 
