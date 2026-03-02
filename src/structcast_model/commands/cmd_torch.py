@@ -1,13 +1,15 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
+from collections import OrderedDict
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from structcast.utils.base import load_yaml_from_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo, get_dataset_size
+from structcast_model.base_trainer import BaseInfo, BestCriterion, Callback, get_dataset_size
 from structcast_model.commands.utils import bool_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
 
 if TYPE_CHECKING:
@@ -16,6 +18,7 @@ if TYPE_CHECKING:
     import numpy as np
     import ptflops
     from structcast.core import instantiator
+    import timm
     import tqdm
 
     from structcast_model.builders import torch_builder
@@ -29,6 +32,7 @@ else:
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
+    timm = LazyModuleImporter("timm")
     tqdm = LazyModuleImporter("tqdm")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
@@ -44,7 +48,7 @@ template_param = Option(
     "--parameter",
     "-p",
     parser=dict_parser,
-    help="Parameters to format the template configuration file with. Can be specified multiple times. "
+    help="Parameters to format the template configuration file with. "
     'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
     "and the value is a dictionary of keyword arguments for formatting the template. "
     'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
@@ -112,7 +116,7 @@ def _instantiate(raw: Any) -> Any:
 @app.command(name="ptflops")
 def call_ptflops(
     model_pattern: Any = model_pattern,
-    shapes: list[dict] | None = shapes,
+    shapes: dict | None = shapes,
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
     flops_units: Literal["GMac", "MMac", "KMac"] = Option("GMac", help="Units for FLOPs: GMac, MMac, or KMac."),
     param_units: Literal["M", "K", "B"] = Option(
@@ -126,7 +130,7 @@ def call_ptflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), reduce_dict(shapes))
+        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), shapes)
         flops, params = ptflops.get_model_complexity_info(
             model=model,
             input_res=(1,),
@@ -149,7 +153,7 @@ def call_ptflops(
 @app.command(name="calflops")
 def call_calflops(
     model_pattern: Any = model_pattern,
-    shapes: list[dict] | None = shapes,
+    shapes: dict | None = shapes,
     include_bp: bool = Option(False, help="Whether to include backpropagation in FLOPs computation."),
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
     bp_factor: float = Option(2.0, help="Factor to multiply the forward FLOPs by to estimate backpropagation FLOPs."),
@@ -158,7 +162,7 @@ def call_calflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), reduce_dict(shapes))
+        model, inputs, _ = torch_trainer.initial_model(_instantiate(model_pattern), shapes)
         flops, macs, params = calflops.calculate_flops(
             model=model,
             input_shape=None,
@@ -183,13 +187,13 @@ def _compile_fn(module: "torch.nn.Module", compile_kw: dict[str, Any] | None) ->
     return module if compile_kw is None else torch.compile(module, **compile_kw)
 
 
-def _init_models(patterns: list[dict[str, Any]]) -> list[tuple[str, "torch.nn.Module"]]:
-    models = []
+def _init_models(patterns: list[dict[str, Any]]) -> OrderedDict[str, "torch.nn.Module"]:
+    models = OrderedDict[str, "torch.nn.Module"]()
     for raw in patterns:
         if len(raw) != 1:
             raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
         model_name, ptn = list(raw.items())[0]
-        models.append((model_name, _instantiate(ptn)))
+        models[model_name] = _instantiate(ptn)
     return models
 
 
@@ -215,6 +219,21 @@ def _to_numpy(value: Any, device: str) -> Any:
     return value
 
 
+def _get_signatures(
+    models: dict[str, "torch.nn.Module"], inputs: dict[str, Any], outputs: dict[str, Any], device: str
+) -> dict[str, "mlflow.models.signature.ModelSignature"]:
+    return {
+        n: mlflow.models.infer_signature(
+            _to_numpy(
+                {k: v for k, v in inputs.items() if k in models[n].inputs} if hasattr(models[n], "inputs") else inputs,
+                device,
+            ),
+            _to_numpy(o, device),
+        )
+        for n, o in outputs.items()
+    }
+
+
 @app.command()
 def train(  # noqa: PLR0915
     model_patterns: list[dict] = Argument(
@@ -225,7 +244,17 @@ def train(  # noqa: PLR0915
         '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
     ),
     shapes: list[dict] | None = shapes,
-    loss_pattern: dict = Option(
+    device: str | None = device,
+    ema: dict[str, Any] | None = Option(
+        None,
+        parser=bool_or_dict_parser,
+        help="Whether to use EMA (Exponential Moving Average) for the model during training. "
+        "Can be set to true/false or a dictionary of keyword arguments for the EMA wrapper (e.g., decay rate).",
+    ),
+    ema_device: str | None = Option(
+        None, help="Device for the EMA model. If not specified, it will use the same device as the main model."
+    ),
+    loss_pattern: dict[str, Any] = Option(
         ...,
         "--loss",
         "-l",
@@ -238,10 +267,10 @@ def train(  # noqa: PLR0915
     loss_outputs: list[str] | None = Option(
         None,
         "--loss-outputs",
-        "-L",
+        "-LO",
         help="Default outputs for the loss module if it doesn't have an 'outputs' attribute.",
     ),
-    metric_pattern: dict | None = Option(
+    metric_pattern: dict[str, Any] | None = Option(
         None,
         "--metric",
         "-m",
@@ -254,10 +283,10 @@ def train(  # noqa: PLR0915
     metric_outputs: list[str] | None = Option(
         None,
         "--metric-outputs",
-        "-M",
+        "-MO",
         help="Default outputs for the metric module if it doesn't have an 'outputs' attribute.",
     ),
-    backward_pattern: dict = Option(
+    backward_pattern: dict[str, Any] | None = Option(
         ...,
         "--backward",
         "-b",
@@ -282,10 +311,36 @@ def train(  # noqa: PLR0915
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
-    device: str | None = device,
+    validation_frequency: int = Option(1, "--validation-frequency", "-f", help="Frequency of validation (in epochs)."),
+    lower_criteria: list[str] = Option(
+        ...,
+        "--lower-criterion",
+        "-LC",
+        default_factory=list,
+        help="Criterion names that require lower values.",
+    ),
+    higher_criteria: list[str] = Option(
+        ...,
+        "--higher-criterion",
+        "-HC",
+        default_factory=list,
+        help="Criterion names that require higher values.",
+    ),
+    save_criteria: list[str] = Option(
+        ...,
+        "--save-criterion",
+        "-SC",
+        default_factory=list,
+        help="Criterion names to monitor for saving the best model. "
+        "Should be a subset of lower_criteria and higher_criteria.",
+    ),
     seed: int = Option(0, help="Random seed for reproducibility."),
     matmul_precision: Literal["highest", "high", "medium"] = Option("high", help="Matrix multiplication precision."),
     experiment: str = Option("experiment", "--experiment", "-x", help="Experiment name for MLflow logging."),
+    log_arguments: list[dict] | None = Option(
+        None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log in MLflow."
+    ),
+    log_artifacts: list[Path] | None = Option(None, "--log-artifacts", "-A", help="Artifacts to log in MLflow."),
     ci: bool = Option(
         False,
         help="Whether to run in CI mode. "
@@ -303,7 +358,7 @@ def train(  # noqa: PLR0915
     device = torch_trainer.get_torch_device(device)
     compile_fn = partial(_compile_fn, compile_kw=instantiator.instantiate(compile_pattern))
 
-    def _log_criteria(info: BaseInfo) -> str:
+    def _log_criteria(info: BaseInfo, **_: torch.nn.Module) -> str:
         """Format the criteria."""
         lrs = getattr(cast(torch_trainer.TorchTrainer, info).backward, "learning_rates", None) or {}
         logs = info.logs()
@@ -317,24 +372,56 @@ def train(  # noqa: PLR0915
             models, inputs, outputs = torch_trainer.initial_model(_init_models(model_patterns), input_shapes)
             loss = compile_fn(_instantiate(loss_pattern))
             metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
-            backward = _instantiate(backward_pattern)(**dict(models))
+            backward = _instantiate(backward_pattern)(**models)
             loss_outputs = _check_module_outputs(loss, loss_outputs, "loss")
             metric_outputs = _check_module_outputs(metric, metric_outputs, "metric") if metric else None
             tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
-            # todo: ema
-        # create mlflow signatures for models from inputs and outputs
+        signatures = _get_signatures(models, inputs, outputs, device)
+
+        def _save_fn(info: BaseInfo, suffix: str, **kwargs: torch.nn.Module) -> None:
+            for name, signature in signatures.items():
+                mlflow.pytorch.log_model(kwargs[name], name=f"{name}{suffix}", step=info.epoch, signature=signature)
+
         mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
         step_kw = {
-            "models": [n for n, _ in models],
+            "models": list(models),
             "loss": loss,
             "metric": metric,
             "autocast": torch_trainer.get_autocast(mixed_precision_type, device),
         }
+        on_epoch_end: list[Callback[torch.nn.Module]] = [partial(_save_fn, suffix="")]
+        on_epoch_end += [
+            BestCriterion[torch.nn.Module](
+                target=n,
+                mode="max",
+                on_best=[lambda i, t, v: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
+                + ([lambda i, t, v, **m: _save_fn(i, suffix="_best", **m)] if n in save_criteria else []),
+            )
+            for n in higher_criteria
+        ]
+        on_epoch_end += [
+            BestCriterion[torch.nn.Module](
+                target=n,
+                mode="min",
+                on_best=[lambda i, t, v: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
+                + ([lambda i, t, v, **m: _save_fn(i, suffix="_best", **m)] if n in save_criteria else []),
+            )
+            for n in lower_criteria
+        ]
         trainer = torch_trainer.TorchTrainer(
+            inference_wrapper=None
+            if ema is None
+            else torch_trainer.TimmEmaWrapper.from_models(
+                models,
+                callbacks=[partial(_save_fn, suffix="_ema")],
+                device=torch.device(ema_device or device),
+                **instantiator.instantiate(ema),
+            ),
             training_step=torch_trainer.TrainingStep(**step_kw),
             validation_step=torch_trainer.ValidationStep(**step_kw),
             backward=backward,
             tracker=tracker,
+            on_epoch_end=on_epoch_end,
         )
         # todo: create dataset & dataloader
         print("Count the dataset sizes...")
@@ -347,7 +434,7 @@ def train(  # noqa: PLR0915
         else:
             pbar = tqdm.tqdm(unit="batch")
 
-            def _update_criteria(info: BaseInfo, criteria: list[str]) -> None:
+            def _update_criteria(info: BaseInfo, criteria: list[str], **_: torch.nn.Module) -> None:
                 logs = info.logs()
                 pbar.update()
                 pbar.set_postfix([(n, logs[n]) for n in criteria])
@@ -361,8 +448,49 @@ def train(  # noqa: PLR0915
             trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
             trainer.on_validation_end.append(lambda _: pbar.refresh())  # type: ignore[arg-type]
             trainer.on_epoch_end.append(lambda t: pbar.write(_log_criteria(t)))  # type: ignore[arg-type]
-
-        # todo: mlflow logging
+        mlflow.log_param("cuda_version", torch.version.cuda)
+        mlflow.log_param("torch_version", torch.__version__)
+        mlflow.log_param("timm_version", timm.__version__)
+        mlflow.log_param("batch_size", batchsize)
+        mlflow.log_param("epochs", epochs)
+        mlflow.log_param("steps_per_epoch", steps_per_epoch)
+        mlflow.log_param("validation_steps", validation_steps)
+        mlflow.log_param("parameters", sum(p.numel() for p in trainer.model.parameters() if p.requires_grad))
+        if hasattr(backward, "param_group_names"):
+            mlflow.log_dict(backward.param_group_names, "param_groups.yaml")
+        mlflow.log_dict(
+            {
+                **reduce_dict(log_arguments),
+                "models": model_patterns,
+                "shapes": input_shapes,
+                "device": device,
+                "ema": ema,
+                "ema_device": ema_device,
+                "loss": loss_pattern,
+                "loss_outputs": loss_outputs,
+                "metric": metric_pattern,
+                "metric_outputs": metric_outputs,
+                "backward": backward_pattern,
+                "mixed_precision_type": mixed_precision_type,
+                "compile": compile_pattern,
+                "epochs": epochs,
+                "start_epoch": start_epoch,
+                "validation_frequency": validation_frequency,
+                "lower_criteria": lower_criteria,
+                "higher_criteria": higher_criteria,
+                "save_criteria": save_criteria,
+                "batchsize": batchsize,
+                # "training_dataset": training_dataset_address_w_cfg_or_path,
+                # "validation_dataset": validation_dataset_address_w_cfg_or_path,
+                "seed": seed,
+                "matmul_precision": matmul_precision,
+                "experiment": experiment,
+                "ci": ci,
+            },
+            "arguments.yaml",
+        )
+        for artifact in log_artifacts or []:
+            mlflow.log_artifact(str(artifact))
         # todo: model fit
 
 
