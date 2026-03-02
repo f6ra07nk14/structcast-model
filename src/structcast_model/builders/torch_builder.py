@@ -89,6 +89,11 @@ class TorchBackwardIntermediate(BackwardIntermediate):
             else:
                 flow.append(f"{flow_indent}self.{name}.step()")
             flow.append(f"{flow_indent}self.{name}.zero_grad()")
+        opts = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
+        if self.mixed_precision is None:
+            grad_scalers = ""
+        else:
+            grad_scalers = ", ".join([f'"{n}": self.{n}_scaler' for n in self.optimizers])
         res = f"""\
 class {self.classname}:
 
@@ -97,25 +102,41 @@ class {self.classname}:
             return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
 
         {sep.join(init_opts)}
-        self.mixed_precision_type = {self.mixed_precision_type}
+        self.mixed_precision_type = "{self.mixed_precision_type}"
 
     def __call__(self, step, {self._backward_losses}, **kwargs):
         {sep.join(flow)}
         return {should_update}
 
     @property
+    def optimizers(self):
+        return {{{opts}}}
+
+    @property
+    def grad_scalers(self):
+        return {{{grad_scalers}}}
+
+    @property
     def learning_rates(self):
         def _get_lr(opt):
             return opt.param_groups[0]["lr"]
 
-        return {{{", ".join([f'"{n}_lr": _get_lr(self.{n})' for n in self.optimizers])}}}
+        return {{k: _get_lr(v) for k, v in self.optimizers.items()}}
 
     @property
     def param_group_names(self):
         def _get_param_groups(opt):
             return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
 
-        return {{{", ".join([f'"{n}": _get_param_groups(self.{n})' for n in self.optimizers])}}}
+        return {{k: _get_param_groups(v) for k, v in self.optimizers.items()}}
+
+    @property
+    def optimizer_state_dicts(self):
+        return {{k: v.state_dict() for k, v in self.optimizers.items()}}
+
+    @property
+    def grad_scaler_state_dicts(self):
+        return {{k: v.state_dict() for k, v in self.grad_scalers.items()}}
 """
         return [res]
 
