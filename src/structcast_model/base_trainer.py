@@ -286,7 +286,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
 
 @dataclass(kw_only=True, slots=True)
 class BestCriterion(Generic[ModelT_contra]):
-    """Save the best criterion."""
+    """Callback to track the best criterion during training or validation."""
 
     target: str
     """The target criterion to monitor."""

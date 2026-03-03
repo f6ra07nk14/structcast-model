@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -13,7 +13,7 @@ from timm.utils import ModelEmaV3
 from torch.nn import Module
 from torch.utils.data import DataLoader
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, Callback, invoke_callback
+from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
 from torch import autocast, bfloat16, cuda, device, float16, float32, no_grad, rand
@@ -203,69 +203,55 @@ class TorchTracker:
 
 
 @dataclass(kw_only=True, slots=True)
-class TimmEmaUpdater:
-    """A callback that updates the EMA model from the timm library."""
-
-    name: str
-    """The name of the model to update the EMA for."""
-
-    ema: ModelEmaV3
-    """The EMA model."""
-
-    def __call__(self, info: BaseInfo, **models: Module) -> None:
-        """Update the EMA model."""
-        self.ema.update(models[self.name], step=info.update)
-
-
-@dataclass(kw_only=True, slots=True)
 class TimmEmaWrapper:
     """An inference wrapper that returns the EMA model from the timm library."""
 
     ema: dict[str, ModelEmaV3]
     """The EMA model."""
 
-    callbacks: list[Callback[Module]] = field(default_factory=list)
-    """The callbacks to invoke when the wrapper is called."""
-
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_update += [TimmEmaUpdater(name=n, ema=e) for n, e in self.ema.items()]
+        GLOBAL_CALLBACKS.on_update += [self.update]
+
+    def update(self, info: BaseInfo, **models: Module) -> None:
+        """Update the EMA model."""
+        for name, ema in self.ema.items():
+            ema.update(models[name], step=info.update)
 
     def __call__(self, info: BaseInfo, **models: Module) -> dict[str, Any]:
         """Return the EMA model."""
-        models = {
+        return {
             n: o.module if n in self.ema and (o := self.ema[n]).device == m.device else m for n, m in models.items()
         }
-        invoke_callback(self.callbacks, info, **models)
-        return models
+
+    @property
+    def models(self) -> dict[str, Module]:
+        """Return the EMA models."""
+        return {n: ema.module for n, ema in self.ema.items()}
 
     @classmethod
-    def from_models(
-        cls,
-        models: dict[str, Module],
-        callbacks: list[Callback[Module]] | None = None,
-        device: device | None = None,
-        **kwargs: Any,
-    ) -> "TimmEmaWrapper":
+    def from_models(cls, models: dict[str, Module], device: device | None = None, **kwargs: Any) -> "TimmEmaWrapper":
         """Create a TimmEmaWrapper from the given models.
 
         Args:
             models (dict[str, Module]): The models to create the EMA wrapper for.
-            callbacks (list[Callback[Module]] | None): The callbacks to invoke when the wrapper is called.
-                If None, no callbacks will be invoked.
             device (device | None): The device to move the EMA models to. If None, the EMA models will not be moved.
             **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
 
         Returns:
             A TimmEmaWrapper instance with the specified EMA models and callbacks.
         """
-        ema = {n: ModelEmaV3(m, device=device, **kwargs) for n, m in models.items()}
-        return cls(ema=ema, callbacks=callbacks or [])
+        return cls(ema={n: ModelEmaV3(m, device=device, **kwargs) for n, m in models.items()})
 
 
 @dataclass(kw_only=True)
 class TorchTrainer(BaseTrainer[Module]):
     """Trainer for PyTorch models."""
+
+
+@dataclass(kw_only=True, slots=True)
+class TorchBestCriterion(BestCriterion[Module]):
+    """A callback to track the best criterion during training or validation for PyTorch models."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -321,9 +307,9 @@ class NamedData(_LoaderWrapper):
 __all__ = [
     "CriteriaTracker",
     "NamedData",
-    "TimmEmaUpdater",
     "TimmEmaWrapper",
     "TimmLoaderWrapper",
+    "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
     "TrainingStep",
