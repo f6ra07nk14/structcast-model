@@ -303,7 +303,7 @@ def train(  # noqa: PLR0913,PLR0915
         help="Criterion names to monitor for saving the best model. "
         "Should be a subset of lower_criteria and higher_criteria.",
     ),
-    seed: int = Option(0, help="Random seed for reproducibility."),
+    seed: int = Option(42, help="Random seed for reproducibility."),
     matmul_precision: Literal["highest", "high", "medium"] = Option("high", help="Matrix multiplication precision."),
     experiment: str = Option("experiment", "--experiment", "-E", help="Experiment name for MLflow logging."),
     log_arguments: list[dict] | None = Option(
