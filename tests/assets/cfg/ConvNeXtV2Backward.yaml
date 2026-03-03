@@ -24,6 +24,7 @@ PARAMETERS:
 IMPORTS: {}
 # "MIXED_PRECISION" can be set to a boolean or a dictionary of keyword arguments for
 # configuring Torch's automatic mixed precision ("torch.amp.GradScaler").
+MIXED_PRECISION_TYPE: bfloat16
 MIXED_PRECISION:
   init_scale: "eval: 2.0**16"
   growth_factor: 2.0

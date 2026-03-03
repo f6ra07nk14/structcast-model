@@ -59,6 +59,7 @@ def test_torch_backward_builder_renders_accumulation_script() -> None:
     """Render backward code with gradient accumulation and clipping."""
     raw = {
         "MIXED_PRECISION": True,
+        "MIXED_PRECISION_TYPE": "bfloat16",
         "ACCUMULATE_GRADIENTS": 2,
         "BACKWARDS": [
             [
