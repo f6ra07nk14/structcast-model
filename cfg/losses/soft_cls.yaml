@@ -1,0 +1,5 @@
+PARAMETERS:
+  DEFAULT: {}
+  SHARED: {}
+FLOW:
+  - [{target: label, x: cls}, ce_loss, [_obj_, {_addr_: timm.loss.SoftTargetCrossEntropy}, _call_]]
