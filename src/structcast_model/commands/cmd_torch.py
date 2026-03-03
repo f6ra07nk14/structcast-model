@@ -384,14 +384,13 @@ def train(  # noqa: PLR0913,PLR0915
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
 
-    def _save_fn(info: BaseInfo, suffix: str, **kwargs: torch.nn.Module) -> None:
-        for name, model in kwargs.items():
-            mlflow.pytorch.log_state_dict(model.state_dict(), artifact_path=f"{name}{suffix}")
+    def _get_state_dict(**kwargs: torch.nn.Module) -> dict[str, Any]:
+        return {n: m.state_dict() for n, m in kwargs.items()}
 
     def _create_criterion_callback(name: str, mode: Literal["min", "max"]) -> Callback[torch.nn.Module]:
         on_best: list[Any] = [lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
         if name in save_criteria:
-            on_best.append(lambda i, t, v, **m: _save_fn(i, suffix="_best", **m))  # type: ignore[arg-type]
+            on_best.append(lambda i, t, v, **m: mlflow.pytorch.log_state_dict(_get_state_dict(**m), f"{t}_best"))  # type: ignore[arg-type]
         return BestCriterion[torch.nn.Module](target=name, mode=mode, on_best=on_best)
 
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
@@ -401,7 +400,7 @@ def train(  # noqa: PLR0913,PLR0915
         if ema is None
         else torch_trainer.TimmEmaWrapper.from_models(
             models,
-            callbacks=[partial(_save_fn, suffix="_ema")],
+            callbacks=[lambda i, **m: mlflow.pytorch.log_state_dict(_get_state_dict(**m), "ema")],  # type: ignore[list-item]
             device=torch.device(ema_device or device),
             **instantiator.instantiate(ema),
         ),
@@ -431,11 +430,13 @@ def train(  # noqa: PLR0913,PLR0915
         trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
 
     def _save_training_state(info: BaseInfo, **kwargs: torch.nn.Module) -> None:
-        states: dict[str, Any] = {"models": {n: m.state_dict() for n, m in kwargs.items()}}
         backward = cast(torch_trainer.TorchTrainer, info).backward
-        states["optimizers"] = getattr(backward, "optimizer_state_dicts", None) or {}
-        states["grad_scalers"] = getattr(backward, "grad_scaler_state_dicts", None) or {}
-        states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
+        states: dict[str, Any] = {
+            "models": _get_state_dict(**kwargs),
+            "optimizers": _get_state_dict(**getattr(backward, "optimizers", {})),
+            "grad_scalers": _get_state_dict(**getattr(backward, "grad_scalers", {})),
+            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
+        }
         mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
 
     trainer.on_epoch_end.append(_save_training_state)

@@ -129,14 +129,6 @@ class {self.classname}:
             return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
 
         return {{k: _get_param_groups(v) for k, v in self.optimizers.items()}}
-
-    @property
-    def optimizer_state_dicts(self):
-        return {{k: v.state_dict() for k, v in self.optimizers.items()}}
-
-    @property
-    def grad_scaler_state_dicts(self):
-        return {{k: v.state_dict() for k, v in self.grad_scalers.items()}}
 """
         return [res]
 
