@@ -5,11 +5,11 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from structcast.utils.base import load_yaml_from_string
+from structcast.utils.base import dump_yaml_to_string, load_yaml_from_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo, BestCriterion, Callback, get_dataset_size
+from structcast_model.base_trainer import BaseInfo, get_dataset_size
 from structcast_model.commands.utils import bool_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
 
 if TYPE_CHECKING:
@@ -318,13 +318,6 @@ def train(  # noqa: PLR0913,PLR0915
 ) -> None:
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    configure_security(allowed_modules_check=False)
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision(matmul_precision)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    input_shapes = reduce_dict(shapes)
-    device = torch_trainer.get_torch_device(device)
 
     def _compile_fn(module: torch.nn.Module, compile_kw: dict[str, Any] | None) -> torch.nn.Module:
         return module if compile_kw is None else torch.compile(module, **compile_kw)
@@ -348,24 +341,13 @@ def train(  # noqa: PLR0913,PLR0915
             f'Please provide default outputs using the "--{name}-outputs" option.'
         )
 
-    def _to_numpy(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {k: _to_numpy(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [_to_numpy(v) for v in value]
-        if torch.is_tensor(value):
-            value = value.detach().numpy() if device == "cpu" else value.detach().cpu().numpy()
-            return value if value.shape else value.reshape(1)
-        return value
-
-    def _log_criteria(info: BaseInfo, **_: torch.nn.Module) -> str:
-        """Format the criteria."""
-        lrs = getattr(cast(torch_trainer.TorchTrainer, info).backward, "learning_rates", None) or {}
-        logs = info.logs()
-        values = "\n\t".join([f"{k}: {v:.4e}" for k, v in {**logs, **lrs}.items()])
-        mlflow.log_metrics({**logs, **lrs}, step=info.epoch)
-        return f"Epoch {info.epoch}:\n\t{values}"
-
+    configure_security(allowed_modules_check=False)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision(matmul_precision)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    input_shapes = reduce_dict(shapes)
+    device = torch_trainer.get_torch_device(device)
     compile_fn = partial(_compile_fn, compile_kw=instantiator.instantiate(compile_pattern))
     training_dataset = _instantiate(training_dataset_pattern)
     validation_dataset = _instantiate(validation_dataset_pattern) if validation_dataset_pattern else None
@@ -383,16 +365,6 @@ def train(  # noqa: PLR0913,PLR0915
         metric_outputs = _check_module_outputs(metric, metric_outputs, "metric") if metric else None
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
-
-    def _get_state_dict(**kwargs: torch.nn.Module) -> dict[str, Any]:
-        return {n: m.state_dict() for n, m in kwargs.items()}
-
-    def _create_criterion_callback(name: str, mode: Literal["min", "max"]) -> Callback[torch.nn.Module]:
-        on_best: list[Any] = [lambda i, t, v, **m: mlflow.log_metric(f"{t}_best", v, step=i.epoch)]  # type: ignore[arg-type]
-        if name in save_criteria:
-            on_best.append(lambda i, t, v, **m: mlflow.pytorch.log_state_dict(_get_state_dict(**m), f"{t}_best"))  # type: ignore[arg-type]
-        return BestCriterion[torch.nn.Module](target=name, mode=mode, on_best=on_best)
-
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
     step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
     trainer = torch_trainer.TorchTrainer(
@@ -400,7 +372,6 @@ def train(  # noqa: PLR0913,PLR0915
         if ema is None
         else torch_trainer.TimmEmaWrapper.from_models(
             models,
-            callbacks=[lambda i, **m: mlflow.pytorch.log_state_dict(_get_state_dict(**m), "ema")],  # type: ignore[list-item]
             device=torch.device(ema_device or device),
             **instantiator.instantiate(ema),
         ),
@@ -409,6 +380,13 @@ def train(  # noqa: PLR0913,PLR0915
         backward=backward,
         tracker=tracker,
     )
+
+    def _log_criteria(info: BaseInfo, **_: torch.nn.Module) -> str:
+        """Format the criteria."""
+        values = {**getattr(cast(torch_trainer.TorchTrainer, info).backward, "learning_rates", {}), **info.logs()}
+        mlflow.log_metrics(values, step=info.epoch)
+        return f"epoch: {info.epoch}\n{dump_yaml_to_string(values)}"
+
     if ci:
         trainer.on_epoch_end.append(lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
     else:
@@ -429,19 +407,35 @@ def train(  # noqa: PLR0913,PLR0915
         trainer.on_validation_end.append(lambda **_: pbar.refresh())  # type: ignore[arg-type]
         trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
 
+    def _get_state_dict(**kwargs: torch.nn.Module) -> dict[str, Any]:
+        return {n: m.state_dict() for n, m in kwargs.items()}
+
+    def _on_best(info: BaseInfo, target: str, value: float, save: bool, **kwargs: torch.nn.Module) -> None:
+        mlflow.log_metric(f"{target}_best", value, step=info.epoch)
+        if save:
+            mlflow.pytorch.log_state_dict(_get_state_dict(**kwargs), f"{target}_best")
+
     def _save_training_state(info: BaseInfo, **kwargs: torch.nn.Module) -> None:
         backward = cast(torch_trainer.TorchTrainer, info).backward
+        wrapper = cast(torch_trainer.TorchTrainer, info).inference_wrapper
         states: dict[str, Any] = {
             "models": _get_state_dict(**kwargs),
             "optimizers": _get_state_dict(**getattr(backward, "optimizers", {})),
             "grad_scalers": _get_state_dict(**getattr(backward, "grad_scalers", {})),
             "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
         }
+        if wrapper is not None:
+            states["ema"] = _get_state_dict(**cast(torch_trainer.TimmEmaWrapper, wrapper).models)
         mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
 
     trainer.on_epoch_end.append(_save_training_state)
-    trainer.on_epoch_end += [_create_criterion_callback(n, mode="max") for n in higher_criteria]
-    trainer.on_epoch_end += [_create_criterion_callback(n, mode="min") for n in lower_criteria]
+    trainer.on_epoch_end += [
+        torch_trainer.TorchBestCriterion(target=n, mode="max", on_best=[partial(_on_best, save=n in save_criteria)])
+        for n in higher_criteria
+    ] + [
+        torch_trainer.TorchBestCriterion(target=n, mode="min", on_best=[partial(_on_best, save=n in save_criteria)])
+        for n in lower_criteria
+    ]
     model_parameters = {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()}
     arguments = {
         **reduce_dict(log_arguments),
