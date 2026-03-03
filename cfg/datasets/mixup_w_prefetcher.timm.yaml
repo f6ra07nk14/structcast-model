@@ -16,7 +16,7 @@ PARAMETERS:
     re_count: 1 # Random erase count
     re_split: false # Random erase split
     class_map: null
-    dataset_download: false
+    download: false
     seed: 42
     repeats: 0.0
     input_key: null
@@ -64,7 +64,7 @@ _obj_:
     - - _obj_
       - {_addr_: structcast.core.specifier.FlexSpec}
       - {_attr_: model_validate}
-      - {_call_: {"image": "0", "label": 1}}
+      - {_call_: {"image": "0", "label": "1"}}
     - - _obj_
       - _addr_: timm.data.create_loader
       - _call_:
@@ -76,7 +76,7 @@ _obj_:
                   name: {{dataset}}
                   root: {{dataset_dir}} 
                   class_map: {{class_map}}
-                  download: {{dataset_download}}
+                  download: {{download}}
                   batch_size: {{batch_size}}
                   seed: {{seed}}
                   repeats: {{repeats}}
