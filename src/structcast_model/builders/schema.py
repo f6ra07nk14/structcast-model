@@ -59,6 +59,13 @@ class UserLayer(Serializable):
     """Parameters for template formatting."""
 
 
+def _validate_name(data: str | None) -> str | None:
+    """Validate the layer name."""
+    if data and not data.isidentifier():
+        raise SpecError(f"NAME must be a valid identifier but got: {data!r}.")
+    return data
+
+
 class LayerBehavior(Serializable):
     """Layer behavior configuration."""
 
@@ -93,6 +100,12 @@ class LayerBehavior(Serializable):
                 raise SpecError(f"LayerBehavior tuple/list must have 2, 3, or 4 elements but got: {raw}.")
             return {"INPUTS": inp, "OUTPUTS": out, "NAME": name, "LAYER": layer}
         return raw
+
+    @field_validator("NAME", mode="after")
+    @classmethod
+    def _validate_name(cls, data: str | None) -> str | None:
+        """Validate the layer name."""
+        return _validate_name(data)
 
     @model_serializer(mode="wrap")
     def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
@@ -313,6 +326,12 @@ class OptimizerBehavior(Serializable):
         """Validate the trainable layers."""
         return check_elements(data)
 
+    @field_validator("NAME", mode="after")
+    @classmethod
+    def _validate_name(cls, data: str | None) -> str | None:
+        """Validate the layer name."""
+        return _validate_name(data)
+
     @field_validator("LAYERS", mode="after")
     @classmethod
     def _validate_trainable_layers_legal(cls, data: list[str]) -> list[str]:
@@ -372,6 +391,12 @@ class BackwardBehavior(WithExtra):
                 raise SpecError(f"The tuple/list for BackwardBehavior must have 2, 3, or 4 elements but got: {raw}.")
             return {"NAME": name, "LOSS": loss, "OPTIMIZERS": opts, **others}
         return raw
+
+    @field_validator("NAME", mode="after")
+    @classmethod
+    def _validate_name(cls, data: str | None) -> str | None:
+        """Validate the layer name."""
+        return _validate_name(data)
 
     @model_serializer(mode="wrap")
     def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
