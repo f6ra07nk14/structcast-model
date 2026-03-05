@@ -379,6 +379,9 @@ class TimmDataLoaderWrapper(WithExtra):
     dataset: TimmDatasetWrapper = Field(default_factory=TimmDatasetWrapper)
     """The dataset to create the data loader for."""
 
+    channels_last: bool = False
+    """Use channels_last memory format for inputs."""
+
     # for mixup
 
     use_prefetcher: bool = True
@@ -402,14 +405,14 @@ class TimmDataLoaderWrapper(WithExtra):
     mixup_mode: Literal["batch", "pair", "elem"] = "batch"
     """Mode of applying mixup or cutmix."""
 
+    mixup_off_epoch: int = 0
+    """Turn off mixup after this epoch, disabled if 0 (default: 0)"""
+
     label_smoothing: float = 0.0
     """Label smoothing value."""
 
     num_classes: int = 1000
     """Number of label classes in dataset."""
-
-    channels_last: bool = False
-    """Use channels_last memory format for inputs."""
 
     # for create_loader
 
@@ -500,9 +503,6 @@ class TimmDataLoaderWrapper(WithExtra):
 
     worker_seeding: Literal["all", "part"] = "all"
     """Control worker random seeding at init."""
-
-    mixup_off_epoch: int = 0
-    """Turn off mixup after this epoch, disabled if 0 (default: 0)"""
 
     # only for validation / is_training=False kwargs:
 
