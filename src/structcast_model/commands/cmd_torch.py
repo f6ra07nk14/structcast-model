@@ -357,7 +357,7 @@ def train(  # noqa: PLR0913,PLR0915
     print(f"Training dataset size: {steps_per_epoch} steps.")
     print(f"Validation dataset size: {validation_steps} steps.")
     with torch.device(device):
-        models, inputs, outputs = torch_trainer.initial_model(_init_models(model_patterns), input_shapes)
+        models, _, _ = torch_trainer.initial_model(_init_models(model_patterns), input_shapes)
         loss = compile_fn(_instantiate(loss_pattern))
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         backward = _instantiate(backward_pattern)(**models)
