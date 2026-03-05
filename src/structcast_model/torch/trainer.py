@@ -1,6 +1,6 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from functools import partial
@@ -8,10 +8,8 @@ from logging import getLogger
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
-from timm.data import Mixup
 from timm.utils import ModelEmaV3
 from torch.nn import Module
-from torch.utils.data import DataLoader
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
@@ -254,61 +252,9 @@ class TorchBestCriterion(BestCriterion[Module]):
     """A callback to track the best criterion during training or validation for PyTorch models."""
 
 
-@dataclass(kw_only=True, slots=True)
-class _LoaderWrapper:
-    """A wrapper for the data loader that moves the data to the specified device and dtype."""
-
-    loader: DataLoader
-    """The data loader."""
-
-    def __len__(self) -> int:
-        """Return the number of batches in the data loader."""
-        return len(self.loader)
-
-    def __getattribute__(self, name) -> Any:
-        loader = super(_LoaderWrapper, self).__getattribute__("loader")
-        return loader if name == "loader" else loader.__getattribute__(name)
-
-
-@dataclass(kw_only=True, slots=True)
-class TimmLoaderWrapper(_LoaderWrapper):
-    """A wrapper for the data loader that applies mixup and moves the data to the specified device and dtype."""
-
-    mixup: Mixup
-    """The mixup function."""
-
-    device: str
-    """The device to move the data to."""
-
-    dtype: str
-    """The data type to move the data to."""
-
-    def __iter__(self) -> Iterable[dict[str, Any]]:
-        """Iterate over the data loader and yield the data with the corresponding names."""
-        device, dtype, mixup = get_torch_device(self.device), DTYPES[self.dtype], self.mixup
-        for input, target in self.loader:
-            input, target = input.to(device=device, dtype=dtype), target.to(device=device)
-            yield mixup(input, target)
-
-
-@dataclass(kw_only=True, slots=True)
-class NamedData(_LoaderWrapper):
-    """A wrapper for the data loader that yields the data with the corresponding names."""
-
-    names: list[str]
-    """The names of the data."""
-
-    def __iter__(self) -> Iterable[dict[str, Any]]:
-        """Iterate over the data loader and yield the data with the corresponding names."""
-        for data in self.loader:
-            yield dict(zip(self.names, data, strict=True))
-
-
 __all__ = [
     "CriteriaTracker",
-    "NamedData",
     "TimmEmaWrapper",
-    "TimmLoaderWrapper",
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
