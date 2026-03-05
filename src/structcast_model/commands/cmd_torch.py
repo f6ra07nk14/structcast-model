@@ -368,6 +368,7 @@ def train(  # noqa: PLR0913,PLR0915
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
     step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
     trainer = torch_trainer.TorchTrainer(
+        device=device,
         inference_wrapper=None
         if ema is None
         else torch_trainer.TimmEmaWrapper.from_models(

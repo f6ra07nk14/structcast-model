@@ -183,6 +183,9 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     history: dict[int, dict[str, Any]] = field(default_factory=dict)
     """History of training and validation logs."""
 
+    def sync(self) -> None:
+        """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
+
     def train(self, dataset: DatasetLike | Callable[[], DatasetLike], **models: ModelT_contra) -> Mapping[str, Any]:
         """Train the model on the given dataset.
 
@@ -202,6 +205,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             elapsed_time -= time()
             criteria = training_step(inputs, **models)
             should_update = backward(self.step, **criteria)
+            self.sync()
             elapsed_time += time()
             logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.training_prefix:
@@ -236,6 +240,7 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
             criteria = validation_step(data, **models)
+            self.sync()
             elapsed_time += time()
             logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.validation_prefix:

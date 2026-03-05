@@ -122,6 +122,7 @@ class TrainingStep:
     """A training step for a PyTorch model."""
 
     models: list[str]
+    """The names of the models to use for the training step."""
 
     losses: Module
     """A module that computes the losses for the model."""
@@ -258,6 +259,14 @@ class TimmEmaWrapper:
 @dataclass(kw_only=True)
 class TorchTrainer(BaseTrainer[Module]):
     """Trainer for PyTorch models."""
+
+    device: str
+    """Device to run the model on, e.g., 'cuda' or 'cpu'."""
+
+    def sync(self) -> None:
+        """Synchronize the device if it is a CUDA device."""
+        if "cuda" in self.device:
+            cuda.synchronize()
 
 
 @dataclass(kw_only=True, slots=True)
