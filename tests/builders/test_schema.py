@@ -1,13 +1,17 @@
 """API-level tests for builder schema models."""
 
+from typing import Any
+
 from pydantic import ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
+from structcast.utils.security import register_dir, unregister_dir
 
 from structcast_model.builders.schema import (
     BackwardBehavior,
     LayerBehavior,
     OptimizerBehavior,
+    Template,
     TemplateBackward,
     TemplateLayer,
     UserDefinedBackward,
@@ -209,3 +213,110 @@ def test_template_layer_call_with_merged_false_and_none_parameters() -> None:
     built = TemplateLayer.model_validate(raw)(None, merged=False)
     assert isinstance(built, UserDefinedLayer)
     assert built.FLOW[0].LAYER is not None
+
+
+# ---------------------------------------------------------------------------
+# _validate_name – invalid identifier
+# ---------------------------------------------------------------------------
+
+
+def test_validate_name_raises_for_invalid_identifier() -> None:
+    """NAME with spaces or non-identifier chars raises SpecError."""
+    with pytest.raises((SpecError, ValidationError)):
+        LayerBehavior.model_validate({"INPUTS": "x", "OUTPUTS": "y", "NAME": "not valid!"})
+
+
+def test_validate_name_raises_via_optimizer_behavior() -> None:
+    """OptimizerBehavior NAME with invalid identifier raises SpecError."""
+    with pytest.raises((SpecError, ValidationError)):
+        OptimizerBehavior.model_validate(
+            {"NAME": "123invalid", "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]}, "LAYERS": ["model"]}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Instance passthrough – OptimizerBehavior and BackwardBehavior
+# ---------------------------------------------------------------------------
+
+
+def test_optimizer_behavior_instance_passthrough() -> None:
+    """Passing an existing OptimizerBehavior to model_validate returns it unchanged."""
+    raw = {"OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]}, "LAYERS": ["model"]}
+    ob = OptimizerBehavior.model_validate(raw)
+    assert OptimizerBehavior.model_validate(ob) is ob
+
+
+def test_backward_behavior_instance_passthrough() -> None:
+    """Passing an existing BackwardBehavior to model_validate returns it unchanged."""
+    raw = {
+        "LOSS": "ce_loss",
+        "OPTIMIZERS": [{"OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]}, "LAYERS": ["model"]}],
+    }
+    bb = BackwardBehavior.model_validate(raw)
+    assert BackwardBehavior.model_validate(bb) is bb
+
+
+# ---------------------------------------------------------------------------
+# UserDefinedBackward – MIXED_PRECISION without type raises
+# ---------------------------------------------------------------------------
+
+
+def test_user_defined_backward_mixed_precision_without_type_raises() -> None:
+    """MIXED_PRECISION=True without MIXED_PRECISION_TYPE raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "ce_loss",
+                "OPTIMIZERS": [{"OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]}, "LAYERS": ["model"]}],
+            }
+        ],
+        "MIXED_PRECISION": True,
+    }
+    with pytest.raises((SpecError, ValidationError)):
+        UserDefinedBackward.model_validate(raw)
+
+
+def test_user_defined_backward_mixed_precision_dict_without_type_raises() -> None:
+    """MIXED_PRECISION dict without MIXED_PRECISION_TYPE raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "ce_loss",
+                "OPTIMIZERS": [{"OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]}, "LAYERS": ["model"]}],
+            }
+        ],
+        "MIXED_PRECISION": {"enabled": True},
+    }
+    with pytest.raises((SpecError, ValidationError)):
+        UserDefinedBackward.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# Template.from_path
+# ---------------------------------------------------------------------------
+
+
+def test_template_from_path_loads_yaml_file(tmp_path: Any) -> None:
+    """Template.from_path can load a simple YAML file."""
+    register_dir(tmp_path)
+    try:
+        cfg = tmp_path / "simple.yaml"
+        cfg.write_text("key: value\ncount: 42\n")
+        tmpl = Template.from_path(cfg)
+        assert isinstance(tmpl, Template)
+    finally:
+        unregister_dir(tmp_path)
+
+
+def test_template_raw_and_others_for_with_extra_target(tmp_path: Any) -> None:
+    """When target_type is WithExtra, _raw_and_others returns all fields in raw."""
+    register_dir(tmp_path)
+    try:
+        cfg = tmp_path / "extra.yaml"
+        cfg.write_text("foo: 1\nbar: 2\n")
+        tmpl = Template.from_path(cfg)
+        # Template.target_type defaults to WithExtra, so all extra fields land in raw
+        assert "foo" in tmpl.raw
+        assert tmpl.others == {}
+    finally:
+        unregister_dir(tmp_path)

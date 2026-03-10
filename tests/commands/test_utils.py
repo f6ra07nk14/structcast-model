@@ -3,7 +3,13 @@
 import pydantic
 import pytest
 
-from structcast_model.commands.utils import dict_parser, reduce_dict, tensor_shape_parser
+from structcast_model.commands.utils import (
+    bool_or_path_or_dict_parser,
+    dict_parser,
+    path_or_any_parser,
+    reduce_dict,
+    tensor_shape_parser,
+)
 
 # ---------------------------------------------------------------------------
 # reduce_dict
@@ -106,3 +112,57 @@ def test_tensor_shape_parser_scalar_raises() -> None:
     """A scalar value (not a sequence or mapping) raises a ValueError."""
     with pytest.raises((ValueError, pydantic.ValidationError)):
         tensor_shape_parser("image: not_a_shape")
+
+
+# ---------------------------------------------------------------------------
+# path_or_any_parser
+# ---------------------------------------------------------------------------
+
+
+def test_path_or_any_parser_empty_string_returns_none() -> None:
+    """Empty string returns None."""
+    assert path_or_any_parser("") is None
+
+
+def test_path_or_any_parser_yaml_dict_returns_dict() -> None:
+    """A YAML dict string is returned directly as a dict."""
+    result = path_or_any_parser("{key: value, count: 1}")
+    assert result == {"key": "value", "count": 1}
+
+
+def test_path_or_any_parser_inline_mapping_returns_dict() -> None:
+    """Inline YAML mapping is returned as a dict."""
+    result = path_or_any_parser("a: 1\nb: 2")
+    assert result == {"a": 1, "b": 2}
+
+
+# ---------------------------------------------------------------------------
+# bool_or_path_or_dict_parser
+# ---------------------------------------------------------------------------
+
+
+def test_bool_or_path_or_dict_parser_empty_string_returns_none() -> None:
+    """Empty string returns None."""
+    assert bool_or_path_or_dict_parser("") is None
+
+
+def test_bool_or_path_or_dict_parser_true_returns_empty_dict() -> None:
+    """YAML 'true' returns an empty dict (enables feature with defaults)."""
+    assert bool_or_path_or_dict_parser("true") == {}
+
+
+def test_bool_or_path_or_dict_parser_false_returns_none() -> None:
+    """YAML 'false' returns None (disables feature)."""
+    assert bool_or_path_or_dict_parser("false") is None
+
+
+def test_bool_or_path_or_dict_parser_dict_yaml_returns_dict() -> None:
+    """A YAML dict string is returned directly as a dict."""
+    result = bool_or_path_or_dict_parser("{decay: 0.9, warmup: 5}")
+    assert result == {"decay": 0.9, "warmup": 5}
+
+
+def test_bool_or_path_or_dict_parser_multiline_dict_yaml() -> None:
+    """A multiline YAML mapping string is parsed into a dict."""
+    result = bool_or_path_or_dict_parser("lr: 0.01\nmomentum: 0.9")
+    assert result == {"lr": 0.01, "momentum": 0.9}

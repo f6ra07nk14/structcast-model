@@ -234,3 +234,21 @@ def test_base_backward_builder_mixed_precision_default_raises() -> None:
     raw = {"BACKWARDS": [["loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]]}
     with pytest.raises(NotImplementedError, match="_get_mixed_precision"):
         _NoMixedPrecisionBuilder(raw=raw)()
+
+
+# ---------------------------------------------------------------------------
+# _Intermediate._get_scripts raises NotImplementedError (line 190)
+# ---------------------------------------------------------------------------
+
+
+def test_intermediate_get_scripts_raises_not_implemented() -> None:
+    """_Intermediate._get_scripts must be overridden; calling it bare raises."""
+    # LazySelectedImporter only exposes __all__; get _Intermediate via function globals.
+    _Intermediate = resolve_object.__globals__["_Intermediate"]  # noqa: N806
+
+    class _BareIntermediate(_Intermediate):  # type: ignore[misc, valid-type]
+        """Subclass that does NOT override _get_scripts."""
+
+    inter = _BareIntermediate(classname="Test", imports={})
+    with pytest.raises(NotImplementedError, match="_get_scripts"):
+        inter._get_scripts()
