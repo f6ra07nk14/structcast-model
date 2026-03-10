@@ -10,7 +10,7 @@ from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
 from structcast_model.base_trainer import BaseInfo, get_dataset_size
-from structcast_model.commands.utils import bool_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
+from structcast_model.commands.utils import bool_or_path_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
 
 if TYPE_CHECKING:
     import calflops
@@ -185,8 +185,8 @@ def call_calflops(
 
 @app.command()
 def train(  # noqa: PLR0913,PLR0915
-    model_patterns: list[dict] = Argument(
-        parser=dict_parser,
+    model_patterns: list = Argument(
+        parser=load_yaml_from_string,
         help="The object patterns used to instantiate models. "
         "For example, if the model is defined as `model_name = my_package.MyModel(...)`, then the pattern should be "
         '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -196,18 +196,19 @@ def train(  # noqa: PLR0913,PLR0915
     device: str | None = device,
     ema: dict[str, Any] | None = Option(
         None,
-        parser=bool_or_dict_parser,
+        parser=bool_or_path_or_dict_parser,
         help="Whether to use EMA (Exponential Moving Average) for the model during training. "
-        "Can be set to true/false or a dictionary of keyword arguments for the EMA wrapper (e.g., decay rate).",
+        "Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments "
+        "for the EMA wrapper (e.g., decay rate).",
     ),
     ema_device: str | None = Option(
         None, help="Device for the EMA model. If not specified, it will use the same device as the main model."
     ),
-    loss_pattern: dict[str, Any] = Option(
+    loss_pattern: Any = Option(
         ...,
         "--loss",
         "-l",
-        parser=dict_parser,
+        parser=load_yaml_from_string,
         help="The object pattern used to instantiate the loss module. "
         "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -219,11 +220,11 @@ def train(  # noqa: PLR0913,PLR0915
         "-LO",
         help="Default outputs for the loss module if it doesn't have an 'outputs' attribute.",
     ),
-    metric_pattern: dict[str, Any] | None = Option(
+    metric_pattern: Any | None = Option(
         None,
         "--metric",
         "-m",
-        parser=dict_parser,
+        parser=load_yaml_from_string,
         help="The object pattern used to instantiate the metric module. "
         "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -235,11 +236,11 @@ def train(  # noqa: PLR0913,PLR0915
         "-MO",
         help="Default outputs for the metric module if it doesn't have an 'outputs' attribute.",
     ),
-    backward_pattern: dict[str, Any] | None = Option(
+    backward_pattern: Any = Option(
         ...,
         "--backward",
         "-b",
-        parser=dict_parser,
+        parser=load_yaml_from_string,
         help="The object pattern used to instantiate the backward class. "
         "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -254,27 +255,27 @@ def train(  # noqa: PLR0913,PLR0915
         None,
         "--compile",
         "-c",
-        parser=bool_or_dict_parser,
+        parser=bool_or_path_or_dict_parser,
         help='Whether to compile the model using "torch.compile". '
-        'Can be set to true/false or a dictionary of keyword arguments for "torch.compile".',
+        'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
-    training_dataset_pattern: dict[str, Any] = Option(
+    training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
         "-t",
-        parser=dict_parser,
+        parser=load_yaml_from_string,
         help="The object pattern used to instantiate the training dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
     ),
-    validation_dataset_pattern: dict[str, Any] | None = Option(
+    validation_dataset_pattern: Any | None = Option(
         None,
         "--validation-dataset",
         "-v",
-        parser=dict_parser,
+        parser=load_yaml_from_string,
         help="The object pattern used to instantiate the validation dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '

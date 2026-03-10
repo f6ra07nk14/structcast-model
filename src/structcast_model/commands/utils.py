@@ -6,10 +6,13 @@ from structcast.utils.base import load_yaml_from_string
 
 if TYPE_CHECKING:
     import pydantic
+
+    from structcast_model.utils import base
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     pydantic = LazyModuleImporter("pydantic")
+    base = LazyModuleImporter("structcast_model.utils.base")
 
 
 def reduce_dict(params: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -22,12 +25,16 @@ def dict_parser(value: str) -> dict[str, Any]:
     return pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value)) if value else {}
 
 
-def bool_or_dict_parser(value: str) -> dict[str, Any] | None:
-    """Parse a YAML string into a boolean or a dictionary."""
+def bool_or_path_or_dict_parser(value: str) -> dict[str, Any] | None:
+    """Parse a YAML string into a boolean, a path, or a dictionary."""
     if not value:
         return None
-    data = pydantic.TypeAdapter(bool | dict[str, Any]).validate_python(load_yaml_from_string(value))
-    return ({} if data else None) if isinstance(data, bool) else data
+    data = pydantic.TypeAdapter(bool | str | dict[str, Any]).validate_python(load_yaml_from_string(value))
+    if isinstance(data, bool):
+        return {} if data else None
+    if isinstance(data, str):
+        return base.load_any(data) if data else None
+    return data
 
 
 def tensor_shape_parser(value: str) -> dict[str, Any]:
@@ -47,7 +54,7 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
     return _check(pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
 
 
-__all__ = ["bool_or_dict_parser", "dict_parser", "reduce_dict", "tensor_shape_parser"]
+__all__ = ["bool_or_path_or_dict_parser", "dict_parser", "reduce_dict", "tensor_shape_parser"]
 
 
 if not TYPE_CHECKING:
