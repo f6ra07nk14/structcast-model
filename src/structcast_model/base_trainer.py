@@ -25,7 +25,7 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
     """Get the size of the dataset."""
     dataset = get_dataset(dataset)
     if hasattr(dataset, "__len__"):
-        return len(dataset)
+        return dataset.__len__()
     return sum(1 for _ in dataset)
 
 
