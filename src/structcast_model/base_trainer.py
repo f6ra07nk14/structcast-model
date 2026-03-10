@@ -1,6 +1,6 @@
 """Base trainer for training a model."""
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from logging import getLogger
 from math import inf
@@ -24,7 +24,7 @@ def get_dataset(dataset: DatasetLike | Callable[[], DatasetLike]) -> Iterable[di
 def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
     """Get the size of the dataset."""
     dataset = get_dataset(dataset)
-    if isinstance(dataset, Sequence):
+    if hasattr(dataset, "__len__"):
         return len(dataset)
     return sum(1 for _ in dataset)
 
