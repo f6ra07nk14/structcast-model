@@ -1,0 +1,9 @@
+# More details about EMA (Exponential Moving Average) settings can be found in "timm.utils.ModelEmaV3"
+decay: 0.9999
+min_decay: 0.0
+update_after_step: 0
+use_warmup: false
+warmup_gamma: 1.0
+# warmup_power: 2/3
+foreach: true
+exclude_buffers: false
