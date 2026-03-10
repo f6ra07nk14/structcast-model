@@ -264,13 +264,17 @@ class TimmEmaWrapper:
         Returns:
             A TimmEmaWrapper instance with the specified EMA models and callbacks.
         """
+
+        def _get_device(model: torch.nn.Module) -> str:
+            return next(model.parameters()).device.type
+
         ema, is_cross_device = {}, {}
         for name, model in models.items():
             ema_model = ModelEmaV3(model, device=device, **kwargs)
             if compile_fn is not None:
                 ema_model = compile_fn(ema_model)
             ema[name] = ema_model
-            is_cross_device[name] = device in next(model.parameters()).device.type
+            is_cross_device[name] = _get_device(model) != _get_device(ema_model.module)
         return cls(ema=ema, is_cross_device=is_cross_device)
 
 
