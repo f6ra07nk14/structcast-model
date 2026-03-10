@@ -245,13 +245,20 @@ class TimmEmaWrapper:
 
     @classmethod
     def from_models(
-        cls, models: dict[str, torch.nn.Module], device: torch.device | None = None, **kwargs: Any
+        cls,
+        models: dict[str, torch.nn.Module],
+        device: torch.device | None = None,
+        compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
+        **kwargs: Any,
     ) -> "TimmEmaWrapper":
         """Create a TimmEmaWrapper from the given models.
 
         Args:
             models (dict[str, torch.nn.Module]): The models to create the EMA wrapper for.
-            device (torch.device | None): The device to move the EMA models to. If None, the EMA models will not be moved.
+            device (torch.device | None): The device to move the EMA models to.
+                If None, the EMA models will not be moved.
+            compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
+                An optional function to compile the EMA models.
             **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
 
         Returns:
@@ -259,7 +266,10 @@ class TimmEmaWrapper:
         """
         ema, is_cross_device = {}, {}
         for name, model in models.items():
-            ema[name] = ModelEmaV3(model, device=device, **kwargs)
+            ema_model = ModelEmaV3(model, device=device, **kwargs)
+            if compile_fn is not None:
+                ema_model = compile_fn(ema_model)
+            ema[name] = ema_model
             is_cross_device[name] = device in next(model.parameters()).device.type
         return cls(ema=ema, is_cross_device=is_cross_device)
 

@@ -380,6 +380,7 @@ def train(  # noqa: PLR0913,PLR0915
         if ema is None
         else torch_trainer.TimmEmaWrapper.from_models(
             models,
+            compile_fn=compile_fn,
             device=torch.device(ema_device or device),
             **instantiator.instantiate(ema),
         ),
