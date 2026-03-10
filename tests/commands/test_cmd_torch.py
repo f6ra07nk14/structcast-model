@@ -155,6 +155,7 @@ def test_ptflops_calls_instantiate(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
+    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = ("1.0 GMac", "1.0 M")
     with patch_cmd_globals(
@@ -173,6 +174,7 @@ def test_ptflops_prints_flops_and_params(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
+    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = ("2.5 GMac", "3.0 M")
     with patch_cmd_globals(
@@ -193,6 +195,7 @@ def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
+    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = (None, None)
     with patch_cmd_globals(
@@ -215,6 +218,7 @@ def test_calflops_calls_instantiate(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
+    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("1.0 GFLOPs", "500 MMac", "1.0 M")
     with patch_cmd_globals(
@@ -233,6 +237,7 @@ def test_calflops_prints_flops_macs_params(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
+    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("4.2 GFLOPs", "2.1 GMac", "5.0 M")
     with patch_cmd_globals(

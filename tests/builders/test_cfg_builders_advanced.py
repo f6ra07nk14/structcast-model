@@ -37,7 +37,8 @@ def test_cfg_convnext_backward_supports_accumulation_and_mp() -> None:
     assert built.accumulate_gradients == 4
     assert "optimizer" in built.optimizers
     assert "torch.amp.GradScaler(" in script
-    assert "(ce_loss / 4).backward(" in script
+    assert "ce_loss = ce_loss / 4" in script
+    assert "self.optimizer_scaler.scale(ce_loss).backward()" in script
     assert "return should_update" in script
 
 

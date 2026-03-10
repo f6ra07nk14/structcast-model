@@ -77,7 +77,8 @@ def test_torch_backward_builder_renders_accumulation_script() -> None:
     }
     backward = TorchBackwardBuilder(raw=raw)(classname="Backward")
     script = backward.scripts[0]
-    assert "(ce_loss / 2).backward(" in script
+    assert "ce_loss = ce_loss / 2" in script
+    assert "self.optimizer_scaler.scale(ce_loss).backward()" in script
     assert "should_update = (step + 1) % 2 == 0" in script
     assert "self.optimizer_scaler.unscale_(self.optimizer)" in script
     assert "self.optimizer_clip(" in script
