@@ -21,20 +21,19 @@ from timm.data import (
 )
 from timm.utils import ModelEmaV3
 from timm.utils.distributed import init_distributed_device_so
-from torch.nn import Module
 from torch.utils.data import DataLoader
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor
-from torch import autocast, bfloat16, channels_last, cuda, device, float16, float32, no_grad, rand
+import torch
 
 logger = getLogger(__name__)
 
 DTYPES = {
-    "float32": float32,
-    "float16": float16,
-    "bfloat16": bfloat16,
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
 }
 
 T = TypeVar("T")
@@ -43,7 +42,7 @@ T = TypeVar("T")
 def create_torch_inputs(shape: Any) -> Any:
     """Create dummy inputs based on the provided shape."""
     try:
-        return rand((1, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=float32)
+        return torch.rand((1, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=torch.float32)
     except ValidationError:
         pass
     if isinstance(shape, dict):
@@ -56,10 +55,10 @@ def create_torch_inputs(shape: Any) -> Any:
 def get_torch_device(device: str | None = None) -> str:
     """Get the device to run the model on."""
     if device is None:
-        return "cuda" if cuda.is_available() else "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
     if device not in ["cpu", "cuda"]:
         raise ValueError(f'Only "cpu" and "cuda" are supported. Got invalid device: {device}')
-    if device == "cuda" and not cuda.is_available():
+    if device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA is not available. Using CPU instead.")
         return "cpu"
     return device
@@ -68,7 +67,7 @@ def get_torch_device(device: str | None = None) -> str:
 def initial_model(
     model: T,
     shapes: dict[str, Any] | None = None,
-    compile_fn: Callable[[Module], Module] | None = None,
+    compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
 ) -> tuple[T, Any, Any]:
     """Initialize the model by creating dummy inputs based on the provided shapes and running a forward pass.
 
@@ -76,8 +75,8 @@ def initial_model(
         model (T): The model to initialize. Can be any nested structure containing PyTorch modules.
         shapes (dict[str, Any] | None): A dictionary mapping module names to their input shapes.
             If None, the model will not be initialized with dummy inputs.
-        compile_fn (Callable[[Module], Module] | None): An optional function to compile the model after initialization.
-            If None, the model will not be compiled.
+        compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
+            An optional function to compile the model after initialization. If None, the model will not be compiled.
 
     Returns:
         A tuple containing the initialized (and optionally compiled) model, the dummy inputs used for initialization,
@@ -87,7 +86,7 @@ def initial_model(
     outputs = {}
 
     def _init(raw: Any) -> Any:
-        if isinstance(raw, Module):
+        if isinstance(raw, torch.nn.Module):
             outputs[raw] = None if inputs is None else raw(**inputs)
             return raw if compile_fn is None else compile_fn(raw)
         if isinstance(raw, Mapping):
@@ -98,7 +97,7 @@ def initial_model(
         return raw
 
     def _construct_outputs(raw: Any) -> Any:
-        if isinstance(raw, Module):
+        if isinstance(raw, torch.nn.Module):
             return outputs[raw]
         if isinstance(raw, Mapping):
             res = {k: _construct_outputs(v) for k, v in raw.items()}
@@ -114,7 +113,7 @@ def get_autocast(mixed_precision_type: str | None, device: str | None) -> Callab
     """Get the appropriate autocast context manager based on the device and mixed precision type."""
     if mixed_precision_type is None:
         return suppress
-    return partial(autocast, device_type=get_torch_device(device), dtype=DTYPES[mixed_precision_type])
+    return partial(torch.autocast, device_type=get_torch_device(device), dtype=DTYPES[mixed_precision_type])
 
 
 @dataclass(kw_only=True, slots=True)
@@ -124,16 +123,16 @@ class TrainingStep:
     models: list[str]
     """The names of the models to use for the training step."""
 
-    losses: Module
+    losses: torch.nn.Module
     """A module that computes the losses for the model."""
 
-    metrics: Module | None = None
+    metrics: torch.nn.Module | None = None
     """A module that computes the metrics for the model."""
 
     autocast: Callable[[], AbstractContextManager[None]] = suppress
     """A context manager for automatic mixed precision (AMP). By default, it does nothing."""
 
-    def __call__(self, inputs: dict[str, Any], **models: Module) -> dict[str, Tensor]:
+    def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
         """Perform the forward pass for the given inputs and return the outputs and any additional information."""
         with self.autocast():
             outputs = inputs.copy()
@@ -142,7 +141,7 @@ class TrainingStep:
             criteria = self.losses(**outputs)
             if self.metrics is None:
                 return criteria
-            with no_grad():
+            with torch.no_grad():
                 criteria.update(self.metrics(**outputs))
             return criteria
 
@@ -151,9 +150,9 @@ class TrainingStep:
 class ValidationStep(TrainingStep):
     """A validation step for a PyTorch model."""
 
-    def __call__(self, inputs: dict[str, Any], **models: Module) -> dict[str, Tensor]:
+    def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
         """Perform the forward pass for the given inputs and return the outputs and any additional information."""
-        with no_grad():
+        with torch.no_grad():
             with self.autocast():
                 outputs = inputs.copy()
                 for name in self.models:
@@ -193,14 +192,15 @@ class TorchTracker:
         cls,
         loss_outputs: list[str],
         metric_outputs: list[str] | None = None,
-        compile_fn: Callable[[Module], Module] | None = None,
+        compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
     ) -> "TorchTracker":
         """Create a tracker from the given loss and metric modules.
 
         Args:
             loss_outputs (list[str]): The outputs to track for the loss module.
             metric_outputs (list[str] | None): The outputs to track for the metric module.
-            compile_fn (Callable[[Module], Module] | None): An optional function to compile the loss and metric modules.
+            compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
+                An optional function to compile the loss and metric modules.
 
         Returns:
             A TorchTracker instance with the specified loss and metric trackers.
@@ -229,27 +229,29 @@ class TimmEmaWrapper:
         """Post-initialization."""
         GLOBAL_CALLBACKS.on_update += [self.update]
 
-    def update(self, info: BaseInfo, **models: Module) -> None:
+    def update(self, info: BaseInfo, **models: torch.nn.Module) -> None:
         """Update the EMA model."""
         for name, ema in self.ema.items():
             ema.update(models[name], step=info.update)
 
-    def __call__(self, info: BaseInfo, **models: Module) -> dict[str, Any]:
+    def __call__(self, info: BaseInfo, **models: torch.nn.Module) -> dict[str, Any]:
         """Return the EMA model."""
         return {n: self.ema[n] if n in self.ema and self.is_cross_device[n] else m for n, m in models.items()}
 
     @property
-    def models(self) -> dict[str, Module]:
+    def models(self) -> dict[str, torch.nn.Module]:
         """Return the EMA models."""
         return {n: ema.module for n, ema in self.ema.items()}
 
     @classmethod
-    def from_models(cls, models: dict[str, Module], device: device | None = None, **kwargs: Any) -> "TimmEmaWrapper":
+    def from_models(
+        cls, models: dict[str, torch.nn.Module], device: torch.device | None = None, **kwargs: Any
+    ) -> "TimmEmaWrapper":
         """Create a TimmEmaWrapper from the given models.
 
         Args:
-            models (dict[str, Module]): The models to create the EMA wrapper for.
-            device (device | None): The device to move the EMA models to. If None, the EMA models will not be moved.
+            models (dict[str, torch.nn.Module]): The models to create the EMA wrapper for.
+            device (torch.device | None): The device to move the EMA models to. If None, the EMA models will not be moved.
             **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
 
         Returns:
@@ -263,7 +265,7 @@ class TimmEmaWrapper:
 
 
 @dataclass(kw_only=True)
-class TorchTrainer(BaseTrainer[Module]):
+class TorchTrainer(BaseTrainer[torch.nn.Module]):
     """Trainer for PyTorch models."""
 
     device: str
@@ -272,11 +274,11 @@ class TorchTrainer(BaseTrainer[Module]):
     def sync(self) -> None:
         """Synchronize the device if it is a CUDA device."""
         if "cuda" in self.device:
-            cuda.synchronize()
+            torch.cuda.synchronize()
 
 
 @dataclass(kw_only=True, slots=True)
-class TorchBestCriterion(BestCriterion[Module]):
+class TorchBestCriterion(BestCriterion[torch.nn.Module]):
     """A callback to track the best criterion during training or validation for PyTorch models."""
 
 
@@ -550,7 +552,7 @@ class TimmDataLoaderWrapper(WithExtra):
         kwargs["mean"] = self.mean
         kwargs["std"] = self.std
         kwargs["img_dtype"] = DTYPES[self.image_dtype]
-        kwargs["device"] = device(self.distributed_results["device"])
+        kwargs["device"] = torch.device(self.distributed_results["device"])
         kwargs["distributed"] = self.distributed_results["distributed"]
         kwargs["use_prefetcher"] = self.use_prefetcher
         if self.dataset.is_training:
@@ -584,7 +586,7 @@ class TimmDataLoaderWrapper(WithExtra):
             return (FastCollateMixup if self.use_prefetcher else Mixup)(**self.mixup_kwargs)
         raise ValueError("Mixup is not active, cannot create mixup function.")
 
-    def disable_mixup(self, info: BaseInfo, **models: Module) -> None:
+    def disable_mixup(self, info: BaseInfo, **models: torch.nn.Module) -> None:
         """Disable mixup after the specified epoch."""
         if info.epoch >= self.mixup_off_epoch:
             self.mixup.mixup_enabled = False
@@ -619,7 +621,7 @@ class TimmDataLoaderWrapper(WithExtra):
         if self.use_prefetcher:
             if self.channels_last:
                 for inp, target in self.dataloader:
-                    yield inp.contiguous(memory_format=channels_last), target
+                    yield inp.contiguous(memory_format=torch.channels_last), target
             else:
                 yield from self.dataloader
         else:
@@ -630,7 +632,7 @@ class TimmDataLoaderWrapper(WithExtra):
                 if mixup is not None:
                     inp, target = mixup(inp, target)
                 if self.channels_last:
-                    inp = inp.contiguous(memory_format=channels_last)
+                    inp = inp.contiguous(memory_format=torch.channels_last)
                 yield inp, target
 
     def __call__(self) -> Any:
