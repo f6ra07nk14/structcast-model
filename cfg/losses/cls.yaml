@@ -1,5 +1,5 @@
 PARAMETERS:
-  DEFAULT: {label_smoothing: 0.1}
+  DEFAULT: {label_smoothing: 0.0}
   SHARED: {}
 FLOW:
   - _jinja_yaml_: |-
