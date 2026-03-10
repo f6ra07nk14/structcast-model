@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from collections.abc import Sequence
+import re
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic_core import from_json
@@ -68,7 +69,54 @@ def unique(values: Sequence[T]) -> list[T]:
     return list(OrderedDict.fromkeys(values))
 
 
-__all__ = ["load_any", "load_json", "unique"]
+def to_snake(value: str) -> str:
+    """Convert a PascalCase, camelCase, or kebab-case string to snake_case.
+
+    Args:
+        value: The string to convert.
+
+    Returns:
+        The converted string in snake_case.
+    """
+    # Handle the sequence of uppercase letters followed by a lowercase letter
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
+    # Insert an underscore between a lowercase letter and an uppercase letter
+    value = re.sub(r"([a-z])([A-Z])", r"\1_\2", value)
+    # Insert an underscore between a digit and an uppercase letter
+    value = re.sub(r"([0-9])([A-Z])", r"\1_\2", value)
+    # Insert an underscore between a lowercase letter and a digit
+    value = re.sub(r"([a-z])([0-9])", r"\1_\2", value)
+    value = re.sub(r"(\W+)", "_", value)
+    value = re.sub("__([A-Z])", r"_\1", value)
+    return value.lower()
+
+
+def to_pascal(value: str) -> str:
+    """Convert a snake_case string to PascalCase.
+
+    Args:
+        value: The string to convert.
+
+    Returns:
+        The PascalCase string.
+    """
+    return "".join(word.title() for word in to_snake(value).split("_"))
+
+
+def to_camel(value: str) -> str:
+    """Convert a snake_case string to camelCase.
+
+    Args:
+        value: The string to convert.
+
+    Returns:
+        The converted camelCase string.
+    """
+    camel = to_pascal(value)
+    return camel[0].lower() + camel[1:] if camel else ""
+
+
+__all__ = ["load_any", "load_json", "to_camel", "to_pascal", "to_snake", "unique"]
 
 
 if not TYPE_CHECKING:

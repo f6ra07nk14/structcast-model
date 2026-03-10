@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from structcast.utils.security import register_dir, unregister_dir
 
-from structcast_model.utils.base import load_any, load_json, unique
+from structcast_model.utils.base import load_any, load_json, to_camel, to_pascal, to_snake, unique
 
 
 @contextmanager
@@ -78,3 +78,54 @@ def test_unique() -> None:
     assert unique([1, 2, 3]) == [1, 2, 3]
     assert unique([]) == []
     assert unique(["a", "a", "a"]) == ["a"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("PascalCase", "pascal_case"),
+        ("camelCase", "camel_case"),
+        ("kebab-case", "kebab_case"),
+        ("snake_case", "snake_case"),
+        ("HTTPSRequest", "https_request"),
+        ("ConvNeXtV2", "conv_ne_xt_v2"),
+        ("already_snake", "already_snake"),
+        ("ABC", "abc"),
+        ("simpleword", "simpleword"),
+    ],
+)
+def test_to_snake(value: str, expected: str) -> None:
+    """Test to_snake function."""
+    assert to_snake(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("snake_case", "SnakeCase"),
+        ("hello_world", "HelloWorld"),
+        ("camelCase", "CamelCase"),
+        ("PascalCase", "PascalCase"),
+        ("single", "Single"),
+        ("already_pascal", "AlreadyPascal"),
+    ],
+)
+def test_to_pascal(value: str, expected: str) -> None:
+    """Test to_pascal function."""
+    assert to_pascal(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("snake_case", "snakeCase"),
+        ("hello_world", "helloWorld"),
+        ("camelCase", "camelCase"),
+        ("PascalCase", "pascalCase"),
+        ("single", "single"),
+        ("already_camel", "alreadyCamel"),
+    ],
+)
+def test_to_camel(value: str, expected: str) -> None:
+    """Test to_camel function."""
+    assert to_camel(value) == expected
