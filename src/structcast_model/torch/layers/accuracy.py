@@ -1,7 +1,5 @@
 """Accuracy."""
 
-from typing import TYPE_CHECKING
-
 import torch
 
 
@@ -26,13 +24,3 @@ def sparse_top_k_categorical_accuracy(y_true: torch.Tensor, y_pred: torch.Tensor
         expanded_y = y_true.view(-1, 1).expand(-1, k)
     _, sorted_indices = torch.topk(y_pred, k=k, dim=-1)
     return torch.eq(sorted_indices, expanded_y).float().sum(dim=-1).mean()
-
-
-__all__ = ["sparse_categorical_accuracy", "sparse_top_k_categorical_accuracy"]
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

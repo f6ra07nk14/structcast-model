@@ -1,7 +1,5 @@
 """Concatenate layer for PyTorch."""
 
-from typing import TYPE_CHECKING
-
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -45,13 +43,3 @@ class Concatenate(Module):
 
 Concat = Concatenate
 """Alias for Concatenate."""
-
-__all__ = ["Concat", "Concatenate"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

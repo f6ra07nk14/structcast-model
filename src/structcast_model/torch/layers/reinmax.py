@@ -5,7 +5,7 @@ References:
     - `ReinMax GitHub <https://github.com/microsoft/ReinMax>`_
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from torch.autograd import Function
 from torch.jit import unused
@@ -65,14 +65,3 @@ def reinmax(logits: Tensor, tau: float = 1.0) -> tuple[Tensor, Tensor]:
     logits = logits.view(-1, shape[-1])
     grad_sample, y_soft = ReinMaxCore.apply(logits, logits.new_empty(1).fill_(tau))
     return grad_sample.view(shape), y_soft.view(shape)
-
-
-__all__ = ["reinmax"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

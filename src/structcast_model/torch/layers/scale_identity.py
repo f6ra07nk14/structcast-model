@@ -1,6 +1,6 @@
 """Scale Identity layer."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from torch.nn import Module, Parameter
 
@@ -28,14 +28,3 @@ class ScaleIdentity(Module):
     def forward(self, input: Tensor) -> Tensor:
         """Forward method."""
         return input.mul(self.scale)
-
-
-__all__ = ["ScaleIdentity"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

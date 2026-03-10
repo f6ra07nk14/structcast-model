@@ -1,6 +1,6 @@
 """Lazy normalization layer."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from torch.nn import LayerNorm, RMSNorm, UninitializedParameter
 from torch.nn.modules.lazy import LazyModuleMixin
@@ -95,14 +95,3 @@ class LazyLayerNorm(LazyModuleMixin, LayerNorm):
                     if self.bias is not None:
                         self.bias.materialize(self.normalized_shape)
                 self.reset_parameters()
-
-
-__all__ = ["LazyLayerNorm", "LazyRMSNorm"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

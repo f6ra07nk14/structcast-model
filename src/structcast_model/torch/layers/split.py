@@ -1,7 +1,5 @@
 """Split layer for PyTorch."""
 
-from typing import TYPE_CHECKING
-
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -43,14 +41,3 @@ class Split(Module):
             str: The extra representation.
         """
         return f"split_size_or_sections={self.split_size_or_sections}, dim={self.dim}"
-
-
-__all__ = ["Split"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

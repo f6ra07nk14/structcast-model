@@ -1,7 +1,5 @@
 """Permute layer for PyTorch."""
 
-from typing import TYPE_CHECKING
-
 from torch.nn import Module
 from torch.nn.modules.lazy import LazyModuleMixin
 
@@ -72,14 +70,3 @@ class ToChannelFirst(LazyModuleMixin, Permute):
         if self.dims[0] == 0:
             size = len(input.shape[1:-1]) + 1
             self.dims = (size, *range(1, size))
-
-
-__all__ = ["Permute", "ToChannelFirst", "ToChannelLast"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())

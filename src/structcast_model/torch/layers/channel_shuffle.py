@@ -1,7 +1,5 @@
 """Channel shuffle layer."""
 
-from typing import TYPE_CHECKING
-
 from torch.nn import Module
 
 from structcast_model.torch.types import Tensor
@@ -27,14 +25,3 @@ class ChannelLastShuffle(Module):
     def extra_repr(self) -> str:
         """Extra representation of the layer."""
         return f"groups={self.groups}"
-
-
-__all__ = ["ChannelLastShuffle"]
-
-
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())
