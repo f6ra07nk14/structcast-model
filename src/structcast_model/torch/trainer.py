@@ -218,6 +218,10 @@ class TorchTracker:
 class TimmEmaWrapper:
     """An inference wrapper that returns the EMA model from the timm library."""
 
+    is_cross_device: dict[str, bool]
+    """A dictionary mapping model names to a boolean indicating whether
+    the EMA model is on a different device than the original model."""
+
     ema: dict[str, ModelEmaV3]
     """The EMA model."""
 
@@ -232,9 +236,7 @@ class TimmEmaWrapper:
 
     def __call__(self, info: BaseInfo, **models: Module) -> dict[str, Any]:
         """Return the EMA model."""
-        return {
-            n: o.module if n in self.ema and (o := self.ema[n]).device == m.device else m for n, m in models.items()
-        }
+        return {n: self.ema[n] if n in self.ema and self.is_cross_device[n] else m for n, m in models.items()}
 
     @property
     def models(self) -> dict[str, Module]:
@@ -253,7 +255,11 @@ class TimmEmaWrapper:
         Returns:
             A TimmEmaWrapper instance with the specified EMA models and callbacks.
         """
-        return cls(ema={n: ModelEmaV3(m, device=device, **kwargs) for n, m in models.items()})
+        ema, is_cross_device = {}, {}
+        for name, model in models.items():
+            ema[name] = ModelEmaV3(model, device=device, **kwargs)
+            is_cross_device[name] = next(model.parameters()).device.type != device
+        return cls(ema=ema, is_cross_device=is_cross_device)
 
 
 @dataclass(kw_only=True)
