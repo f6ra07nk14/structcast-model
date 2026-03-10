@@ -6,7 +6,7 @@ from structcast.utils.base import dump_yaml, dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.commands import cmd_torch
-from structcast_model.commands.utils import dict_parser
+from structcast_model.commands.utils import dict_parser, reduce_dict
 
 if TYPE_CHECKING:
     from structcast_model.builders import schema
@@ -41,11 +41,13 @@ def format_template(
     ),
 ) -> None:
     """Format a template configuration file with the provided parameters and print or save the result."""
-    res: Any = schema.Template.from_path(cfg_path)(cmd_torch.reduce_dict(parameters)).model_dump(mode="json")
+    res: Any = schema.Template.from_path(cfg_path)(reduce_dict(parameters)).model_dump(mode="json")
+    raw = dump_yaml_to_string(res)
     if output is None:
-        print(dump_yaml_to_string(res))
+        print(raw)
     else:
-        dump_yaml(res, output)
+        with open(output, "w") as f:
+            dump_yaml(res, f)
 
 
 __all__ = ["app"]
