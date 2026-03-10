@@ -496,10 +496,12 @@ class Template(WithExtra, Generic[SerializableT]):
     @classmethod
     def from_path(cls, path: PathLike) -> Self:
         """Create a template from a configuration file."""
-        return cls.model_validate_file(load_any(path))
+        return cls.model_validate(load_any(path))
 
     @cached_property
     def _raw_and_others(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        if issubclass(self.target_type, WithExtra):
+            return self.model_extra.copy(), {}
         target_fields = list(self.target_type.model_fields) + ALIAS_ALL
         raw: dict[str, Any] = {}
         others: dict[str, Any] = {}
