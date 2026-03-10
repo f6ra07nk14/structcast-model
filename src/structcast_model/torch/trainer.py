@@ -177,9 +177,9 @@ class TorchTracker:
 
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_training_begin.append(lambda _: self.losses_tracker.reset())  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_training_begin.append(lambda i, **kw: self.losses_tracker.reset())  # type: ignore[arg-type]
         if self.metrics_tracker is not None:
-            GLOBAL_CALLBACKS.on_training_begin.append(lambda _: self.metrics_tracker.reset())  # type: ignore[arg-type]
+            GLOBAL_CALLBACKS.on_training_begin.append(lambda i, **kw: self.metrics_tracker.reset())  # type: ignore[arg-type]
 
     def __call__(self, **criteria: Tensor) -> dict[str, float]:
         """Log the criteria and return the average values."""
