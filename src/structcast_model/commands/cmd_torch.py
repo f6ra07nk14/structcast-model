@@ -405,14 +405,14 @@ def train(  # noqa: PLR0913,PLR0915
             pbar.update()
             pbar.set_postfix([(n, logs[n]) for n in criteria])
 
-        trainer.on_training_begin.append(lambda **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
+        trainer.on_training_begin.append(lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
         train_losses = [f"{trainer.training_prefix}{n}" for n in loss_outputs]
         trainer.on_training_step_end.append(partial(_update_criteria, criteria=train_losses))  # type: ignore[arg-type]
-        trainer.on_training_end.append(lambda **_: pbar.refresh())  # type: ignore[arg-type]
-        trainer.on_validation_begin.append(lambda **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
+        trainer.on_training_end.append(lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
+        trainer.on_validation_begin.append(lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
         valid_losses = [f"{trainer.validation_prefix}{n}" for n in loss_outputs]
         trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
-        trainer.on_validation_end.append(lambda **_: pbar.refresh())  # type: ignore[arg-type]
+        trainer.on_validation_end.append(lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
         trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
 
     def _get_state_dict(**kwargs: torch.nn.Module) -> dict[str, Any]:
