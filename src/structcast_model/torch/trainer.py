@@ -258,7 +258,7 @@ class TimmEmaWrapper:
         ema, is_cross_device = {}, {}
         for name, model in models.items():
             ema[name] = ModelEmaV3(model, device=device, **kwargs)
-            is_cross_device[name] = next(model.parameters()).device.type != device
+            is_cross_device[name] = device in next(model.parameters()).device.type
         return cls(ema=ema, is_cross_device=is_cross_device)
 
 
