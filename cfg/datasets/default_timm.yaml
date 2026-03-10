@@ -21,9 +21,9 @@ PARAMETERS:
     workers: 4
 _obj_:
   - _addr_: structcast_model.torch.trainer.TimmDataLoaderWrapper
-  - {_attr_: model_validate}
-  - _call_:
-      spec: {image: "0", label: "1"}
+  - _attr_: model_validate
+  - - _call_
+    - spec: {image: "0", label: "1"}
       dataset:
         input_img_mode: RGB
         input_key: null
@@ -37,7 +37,7 @@ _obj_:
           repeats: {{repeats}}
           download: {{download}}
           trust_remote_code: {{trust_remote_code}}
-          num_samples: {{num_samples}}
+          num_samples: {{"null" if num_samples is none else num_samples}}
           is_training: {{training}}
           split: {{"train" if training else "validation"}}
       use_prefetcher: true
