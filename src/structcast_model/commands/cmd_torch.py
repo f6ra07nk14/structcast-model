@@ -5,12 +5,18 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from structcast.utils.base import dump_yaml_to_string, load_yaml_from_string
+from structcast.utils.base import dump_yaml_to_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
 from structcast_model.base_trainer import BaseInfo, get_dataset_size
-from structcast_model.commands.utils import bool_or_path_or_dict_parser, dict_parser, reduce_dict, tensor_shape_parser
+from structcast_model.commands.utils import (
+    bool_or_path_or_dict_parser,
+    dict_parser,
+    path_or_any_parser,
+    reduce_dict,
+    tensor_shape_parser,
+)
 
 if TYPE_CHECKING:
     import calflops
@@ -55,7 +61,7 @@ template_param = Option(
 )
 output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
 model_pattern = Argument(
-    parser=load_yaml_from_string,
+    parser=path_or_any_parser,
     help="The object pattern used to instantiate models. "
     "For example, if the model is defined as `my_package.MyModel(...)`, "
     'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -185,8 +191,8 @@ def call_calflops(
 
 @app.command()
 def train(  # noqa: PLR0913,PLR0915
-    model_patterns: list = Argument(
-        parser=load_yaml_from_string,
+    model_patterns: list[dict] = Argument(
+        parser=dict_parser,
         help="The object patterns used to instantiate models. "
         "For example, if the model is defined as `model_name = my_package.MyModel(...)`, then the pattern should be "
         '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -208,7 +214,7 @@ def train(  # noqa: PLR0913,PLR0915
         ...,
         "--loss",
         "-l",
-        parser=load_yaml_from_string,
+        parser=path_or_any_parser,
         help="The object pattern used to instantiate the loss module. "
         "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -224,7 +230,7 @@ def train(  # noqa: PLR0913,PLR0915
         None,
         "--metric",
         "-m",
-        parser=load_yaml_from_string,
+        parser=path_or_any_parser,
         help="The object pattern used to instantiate the metric module. "
         "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -240,7 +246,7 @@ def train(  # noqa: PLR0913,PLR0915
         ...,
         "--backward",
         "-b",
-        parser=load_yaml_from_string,
+        parser=path_or_any_parser,
         help="The object pattern used to instantiate the backward class. "
         "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -265,7 +271,7 @@ def train(  # noqa: PLR0913,PLR0915
         ...,
         "--training-dataset",
         "-t",
-        parser=load_yaml_from_string,
+        parser=path_or_any_parser,
         help="The object pattern used to instantiate the training dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -275,7 +281,7 @@ def train(  # noqa: PLR0913,PLR0915
         None,
         "--validation-dataset",
         "-v",
-        parser=load_yaml_from_string,
+        parser=path_or_any_parser,
         help="The object pattern used to instantiate the validation dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
@@ -323,7 +329,7 @@ def train(  # noqa: PLR0913,PLR0915
     def _compile_fn(module: torch.nn.Module, compile_kw: dict[str, Any] | None) -> torch.nn.Module:
         return module if compile_kw is None else torch.compile(module, **compile_kw)
 
-    def _init_models(patterns: list[dict[str, Any]]) -> OrderedDict[str, torch.nn.Module]:
+    def _init_models(patterns: list) -> OrderedDict[str, torch.nn.Module]:
         res = OrderedDict[str, torch.nn.Module]()
         for raw in patterns:
             if len(raw) != 1:
@@ -363,7 +369,7 @@ def train(  # noqa: PLR0913,PLR0915
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         backward = _instantiate(backward_pattern)(**models)
         loss_outputs = _check_module_outputs(loss, loss_outputs, "loss")
-        metric_outputs = _check_module_outputs(metric, metric_outputs, "metric") if metric else None
+        metric_outputs = None if metric is None else _check_module_outputs(metric, metric_outputs, "metric")
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
