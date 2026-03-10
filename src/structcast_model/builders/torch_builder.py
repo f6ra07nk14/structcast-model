@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from structcast_model.builders.base_builder import (
@@ -61,18 +62,27 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
 class TorchBackwardIntermediate(BackwardIntermediate):
     """Intermediate representation of a PyTorch backward layer."""
 
+    @cached_property
+    def _backward_flow(self) -> list[str]:
+        return [
+            f"{L if self.mixed_precision is None else f'self.{n}_scaler.scale({L})'}.backward({kw})"
+            for L, kw, opts in self.backwards
+            for n in opts
+        ]
+
     def _get_scripts(self) -> list[str]:
         indent = " " * 4
         sep = "\n" + indent * 2
         init_opts = [f"self.{n} = {o}(_get_param([{', '.join(L)}]))" for n, (o, L, _) in self.optimizers.items()]
         flow = []
         if self.accumulate_gradients:
-            flow.extend([f"({L} / {self.accumulate_gradients}).backward({kw})" for L, kw, _ in self.backwards])
+            flow += [f"{L} = {L} / {self.accumulate_gradients}" for L, _, _ in self.backwards]
+            flow += self._backward_flow
             flow += [f"should_update = (step + 1) % {self.accumulate_gradients} == 0", "if should_update:"]
             should_update = "should_update"
             flow_indent = indent
         else:
-            flow += [f"{L}.backward({kw})" for L, kw, _ in self.backwards]
+            flow += self._backward_flow
             should_update = "True"
             flow_indent = ""
         for name in [n for _, _, opts in self.backwards for n in opts]:
