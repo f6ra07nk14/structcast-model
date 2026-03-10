@@ -656,6 +656,7 @@ class TimmDataLoaderWrapper(WithExtra):
 __all__ = [
     "CriteriaTracker",
     "TimmDataLoaderWrapper",
+    "TimmDatasetWrapper",
     "TimmEmaWrapper",
     "TorchBestCriterion",
     "TorchTracker",
