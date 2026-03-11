@@ -601,6 +601,12 @@ scm torch train \
 
 ## Development
 
+Set up the development environment with:
+
+```bash
+uv sync --extra torch-cpu --dev --group tox
+```
+
 Run the test suite:
 
 ```bash
