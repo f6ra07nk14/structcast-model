@@ -327,78 +327,78 @@ jobs:
             echo "Dev branch does not exist, skipping back-merge"
           fi
 
-  # # Publish to PyPI Job: Publishes the wheel file to PyPI after successful release
-  # publish-to-pypi:
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
-  #   needs: release
-  #   # if: "!contains(github.event.head_commit.message, '[skip ci]')"
-  #   runs-on: ubuntu-latest
-  #   environment:
-  #     name: pypi
-  #     url: https://pypi.org/p/structcast-model
-  #   permissions:
-  #     contents: read
-  #     id-token: write # IMPORTANT: mandatory for trusted publishing
-  #   steps:
-  #     - name: Get latest release
-  #       id: get-release
-  #       env:
-  #         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #       run: |
-  #         # Get the latest release information
-  #         RELEASE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-  #                             -H "Accept: application/vnd.github+json" \
-  #                             "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+  # Publish to PyPI Job: Publishes the wheel file to PyPI after successful release
+  publish-to-pypi:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    needs: release
+    # if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/structcast-model
+    permissions:
+      contents: read
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+    steps:
+      - name: Get latest release
+        id: get-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the latest release information
+          RELEASE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                              -H "Accept: application/vnd.github+json" \
+                              "https://api.github.com/repos/${{ github.repository }}/releases/latest")
 
-  #         RELEASE_TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
-  #         RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id')
+          RELEASE_TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id')
 
-  #         if [ "$RELEASE_TAG" = "null" ] || [ -z "$RELEASE_TAG" ]; then
-  #           echo "No release found, skipping publish"
-  #           echo "has_release=false" >> $GITHUB_OUTPUT
-  #         else
-  #           echo "has_release=true" >> $GITHUB_OUTPUT
-  #           echo "tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-  #           echo "id=$RELEASE_ID" >> $GITHUB_OUTPUT
-  #           echo "Found release: $RELEASE_TAG (ID: $RELEASE_ID)"
-  #         fi
+          if [ "$RELEASE_TAG" = "null" ] || [ -z "$RELEASE_TAG" ]; then
+            echo "No release found, skipping publish"
+            echo "has_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_release=true" >> $GITHUB_OUTPUT
+            echo "tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+            echo "id=$RELEASE_ID" >> $GITHUB_OUTPUT
+            echo "Found release: $RELEASE_TAG (ID: $RELEASE_ID)"
+          fi
 
-  #     - name: Download wheel from release
-  #       if: steps.get-release.outputs.has_release == 'true'
-  #       run: |
-  #         RELEASE_TAG="${{ steps.get-release.outputs.tag }}"
+      - name: Download wheel from release
+        if: steps.get-release.outputs.has_release == 'true'
+        run: |
+          RELEASE_TAG="${{ steps.get-release.outputs.tag }}"
 
-  #         # Get release assets
-  #         ASSETS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-  #                       -H "Accept: application/vnd.github+json" \
-  #                       "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")
+          # Get release assets
+          ASSETS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                        -H "Accept: application/vnd.github+json" \
+                        "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")
 
-  #         # Find the wheel file (.whl)
-  #         WHEEL_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .browser_download_url' | head -n 1)
-  #         WHEEL_NAME=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .name' | head -n 1)
+          # Find the wheel file (.whl)
+          WHEEL_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .browser_download_url' | head -n 1)
+          WHEEL_NAME=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | endswith(".whl")) | .name' | head -n 1)
 
-  #         if [ -z "$WHEEL_URL" ] || [ "$WHEEL_URL" = "null" ]; then
-  #           echo "No wheel file found in release"
-  #           exit 1
-  #         fi
+          if [ -z "$WHEEL_URL" ] || [ "$WHEEL_URL" = "null" ]; then
+            echo "No wheel file found in release"
+            exit 1
+          fi
 
-  #         echo "Downloading wheel: $WHEEL_NAME"
-  #         echo "From: $WHEEL_URL"
+          echo "Downloading wheel: $WHEEL_NAME"
+          echo "From: $WHEEL_URL"
 
-  #         # Create dist directory and download the wheel
-  #         mkdir -p dist
-  #         curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-  #              -H "Accept: application/octet-stream" \
-  #              -o "dist/$WHEEL_NAME" \
-  #              "$WHEEL_URL"
+          # Create dist directory and download the wheel
+          mkdir -p dist
+          curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+               -H "Accept: application/octet-stream" \
+               -o "dist/$WHEEL_NAME" \
+               "$WHEEL_URL"
 
-  #         echo "✓ Successfully downloaded: dist/$WHEEL_NAME"
-  #         ls -lh dist/
+          echo "✓ Successfully downloaded: dist/$WHEEL_NAME"
+          ls -lh dist/
 
-  #     - name: Publish to PyPI
-  #       if: steps.get-release.outputs.has_release == 'true'
-  #       uses: pypa/gh-action-pypi-publish@release/v1
-  #       with:
-  #         skip-existing: true
-  #         verbose: true
-  #         print-hash: true
+      - name: Publish to PyPI
+        if: steps.get-release.outputs.has_release == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          verbose: true
+          print-hash: true
