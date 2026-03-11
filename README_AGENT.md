@@ -1,16 +1,17 @@
-# StructCast-Model -- AI Agent Reference
+# StructCast-Model — AI Agent Reference
 
-> This document is designed for AI coding agents. For human-oriented usage, see [README.md](README.md).
+> This document is written for AI coding agents. For human-oriented usage, see [README.md](README.md).
+> For the upstream library, see the [StructCast repository](https://github.com/f6ra07nk14/structcast).
 
 ## What This Project Does
 
-StructCast-Model turns YAML templates into executable PyTorch training systems. The repository has three main responsibilities:
+StructCast-Model turns YAML templates into executable PyTorch training systems. It has three responsibilities:
 
-1. Generate PyTorch model code from declarative templates.
-2. Generate backward, optimizer, AMP, and scheduler orchestration code from declarative templates.
-3. Run training workflows by instantiating generated artifacts through StructCast object patterns.
+1. **Code generation**: Generate PyTorch `nn.Module` classes and backward/optimizer orchestration classes from declarative YAML templates.
+2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
+3. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via the `scm torch train` CLI.
 
-The active implementation is PyTorch-first. JAX and TensorFlow appear in extras and roadmap items, but the CLI, tests, and runtime integration in this repository are centered on PyTorch.
+The active implementation is PyTorch-first. JAX and TensorFlow extras exist in `pyproject.toml` but have no active CLI commands or tests.
 
 ## Repository Map
 
@@ -48,7 +49,9 @@ tests/
 └── test_base_trainer.py       # Generic trainer tests
 ```
 
-## Data Flow -- How the Pieces Connect
+## Data Flow
+
+The following diagram shows how data moves through the system. Use this to understand which module to inspect when debugging or modifying a specific stage.
 
 ```text
 YAML template in cfg/
@@ -68,21 +71,21 @@ Live models / losses / metrics / backward objects
   |  initial_model(), get_autocast(), trackers       <- torch/trainer.py
   v
 TorchTrainer.fit(...)
-  |  train/evaluate loop + callbacks                <- base_trainer.py + torch/trainer.py
+  |  train/evaluate loop + callbacks                 <- base_trainer.py + torch/trainer.py
   v
 MLflow logs + model states + best checkpoints
 ```
 
-The repository's signature workflow is:
+The repository's signature workflow (the "generate-then-reimport" loop) is:
 
 1. Render specialized YAML from templates with `scm format`.
-2. Generate model, loss, metric, and backward Python modules.
-3. Re-import those modules through StructCast `_file_` patterns.
+2. Generate model, loss, metric, and backward Python modules with `scm torch create`.
+3. Re-import those modules through StructCast `_file_` patterns at runtime.
 4. Train them through `scm torch train`.
 
 ## CLI Surface
 
-The CLI entry point is `scm = structcast_model.commands.main:app`.
+The CLI entry point is defined in `pyproject.toml` as `scm = "structcast_model.commands.main:app"` (a [Typer](https://typer.tiangolo.com/) application).
 
 ### Top-level commands
 
@@ -94,6 +97,8 @@ The CLI entry point is `scm = structcast_model.commands.main:app`.
 - `scm torch train`
 
 ### `scm format`
+
+Defined in `commands/main.py`, not `cmd_torch.py`.
 
 Purpose:
 
@@ -147,9 +152,9 @@ Purpose:
 
 Key runtime behavior:
 
-- `configure_security(allowed_modules_check=False)` is used because commands frequently import generated local files.
+- `configure_security(allowed_modules_check=False)` is called because commands frequently import generated local files via `_file_` patterns.
 - `torch.compile` is optional and configured via `-c/--compile`.
-- Mixed precision dtype comes from the backward object when available, otherwise from the CLI flag.
+- Mixed precision dtype is taken from the backward object when available; otherwise from the `--mixed-precision` CLI flag.
 - Validation progress uses `tqdm` unless `--ci` is enabled.
 
 ## Builder Architecture
@@ -240,7 +245,9 @@ timm integrations:
 
 ## Pattern Alias Quick Reference
 
-### Instantiator patterns used heavily in this repository
+### Instantiator patterns used in this repository
+
+These are [StructCast](https://github.com/f6ra07nk14/structcast) object pattern aliases. See the StructCast README for full pattern documentation.
 
 | Alias | Meaning | Typical use here |
 | --- | --- | --- |
@@ -251,7 +258,7 @@ timm integrations:
 | `_attr_` | Resolve an attribute on the current object | `model_validate`, helper method access |
 | `_obj_` | Chain all of the above | Main object construction mechanism |
 
-### Template features used heavily in config
+### Template features used in config YAML files
 
 | Alias or syntax | Meaning |
 | --- | --- |
@@ -266,10 +273,10 @@ timm integrations:
 
 ## Dynamic Import and Security Notes
 
-- CLI commands intentionally disable the StructCast allowlist check when instantiating user-provided or generated runtime modules.
-- Generated modules are commonly loaded with `_file_` patterns pointing at local files.
-- When debugging command failures, confirm that generated files exist at the paths referenced in `_file_`.
-- If code is being used outside the CLI, remember that StructCast security settings may block imports unless configured appropriately.
+- CLI commands call `configure_security(allowed_modules_check=False)` to disable the StructCast module allowlist, because generated local files (loaded via `_file_`) would otherwise be blocked.
+- Generated modules are loaded with `_file_` patterns pointing at local files.
+- When debugging command failures, verify that generated files exist at the exact paths referenced in `_file_`.
+- Code used outside the CLI must explicitly configure StructCast security settings to permit local imports.
 
 ## Development Commands
 
@@ -290,15 +297,15 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 ## Code Conventions
 
-- Python target is 3.11. Prefer modern union syntax such as `X | Y`.
-- Pydantic v2 is used throughout the builders and schemas.
+- Python target is `>=3.11` (set in `pyproject.toml`). Use modern union syntax `X | Y` instead of `Union[X, Y]`.
+- Pydantic v2 is used throughout builders and schemas.
 - Google-style docstrings are expected.
-- Dataclasses typically use `@dataclass(kw_only=True, slots=True)`.
+- Dataclasses use `@dataclass(kw_only=True, slots=True)`.
 - Lazy import wrappers are used broadly:
-  - `LazyModuleImporter` for optional dependencies
-  - `LazySelectedImporter` for module export surfaces
+  - `LazyModuleImporter` for optional heavy dependencies (torch, timm, mlflow).
+  - `LazySelectedImporter` for module export surfaces (`__all__`).
 - Generated code should stay minimal and preserve current public APIs.
-- `outputs` attributes on loss and metric modules matter because the CLI uses them to infer tracked keys.
+- `outputs` attributes on generated loss and metric modules are significant — the CLI reads them to determine which keys `TorchTracker` should track.
 
 ## Testing Notes
 
@@ -309,24 +316,21 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 ## Common Failure Modes
 
-- `ValueError: Each model pattern should contain exactly one model definition`
-  - Cause: a positional model argument passed multiple names in one YAML object.
-- `Module "loss" does not have an "outputs" attribute`
-  - Cause: generated or custom loss/metric modules do not expose `outputs`, and CLI defaults were not provided.
-- `ValueError: Invalid tensor shape`
-  - Cause: `-s/--shape` was not a tuple/list/dict shape structure.
-- `ValueError: Mixup is not active`
-  - Cause: code accessed `TimmDataLoaderWrapper.mixup` while mixup/cutmix settings were disabled.
-- CUDA requested but CPU used
-  - Cause: `get_torch_device("cuda")` falls back when CUDA is unavailable.
+| Error | Cause | Fix |
+| --- | --- | --- |
+| `ValueError: Each model pattern should contain exactly one model definition` | A positional model argument included multiple names in one YAML dict. | Split into separate positional arguments, one model name per dict. |
+| `Module "loss" does not have an "outputs" attribute` | Generated or custom loss/metric modules do not expose `outputs`, and CLI defaults were not provided. | Define `outputs` on the module or pass `--loss-outputs` / `--metric-outputs`. |
+| `ValueError: Invalid tensor shape` | `-s/--shape` was not a tuple/list/dict of integers. | Use shapes like `'image: [3, 224, 224]'`. |
+| `ValueError: Mixup is not active` | Code accessed `TimmDataLoaderWrapper.mixup` while mixup/cutmix settings were disabled. | Enable `mixup_alpha`, `cutmix_alpha`, or `cutmix_minmax` first. |
+| CUDA requested but CPU used | `get_torch_device("cuda")` falls back when CUDA is unavailable. | Verify PyTorch CUDA installation. |
 
 ## Key Integration Example
 
-The repository's core end-to-end workflow is the ConvNeXtV2 example:
+The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 
 1. Generate `model.py` from `cfg/models/ConvNeXtV2.yaml`.
-2. Generate `loss.py`, `metric.py`, and `backward.py`.
+2. Generate `loss.py`, `metric.py`, and `backward.py` from their respective templates.
 3. Format `dataset_train.yaml` and `dataset_valid.yaml` from `cfg/datasets/default_timm.yaml`.
 4. Train through `scm torch train` using `_file_`-based StructCast object patterns.
 
-This generated-code-plus-pattern-reimport loop is the main mental model for the entire repository.
+This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the training CLI (execution phase).

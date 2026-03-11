@@ -1,11 +1,13 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch models and training workflows from YAML templates built on StructCast. Use this when working with scm CLI commands, StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, or MLflow-integrated training runs.
+description: StructCast-Model generates PyTorch models and training workflows from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch create, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, or MLflow-integrated training runs.
 ---
 
 # StructCast-Model
 
 Capability reference for the repository, organized by workflow and module entry point.
+
+Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 
 ## Quick Reference
 
@@ -106,22 +108,20 @@ What happens:
 
 ## CLI Surface
 
-**Modules**: `structcast_model.commands.main`, `structcast_model.commands.cmd_torch`
-
-| Command | Purpose | Primary entry point |
+| Command | Module | Primary entry point |
 | -- | -- | -- |
-| `scm format` | Render a YAML template with parameters | `format_template()` |
-| `scm torch create model` | Generate a PyTorch module from a layer template | `create_model()` |
-| `scm torch create backward` | Generate backward/optimizer orchestration code | `create_backward()` |
-| `scm torch ptflops` | Compute FLOPs and parameter counts with ptflops | `call_ptflops()` |
-| `scm torch calflops` | Compute FLOPs, MACs, and parameters with calflops | `call_calflops()` |
-| `scm torch train` | Run end-to-end training with MLflow logging | `train()` |
+| `scm format` | `commands.main` | `format_template()` |
+| `scm torch create model` | `commands.cmd_torch` | `create_model()` |
+| `scm torch create backward` | `commands.cmd_torch` | `create_backward()` |
+| `scm torch ptflops` | `commands.cmd_torch` | `call_ptflops()` |
+| `scm torch calflops` | `commands.cmd_torch` | `call_calflops()` |
+| `scm torch train` | `commands.cmd_torch` | `train()` |
 
 ### Important CLI conventions
 
-- Model arguments for `ptflops`, `calflops`, and `train` are StructCast object patterns, not plain import strings.
-- Dataset arguments can be rendered YAML files or inline patterns.
-- `configure_security(allowed_modules_check=False)` is used in runtime CLI paths because generated local modules are commonly imported via `_file_`.
+- Model arguments for `ptflops`, `calflops`, and `train` are [StructCast](https://github.com/f6ra07nk14/structcast) object patterns, not plain import strings.
+- Dataset arguments can be rendered YAML files or inline StructCast patterns.
+- `configure_security(allowed_modules_check=False)` is called in CLI paths because generated local modules are imported via `_file_`.
 
 ## Builder APIs
 
@@ -194,6 +194,8 @@ built("model.py")
 ## Config and Pattern Vocabulary
 
 ### StructCast object patterns used in this repository
+
+See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full pattern documentation.
 
 | Alias | Meaning | Example |
 | -- | -- | -- |
@@ -283,9 +285,9 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 ## Mental Model
 
-The repository is easiest to reason about as a two-phase system:
+The repository operates as a two-phase system:
 
-1. **Generation phase**: YAML templates become Python modules through the builders.
-2. **Execution phase**: generated modules are re-imported through StructCast patterns and run by the training CLI.
+1. **Generation phase**: YAML templates are transformed into Python modules through the builders.
+2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by the training CLI.
 
-If a task relates to YAML, imports, generated source, optimizer orchestration, or the training command, this skill is the correct reference.
+If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, or the training command, this skill is the correct reference.

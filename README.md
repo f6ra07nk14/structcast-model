@@ -1,8 +1,8 @@
 # StructCast-Model
 
-StructCast-Model is a configuration-driven toolkit for generating PyTorch models and training workflows from YAML templates. It builds on top of StructCast's pattern system, template rendering, and runtime instantiation so that model structure, optimizer logic, dataset wiring, and training orchestration can all be described declaratively.
+StructCast-Model is a configuration-driven toolkit that generates PyTorch models and training workflows from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
 
-The implemented workflow in this repository is PyTorch-first. JAX and TensorFlow appear in the dependency matrix and roadmap, but the active CLI, builders, examples, and tests are centered on the PyTorch stack.
+The current implementation focuses on PyTorch. JAX and TensorFlow support is planned (see [Roadmap](#roadmap)), but all active CLI commands, code generators, and tests target the PyTorch stack.
 
 ## Table of Contents
 
@@ -19,11 +19,11 @@ The implemented workflow in this repository is PyTorch-first. JAX and TensorFlow
     - [3. Generate Loss, Metric, and Backward Classes](#3-generate-loss-metric-and-backward-classes)
     - [4. Inspect FLOPs and Parameters](#4-inspect-flops-and-parameters)
     - [5. Train a Generated Model](#5-train-a-generated-model)
-  - [Configuration Examples Included in This Repository](#configuration-examples-included-in-this-repository)
+  - [Configuration Examples](#configuration-examples)
     - [`cfg/models/ConvNeXtV2.yaml`](#cfgmodelsconvnextv2yaml)
     - [`cfg/backwards/ConvNeXtV2.yaml`](#cfgbackwardsconvnextv2yaml)
     - [`cfg/datasets/default_timm.yaml`](#cfgdatasetsdefault_timmyaml)
-  - [API Introduction: `base_trainer.py`](#api-introduction-base_trainerpy)
+  - [API Reference: `base_trainer.py`](#api-reference-base_trainerpy)
     - [Utility functions](#utility-functions)
       - [`get_dataset(dataset)`](#get_datasetdataset)
       - [`get_dataset_size(dataset)`](#get_dataset_sizedataset)
@@ -40,7 +40,7 @@ The implemented workflow in this repository is PyTorch-first. JAX and TensorFlow
     - [Core classes](#core-classes)
       - [`BaseTrainer`](#basetrainer)
       - [`BestCriterion`](#bestcriterion)
-  - [API Introduction: `trainer.py`](#api-introduction-trainerpy)
+  - [API Reference: `trainer.py`](#api-reference-trainerpy)
     - [Utility functions](#utility-functions-1)
       - [`create_torch_inputs(shape)`](#create_torch_inputsshape)
       - [`get_torch_device(device=None)`](#get_torch_devicedevicenone)
@@ -62,27 +62,29 @@ The implemented workflow in this repository is PyTorch-first. JAX and TensorFlow
 
 ## What This Project Does
 
-- Generate PyTorch model classes from YAML templates.
-- Generate backward and optimizer orchestration classes from YAML templates.
-- Format reusable YAML templates into concrete runtime configs.
-- Compute model complexity with `ptflops` and `calflops`.
-- Run end-to-end training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets and Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow logging](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/).
+- **Generate model code** — Produce PyTorch `nn.Module` classes from YAML layer templates.
+- **Generate training code** — Produce backward-pass, optimizer, and scheduler orchestration classes from YAML templates.
+- **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
+- **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch).
+- **Train end-to-end** — Run training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
 
 ## Installation
 
-The package exposes the `scm` CLI.
+StructCast-Model is installed with [uv](https://docs.astral.sh/uv/) and exposes the `scm` CLI entry point.
 
 ```bash
 uv sync --extra torch-cu130 --extra mlflow --extra flops
 ```
 
-Typical extras:
+Each extra installs a group of optional dependencies:
 
-- `torch-cu130`: PyTorch and torchvision for CUDA 13.0
-- `mlflow`: experiment tracking during `scm torch train`
-- `flops`: enables both `ptflops` and `calflops`
+| Extra         | What it provides                                              |
+| ------------- | ------------------------------------------------------------- |
+| `torch-cu130` | PyTorch and torchvision with CUDA 13.0 support                |
+| `mlflow`      | Experiment tracking for `scm torch train`                     |
+| `flops`       | Both `ptflops` and `calflops` for model complexity inspection |
 
-If you do not need FLOPs inspection or MLflow logging, you can omit those extras.
+Omit any extra you do not need. For example, `uv sync --extra torch-cu130` is sufficient if you only want to generate and train models without FLOPs analysis or MLflow logging.
 
 ## Project Structure
 
@@ -107,52 +109,63 @@ structcast-model/
 
 The main package areas are:
 
-- `builders`: turns validated templates into intermediate representations and then Python source code.
-- `commands`: exposes the `scm` CLI.
-- `torch`: contains the runtime pieces used by the CLI and by direct Python usage.
-- `cfg`: serves as the declarative source of truth for generated models, backwards, datasets, and presets.
+| Directory   | Purpose                                                                                                                               |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `builders/` | Converts validated YAML templates into intermediate representations, then renders Python source code.                                 |
+| `commands/` | Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)).                                                              |
+| `torch/`    | Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers. |
+| `cfg/`      | Declarative source of truth: YAML templates for models, backward logic, datasets, and runtime presets.                                |
 
 ## Core Workflow
 
-The repository follows a repeatable workflow:
+The repository follows a repeatable five-step workflow:
 
-1. Write or reuse YAML templates under `cfg/`.
-2. Render or specialize templates with `scm format` and `-p/--parameter` overrides.
-3. Generate Python source files for the model, losses, metrics, and backward logic.
-4. Instantiate those generated artifacts through StructCast object patterns.
-5. Train through `scm torch train`, which wires datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow together.
+1. **Write or reuse** YAML templates under `cfg/`.
+2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
+3. **Generate** Python source files for the model, loss, metric, and backward logic using `scm torch create`.
+4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
+5. **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow.
+
+```text
+YAML templates  --->  scm format / scm torch create  --->  Generated .py files
+                                                                 |
+StructCast patterns  <-------------------------------------------+
+       |
+       v
+scm torch train  --->  MLflow logs + model checkpoints
+```
 
 ## StructCast Pattern Basics
 
-This repository relies heavily on StructCast object patterns. The minimum syntax you need to read the commands is:
+This repository relies heavily on [StructCast](https://github.com/f6ra07nk14/structcast) object patterns to bridge generated source files and runtime commands. The minimum syntax you need to read the CLI examples is:
 
-| Alias    | Meaning                                   |
-| -------- | ----------------------------------------- |
-| `_obj_`  | Chain multiple construction steps         |
-| `_addr_` | Import a class or function by dotted path |
-| `_file_` | Load the symbol from a local Python file  |
-| `_call_` | Invoke the current callable               |
-| `_bind_` | Partially apply arguments                 |
-| `_attr_` | Access an attribute or method             |
+| Alias    | Meaning                                   | Example                                    |
+| -------- | ----------------------------------------- | ------------------------------------------ |
+| `_obj_`  | Chain multiple construction steps         | `[_obj_, ..., ...]`                        |
+| `_addr_` | Import a class or function by dotted path | `{_addr_: torch.nn.ReLU}`                  |
+| `_file_` | Load the symbol from a local Python file  | `{_addr_: model.Model, _file_: model.py}`  |
+| `_call_` | Invoke the current callable               | `_call_` or `{_call_: {out_features: 10}}` |
+| `_bind_` | Partially apply arguments                 | `{_bind_: {lr: 0.001}}`                    |
+| `_attr_` | Access an attribute or method             | `{_attr_: model_validate}`                 |
 
-Example:
+**Example:**
 
 ```yaml
 [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]
 ```
 
-This means:
+This pattern does the following:
 
-1. Import `Model` from `model.py`.
-2. Call `Model()` and return the instance.
+1. Import `Model` from the local file `model.py`.
+2. Call `Model()` with no arguments and return the instance.
 
-That pattern is the bridge between generated source files and runtime commands such as `ptflops`, `calflops`, and `train`.
+This pattern is the bridge between generated source files and runtime commands like `ptflops`, `calflops`, and `train`. For full documentation on StructCast patterns, see the [StructCast README](https://github.com/f6ra07nk14/structcast).
 
 ## Command Guide
 
 ### 1. Format Templates
 
-Use `scm format` when a YAML file is parameterized (e.g. [`cfg/datasets/default_timm.yaml`](cfg/datasets/default_timm.yaml)) and you want a concrete config.
+Use `scm format` to render a parameterized YAML template (such as [`cfg/datasets/default_timm.yaml`](cfg/datasets/default_timm.yaml)) into a concrete configuration file.
 
 ```bash
 scm format cfg/datasets/default_timm.yaml \
@@ -164,16 +177,16 @@ scm format cfg/datasets/default_timm.yaml \
     -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 ```
 
-What it does:
+What this does:
 
-- Loads the template.
-- Merges repeated `-p/--parameter` groups.
-- Renders Jinja-based sections.
-- Prints the resolved YAML or writes it to `-o/--output`.
+1. Loads the YAML template.
+2. Merges any repeated `-p/--parameter` groups into a single parameter set.
+3. Renders Jinja-based sections within the template.
+4. Writes the resolved YAML to `-o/--output` (or prints to stdout if `-o` is omitted).
 
 ### 2. Generate a Model Class
 
-Generate a Python model module from a YAML template (e.g., [`cfg/models/ConvNeXtV2.yaml`](cfg/models/ConvNeXtV2.yaml)).
+Generate a Python `nn.Module` from a YAML layer template (such as [`cfg/models/ConvNeXtV2.yaml`](cfg/models/ConvNeXtV2.yaml)).
 
 ```bash
 scm torch create model cfg/models/ConvNeXtV2.yaml
@@ -187,13 +200,13 @@ Useful options:
 - `-c/--classname`: set the generated class name, default `Model`
 - `--no-structured-output`: force tuple-like return behavior instead of a structured output mapping
 - `-s/--sublayer`: generate a named sublayer from the template instead of the root model
-- `-o/--output`: output file path; if omitted, the file is written to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
+- `-o/--output`: output file path; if omitted, defaults to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
 
-The ConvNeXtV2 template uses Jinja groups to switch backbone variants such as `atto`, `femto`, `tiny`, and `base`.
+The ConvNeXtV2 template uses Jinja parameter groups to switch between backbone variants such as `atto`, `femto`, `tiny`, and `base`.
 
 ### 3. Generate Loss, Metric, and Backward Classes
 
-Losses and metrics are generated through the same model command because they are still layer graphs.
+Losses and metrics use the same `scm torch create model` command because they are also layer graphs.
 
 ```bash
 scm torch create model cfg/losses/cls.yaml -c Loss -o loss.py
@@ -201,7 +214,7 @@ scm torch create model cfg/metrics/topk.yaml -c Metric -o metric.py
 scm torch create backward cfg/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 ```
 
-`scm torch create backward` turns the backward template into a class that owns:
+The `scm torch create backward` command turns a backward template into a class that manages:
 
 - optimizer construction
 - optional gradient scaler creation
@@ -212,7 +225,7 @@ scm torch create backward cfg/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}
 
 ### 4. Inspect FLOPs and Parameters
 
-Once a model has been generated, it can be instantiated from a StructCast pattern and inspected with either FLOPs backend.
+Once a model has been generated, you can instantiate it from a StructCast pattern and measure its computational complexity.
 
 ```bash
 scm torch ptflops '[_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
@@ -225,14 +238,14 @@ scm torch calflops '[_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
 
 What these commands do internally:
 
-- Instantiate the model from the `_obj_` pattern.
-- Create dummy tensors from `-s/--shape`.
-- Run one initialization forward pass with [`initial_model(...)`](src/structcast_model/torch/trainer.py#L67).
-- Pass the initialized model to `ptflops` or `calflops`.
+1. Instantiate the model from the `_obj_` pattern.
+2. Create dummy tensors from the `-s/--shape` specification.
+3. Run one initialization forward pass via [`initial_model(...)`](src/structcast_model/torch/trainer.py).
+4. Pass the initialized model to `ptflops` or `calflops` for complexity analysis.
 
 ### 5. Train a Generated Model
 
-This is the complete example flow from the current repository.
+Below is the complete training command from the included ConvNeXtV2 example.
 
 ```bash
 scm torch train \
@@ -287,18 +300,20 @@ Key arguments:
 
 What the train command does internally:
 
-1. Instantiates datasets and counts their lengths.
-2. Initializes the models with optional dummy inputs.
+1. Instantiates datasets and determines their lengths.
+2. Initializes models with optional dummy-input forward passes.
 3. Instantiates loss, metric, backward, compile, and EMA objects.
-4. Builds a `TorchTracker` from declared output names.
+4. Builds a `TorchTracker` from the declared output names.
 5. Creates a `TorchTrainer` with training and validation step objects.
-6. Logs metrics, arguments, model state, optimizer state, gradient scaler state, and best checkpoints to MLflow.
+6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
 
-## Configuration Examples Included in This Repository
+## Configuration Examples
+
+The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow.
 
 ### `cfg/models/ConvNeXtV2.yaml`
 
-This template demonstrates the model-building style used throughout the project:
+Demonstrates the model-building style used throughout the project:
 
 - parameter groups for multiple backbone sizes
 - nested user-defined layers such as `Backbone`, `Stem`, `DownSample`, and `Block`
@@ -308,7 +323,7 @@ This template demonstrates the model-building style used throughout the project:
 
 ### `cfg/backwards/ConvNeXtV2.yaml`
 
-This template shows how backward logic is configured declaratively:
+Demonstrates how backward logic is configured declaratively:
 
 - `MIXED_PRECISION` for `torch.amp.GradScaler`
 - `MIXED_PRECISION_TYPE` for autocast dtype
@@ -318,7 +333,7 @@ This template shows how backward logic is configured declaratively:
 
 ### `cfg/datasets/default_timm.yaml`
 
-This template formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. It covers:
+Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Covers:
 
 - timm dataset construction
 - timm dataloader construction
@@ -326,9 +341,9 @@ This template formats directly into a `TimmDataLoaderWrapper.model_validate(...)
 - mixup and cutmix options
 - train or validation split generation from one template
 
-## API Introduction: `base_trainer.py`
+## API Reference: `base_trainer.py`
 
-`src/structcast_model/base_trainer.py` provides the framework-agnostic training loop, state management, and callback system that concrete trainers such as `TorchTrainer` build upon.
+[`src/structcast_model/base_trainer.py`](src/structcast_model/base_trainer.py) provides the framework-agnostic training loop, state management, and callback system. Concrete trainers such as `TorchTrainer` build on top of these abstractions.
 
 ### Utility functions
 
@@ -348,11 +363,11 @@ Iterates over a callback list and calls each entry with `info` and keyword model
 
 #### `Forward`
 
-Called once per batch during training or validation. Accepts any `inputs` dict and keyword models; returns `dict[str, Any]` of named outputs and criteria.
+Called once per batch during training or validation. Accepts an `inputs` dictionary and keyword model arguments; returns a `dict[str, Any]` of named outputs and criteria.
 
 #### `Backward`
 
-Called once per training step. Receives the step index and criterion keyword arguments; returns `True` when the optimizer has been stepped, `False` during gradient accumulation.
+Called once per training step. Receives the step index and criterion keyword arguments; returns `True` when the optimizer has stepped, `False` when gradients are being accumulated.
 
 #### `Callback` and `BestCallback`
 
@@ -438,28 +453,23 @@ trainer.on_epoch_end.append(checkpoint)
 
 Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `BestCallback`).
 
-## API Introduction: `trainer.py`
+## API Reference: `trainer.py`
 
-`src/structcast_model/torch/trainer.py` contains the reusable runtime layer for PyTorch execution.
+[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer.
 
 ### Utility functions
 
 #### `create_torch_inputs(shape)`
 
-Creates dummy `float32` tensors from tuple, list, or dict shape descriptions. It is used for model initialization and FLOPs inspection.
+Creates dummy `float32` tensors from tuple, list, or dict shape descriptions. Used for model initialization and FLOPs inspection.
 
 #### `get_torch_device(device=None)`
 
-Returns the runtime device:
-
-- `cuda` when available and requested
-- `cpu` otherwise
-
-If `cuda` is requested but unavailable, it falls back to CPU.
+Returns the runtime device. Selects `cuda` when available and requested, otherwise falls back to `cpu`.
 
 #### `initial_model(model, shapes=None, compile_fn=None)`
 
-Walks a module or nested module structure, optionally builds dummy inputs, optionally runs a forward pass, and optionally applies a compile function to each module. It returns:
+Walks a module or nested module structure, optionally builds dummy inputs, runs a forward pass, and applies a compile function to each module. Returns:
 
 ```python
 (initialized_model, inputs, outputs)
@@ -467,10 +477,10 @@ Walks a module or nested module structure, optionally builds dummy inputs, optio
 
 #### `get_autocast(mixed_precision_type, device)`
 
-Returns either:
+Returns a context manager for automatic mixed precision:
 
-- `contextlib.suppress` when AMP is disabled
-- a configured `torch.autocast(...)` partial when AMP is enabled
+- `contextlib.suppress` when AMP is disabled.
+- A configured `torch.autocast(...)` partial when AMP is enabled.
 
 ### Step objects
 
@@ -496,7 +506,7 @@ Same interface as `TrainingStep`, but always executes under `torch.no_grad()`.
 
 #### `TorchTracker`
 
-Wraps `CriteriaTracker` modules for losses and metrics, resets them through global callbacks, and returns float logs suitable for history storage and MLflow logging.
+Wraps `CriteriaTracker` instances for losses and metrics, resets them through global callbacks, and returns float-valued logs suitable for history storage and MLflow logging.
 
 ```python
 tracker = TorchTracker.from_criteria(["ce_loss"], ["acc1", "acc5"])
@@ -534,18 +544,18 @@ Holds validated dataset configuration and lazily calls `timm.data.create_dataset
 
 Builds a timm dataloader with support for:
 
-- prefetching
-- channels-last conversion
-- mixup and cutmix
-- train/validation-specific augmentation settings
-- distributed device initialization
-- optional `FlexSpec` output remapping
+- Prefetching
+- Channels-last memory format conversion
+- Mixup and cutmix data augmentation
+- Train/validation-specific augmentation settings
+- Distributed device initialization
+- Optional `FlexSpec` output remapping
 
-The dataset template under `cfg/datasets/default_timm.yaml` formats into this wrapper.
+The dataset template at `cfg/datasets/default_timm.yaml` formats into this wrapper.
 
 #### `TimmEmaWrapper`
 
-Creates and updates `timm.utils.ModelEmaV3` instances and can swap them into inference-time evaluation when appropriate.
+Creates and updates `timm.utils.ModelEmaV3` instances and swaps them into inference-time evaluation when appropriate.
 
 ## Minimal End-to-End Example
 
@@ -591,7 +601,7 @@ scm torch train \
 
 ## Development
 
-Run the test suite with:
+Run the test suite:
 
 ```bash
 pytest
@@ -611,14 +621,14 @@ ruff check src tests
 ruff format src tests
 ```
 
-The repository already includes tests for:
+The repository includes tests for:
 
 - CLI behavior
-- builder generation
-- schema validation
-- trainer utilities
+- Builder code generation
+- Schema validation
+- Trainer utilities
 - timm dataset and dataloader wrappers
-- custom torch layers
+- Custom torch layers
 
 ## Roadmap
 
