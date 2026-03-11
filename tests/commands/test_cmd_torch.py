@@ -465,14 +465,14 @@ def _build_train_deps(
     trainer_ns.initial_model.side_effect = lambda models, _shapes: (models, {}, None)
     trainer_ns.TorchTracker.from_criteria.return_value = "tracker"
     trainer_ns.get_autocast.return_value = "autocast"
-    trainer_ns.TrainingStep.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-    trainer_ns.ValidationStep.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-    trainer_ns.TorchTrainer.side_effect = lambda **kwargs: _FakeTrainer(**kwargs)
-    trainer_ns.TorchBestCriterion.side_effect = (
-        lambda target, mode, on_best: _FakeBestCriterion(target=target, mode=mode, on_best=on_best)
+    trainer_ns.TrainingStep.side_effect = SimpleNamespace
+    trainer_ns.ValidationStep.side_effect = SimpleNamespace
+    trainer_ns.TorchTrainer.side_effect = _FakeTrainer
+    trainer_ns.TorchBestCriterion.side_effect = lambda target, mode, on_best: _FakeBestCriterion(
+        target=target, mode=mode, on_best=on_best
     )
-    trainer_ns.TimmEmaWrapper.from_models.side_effect = (
-        lambda models, **_: SimpleNamespace(models=models) if use_ema else None
+    trainer_ns.TimmEmaWrapper.from_models.side_effect = lambda models, **_: (
+        SimpleNamespace(models=models) if use_ema else None
     )
 
     deps = {
@@ -508,7 +508,9 @@ def test_train_raises_for_invalid_model_pattern_shape(tmp_path: Any) -> None:
         optimizers={"opt": _FakeModule()},
         grad_scalers={"scaler": _FakeModule()},
     )
-    deps, *_ = _build_train_deps(loss_module=_FakeModule(outputs=["loss"]), metric_module=None, backward=backward, use_ema=False)
+    deps, *_ = _build_train_deps(
+        loss_module=_FakeModule(outputs=["loss"]), metric_module=None, backward=backward, use_ema=False
+    )
 
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match="exactly one model definition"):
         train_fn(**args)
