@@ -1,0 +1,133 @@
+PARAMETERS:
+  DEFAULT:
+    backbone: atto
+  SHARED:
+    stem_kernel_size: 4
+    kernel_size: 7
+    drop_path_rate: 0.
+    norm_eps: 1.0e-6
+    activation: GELU
+    mlp_ratio: 4
+    num_classes: 1000
+  # backbone model parameters
+  atto:
+    dims: [40, 80, 160, 320]
+    depths: [2, 2, 6, 2]
+  femto:
+    dims: [48, 96, 192, 384]
+    depths: [2, 2, 6, 2]
+  pico:
+    dims: [64, 128, 256, 512]
+    depths: [2, 2, 6, 2]
+  nano:
+    dims: [80, 160, 320, 640]
+    depths: [2, 2, 8, 2]
+  tiny:
+    dims: [96, 192, 384, 768]
+    depths: [3, 3, 9, 3]
+  small:
+    dims: [96, 192, 384, 768]
+    depths: [3, 3, 27, 3]
+  base:
+    dims: [128, 256, 512, 1024]
+    depths: [3, 3, 27, 3]
+  large:
+    dims: [192, 384, 768, 1536]
+    depths: [3, 3, 27, 3]
+  huge:
+    dims: [352, 704, 1408, 2816]
+    depths: [3, 3, 27, 3]
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [cls]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+  - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{backbone}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{dims[-1]}}, eps: {{norm_eps}}}}]]
+      {% endraw %}
+      - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+Backbone:
+  INPUTS: [image]
+  OUTPUTS: [feat1, feat2, feat3, feat4]
+  STRUCTURED_OUTPUT: true
+  FLOW:
+    - _jinja_yaml_: |-
+        - _jinja_group_: {{backbone}}
+        {% raw %}
+          _jinja_yaml_: |-
+            {% set cum_depths = [0] + depths | cumsum %}
+            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fout: {{dims[0]}}}}}]
+            {% for i in range(cum_depths[0], cum_depths[1]) %}
+            - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat1, feat2, "downsample1", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
+            {% for i in range(cum_depths[1], cum_depths[2]) %}
+            - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat2, feat3, "downsample2", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
+            {% for i in range(cum_depths[2], cum_depths[3]) %}
+            - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+            - [feat3, feat4, "downsample3", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
+            {% for i in range(cum_depths[3], cum_depths[4]) %}
+            - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1)}}}}}]
+            {% endfor %}
+        {% endraw %}
+Stem:
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - INPUTS: inp
+          OUTPUTS: _
+          LAYER:
+            - _obj_
+            - _addr_: torch.nn.LazyConv2d
+            - _call_: {out_channels: {{fout}}, kernel_size: {{stem_kernel_size}}, stride: {{stem_kernel_size}}}
+        - [_, out, {TYPE: LayerNorm, PARAM: {DEFAULT: {fout: {{fout}}}}}]
+DownSample:
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - [inp, _, {TYPE: LayerNorm, PARAM: {DEFAULT: {fout: {{fin}}}}}]
+        - [_, out, [_obj_, {_addr_: torch.nn.LazyConv2d}, _call_: {out_channels: {{fout}}, kernel_size: 2, stride: 2}]]
+Block:
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - INPUTS: inp
+          OUTPUTS: _
+          LAYER:
+            - _obj_
+            - _addr_: torch.nn.LazyConv2d
+            - _call_: {out_channels: {{fout}}, kernel_size: {{kernel_size}}, groups: {{fout}}, padding: "eval: {{kernel_size}} // 2"}
+        - [_, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelLast}, _call_]]
+        - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{fout}}, eps: {{norm_eps}}}}]]
+        - [_, _, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: "eval: {{fout}} * {{mlp_ratio}}"}}]]
+        - [_, _, [_obj_, {_addr_: "timm.layers.{{activation}}"}, {_call_: {inplace: true}}]]
+        - INPUTS: _
+          OUTPUTS: _
+          LAYER:
+            - _obj_
+            - _addr_: timm.layers.grn.GlobalResponseNorm
+            - _call_: {dim: "eval: {{fout}} * {{mlp_ratio}}", eps: {{norm_eps}}, channels_last: true}
+        - [_, _, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{fout}}}}]]
+        - [_, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelFirst}, _call_]]
+        - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+        - [[[inp, feat]], out, [_obj_, {_addr_: structcast_model.torch.layers.Add}, _call_]]
+LayerNorm: # support channel first
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - [inp, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelLast}, _call_]]
+        - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{fout}}, eps: {{norm_eps}}}}]]
+        - [_, out, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelFirst}, _call_]]
+DropPath:
+  _jinja_yaml_: |-
+    FLOW: [[inp, out, [_obj_, {_addr_: timm.layers.DropPath}, {_call_: {drop_prob: {{drop_prob}}}}]]]
+  INFERENCE_FLOW: [[inp, out]]

@@ -1,0 +1,6 @@
+PARAMETERS:
+  DEFAULT: {label_smoothing: 0.0}
+  SHARED: {}
+FLOW:
+  - _jinja_yaml_: |-
+      - [{target: label, input: cls}, ce_loss, [_obj_, {_addr_: torch.nn.CrossEntropyLoss}, {_call_: {label_smoothing: {{label_smoothing}}}}]]

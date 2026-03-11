@@ -1,0 +1,7 @@
+PARAMETERS:
+  DEFAULT: {k: 5}
+  SHARED: {}
+FLOW:
+  - [{y_true: label, y_pred: cls}, acc1, [_obj_, {_addr_: structcast_model.torch.layers.sparse_categorical_accuracy}]]
+  - _jinja_yaml_: |-
+      - [{y_true: label, y_pred: cls, k: {{k}}}, acc5, [_obj_, {_addr_: structcast_model.torch.layers.sparse_top_k_categorical_accuracy}]]

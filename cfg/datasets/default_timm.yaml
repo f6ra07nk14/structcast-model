@@ -1,0 +1,83 @@
+PARAMETERS:
+  DEFAULT:
+    training: false
+    epochs: 300
+    batch_size: 128
+    dataset: mnist
+    dataset_dir: data
+    num_classes: 1000
+    label_smoothing: 0.0
+    input_size: [3, 224, 224]
+    image_dtype: float32 # "float32", "float16", or "bfloat16"
+    no_aug: false
+    download: false
+    seed: 42
+    repeats: 0.0
+    num_samples: null
+    trust_remote_code: false
+    use_multi_epochs_loader: false
+    pin_memory: true
+    device: cuda # "cuda" or "cpu"
+    workers: 4
+_obj_:
+  - _addr_: structcast_model.torch.trainer.TimmDataLoaderWrapper
+  - _attr_: model_validate
+  - - _call_
+    - spec: {image: "0", label: "1"}
+      dataset:
+        input_img_mode: RGB
+        input_key: null
+        target_key: null
+        class_map: null
+        _jinja_yaml_: |-
+          batch_size: {{batch_size}}
+          name: {{dataset}}
+          root: {{dataset_dir}}
+          seed: {{seed}}
+          repeats: {{repeats}}
+          download: {{download}}
+          trust_remote_code: {{trust_remote_code}}
+          num_samples: {{"null" if num_samples is none else num_samples}}
+          is_training: {{training}}
+          split: {{"train" if training else "validation"}}
+      use_prefetcher: true
+      mixup_alpha: 0.0
+      cutmix_alpha: 0.0
+      cutmix_minmax: null # null or [min, max]
+      mixup_prob: 1.0
+      mixup_switch_prob: 0.5
+      mixup_mode: batch # "batch", "pair", or "elem"
+      mixup_off_epoch: 0
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      re_prob: 0.0 # Random erase prob
+      re_mode: const # Random erase mode ("const", "pixel", or "rand")
+      re_count: 1 # Random erase count
+      re_split: false # Random erase split
+      train_crop_mode: rrc # Training random crop mode ("rrc", "rkrc", "rkrr")
+      scale: [0.08, 1.0] # Random resize scale
+      # ratio: [3.0 / 4.0, 4.0 / 3.0] # Random resize aspect ratio
+      hflip: 0.5 # Random horizontal flip probability
+      vflip: 0.0 # Random vertical flip probability
+      color_jitter: 0.4 # Color jitter factor (0 means no jitter)
+      color_jitter_prob: null # Color jitter probability
+      grayscale_prob: 0.0 # Random grayscale probability
+      gaussian_blur_prob: 0.0 # Random Gaussian blur probability
+      auto_augment: null # Auto augment policy (e.g., "v0", "original", "v0r", "originalr", "3a", "rand-m9-mstd0.5-inc1", ...)
+      num_aug_repeats: 0
+      num_aug_splits: 0
+      worker_seeding: all # "all", "part"
+      crop_pct: 0.875
+      _jinja_yaml_: |-
+        label_smoothing: {{label_smoothing}}
+        num_classes: {{num_classes}}
+        input_size: {{input_size}}
+        interpolation: {{"random" if training else "bicubic"}}
+        image_dtype: {{image_dtype}}
+        num_workers: {{workers}}
+        pin_memory: {{pin_memory}}
+        device: {{device}}
+        no_aug: {{no_aug}}
+        use_multi_epochs_loader: {{use_multi_epochs_loader}} 
+
+
