@@ -28,7 +28,7 @@ RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=README.md,target=README.md \
     --mount=type=bind,source=tox.ini,target=tox.ini \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --dev --group tox --extra torch-cpu --extra flops
+    uv sync --frozen --no-install-project --dev --group tox --extra torch-cpu
 
 # Activate virtual environment and set up PATH to use installed tools
 ENV PATH="/app/.venv/bin:${PATH}"
