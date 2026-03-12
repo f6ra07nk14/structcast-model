@@ -11,6 +11,7 @@ from structcast.utils.security import configure_security
 from typer import Typer
 from typer.testing import CliRunner
 
+from structcast_model.base_trainer import NamedCallbackList
 from structcast_model.commands.cmd_torch import app
 
 # ---------------------------------------------------------------------------
@@ -346,13 +347,26 @@ class _FakeTrainer:
     def __init__(self, **kwargs: Any) -> None:
         self.backward = kwargs["backward"]
         self.inference_wrapper = kwargs["inference_wrapper"]
-        self.on_epoch_end: list[Any] = []
-        self.on_training_begin: list[Any] = []
-        self.on_training_step_end: list[Any] = []
-        self.on_training_end: list[Any] = []
-        self.on_validation_begin: list[Any] = []
-        self.on_validation_step_end: list[Any] = []
-        self.on_validation_end: list[Any] = []
+        self.on_epoch_end: NamedCallbackList = NamedCallbackList()
+        self.on_training_begin: NamedCallbackList = NamedCallbackList()
+        self.on_training_step_end: NamedCallbackList = NamedCallbackList()
+        self.on_training_end: NamedCallbackList = NamedCallbackList()
+        self.on_validation_begin: NamedCallbackList = NamedCallbackList()
+        self.on_validation_step_end: NamedCallbackList = NamedCallbackList()
+        self.on_validation_end: NamedCallbackList = NamedCallbackList()
+
+    def describe(self) -> dict[str, list[str]]:
+        """Return registered callback names for display."""
+        attrs = (
+            "on_epoch_end",
+            "on_training_begin",
+            "on_training_step_end",
+            "on_training_end",
+            "on_validation_begin",
+            "on_validation_step_end",
+            "on_validation_end",
+        )
+        return {a: getattr(self, a).names() for a in attrs if getattr(self, a)}
 
     def fit(self, **kwargs: Any) -> None:
         modules = {name: module for name, module in kwargs.items() if hasattr(module, "state_dict")}

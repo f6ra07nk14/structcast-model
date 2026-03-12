@@ -49,10 +49,13 @@ def _clean_global_callbacks() -> Any:
         "on_epoch_begin",
         "on_epoch_end",
     )
-    saved = {a: list(getattr(GLOBAL_CALLBACKS, a)) for a in _attrs}
+    saved = {a: (list(getattr(GLOBAL_CALLBACKS, a)), list(getattr(GLOBAL_CALLBACKS, a)._names)) for a in _attrs}
     yield
-    for a, v in saved.items():
-        setattr(GLOBAL_CALLBACKS, a, v)
+    for a, (cbs, names) in saved.items():
+        ncl = getattr(GLOBAL_CALLBACKS, a)
+        ncl.clear()
+        for name, cb in zip(names, cbs, strict=True):
+            ncl.register(name, cb)
 
 
 class _IdentityModel(Module):

@@ -1,5 +1,6 @@
 """Build optimizers."""
 
+from logging import getLogger
 from re import Pattern as RePattern, compile as re_compile
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,9 @@ else:
     Parameter = Any
     Optimizer = Any
     LRScheduler = Any
+
+
+logger = getLogger(__name__)
 
 
 def _match_no_weight_decay(
@@ -122,9 +126,9 @@ def _create_opt(
     nwd_regexes = [re_compile(r) for r in no_weight_decay_regexes or []]
     has_lr_scale = False
     if layer_decay is not None:
-        print(f"Using layer decay: {layer_decay}")
+        logger.info(f"Using layer decay: {layer_decay}")
     if weight_decay > 0.0:
-        print(f"Using layer decay with weight decay: {weight_decay}")
+        logger.info(f"Using layer decay with weight decay: {weight_decay}")
     if layer_decay is not None and layer_decay > 0.0:
         parameters: Any = _param_groups_layer_decay(
             params,
@@ -168,28 +172,40 @@ def _create_native_scheduler(
         # ReduceLROnPlateau: step(self, metrics: SupportsFloat, epoch=None)
         if criterion is None:
             raise ValueError("criterion must be specified for ReduceLROnPlateau scheduler")
-        GLOBAL_CALLBACKS.on_epoch_end.append(lambda i, **kw: scheduler.step(i.logs()[criterion], i.epoch))  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_epoch_end.register(
+            "lr_scheduler_step",
+            lambda i, **kw: scheduler.step(i.logs()[criterion], i.epoch),  # type: ignore[arg-type]
+        )
         if has_lr_scale:
-            GLOBAL_CALLBACKS.on_epoch_end.append(lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
+            GLOBAL_CALLBACKS.on_epoch_end.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
     elif isinstance(scheduler, lr_scheduler.CosineAnnealingWarmRestarts):
         # CosineAnnealingWarmRestarts: step(epoch + i / iters)
         if updates_per_epoch is None or updates_per_epoch <= 0:
             raise ValueError("updates_per_epoch must be a positive integer for CosineAnnealingWarmRestarts scheduler")
-        GLOBAL_CALLBACKS.on_update.append(lambda i, **kw: scheduler.step((i.update - 1) / updates_per_epoch))  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_update.register(
+            "lr_scheduler_step",
+            lambda i, **kw: scheduler.step((i.update - 1) / updates_per_epoch),  # type: ignore[arg-type]
+        )
         if has_lr_scale:
-            GLOBAL_CALLBACKS.on_update.append(lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
+            GLOBAL_CALLBACKS.on_update.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
     else:
-        GLOBAL_CALLBACKS.on_epoch_end.append(lambda i, **kw: scheduler.step())  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_epoch_end.register("lr_scheduler_step", lambda i, **kw: scheduler.step())  # type: ignore[arg-type]
         if has_lr_scale:
-            GLOBAL_CALLBACKS.on_epoch_end.append(lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
+            GLOBAL_CALLBACKS.on_epoch_end.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
 
 
 def _create_timm_scheduler(optimizer: Optimizer, criterion: str, name: str, **kwargs: Any) -> None:
     """Create the timm scheduler."""
     scheduler, epochs = create_scheduler_v2(optimizer, sched=name, **kwargs)
-    print(f"Scheduled epochs: {epochs}. LR stepped per {'epoch' if scheduler.t_in_epochs else 'update'}.")
-    GLOBAL_CALLBACKS.on_update.append(lambda i, **kw: scheduler.step_update(i.update, i.logs()[criterion]))  # type: ignore[arg-type]
-    GLOBAL_CALLBACKS.on_epoch_end.append(lambda i, **kw: scheduler.step(i.epoch, i.logs()[criterion]))  # type: ignore[arg-type]
+    logger.info(f"Scheduled epochs: {epochs}. LR stepped per {'epoch' if scheduler.t_in_epochs else 'update'}.")
+    GLOBAL_CALLBACKS.on_update.register(
+        "lr_scheduler_step_update",
+        lambda i, **kw: scheduler.step_update(i.update, i.logs()[criterion]),  # type: ignore[arg-type]
+    )
+    GLOBAL_CALLBACKS.on_epoch_end.register(
+        "lr_scheduler_step",
+        lambda i, **kw: scheduler.step(i.epoch, i.logs()[criterion]),  # type: ignore[arg-type]
+    )
 
 
 def _create_scheduler(optimizer: Optimizer, name: str, has_lr_scale: bool, **kwargs: Any) -> None:
