@@ -40,6 +40,8 @@ Issues = "https://github.com/f6ra07nk14/structcast-model/issues"
 scm = "structcast_model.commands.main:app"
 
 [project.optional-dependencies]
+# NOTE: JAX, TensorFlow, and Keras extras install dependencies only.
+# No builder or trainer implementations exist for these frameworks yet.
 jax-cpu = ["flax>=0.12.2", "jax[cpu]>=0.9.0.1"]
 jax-cu12 = ["flax>=0.12.2", "jax[cuda12]>=0.9.0.1"]
 jax-cu13 = ["flax>=0.12.2", "jax[cuda13]>=0.9.0.1"]
