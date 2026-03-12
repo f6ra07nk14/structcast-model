@@ -1,6 +1,7 @@
 """Base trainer for training a model."""
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from logging import getLogger
 from math import inf
@@ -82,7 +83,12 @@ class BestCallback(Protocol[ModelT_contra]):
         """Call the callback with the given info, target criterion, and best value."""
 
 
-def invoke_callback(callbacks: list[Callable[..., None]], info: BaseInfo, *args: Any, **models: ModelT_contra) -> None:
+def invoke_callback(
+    callbacks: Sequence[Callable[..., None]],
+    info: BaseInfo,
+    *args: Any,
+    **models: ModelT_contra,
+) -> None:
     """Invoke callback."""
     for callback in callbacks:
         callback(info, *args, **models)
@@ -143,9 +149,45 @@ class Callbacks(Generic[ModelT_contra]):
             self.on_epoch_begin.extend(GLOBAL_CALLBACKS.on_epoch_begin)
             self.on_epoch_end.extend(GLOBAL_CALLBACKS.on_epoch_end)
 
+    def clear(self) -> None:
+        """Reset all callback lists to empty."""
+        for attr in (
+            "on_update",
+            "on_training_begin",
+            "on_training_end",
+            "on_training_step_begin",
+            "on_training_step_end",
+            "on_validation_begin",
+            "on_validation_end",
+            "on_validation_step_begin",
+            "on_validation_step_end",
+            "on_epoch_begin",
+            "on_epoch_end",
+        ):
+            getattr(self, attr).clear()
+
 
 GLOBAL_CALLBACKS = Callbacks[Any](add_global_callbacks=False)
 """Global callbacks."""
+
+
+@contextmanager
+def callbacks_session() -> Generator[None, None, None]:
+    """Context manager that clears GLOBAL_CALLBACKS on entry and exit.
+
+    Use this to scope callback registrations to a single training session,
+    preventing accumulation of stale callbacks across multiple runs.
+
+    Example:
+        >>> with callbacks_session():
+        ...     # register callbacks and run training
+        ...     pass
+    """
+    GLOBAL_CALLBACKS.clear()
+    try:
+        yield
+    finally:
+        GLOBAL_CALLBACKS.clear()
 
 
 class InferenceWrapper(Protocol[ModelT_contra]):
@@ -331,6 +373,7 @@ __all__ = [
     "DatasetLike",
     "Forward",
     "InferenceWrapper",
+    "callbacks_session",
     "get_dataset",
     "get_dataset_size",
     "invoke_callback",

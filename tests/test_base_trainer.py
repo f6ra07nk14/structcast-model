@@ -14,6 +14,7 @@ from structcast_model.base_trainer import (
     BaseTrainer,
     BestCriterion,
     Callbacks,
+    callbacks_session,
     get_dataset,
     get_dataset_size,
     invoke_callback,
@@ -163,6 +164,100 @@ def test_callbacks_post_init_skips_global_when_disabled() -> None:
         assert cb not in cbs.on_update
     finally:
         GLOBAL_CALLBACKS.on_update.remove(cb)
+
+
+# ---------------------------------------------------------------------------
+# Callbacks.clear
+# ---------------------------------------------------------------------------
+
+
+def test_callbacks_clear_empties_all_lists() -> None:
+    """clear() resets every callback list to empty."""
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    cbs = Callbacks(add_global_callbacks=False)
+    cbs.on_update.append(cb)
+    cbs.on_epoch_end.append(cb)
+    cbs.on_training_begin.append(cb)
+    cbs.clear()
+    assert cbs.on_update == []
+    assert cbs.on_epoch_end == []
+    assert cbs.on_training_begin == []
+
+
+def test_callbacks_clear_on_global_callbacks() -> None:
+    """clear() on GLOBAL_CALLBACKS removes all previously registered callbacks."""
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    GLOBAL_CALLBACKS.on_epoch_end.append(cb)
+    GLOBAL_CALLBACKS.on_update.append(cb)
+    GLOBAL_CALLBACKS.clear()
+    assert cb not in GLOBAL_CALLBACKS.on_epoch_end
+    assert cb not in GLOBAL_CALLBACKS.on_update
+
+
+# ---------------------------------------------------------------------------
+# callbacks_session
+# ---------------------------------------------------------------------------
+
+
+def test_callbacks_session_clears_on_entry() -> None:
+    """callbacks_session() clears GLOBAL_CALLBACKS before yielding."""
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    GLOBAL_CALLBACKS.on_epoch_end.append(cb)
+    with callbacks_session():
+        assert cb not in GLOBAL_CALLBACKS.on_epoch_end
+
+
+def test_callbacks_session_clears_on_exit() -> None:
+    """callbacks_session() clears GLOBAL_CALLBACKS when the block exits normally."""
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    with callbacks_session():
+        GLOBAL_CALLBACKS.on_epoch_end.append(cb)
+    assert cb not in GLOBAL_CALLBACKS.on_epoch_end
+
+
+def test_callbacks_session_clears_on_exception() -> None:
+    """callbacks_session() clears GLOBAL_CALLBACKS even when an exception is raised."""
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    def _run_with_error() -> None:
+        with callbacks_session():
+            GLOBAL_CALLBACKS.on_update.append(cb)
+            raise RuntimeError("test")
+
+    with pytest.raises(RuntimeError):
+        _run_with_error()
+    assert cb not in GLOBAL_CALLBACKS.on_update
+
+
+def test_callbacks_session_isolates_multiple_runs() -> None:
+    """Callbacks registered in one session are not seen by the next session."""
+    registered: list[Any] = []
+
+    def cb(i: Any, **kw: Any) -> None:
+        pass
+
+    with callbacks_session():
+        GLOBAL_CALLBACKS.on_training_begin.append(cb)
+        registered.append(cb)
+
+    # Second session starts clean
+    with callbacks_session():
+        for item in registered:
+            assert item not in GLOBAL_CALLBACKS.on_training_begin
 
 
 # ---------------------------------------------------------------------------
