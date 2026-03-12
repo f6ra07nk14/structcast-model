@@ -43,3 +43,5 @@ class Concatenate(Module):
 
 Concat = Concatenate
 """Alias for Concatenate."""
+
+__all__ = ["Concat", "Concatenate"]

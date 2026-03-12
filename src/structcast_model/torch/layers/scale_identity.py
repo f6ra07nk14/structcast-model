@@ -28,3 +28,6 @@ class ScaleIdentity(Module):
     def forward(self, input: Tensor) -> Tensor:
         """Forward method."""
         return input.mul(self.scale)
+
+
+__all__ = ["ScaleIdentity"]

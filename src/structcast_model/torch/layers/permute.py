@@ -70,3 +70,6 @@ class ToChannelFirst(LazyModuleMixin, Permute):
         if self.dims[0] == 0:
             size = len(input.shape[1:-1]) + 1
             self.dims = (size, *range(1, size))
+
+
+__all__ = ["Permute", "ToChannelFirst", "ToChannelLast"]

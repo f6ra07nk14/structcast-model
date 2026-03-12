@@ -14,3 +14,6 @@ class Multiply(Module):
         for inp in inputs[1:]:
             out = out.mul(inp)
         return out
+
+
+__all__ = ["Multiply"]

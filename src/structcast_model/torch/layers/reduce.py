@@ -22,3 +22,6 @@ class ReduceSum(Module):
         if self.dim is None:
             return input.sum()
         return input.sum(self.dim, keepdim=self.keepdim)
+
+
+__all__ = ["ReduceSum"]
