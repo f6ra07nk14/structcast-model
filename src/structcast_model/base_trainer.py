@@ -1,6 +1,7 @@
 """Base trainer for training a model."""
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from logging import getLogger
 from math import inf
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, Ty
 logger = getLogger(__name__)
 
 ModelT_contra = TypeVar("ModelT_contra", contravariant=True)
+_NCL_T = TypeVar("_NCL_T")
 
 DatasetLike: TypeAlias = Iterable[dict[str, Any]]
 """Dataset-like object."""
@@ -82,47 +84,137 @@ class BestCallback(Protocol[ModelT_contra]):
         """Call the callback with the given info, target criterion, and best value."""
 
 
-def invoke_callback(callbacks: list[Callable[..., None]], info: BaseInfo, *args: Any, **models: ModelT_contra) -> None:
+def invoke_callback(
+    callbacks: Sequence[Callable[..., None]],
+    info: BaseInfo,
+    *args: Any,
+    **models: ModelT_contra,
+) -> None:
     """Invoke callback."""
     for callback in callbacks:
         callback(info, *args, **models)
+
+
+_CALLBACK_ATTRS: tuple[str, ...] = (
+    "on_update",
+    "on_training_begin",
+    "on_training_end",
+    "on_training_step_begin",
+    "on_training_step_end",
+    "on_validation_begin",
+    "on_validation_end",
+    "on_validation_step_begin",
+    "on_validation_step_end",
+    "on_epoch_begin",
+    "on_epoch_end",
+)
+
+
+def _callback_name(callback: Any) -> str:
+    """Derive a display name from a callback object."""
+    name = getattr(callback, "__name__", None)
+    if name is None:
+        func = getattr(callback, "__func__", None)
+        name = getattr(func, "__name__", None)
+    return name or type(callback).__name__
+
+
+class NamedCallbackList(list[_NCL_T]):
+    """A generic list of callbacks that supports named registration for clearer introspection.
+
+    Callbacks appended via :meth:`append` or :meth:`extend` receive an auto-generated
+    display name inferred from the callable.  Use :meth:`register` to supply an
+    explicit human-readable name.
+
+    Example:
+        >>> from typing import Any
+        >>> ncl: NamedCallbackList[Any] = NamedCallbackList()
+        >>> ncl.register("log_metrics", lambda i, **kw: None)
+        >>> ncl.names()
+        ['log_metrics']
+    """
+
+    _names: list[str]
+
+    def __init__(self) -> None:
+        """Initialize an empty list with an accompanying name registry."""
+        super().__init__()
+        self._names = []
+
+    def __class_getitem__(cls, item: Any) -> type:  # type: ignore[override]
+        """Support generic-alias syntax ``NamedCallbackList[X]`` in annotations."""
+        return cls
+
+    def append(self, callback: _NCL_T) -> None:  # type: ignore[override]
+        """Append *callback*, using its inferred name as the display name."""
+        super().append(callback)
+        self._names.append(_callback_name(callback))
+
+    def extend(self, callbacks: Iterable[_NCL_T]) -> None:  # type: ignore[override]
+        """Extend the list, deriving display names automatically."""
+        for cb in callbacks:
+            self.append(cb)
+
+    def register(self, name: str, callback: _NCL_T) -> None:
+        """Register *callback* with an explicit display *name*.
+
+        Args:
+            name: Human-readable label shown when describing registered callbacks.
+            callback: The callable to register.
+        """
+        super().append(callback)
+        self._names.append(name)
+
+    def clear(self) -> None:
+        """Clear all callbacks and their display names."""
+        super().clear()
+        self._names.clear()
+
+    def names(self) -> list[str]:
+        """Return the display names of all registered callbacks.
+
+        Returns:
+            A new list containing the display name of each registered callback,
+            in registration order.
+        """
+        return list(self._names)
 
 
 @dataclass(kw_only=True)
 class Callbacks(Generic[ModelT_contra]):
     """Callbacks."""
 
-    on_update: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_update: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to call after each update."""
 
-    on_training_begin: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_training_begin: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to call at the beginning of training."""
 
-    on_training_end: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_training_end: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to call at the end of training."""
 
-    on_training_step_begin: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_training_step_begin: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the beginning of each training step."""
 
-    on_training_step_end: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_training_step_end: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the end of each training step."""
 
-    on_validation_begin: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_validation_begin: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the beginning of validation."""
 
-    on_validation_end: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_validation_end: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the end of validation."""
 
-    on_validation_step_begin: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_validation_step_begin: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the beginning of each validation step."""
 
-    on_validation_step_end: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_validation_step_end: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the end of each validation step."""
 
-    on_epoch_begin: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_epoch_begin: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the beginning of each epoch."""
 
-    on_epoch_end: list[Callback[ModelT_contra]] = field(default_factory=list)
+    on_epoch_end: NamedCallbackList[Callback[ModelT_contra]] = field(default_factory=NamedCallbackList)
     """Callbacks to be called at the end of each epoch."""
 
     add_global_callbacks: bool = True
@@ -131,21 +223,48 @@ class Callbacks(Generic[ModelT_contra]):
     def __post_init__(self) -> None:
         """Post initialization."""
         if self.add_global_callbacks:
-            self.on_update.extend(GLOBAL_CALLBACKS.on_update)
-            self.on_training_begin.extend(GLOBAL_CALLBACKS.on_training_begin)
-            self.on_training_end.extend(GLOBAL_CALLBACKS.on_training_end)
-            self.on_training_step_begin.extend(GLOBAL_CALLBACKS.on_training_step_begin)
-            self.on_training_step_end.extend(GLOBAL_CALLBACKS.on_training_step_end)
-            self.on_validation_begin.extend(GLOBAL_CALLBACKS.on_validation_begin)
-            self.on_validation_end.extend(GLOBAL_CALLBACKS.on_validation_end)
-            self.on_validation_step_begin.extend(GLOBAL_CALLBACKS.on_validation_step_begin)
-            self.on_validation_step_end.extend(GLOBAL_CALLBACKS.on_validation_step_end)
-            self.on_epoch_begin.extend(GLOBAL_CALLBACKS.on_epoch_begin)
-            self.on_epoch_end.extend(GLOBAL_CALLBACKS.on_epoch_end)
+            for attr in _CALLBACK_ATTRS:
+                src: NamedCallbackList = getattr(GLOBAL_CALLBACKS, attr)
+                dst: NamedCallbackList = getattr(self, attr)
+                for name, cb in zip(src._names, src, strict=True):
+                    dst.register(name, cb)
+
+    def clear(self) -> None:
+        """Reset all callback lists to empty."""
+        for attr in _CALLBACK_ATTRS:
+            getattr(self, attr).clear()
+
+    def describe(self) -> dict[str, list[str]]:
+        """Return a mapping of event name to registered callback display names.
+
+        Returns:
+            A dict keyed by event name (e.g. ``"on_epoch_end"``) whose values are
+            lists of display names.  Events with no registered callbacks are omitted.
+        """
+        return {attr: getattr(self, attr).names() for attr in _CALLBACK_ATTRS if getattr(self, attr)}
 
 
 GLOBAL_CALLBACKS = Callbacks[Any](add_global_callbacks=False)
 """Global callbacks."""
+
+
+@contextmanager
+def callbacks_session() -> Generator[None, None, None]:
+    """Context manager that clears GLOBAL_CALLBACKS on entry and exit.
+
+    Use this to scope callback registrations to a single training session,
+    preventing accumulation of stale callbacks across multiple runs.
+
+    Example:
+        >>> with callbacks_session():
+        ...     # register callbacks and run training
+        ...     pass
+    """
+    GLOBAL_CALLBACKS.clear()
+    try:
+        yield
+    finally:
+        GLOBAL_CALLBACKS.clear()
 
 
 class InferenceWrapper(Protocol[ModelT_contra]):
@@ -299,7 +418,7 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=list)
+    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=NamedCallbackList)  # type: ignore[assignment]
     """Callbacks to be called when a new best criterion is found."""
 
     _best: float = field(init=False, repr=False)
@@ -309,6 +428,12 @@ class BestCriterion(Generic[ModelT_contra]):
         """Post initialization."""
         self._compare = lt if self.mode == "min" else gt
         self._best = inf if self.mode == "min" else -inf
+        if not isinstance(self.on_best, NamedCallbackList):
+            raw = list(self.on_best)
+            ncl: NamedCallbackList = NamedCallbackList()
+            for cb in raw:
+                ncl.append(cb)
+            self.on_best = ncl
 
     def __call__(self, info: BaseInfo, **models: ModelT_contra) -> None:
         """Check and update the best criterion."""
@@ -331,6 +456,8 @@ __all__ = [
     "DatasetLike",
     "Forward",
     "InferenceWrapper",
+    "NamedCallbackList",
+    "callbacks_session",
     "get_dataset",
     "get_dataset_size",
     "invoke_callback",

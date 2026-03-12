@@ -95,3 +95,6 @@ class LazyLayerNorm(LazyModuleMixin, LayerNorm):
                     if self.bias is not None:
                         self.bias.materialize(self.normalized_shape)
                 self.reset_parameters()
+
+
+__all__ = ["LazyLayerNorm", "LazyRMSNorm"]

@@ -25,3 +25,6 @@ class ChannelLastShuffle(Module):
     def extra_repr(self) -> str:
         """Extra representation of the layer."""
         return f"groups={self.groups}"
+
+
+__all__ = ["ChannelLastShuffle"]

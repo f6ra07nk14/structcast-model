@@ -65,3 +65,6 @@ def reinmax(logits: Tensor, tau: float = 1.0) -> tuple[Tensor, Tensor]:
     logits = logits.view(-1, shape[-1])
     grad_sample, y_soft = ReinMaxCore.apply(logits, logits.new_empty(1).fill_(tau))
     return grad_sample.view(shape), y_soft.view(shape)
+
+
+__all__ = ["ReinMaxCore", "reinmax"]

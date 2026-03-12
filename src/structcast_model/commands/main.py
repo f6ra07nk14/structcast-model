@@ -1,5 +1,6 @@
 """Main entry point for the StructCast Model CLI application."""
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.base import dump_yaml, dump_yaml_to_string
@@ -9,10 +10,13 @@ from structcast_model.commands import cmd_torch
 from structcast_model.commands.utils import dict_parser, reduce_dict
 
 if TYPE_CHECKING:
+    import jinja2
+
     from structcast_model.builders import schema
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
+    jinja2 = LazyModuleImporter("jinja2")
     schema = LazyModuleImporter("structcast_model.builders.schema")
 
 
@@ -41,7 +45,15 @@ def format_template(
     ),
 ) -> None:
     """Format a template configuration file with the provided parameters and print or save the result."""
-    res: Any = schema.Template.from_path(cfg_path)(reduce_dict(parameters)).model_dump(mode="json")
+    try:
+        res: Any = schema.Template.from_path(cfg_path)(reduce_dict(parameters)).model_dump(mode="json")
+    except jinja2.UndefinedError as exc:
+        match = re.search(r"'([^']+)' is undefined", str(exc))
+        var_hint = f" '{match.group(1)}'" if match else ""
+        missing_hint = f' Provide it with: --parameter "{match.group(1)}: {{...}}"' if match else ""
+        raise SystemExit(
+            f"Template rendering failed: {exc}\nHint: missing template variable{var_hint}.{missing_hint}"
+        ) from exc
     raw = dump_yaml_to_string(res)
     if output is None:
         print(raw)

@@ -1,10 +1,11 @@
 ARG PY_VERSION=3.11
 FROM ghcr.io/astral-sh/uv:python${PY_VERSION}-bookworm-slim
 
-# Install build dependencies for compiling Python packages and Node.js
+# Install build dependencies
+# Note: build-essential is not needed for binary wheel installs (torch-cpu, etc.)
+# curl is required by uv python install --preview to download Python binaries
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

@@ -9,7 +9,7 @@ from structcast.utils.base import dump_yaml_to_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo, get_dataset_size
+from structcast_model.base_trainer import BaseInfo, callbacks_session, get_dataset_size
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
@@ -119,6 +119,68 @@ def _instantiate(raw: Any) -> Any:
     return instantiator.ObjectPattern.model_validate(raw).build().runs[0]
 
 
+def _compile_module(module: Any, compile_kw: dict[str, Any] | None) -> Any:
+    """Compile a PyTorch module if compile_kw is provided."""
+    return module if compile_kw is None else torch.compile(module, **compile_kw)
+
+
+def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
+    """Instantiate models from a list of name-pattern mappings."""
+    res: OrderedDict[str, Any] = OrderedDict()
+    for raw in patterns:
+        if len(raw) != 1:
+            raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+        model_name, ptn = list(raw.items())[0]
+        res[model_name] = _instantiate(ptn)
+    return res
+
+
+def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
+    """Return output names from a module attribute or the provided default, raising if neither is available."""
+    if hasattr(module, "outputs"):
+        return module.outputs
+    if default:
+        return default
+    raise ValueError(
+        f'Module "{name}" does not have an "outputs" attribute. '
+        f'Please provide default outputs using the "--{name}-outputs" option.'
+    )
+
+
+def _get_state_dict(**kwargs: Any) -> dict[str, Any]:
+    """Return a mapping of name to state dict for all given modules."""
+    return {n: m.state_dict() for n, m in kwargs.items()}
+
+
+def _on_best(info: BaseInfo, target: str, value: float, save: bool, **kwargs: Any) -> None:
+    """Log best metric value and optionally save model state dict to MLflow."""
+    mlflow.log_metric(f"{target}_best", value, step=info.epoch)
+    if save:
+        mlflow.pytorch.log_state_dict(_get_state_dict(**kwargs), f"{target}_best")
+
+
+def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
+    """Save full training state (models, optimizers, grad scalers, EMA, meta) to MLflow."""
+    backward = cast("torch_trainer.TorchTrainer", info).backward
+    wrapper = cast("torch_trainer.TorchTrainer", info).inference_wrapper
+    states: dict[str, Any] = {
+        "models": _get_state_dict(**kwargs),
+        "optimizers": _get_state_dict(**getattr(backward, "optimizers", {})),
+        "grad_scalers": _get_state_dict(**getattr(backward, "grad_scalers", {})),
+        "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
+    }
+    if wrapper is not None:
+        states["ema"] = _get_state_dict(**cast("torch_trainer.TimmEmaWrapper", wrapper).models)
+    mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
+
+
+def _log_criteria(info: BaseInfo) -> str:
+    """Format current epoch criteria as YAML and log metrics to MLflow, returning a display string."""
+    values = {**getattr(cast("torch_trainer.TorchTrainer", info).backward, "learning_rates", {}), **info.logs()}
+    mlflow.log_metrics(values, step=info.epoch)
+    return f"epoch: {info.epoch}\n{dump_yaml_to_string(values)}"
+
+
 @app.command(name="ptflops")
 def call_ptflops(
     model_pattern: Any = model_pattern,
@@ -190,6 +252,7 @@ def call_calflops(
 
 
 @app.command()
+@callbacks_session()
 def train(  # noqa: PLR0913,PLR0915
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
@@ -323,30 +386,9 @@ def train(  # noqa: PLR0913,PLR0915
         "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
     ),
 ) -> None:
+    """Train a PyTorch model with MLflow tracking."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-
-    def _compile_fn(module: torch.nn.Module, compile_kw: dict[str, Any] | None) -> torch.nn.Module:
-        return module if compile_kw is None else torch.compile(module, **compile_kw)
-
-    def _init_models(patterns: list) -> OrderedDict[str, torch.nn.Module]:
-        res = OrderedDict[str, torch.nn.Module]()
-        for raw in patterns:
-            if len(raw) != 1:
-                raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
-            model_name, ptn = list(raw.items())[0]
-            res[model_name] = _instantiate(ptn)
-        return res
-
-    def _check_module_outputs(module: torch.nn.Module, default: list[str] | None, name: str) -> list[str]:
-        if hasattr(module, "outputs"):
-            return module.outputs
-        if default:
-            return default
-        raise ValueError(
-            f'Module "{name}" does not have an "outputs" attribute. '
-            f'Please provide default outputs using the "--{name}-outputs" option.'
-        )
 
     configure_security(allowed_modules_check=False)
     torch.backends.cudnn.benchmark = True
@@ -355,7 +397,7 @@ def train(  # noqa: PLR0913,PLR0915
     np.random.seed(seed)
     input_shapes = reduce_dict(shapes)
     device = torch_trainer.get_torch_device(device)
-    compile_fn = partial(_compile_fn, compile_kw=instantiator.instantiate(compile_pattern))
+    compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     training_dataset = _instantiate(training_dataset_pattern)
     validation_dataset = _instantiate(validation_dataset_pattern) if validation_dataset_pattern else None
     print("Count the dataset sizes...")
@@ -364,12 +406,12 @@ def train(  # noqa: PLR0913,PLR0915
     print(f"Training dataset size: {steps_per_epoch} steps.")
     print(f"Validation dataset size: {validation_steps} steps.")
     with torch.device(device):
-        models, _, _ = torch_trainer.initial_model(_init_models(model_patterns), input_shapes)
+        models, _, _ = torch_trainer.initial_model(_instantiate_models(model_patterns), input_shapes)
         loss = compile_fn(_instantiate(loss_pattern))
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         backward = _instantiate(backward_pattern)(**models)
-        loss_outputs = _check_module_outputs(loss, loss_outputs, "loss")
-        metric_outputs = None if metric is None else _check_module_outputs(metric, metric_outputs, "metric")
+        loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
+        metric_outputs = None if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
@@ -390,54 +432,28 @@ def train(  # noqa: PLR0913,PLR0915
         tracker=tracker,
     )
 
-    def _log_criteria(info: BaseInfo, **_: torch.nn.Module) -> str:
-        """Format the criteria."""
-        values = {**getattr(cast(torch_trainer.TorchTrainer, info).backward, "learning_rates", {}), **info.logs()}
-        mlflow.log_metrics(values, step=info.epoch)
-        return f"epoch: {info.epoch}\n{dump_yaml_to_string(values)}"
-
     if ci:
-        trainer.on_epoch_end.append(lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
+        trainer.on_epoch_end.register("log_criteria", lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
     else:
         pbar = tqdm.tqdm(unit="batch")
 
-        def _update_criteria(info: BaseInfo, criteria: list[str], **_: torch.nn.Module) -> None:
+        def _update_criteria(info: BaseInfo, criteria: list[str], **_: Any) -> None:
             logs = info.logs()
             pbar.update()
             pbar.set_postfix([(n, logs[n]) for n in criteria])
 
-        trainer.on_training_begin.append(lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
         train_losses = [f"{trainer.training_prefix}{n}" for n in loss_outputs]
-        trainer.on_training_step_end.append(partial(_update_criteria, criteria=train_losses))  # type: ignore[arg-type]
-        trainer.on_training_end.append(lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
-        trainer.on_validation_begin.append(lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
+        trainer.on_training_begin.register("pbar_reset_training", lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
+        trainer.on_training_step_end.register("pbar_update_training", partial(_update_criteria, criteria=train_losses))
+        trainer.on_training_end.register("pbar_refresh_training", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
+        trainer.on_validation_begin.register("pbar_reset_validation", lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
         valid_losses = [f"{trainer.validation_prefix}{n}" for n in loss_outputs]
-        trainer.on_validation_step_end.append(partial(_update_criteria, criteria=valid_losses))  # type: ignore[arg-type]
-        trainer.on_validation_end.append(lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
-        trainer.on_epoch_end.append(lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
+        pbar_update_validation = partial(_update_criteria, criteria=valid_losses)
+        trainer.on_validation_step_end.register("pbar_update_validation", pbar_update_validation)
+        trainer.on_validation_end.register("pbar_refresh_validation", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
+        trainer.on_epoch_end.register("pbar_log_criteria", lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
 
-    def _get_state_dict(**kwargs: torch.nn.Module) -> dict[str, Any]:
-        return {n: m.state_dict() for n, m in kwargs.items()}
-
-    def _on_best(info: BaseInfo, target: str, value: float, save: bool, **kwargs: torch.nn.Module) -> None:
-        mlflow.log_metric(f"{target}_best", value, step=info.epoch)
-        if save:
-            mlflow.pytorch.log_state_dict(_get_state_dict(**kwargs), f"{target}_best")
-
-    def _save_training_state(info: BaseInfo, **kwargs: torch.nn.Module) -> None:
-        backward = cast(torch_trainer.TorchTrainer, info).backward
-        wrapper = cast(torch_trainer.TorchTrainer, info).inference_wrapper
-        states: dict[str, Any] = {
-            "models": _get_state_dict(**kwargs),
-            "optimizers": _get_state_dict(**getattr(backward, "optimizers", {})),
-            "grad_scalers": _get_state_dict(**getattr(backward, "grad_scalers", {})),
-            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
-        }
-        if wrapper is not None:
-            states["ema"] = _get_state_dict(**cast(torch_trainer.TimmEmaWrapper, wrapper).models)
-        mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
-
-    trainer.on_epoch_end.append(_save_training_state)
+    trainer.on_epoch_end.register("save_training_state", _save_training_state)
     trainer.on_epoch_end += [
         torch_trainer.TorchBestCriterion(target=n, mode="max", on_best=[partial(_on_best, save=n in save_criteria)])
         for n in higher_criteria
@@ -487,14 +503,19 @@ def train(  # noqa: PLR0913,PLR0915
         mlflow.log_dict(arguments, "arguments.yaml")
         for artifact in log_artifacts or []:
             mlflow.log_artifact(str(artifact))
-        trainer.fit(
-            epochs=epochs,
-            training_dataset=training_dataset,
-            validation_dataset=validation_dataset,
-            start_epoch=start_epoch,
-            validation_frequency=validation_frequency,
-            **models,
-        )
+        print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
+        try:
+            trainer.fit(
+                epochs=epochs,
+                training_dataset=training_dataset,
+                validation_dataset=validation_dataset,
+                start_epoch=start_epoch,
+                validation_frequency=validation_frequency,
+                **models,
+            )
+        except KeyboardInterrupt:
+            print("Training interrupted by user. Saving current state to MLflow.")
+            _save_training_state(trainer, **models)
 
 
 __all__ = ["app"]

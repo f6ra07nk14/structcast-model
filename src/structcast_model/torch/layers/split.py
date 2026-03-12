@@ -41,3 +41,6 @@ class Split(Module):
             str: The extra representation.
         """
         return f"split_size_or_sections={self.split_size_or_sections}, dim={self.dim}"
+
+
+__all__ = ["Split"]

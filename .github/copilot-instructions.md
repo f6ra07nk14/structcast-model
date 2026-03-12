@@ -37,7 +37,6 @@ ruff format src tests           # auto-format
 
 - **Python ≥ 3.11**, line length 120 (`ruff`)
 - **Google-style docstrings** — enforced by `ruff` pydocstyle
-- **`from __future__ import annotations`** in every module
 - **Explicit `__all__`** in every module
 - **Absolute imports** — `from structcast_model.xxx import yyy`
 - **Lazy imports** in `__init__.py` via `LazySelectedImporter` (guarded by `TYPE_CHECKING`)

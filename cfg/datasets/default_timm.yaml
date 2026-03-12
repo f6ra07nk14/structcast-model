@@ -18,7 +18,7 @@ PARAMETERS:
     use_multi_epochs_loader: false
     pin_memory: true
     device: cuda # "cuda" or "cpu"
-    workers: 4
+    workers: 16
 _obj_:
   - _addr_: structcast_model.torch.trainer.TimmDataLoaderWrapper
   - _attr_: model_validate

@@ -14,3 +14,6 @@ class Add(Module):
         for inp in inputs[1:]:
             out = out.add(inp)
         return out
+
+
+__all__ = ["Add"]

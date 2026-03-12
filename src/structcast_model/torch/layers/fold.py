@@ -116,3 +116,6 @@ class FoldExt(LazyModuleMixin, Fold):
                 stride=self.stride,
                 output_padding=self.output_padding,
             )
+
+
+__all__ = ["FoldExt", "UnfoldExt", "compute_spatial_shape", "compute_transposed_spatial_shape"]

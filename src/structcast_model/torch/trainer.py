@@ -176,9 +176,13 @@ class TorchTracker:
 
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_training_begin.append(lambda i, **kw: self.losses_tracker.reset())  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_training_begin.register("reset_losses_tracker", lambda i, **kw: self.losses_tracker.reset())  # type: ignore[arg-type]
         if self.metrics_tracker is not None:
-            GLOBAL_CALLBACKS.on_training_begin.append(lambda i, **kw: self.metrics_tracker.reset())  # type: ignore[arg-type]
+            _metrics_tracker = self.metrics_tracker  # capture narrowed reference for the lambda
+            GLOBAL_CALLBACKS.on_training_begin.register(
+                "reset_metrics_tracker",
+                lambda i, **kw: _metrics_tracker.reset(),  # type: ignore[arg-type]
+            )
 
     def __call__(self, **criteria: Tensor) -> dict[str, float]:
         """Log the criteria and return the average values."""
@@ -227,7 +231,7 @@ class TimmEmaWrapper:
 
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_update += [self.update]
+        GLOBAL_CALLBACKS.on_update.register("ema_update", self.update)
 
     def update(self, info: BaseInfo, **models: torch.nn.Module) -> None:
         """Update the EMA model."""

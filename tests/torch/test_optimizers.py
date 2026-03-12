@@ -47,10 +47,13 @@ def _clean_global_callbacks() -> Any:
         "on_epoch_begin",
         "on_epoch_end",
     )
-    saved = {attr: list(getattr(GLOBAL_CALLBACKS, attr)) for attr in _cb_attrs}
+    saved = {a: (list(getattr(GLOBAL_CALLBACKS, a)), list(getattr(GLOBAL_CALLBACKS, a)._names)) for a in _cb_attrs}
     yield
-    for attr, value in saved.items():
-        setattr(GLOBAL_CALLBACKS, attr, value)
+    for attr, (cbs, names) in saved.items():
+        ncl = getattr(GLOBAL_CALLBACKS, attr)
+        ncl.clear()
+        for name, cb in zip(names, cbs, strict=True):
+            ncl.register(name, cb)
 
 
 # ---------------------------------------------------------------------------
