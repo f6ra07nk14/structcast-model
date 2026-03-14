@@ -588,7 +588,7 @@ def test_timm_dataloader_distributed_results(
         monkeypatch,
         TimmDataLoaderWrapper.distributed_results.func,
         "init_distributed_device_so",
-        lambda device: {"device": "cpu", "distributed": False},
+        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
     )
     result = TimmDataLoaderWrapper().distributed_results
     assert result["device"] == "cpu"
@@ -603,7 +603,7 @@ def test_timm_dataloader_default_kwargs_validation_branch(
         monkeypatch,
         TimmDataLoaderWrapper.distributed_results.func,
         "init_distributed_device_so",
-        lambda device: {"device": "cpu", "distributed": False},
+        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
     )
     kwargs = TimmDataLoaderWrapper().default_kwargs
     assert "crop_pct" in kwargs
@@ -618,10 +618,9 @@ def test_timm_dataloader_default_kwargs_training_branch(
         monkeypatch,
         TimmDataLoaderWrapper.distributed_results.func,
         "init_distributed_device_so",
-        lambda device: {"device": "cpu", "distributed": False},
+        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
     )
-    wrapper = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True))
-    kwargs = wrapper.default_kwargs
+    kwargs = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True)).default_kwargs
     assert "no_aug" in kwargs
     assert "re_prob" in kwargs
     assert "auto_augment" in kwargs
@@ -641,18 +640,12 @@ def test_timm_dataloader_mixup_raises_when_inactive() -> None:
 
 def test_timm_dataloader_mixup_returns_fast_collate_with_prefetcher() -> None:
     """With use_prefetcher=True and mixup_alpha>0, mixup returns FastCollateMixup (lines 595–596)."""
-    assert isinstance(
-        TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=True).mixup,
-        FastCollateMixup,
-    )
+    assert isinstance(TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=True).mixup, FastCollateMixup)
 
 
 def test_timm_dataloader_mixup_returns_mixup_without_prefetcher() -> None:
     """With use_prefetcher=False and mixup_alpha>0, mixup returns Mixup (lines 595–596)."""
-    assert isinstance(
-        TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=False).mixup,
-        Mixup,
-    )
+    assert isinstance(TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=False).mixup, Mixup)
 
 
 # ---------------------------------------------------------------------------
@@ -702,57 +695,39 @@ def patch_timm_io(monkeypatch: pytest.MonkeyPatch) -> _FakeLoader:
         monkeypatch,
         TimmDataLoaderWrapper.distributed_results.func,
         "init_distributed_device_so",
-        lambda device: {"device": "cpu", "distributed": False},
+        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
     )
-    _patch_global(
-        monkeypatch,
-        TimmDatasetWrapper.dataset.func,
-        "create_dataset",
-        lambda **kw: MagicMock(),
-    )
-    _patch_global(
-        monkeypatch,
-        TimmDataLoaderWrapper.dataloader.func,
-        "create_loader",
-        lambda **kw: loader,
-    )
+    _patch_global(monkeypatch, TimmDatasetWrapper.dataset.func, "create_dataset", lambda **kw: MagicMock())
+    _patch_global(monkeypatch, TimmDataLoaderWrapper.dataloader.func, "create_loader", lambda **kw: loader)
     return loader
 
 
-def test_timm_dataloader_wrapper_dataloader_validation(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_wrapper_dataloader_validation(patch_timm_io: _FakeLoader) -> None:
     """Dataloader property returns the object from create_loader in validation mode (lines 607–608)."""
-    wrapper = TimmDataLoaderWrapper()
-    assert wrapper.dataloader is patch_timm_io
+    assert TimmDataLoaderWrapper().dataloader is patch_timm_io
 
 
 def test_timm_dataloader_wrapper_dataloader_training_no_mixup(
     patch_timm_io: _FakeLoader,
 ) -> None:
     """Dataloader is obtained in training mode without mixup (line 608)."""
-    wrapper = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True))
-    assert wrapper.dataloader is patch_timm_io
+    assert TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True)).dataloader is patch_timm_io
 
 
-def test_timm_dataloader_wrapper_dataloader_training_with_mixup_off_epoch(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_wrapper_dataloader_training_with_mixup_off_epoch(patch_timm_io: _FakeLoader) -> None:
     """Dataloader with mixup and mixup_off_epoch>0 registers disable_mixup callback (lines 609–613)."""
     before = len(GLOBAL_CALLBACKS.on_training_begin)
-    wrapper = TimmDataLoaderWrapper(
+    _ = TimmDataLoaderWrapper(
         dataset=TimmDatasetWrapper(is_training=True),
         mixup_alpha=0.5,
         mixup_off_epoch=3,
         use_prefetcher=True,
-    )
-    _ = wrapper.dataloader
+    ).dataloader
     assert len(GLOBAL_CALLBACKS.on_training_begin) > before
 
 
 def test_timm_dataloader_wrapper_dataloader_with_aug_splits(
-    patch_timm_io: _FakeLoader,
-    monkeypatch: pytest.MonkeyPatch,
+    patch_timm_io: _FakeLoader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """num_aug_splits>1 wraps the dataset in AugMixDataset (lines 614–615)."""
     aug_ds_created: list[tuple[Any, int]] = []
@@ -762,11 +737,7 @@ def test_timm_dataloader_wrapper_dataloader_with_aug_splits(
             aug_ds_created.append((dataset, num_splits))
 
     _patch_global(monkeypatch, TimmDataLoaderWrapper.dataloader.func, "AugMixDataset", _FakeAugMix)
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(is_training=True),
-        num_aug_splits=2,
-    )
-    _ = wrapper.dataloader
+    _ = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True), num_aug_splits=2).dataloader
     assert len(aug_ds_created) == 1
     assert aug_ds_created[0][1] == 2
 
@@ -776,9 +747,7 @@ def test_timm_dataloader_wrapper_len(patch_timm_io: _FakeLoader) -> None:
     assert len(TimmDataLoaderWrapper()) == len(patch_timm_io)
 
 
-def test_timm_dataloader_call_prefetcher_no_channels_last(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_call_prefetcher_no_channels_last(patch_timm_io: _FakeLoader) -> None:
     """_call with prefetcher=True channels_last=False yields from dataloader directly (line 636)."""
     wrapper = TimmDataLoaderWrapper(use_prefetcher=True, channels_last=False)
     batches = list(wrapper._call())
@@ -787,9 +756,7 @@ def test_timm_dataloader_call_prefetcher_no_channels_last(
     assert inp.shape == (2, 3, 4, 4)
 
 
-def test_timm_dataloader_call_prefetcher_channels_last(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_call_prefetcher_channels_last(patch_timm_io: _FakeLoader) -> None:
     """_call with prefetcher=True channels_last=True yields channels_last tensors (lines 633–634)."""
     wrapper = TimmDataLoaderWrapper(use_prefetcher=True, channels_last=True)
     batches = list(wrapper._call())
@@ -798,36 +765,28 @@ def test_timm_dataloader_call_prefetcher_channels_last(
     assert inp.is_contiguous(memory_format=torch.channels_last)
 
 
-def test_timm_dataloader_call_no_prefetcher(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_call_no_prefetcher(patch_timm_io: _FakeLoader) -> None:
     """_call with prefetcher=False moves tensors to device/dtype (lines 638–641, 646)."""
     wrapper = TimmDataLoaderWrapper(use_prefetcher=False)
     batches = list(wrapper._call())
     assert len(batches) == 1
 
 
-def test_timm_dataloader_call_no_prefetcher_with_mixup(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_call_no_prefetcher_with_mixup(patch_timm_io: _FakeLoader) -> None:
     """_call with prefetcher=False and mixup_alpha>0 applies Mixup to each batch (lines 639, 642–643)."""
     wrapper = TimmDataLoaderWrapper(use_prefetcher=False, mixup_alpha=0.4)
     batches = list(wrapper._call())
     assert len(batches) == 1
 
 
-def test_timm_dataloader_call_no_prefetcher_channels_last(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_call_no_prefetcher_channels_last(patch_timm_io: _FakeLoader) -> None:
     """_call with prefetcher=False channels_last=True applies channels_last format (lines 644–645)."""
     wrapper = TimmDataLoaderWrapper(use_prefetcher=False, channels_last=True)
     inp, _ = next(iter(wrapper._call()))
     assert inp.is_contiguous(memory_format=torch.channels_last)
 
 
-def test_timm_dataloader_dunder_call_no_spec(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_dunder_call_no_spec(patch_timm_io: _FakeLoader) -> None:
     """__call__ with spec=None yields raw (inp, target) pairs (lines 650–651)."""
     wrapper = TimmDataLoaderWrapper(spec=None)
     batches = list(wrapper())
@@ -836,9 +795,7 @@ def test_timm_dataloader_dunder_call_no_spec(
     assert isinstance(inp, torch.Tensor)
 
 
-def test_timm_dataloader_dunder_call_with_spec(
-    patch_timm_io: _FakeLoader,
-) -> None:
+def test_timm_dataloader_dunder_call_with_spec(patch_timm_io: _FakeLoader) -> None:
     """__call__ with a spec applies map(spec, _call()) (lines 652–653)."""
     wrapper = TimmDataLoaderWrapper(spec=None)
     results: list[Any] = []
