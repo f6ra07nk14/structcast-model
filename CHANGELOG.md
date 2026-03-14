@@ -1,3 +1,39 @@
+## [1.1.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.0.0...v1.1.0) (2026-03-12)
+
+
+### 👷 Build
+
+* remove unnecessary build-essential installation from Dockerfile ([da8bb18](https://github.com/f6ra07nk14/structcast-model/commit/da8bb1884f1b49a6029a050a63d5d81f2f1b94b6))
+* specify version constraints for torch dependencies in pyproject.toml ([d639062](https://github.com/f6ra07nk14/structcast-model/commit/d6390620dee0c36374bd6bdcd14209529ece19ea))
+
+
+### 📦 Other
+
+* add notes on optional dependencies for JAX, TensorFlow, and Keras ([24807f4](https://github.com/f6ra07nk14/structcast-model/commit/24807f48d5148026a09c4e82a2f02049869ce049))
+* increase number of workers to improve data loading performance ([e018367](https://github.com/f6ra07nk14/structcast-model/commit/e018367e60b3156506984b53f15f7a38cef176ec))
+
+
+### 📔 Docs
+
+* Remove `from __future__ import annotations` requirement from code style ([bc7f99d](https://github.com/f6ra07nk14/structcast-model/commit/bc7f99d7a4bf255cfdedbc8b0ac37dffb2d6eb3c))
+
+
+### 💎 Features
+
+* add context manager for callback session management and refactor invoke_callback signature ([5a7b993](https://github.com/f6ra07nk14/structcast-model/commit/5a7b9939009af53764a7a819de51658f99be124d))
+* implement NamedCallbackList for enhanced callback management and refactor callback registration in trainer and optimizer ([c5d6e58](https://github.com/f6ra07nk14/structcast-model/commit/c5d6e58addc8087619f7b2c9bc1786df893d1226))
+
+
+### 🔧 Fixes
+
+* add __all__ exports to various layers for improved module visibility ([1a207d1](https://github.com/f6ra07nk14/structcast-model/commit/1a207d12b43456f40b65b30d758530a2fa8819d6))
+* enhance error handling in format_template for undefined jinja2 variables ([85bdcb6](https://github.com/f6ra07nk14/structcast-model/commit/85bdcb691f0ea30b0586c1f33ce73e2a88622df3))
+
+
+### 🔨 Refactor
+
+* capture narrowed reference for metrics_tracker in TorchTracker ([ea80766](https://github.com/f6ra07nk14/structcast-model/commit/ea80766a9bbb50a65410d5138ce902f198d74439))
+
 ## 1.0.0 (2026-03-11)
 
 
