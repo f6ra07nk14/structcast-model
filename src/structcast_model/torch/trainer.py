@@ -560,6 +560,11 @@ class TimmDataLoaderWrapper(WithExtra):
         return init_distributed_device_so(device=self.device)
 
     @cached_property
+    def distributed(self) -> bool:
+        """Whether the data loader is distributed."""
+        return self.distributed_results["distributed"]
+
+    @cached_property
     def default_kwargs(self) -> dict[str, Any]:
         """Default kwargs for the data loader."""
         kwargs: dict[str, Any] = {}
@@ -571,7 +576,7 @@ class TimmDataLoaderWrapper(WithExtra):
         kwargs["std"] = self.std
         kwargs["img_dtype"] = DTYPES[self.image_dtype]
         kwargs["device"] = torch.device(self.distributed_results["device"])
-        kwargs["distributed"] = self.distributed_results["distributed"]
+        kwargs["distributed"] = self.distributed
         kwargs["use_prefetcher"] = self.use_prefetcher
         if self.dataset.is_training:
             kwargs["no_aug"] = self.no_aug
@@ -610,18 +615,32 @@ class TimmDataLoaderWrapper(WithExtra):
             self.mixup.mixup_enabled = False
 
     @cached_property
+    def dataset_wrapper(self) -> TimmDatasetWrapper:
+        """Return the dataset wrapper."""
+        dataset = self.dataset.dataset
+        if self.dataset.is_training and self.num_aug_splits > 1:
+            dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
+        return dataset
+
+    def set_dataset_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Set the epoch for the dataset if it has a set_epoch method."""
+        self.dataset_wrapper.set_epoch(info.epoch - 1)
+
+    def set_dataloader_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Set the epoch for the data loader if it has a set_epoch method."""
+        self.dataloader.sampler.set_epoch(info.epoch - 1)
+
+    @cached_property
     def dataloader(self) -> DataLoader:
         """Create a data loader using the timm library."""
-        collate_fn, dataset = None, self.dataset.dataset
+        collate_fn, dataset = None, self.dataset_wrapper
         if self.dataset.is_training:
             if self.mixup_active:
                 if self.use_prefetcher:
                     collate_fn = self.mixup
                 if self.mixup_off_epoch:
-                    GLOBAL_CALLBACKS.on_training_begin.append(self.disable_mixup)
-            if self.num_aug_splits > 1:
-                dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
-        return create_loader(
+                    GLOBAL_CALLBACKS.on_training_begin.register("disable_mixup", self.disable_mixup)
+        loader = create_loader(
             dataset=dataset,
             batch_size=self.dataset.batch_size,
             is_training=self.dataset.is_training,
@@ -629,6 +648,12 @@ class TimmDataLoaderWrapper(WithExtra):
             **self.default_kwargs,
             **self.model_extra,
         )
+        if self.dataset.is_training:
+            if hasattr(dataset, "set_epoch"):
+                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataset_epoch", self.set_dataset_epoch)
+            elif self.distributed and hasattr(loader.sampler, "set_epoch"):
+                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataloader_epoch", self.set_dataloader_epoch)
+        return loader
 
     def __len__(self) -> int:
         """Return the length of the data loader."""
