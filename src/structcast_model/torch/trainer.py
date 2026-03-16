@@ -408,6 +408,19 @@ class TimmDataLoaderWrapper(WithExtra):
     channels_last: bool = False
     """Use channels_last memory format for inputs."""
 
+    # for distributed training, will be passed to init_distributed_device_so:
+
+    device: str = "cpu"
+    """Device to move data to after loading, e.g. 'cuda' or 'cpu'. If None, data will not be moved."""
+
+    dist_backend: str | None = None
+    """The backend to use for distributed training.
+    If None, the backend will be automatically selected based on the device."""
+
+    dist_url: str | None = None
+    """The URL to use for distributed training initialization.
+    If None, the URL will be automatically generated based on the environment."""
+
     # for mixup
 
     use_prefetcher: bool = True
@@ -463,9 +476,6 @@ class TimmDataLoaderWrapper(WithExtra):
 
     pin_memory: bool = False
     """Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU."""
-
-    device: str = "cpu"
-    """Device to move data to after loading, e.g. 'cuda' or 'cpu'. If None, data will not be moved."""
 
     # only for training / is_training=True kwargs:
 
@@ -557,7 +567,7 @@ class TimmDataLoaderWrapper(WithExtra):
     @cached_property
     def distributed_results(self) -> dict[str, Any]:
         """Distributed results for the data loader."""
-        return init_distributed_device_so(device=self.device)
+        return init_distributed_device_so(device=self.device, dist_backend=self.dist_backend, dist_url=self.dist_url)
 
     @cached_property
     def distributed(self) -> bool:

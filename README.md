@@ -627,6 +627,12 @@ ruff check src tests
 ruff format src tests
 ```
 
+Run all checks in parallel with:
+
+```bash
+tox run-parallel --parallel all
+```
+
 The repository includes tests for:
 
 - CLI behavior
