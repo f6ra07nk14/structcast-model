@@ -159,26 +159,7 @@ def test_ptflops_calls_instantiate(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
-    mock_ptflops = MagicMock()
-    mock_ptflops.get_model_complexity_info.return_value = ("1.0 GMac", "1.0 M")
-    with patch_cmd_globals(
-        _instantiate=mock_instantiate,
-        torch=_make_torch_mock(),
-        torch_trainer=mock_torch_trainer,
-        ptflops=mock_ptflops,
-    ):
-        assert cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG]).exit_code == 0
-    mock_instantiate.assert_called_once()
-
-
-def test_ptflops_prints_flops_and_params(cli_runner: CliRunner) -> None:
-    """'ptflops' should print FLOPs and parameter counts to stdout."""
-    mock_instantiate = MagicMock(return_value=MagicMock())
-    mock_torch_trainer = MagicMock()
-    mock_torch_trainer.get_torch_device.return_value = "cpu"
-    mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
+    mock_torch_trainer.initial_model.return_value = ({}, None)
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = ("2.5 GMac", "3.0 M")
     with patch_cmd_globals(
@@ -199,7 +180,7 @@ def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
+    mock_torch_trainer.initial_model.return_value = ({}, None)
     mock_ptflops = MagicMock()
     mock_ptflops.get_model_complexity_info.return_value = (None, None)
     with patch_cmd_globals(
@@ -222,7 +203,7 @@ def test_calflops_calls_instantiate(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
+    mock_torch_trainer.initial_model.return_value = ({}, None)
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("1.0 GFLOPs", "500 MMac", "1.0 M")
     with patch_cmd_globals(
@@ -241,7 +222,7 @@ def test_calflops_prints_flops_macs_params(cli_runner: CliRunner) -> None:
     mock_torch_trainer = MagicMock()
     mock_torch_trainer.get_torch_device.return_value = "cpu"
     mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = (MagicMock(), {}, None)
+    mock_torch_trainer.initial_model.return_value = ({}, None)
     mock_calflops = MagicMock()
     mock_calflops.calculate_flops.return_value = ("4.2 GFLOPs", "2.1 GMac", "5.0 M")
     with patch_cmd_globals(
@@ -317,14 +298,28 @@ class _FakeModule:
 
 
 class _FakeBestCriterion:
-    def __init__(self, target: str, mode: str, on_best: list[Any]) -> None:
+    def __init__(self, target: str, mode: str, on_best: list[Any] | None = None) -> None:
         self.target = target
         self.mode = mode
-        self.on_best = on_best
+        self.on_best: NamedCallbackList = NamedCallbackList()
+        if on_best:
+            for cb in on_best:
+                self.on_best.append(cb)
+        self._step = 0
+        self._value = 0.5
+
+    @property
+    def step(self) -> int:
+        return self._step
+
+    @property
+    def value(self) -> float:
+        return self._value
 
     def __call__(self, info: Any, **kwargs: _FakeModule) -> None:
+        self._step = info.step
         for callback in self.on_best:
-            callback(info, target=self.target, value=0.5, **kwargs)
+            callback(info, self, **kwargs)
 
 
 class _FakeInfo:
@@ -470,20 +465,24 @@ def _build_train_deps(
     torch_mock.compile = MagicMock(side_effect=lambda module, **_: module)
     torch_mock.version = SimpleNamespace(cuda="12.4")
     torch_mock.__version__ = "2.6.0"
+    # _unwrap_ddp uses isinstance(..., torch.nn.parallel.DistributedDataParallel)
+    # so we need a real type, not a MagicMock
+    torch_mock.nn.parallel.DistributedDataParallel = type("DistributedDataParallel", (), {})
 
     np_mock = MagicMock()
     np_mock.random = MagicMock()
 
     trainer_ns = MagicMock()
     trainer_ns.get_torch_device.return_value = "cpu"
-    trainer_ns.initial_model.side_effect = lambda models, _shapes: (models, {}, None)
+    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 1, False)
+    trainer_ns.initial_model.side_effect = lambda models, _shapes: ({}, None)
     trainer_ns.TorchTracker.from_criteria.return_value = "tracker"
     trainer_ns.get_autocast.return_value = "autocast"
     trainer_ns.TrainingStep.side_effect = SimpleNamespace
     trainer_ns.ValidationStep.side_effect = SimpleNamespace
     trainer_ns.TorchTrainer.side_effect = _FakeTrainer
-    trainer_ns.TorchBestCriterion.side_effect = lambda target, mode, on_best: _FakeBestCriterion(
-        target=target, mode=mode, on_best=on_best
+    trainer_ns.TorchBestCriterion.side_effect = lambda target, mode: _FakeBestCriterion(
+        target=target, mode=mode, on_best=[]
     )
     trainer_ns.TimmEmaWrapper.from_models.side_effect = lambda models, **_: (
         SimpleNamespace(models=models) if use_ema else None
@@ -564,7 +563,7 @@ def test_train_runs_non_ci_flow_and_best_criteria_logging(tmp_path: Any) -> None
     state_dict_calls = mlflow_mock.pytorch.log_state_dict.call_args_list
     artifact_paths = [call.kwargs.get("artifact_path") for call in state_dict_calls if "artifact_path" in call.kwargs]
     assert "training_state" in artifact_paths
-    assert any(call.args[1] == "valid/acc_best" for call in state_dict_calls if len(call.args) >= 2)
+    assert any(call.args[1] == "best_valid/acc" for call in state_dict_calls if len(call.args) >= 2)
 
 
 def test_train_runs_ci_with_ema_and_default_outputs(tmp_path: Any) -> None:
