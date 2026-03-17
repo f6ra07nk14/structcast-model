@@ -1,3 +1,36 @@
+## [1.2.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.1.0...v1.2.0) (2026-03-17)
+
+
+### 🦊 CI/CD
+
+* remove unused 'flops' extra from tox configuration ([ab8223a](https://github.com/f6ra07nk14/structcast-model/commit/ab8223a39a868ed310d1e993ec484e8f9ef5cebf))
+
+
+### 📔 Docs
+
+* add parallel check command to README ([347cc3c](https://github.com/f6ra07nk14/structcast-model/commit/347cc3ce19d562d320971e97bf28e05a51f5fee1))
+* add warning about SyncBatchNorm for multi-GPU training with DDP ([e0471b7](https://github.com/f6ra07nk14/structcast-model/commit/e0471b73bb11a615132742f2bcd1ff1d77084368))
+* enhance documentation for distributed training support with torchrun ([13aea9d](https://github.com/f6ra07nk14/structcast-model/commit/13aea9d45c1c4e3fa9e19fb7d43a91d2cf5d7242))
+
+
+### 💎 Features
+
+* enhance BestCriterion and TorchTracker for improved tracking and callback functionality ([6692427](https://github.com/f6ra07nk14/structcast-model/commit/6692427c8ad09952a7ad5a336fcef8ba7972ba54))
+* enhance TimmDataLoaderWrapper with distributed support and dataset management ([a90ebff](https://github.com/f6ra07nk14/structcast-model/commit/a90ebff348031aa6b8849bac629dad8039a15743))
+* refactor training logic and enhance distributed training support ([b8e8a74](https://github.com/f6ra07nk14/structcast-model/commit/b8e8a740b542a67fb9986041c0d3141e3daa3728))
+
+
+### 🔧 Fixes
+
+* enhance TimmDataLoaderWrapper for distributed training support with additional parameters ([305ae08](https://github.com/f6ra07nk14/structcast-model/commit/305ae08415c1eec8434f596916674f4ffea4ef6a))
+* fix the bugs of returning incorrect update code script in TorchBackwardIntermediate ([89dffbe](https://github.com/f6ra07nk14/structcast-model/commit/89dffbe9bffd260239a71da65f13ab7ef93df125))
+* update command-line argument flags for consistency in training options ([35ea5a9](https://github.com/f6ra07nk14/structcast-model/commit/35ea5a906fd67587c2f85189684f26c78bb02e7a))
+
+
+### ✨ Style
+
+* update noqa comments in train function for improved linting compliance ([f14806e](https://github.com/f6ra07nk14/structcast-model/commit/f14806ec3c2ca000074c7c193cdfdd32f9844c24))
+
 ## [1.1.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.0.0...v1.1.0) (2026-03-12)
 
 
