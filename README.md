@@ -19,6 +19,12 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
     - [3. Generate Loss, Metric, and Backward Classes](#3-generate-loss-metric-and-backward-classes)
     - [4. Inspect FLOPs and Parameters](#4-inspect-flops-and-parameters)
     - [5. Train a Generated Model](#5-train-a-generated-model)
+  - [Distributed Training with `torchrun`](#distributed-training-with-torchrun)
+    - [How It Works](#how-it-works)
+    - [Single-Node Multi-GPU](#single-node-multi-gpu)
+    - [Multi-Node Training](#multi-node-training)
+    - [Dataset Configuration](#dataset-configuration)
+    - [Distributed Training Notes](#distributed-training-notes)
   - [Configuration Examples](#configuration-examples)
     - [`cfg/models/ConvNeXtV2.yaml`](#cfgmodelsconvnextv2yaml)
     - [`cfg/backwards/ConvNeXtV2.yaml`](#cfgbackwardsconvnextv2yaml)
@@ -307,9 +313,133 @@ What the train command does internally:
 5. Creates a `TorchTrainer` with training and validation step objects.
 6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
 
+## Distributed Training with `torchrun`
+
+`scm torch train` supports multi-GPU and multi-node [distributed data parallel (DDP)](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) training out of the box via [`torchrun`](https://docs.pytorch.org/docs/stable/elastic/run.html). No changes to your generated code, YAML templates, or dataset configurations are required — the same `scm torch train` command works for both single-GPU and distributed training.
+
 > **⚠️ SyncBatchNorm Warning**
 >
 > When using multi-GPU training with `DistributedDataParallel`, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training with DDP, consider applying [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) to the model **before** wrapping it with `DistributedDataParallel`. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
+
+### How It Works
+
+When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT` are set automatically. `scm torch train` detects these and enables distributed mode:
+
+1. **Process group initialization** — The NCCL backend is initialized via [`torch.distributed.init_process_group`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group).
+2. **Per-rank device assignment** — Each process is assigned to `cuda:<LOCAL_RANK>`.
+3. **DDP model wrapping** — All models are wrapped with [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
+4. **Distributed data loading** — `TimmDataLoaderWrapper` automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. The sampler's `set_epoch()` is called each epoch for proper shuffling.
+5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
+6. **Rank-0 logging** — MLflow logging, progress bars, and checkpoint saving are performed only on rank 0.
+7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
+8. **EMA handling** — `TimmEmaWrapper` automatically unwraps the DDP module before updating EMA weights.
+9. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
+
+### Single-Node Multi-GPU
+
+To train on all GPUs of a single machine, prefix your `scm torch train` command with `torchrun`:
+
+```bash
+# Use all available GPUs on the current machine
+torchrun --nproc_per_node=gpu \
+    -m structcast_model.commands.main \
+    torch train \
+    'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
+    -s 'image: [3, 224, 224]' \
+    -d cuda \
+    --ema cfg/others/ema.yaml \
+    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
+    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
+    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+    -c cfg/others/compile_default.yaml \
+    -e 5 \
+    -T dataset_train.yaml \
+    -V dataset_valid.yaml \
+    -f 1 \
+    -LC ce_loss -LC val_ce_loss \
+    -HC acc1 -HC val_acc1 -HC acc5 -HC val_acc5 \
+    -SC val_acc1 \
+    --matmul-precision high \
+    -E Test
+```
+
+Or specify an exact GPU count:
+
+```bash
+# Use exactly 4 GPUs
+torchrun --nproc_per_node=4 \
+    -m structcast_model.commands.main \
+    torch train ...
+```
+
+> **Note:** `torchrun` launches the training script as a Python module (`-m structcast_model.commands.main`) rather than through the `scm` entry point. This is because `torchrun` requires a module or script path, not a console script wrapper.
+
+### Multi-Node Training
+
+For training across multiple machines, provide the node topology to `torchrun` on each node:
+
+```bash
+# On node 0 (master)
+torchrun \
+    --nproc_per_node=4 \
+    --nnodes=2 \
+    --node_rank=0 \
+    --master_addr=192.168.1.100 \
+    --master_port=29500 \
+    -m structcast_model.commands.main \
+    torch train ...
+
+# On node 1
+torchrun \
+    --nproc_per_node=4 \
+    --nnodes=2 \
+    --node_rank=1 \
+    --master_addr=192.168.1.100 \
+    --master_port=29500 \
+    -m structcast_model.commands.main \
+    torch train ...
+```
+
+This creates 8 total processes (4 GPUs × 2 nodes) training with DDP.
+
+`torchrun` parameters:
+
+| Parameter          | Description                                                      |
+| ------------------ | ---------------------------------------------------------------- |
+| `--nproc_per_node` | Number of processes per node. Use `gpu` for all available GPUs.  |
+| `--nnodes`         | Total number of nodes. Defaults to `1` for single-node training. |
+| `--node_rank`      | Rank of the current node (0-indexed).                            |
+| `--master_addr`    | IP address of the master node.                                   |
+| `--master_port`    | Port for inter-node communication.                               |
+
+`scm torch train` distributed-related options:
+
+| Option           | Description                                                                                               |
+| ---------------- | --------------------------------------------------------------------------------------------------------- |
+| `--dist-backend` | Distributed backend (`nccl`, `gloo`). Auto-selected if omitted. Also settable via `DIST_BACKEND` env var. |
+| `--dist-url`     | URL for distributed setup. Defaults to `env://`. Also settable via `DIST_URL` env var.                    |
+| `--ci`           | Disables `tqdm` progress bars — useful in cluster job logs.                                               |
+
+### Dataset Configuration
+
+Dataset YAML files do **not** need per-rank customization. A single `device: cuda` value in the dataset configuration works for all ranks — `TimmDataLoaderWrapper` internally resolves it to the correct `cuda:<LOCAL_RANK>` device for each process.
+
+```bash
+# The same dataset YAML works for single-GPU and distributed training
+scm format cfg/datasets/default_timm.yaml \
+    -o dataset_train.yaml \
+    -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
+```
+
+> **Tip:** The `batch_size` in the dataset template is the **per-GPU** batch size. With 4 GPUs and `batch_size: 32`, the effective global batch size is 128.
+
+### Distributed Training Notes
+
+- **Seed reproducibility** — Each rank's random seed is offset by `global_rank` to ensure different data augmentation across processes while remaining reproducible.
+- **Learning rate scaling** — When scaling to multiple GPUs, consider adjusting the learning rate. A common practice is [linear scaling](https://arxiv.org/abs/1706.02677): multiply the base learning rate by the number of GPUs. This must be configured in the backward template or optimizer settings — `scm torch train` does not scale the learning rate automatically.
+- **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#5-train-a-generated-model) for details.
+- **`torch.compile` and DDP** — When both `--compile` and DDP are active, `torch.compile` is applied **before** DDP wrapping.
+- **Checkpoint saving** — Only rank 0 saves checkpoints and logs to MLflow. When resuming from a checkpoint in a distributed setting, all ranks load the same checkpoint.
 
 ## Configuration Examples
 

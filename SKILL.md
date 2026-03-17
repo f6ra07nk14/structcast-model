@@ -1,6 +1,6 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch models and training workflows from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch create, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, or MLflow-integrated training runs.
+description: StructCast-Model generates PyTorch models and training workflows from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch create, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, MLflow-integrated training runs, or distributed multi-GPU training with torchrun and DistributedDataParallel (DDP).
 ---
 
 # StructCast-Model
@@ -22,6 +22,8 @@ Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 **Inspect FLOPs**: `scm torch ptflops '[_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' -s 'image: [3, 224, 224]'`
 
 **Train**: `scm torch train 'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' ...`
+
+**Distributed train**: `torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train ...`
 
 ## Common Workflows
 
@@ -88,12 +90,12 @@ scm torch train \
   -s 'image: [3, 224, 224]' \
   -d cuda \
   --ema cfg/others/ema.yaml \
-  -l '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-  -m '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-  -b '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+  -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
+  -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
+  -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
   -c cfg/others/compile_default.yaml \
-  -t dataset_train.yaml \
-  -v dataset_valid.yaml \
+  -T dataset_train.yaml \
+  -V dataset_valid.yaml \
   -LC ce_loss -LC val_ce_loss \
   -HC acc1 -HC val_acc1
 ```
@@ -105,6 +107,45 @@ What happens:
 3. Loss, metric, backward, and EMA objects are instantiated.
 4. `TorchTracker` is built from output names.
 5. `TorchTrainer` runs the loop and MLflow logging is attached.
+
+### Workflow 6: Distributed Training with `torchrun`
+
+The same `scm torch train` command supports multi-GPU and multi-node distributed training when launched through `torchrun`:
+
+```bash
+# Single-node, all GPUs
+torchrun --nproc_per_node=gpu \
+  -m structcast_model.commands.main \
+  torch train \
+  'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
+  -s 'image: [3, 224, 224]' \
+  -d cuda \
+  --ema cfg/others/ema.yaml \
+  -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
+  -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
+  -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+  -c cfg/others/compile_default.yaml \
+  -T dataset_train.yaml \
+  -V dataset_valid.yaml \
+  -LC ce_loss -LC val_ce_loss \
+  -HC acc1 -HC val_acc1
+
+# Multi-node (2 nodes × 4 GPUs)
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+  --master_addr=192.168.1.100 --master_port=29500 \
+  -m structcast_model.commands.main \
+  torch train ...
+```
+
+What happens:
+
+1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
+2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
+3. Each model is wrapped with `DistributedDataParallel`.
+4. `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` each epoch.
+5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
+6. MLflow logging and checkpoints are gated to rank 0 only.
+7. DDP gradient sync is skipped during gradient accumulation steps.
 
 ## CLI Surface
 
@@ -182,6 +223,7 @@ built("model.py")
 | Validation step | `ValidationStep(...)` | Evaluation-time forward pass under `torch.no_grad()` |
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Build loss/metric trackers and reset callbacks |
 | Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization |
+| Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
 ### timm integration layer
 
@@ -190,6 +232,16 @@ built("model.py")
 | Dataset wrapper | `TimmDatasetWrapper` | Lazily call `timm.data.create_dataset(...)` |
 | Dataloader wrapper | `TimmDataLoaderWrapper` | Lazily call `timm.data.create_loader(...)` |
 | EMA wrapper | `TimmEmaWrapper.from_models(...)` | Manage `ModelEmaV3` instances and update callbacks |
+
+### Distributed training layer
+
+| Capability | Entry point | Purpose |
+| -- | -- | -- |
+| Distributed environment detection | `initial_distributed_env(device, ...)` | Read `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars, init process group |
+| DDP model wrapping | `DistributedDataParallel` (via `cmd_torch.py`) | Wrap models for multi-GPU gradient synchronization |
+| Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
+| Gradient sync optimization | `TorchTrainer.no_sync()` | Skip DDP gradient sync during accumulation steps |
+| EMA DDP unwrapping | `TimmEmaWrapper.update()` | Unwrap DDP module before EMA weight update |
 
 ## Config and Pattern Vocabulary
 
