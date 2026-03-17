@@ -102,6 +102,9 @@ class TorchBackwardIntermediate(BackwardIntermediate):
             grad_scalers = ""
         else:
             grad_scalers = ", ".join([f'"{n}": self.{n}_scaler' for n in self.optimizers])
+        need_update = ["return self.need_update"]
+        if self.accumulate_gradients:
+            need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
         res = f"""\
 class {self.classname}:
 
@@ -111,11 +114,10 @@ class {self.classname}:
 
         {sep.join(init_opts)}
         self.mixed_precision_type = "{self.mixed_precision_type}"
-        self.need_update = False
+        self.need_update = True
 
     def update(self, step: int) -> bool:
-        self.need_update = (step + 1) % {self.accumulate_gradients} == 0
-        return self.need_update
+        {sep.join(need_update)}
 
     def __call__(self, {self._backward_losses}, **kwargs):
         {sep.join(flow)}
