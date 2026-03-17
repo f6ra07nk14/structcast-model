@@ -285,7 +285,7 @@ def train(  # noqa: PLR0913,PLR0915
     loss_pattern: Any = Option(
         ...,
         "--loss",
-        "-l",
+        "-L",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the loss module. "
         "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
@@ -301,7 +301,7 @@ def train(  # noqa: PLR0913,PLR0915
     metric_pattern: Any | None = Option(
         None,
         "--metric",
-        "-m",
+        "-M",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the metric module. "
         "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
@@ -317,7 +317,7 @@ def train(  # noqa: PLR0913,PLR0915
     backward_pattern: Any = Option(
         ...,
         "--backward",
-        "-b",
+        "-B",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the backward class. "
         "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
@@ -342,7 +342,7 @@ def train(  # noqa: PLR0913,PLR0915
     training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
-        "-t",
+        "-T",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the training dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
@@ -352,7 +352,7 @@ def train(  # noqa: PLR0913,PLR0915
     validation_dataset_pattern: Any | None = Option(
         None,
         "--validation-dataset",
-        "-v",
+        "-V",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the validation dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "

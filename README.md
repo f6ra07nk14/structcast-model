@@ -253,13 +253,13 @@ scm torch train \
     -s 'image: [3, 224, 224]' \
     -d cuda \
     --ema cfg/others/ema.yaml \
-    -l '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-    -m '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-    -b '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
+    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
+    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
     -c cfg/others/compile_default.yaml \
     -e 5 \
-    -t dataset_train.yaml \
-    -v dataset_valid.yaml \
+    -T dataset_train.yaml \
+    -V dataset_valid.yaml \
     -f 1 \
     -LC ce_loss \
     -LC val_ce_loss \
@@ -286,12 +286,12 @@ Key arguments:
 - `-s/--shape`: dummy input shapes used for model initialization
 - `-d/--device`: `cpu` or `cuda`
 - `--ema`: boolean, YAML file, or inline dict for `timm.utils.ModelEmaV3`
-- `-l/--loss`: StructCast pattern for the loss module
-- `-m/--metric`: StructCast pattern for the metric module
-- `-b/--backward`: StructCast pattern for the backward class
+- `-L/--loss`: StructCast pattern for the loss module
+- `-M/--metric`: StructCast pattern for the metric module
+- `-B/--backward`: StructCast pattern for the backward class
 - `-c/--compile`: boolean, YAML file, or inline dict for `torch.compile`
-- `-t/--training-dataset`: training dataset pattern or rendered dataset YAML
-- `-v/--validation-dataset`: validation dataset pattern or rendered dataset YAML
+- `-T/--training-dataset`: training dataset pattern or rendered dataset YAML
+- `-V/--validation-dataset`: validation dataset pattern or rendered dataset YAML
 - `-LC/--lower-criterion`: criteria where lower is better
 - `-HC/--higher-criterion`: criteria where higher is better
 - `-SC/--save-criterion`: criteria that should trigger best-model saving
@@ -584,13 +584,13 @@ scm torch train \
     -s 'image: [3, 224, 224]' \
     -d cuda \
     --ema cfg/others/ema.yaml \
-    -l '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-    -m '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-    -b '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
+    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
+    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
     -c cfg/others/compile_default.yaml \
     -e 5 \
-    -t dataset_train.yaml \
-    -v dataset_valid.yaml \
+    -T dataset_train.yaml \
+    -V dataset_valid.yaml \
     -f 1 \
     -LC ce_loss \
     -LC val_ce_loss \
