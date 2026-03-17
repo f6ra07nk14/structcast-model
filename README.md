@@ -307,6 +307,10 @@ What the train command does internally:
 5. Creates a `TorchTrainer` with training and validation step objects.
 6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
 
+> **⚠️ SyncBatchNorm Warning**
+>
+> When using multi-GPU training with `DistributedDataParallel`, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training with DDP, consider applying [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) to the model **before** wrapping it with `DistributedDataParallel`. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
+
 ## Configuration Examples
 
 The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow.
