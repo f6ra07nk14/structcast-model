@@ -265,6 +265,19 @@ def test_callbacks_session_isolates_multiple_runs() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _FakeBackward:
+    """Minimal Backward protocol implementation for tests."""
+
+    def __init__(self, should_update: bool = True) -> None:
+        self._should_update = should_update
+
+    def update(self, step: int) -> bool:
+        return self._should_update
+
+    def __call__(self, **criteria: Any) -> None:
+        pass
+
+
 def _make_trainer(
     *,
     prefix: str = "",
@@ -276,15 +289,12 @@ def _make_trainer(
     def _forward(inputs: dict, **models: Any) -> dict:
         return {"loss": 0.5}
 
-    def _backward(step: int, **criteria: Any) -> bool:
-        return should_update
-
     def _tracker(**criteria: Any) -> dict[str, float]:
         return {"loss": float(criteria.get("loss", 0.0))}
 
     return BaseTrainer(
         training_step=_forward,
-        backward=_backward,
+        backward=_FakeBackward(should_update),
         tracker=_tracker,
         training_prefix=prefix,
         validation_prefix=validation_prefix,
@@ -528,8 +538,8 @@ def test_best_criterion_min_mode_updates_on_improvement() -> None:
     """In 'min' mode _best decreases when a lower value is found."""
     best_values: list[float] = []
 
-    def cb(info: Any, target: Any, best: float, **kw: Any) -> None:
-        best_values.append(best)
+    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
+        best_values.append(best.value)
 
     criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
 
@@ -549,8 +559,8 @@ def test_best_criterion_min_mode_does_not_update_on_regression() -> None:
     """In 'min' mode _best does not change when a higher value is seen."""
     best_values: list[float] = []
 
-    def cb(info: Any, target: Any, best: float, **kw: Any) -> None:
-        best_values.append(best)
+    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
+        best_values.append(best.value)
 
     criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
 
@@ -569,8 +579,8 @@ def test_best_criterion_max_mode_updates_on_improvement() -> None:
     """In 'max' mode _best increases when a higher value is found."""
     best_values: list[float] = []
 
-    def cb(info: Any, target: Any, best: float, **kw: Any) -> None:
-        best_values.append(best)
+    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
+        best_values.append(best.value)
 
     criterion = BestCriterion(target="acc", mode="max", on_best=[cb])
 
@@ -585,7 +595,7 @@ def test_best_criterion_on_best_not_called_when_target_missing() -> None:
     """on_best callbacks are skipped when the target key is absent from logs."""
     called: list[bool] = []
 
-    def cb(info: Any, target: Any, best: float, **kw: Any) -> None:
+    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
         called.append(True)
 
     criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
@@ -601,7 +611,7 @@ def test_best_criterion_on_best_called_even_without_improvement() -> None:
     """on_best IS always called as long as the target is present in logs."""
     called_count = 0
 
-    def cb(info: Any, target: str, best: float, **kw: Any) -> None:
+    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
         nonlocal called_count
         called_count += 1
 

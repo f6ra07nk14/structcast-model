@@ -1,11 +1,12 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import AbstractContextManager, suppress
-from dataclasses import dataclass
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass, field
 from functools import cached_property, partial
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+import os
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from pydantic import Field, TypeAdapter, ValidationError
 from structcast.core.base import WithExtra
@@ -20,7 +21,7 @@ from timm.data import (
     create_loader,
 )
 from timm.utils import ModelEmaV3
-from timm.utils.distributed import init_distributed_device_so
+from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 from torch.utils.data import DataLoader
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
@@ -56,39 +57,102 @@ def get_torch_device(device: str | None = None) -> str:
     """Get the device to run the model on."""
     if device is None:
         return "cuda" if torch.cuda.is_available() else "cpu"
-    if device not in ["cpu", "cuda"]:
-        raise ValueError(f'Only "cpu" and "cuda" are supported. Got invalid device: {device}')
-    if device == "cuda" and not torch.cuda.is_available():
+    if "cpu" in device:
+        return device
+    if "cuda" in device:
+        if torch.cuda.is_available():
+            return device
         logger.warning("CUDA is not available. Using CPU instead.")
         return "cpu"
-    return device
+    raise ValueError(f'Only "cpu" and "cuda" (with optional rank suffix) are supported. Got invalid device: {device}')
 
 
-def initial_model(
-    model: T,
-    shapes: dict[str, Any] | None = None,
-    compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
-) -> tuple[T, Any, Any]:
+def get_torch_device_type(device: str | None = None) -> str:
+    """Get the device type (cpu or cuda) from the device string."""
+    return get_torch_device(device).split(":")[0]
+
+
+@overload
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: Literal[True] = True,
+) -> dict[str, Any]: ...
+
+
+@overload
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: Literal[False] = False,
+) -> tuple[str, int, int, int, bool]: ...
+
+
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: bool = True,
+) -> dict[str, Any] | tuple[str, int, int, int, bool]:
+    """Initialize the distributed environment.
+
+    Args:
+        device (str | None): The device to run the model on, e.g., 'cuda' or 'cpu'.
+        dist_backend (str | None): The backend to use for distributed training.
+            If None, the backend will be automatically selected based on the device.
+        dist_url (str | None): The URL to use for distributed training initialization.
+            If None, the URL will be automatically generated based on the environment.
+        return_dict (bool): Whether to return the result as a dictionary.
+
+    Returns:
+        If return_dict is False, returns a tuple of (device, global_rank, local_rank, world_size, distributed).
+        If return_dict is True, returns a dictionary with device, global_rank, local_rank, world_size, distributed keys.
+    """
+    if is_distributed_env() and torch.distributed.is_initialized():
+        if "SLURM_PROCID" in os.environ:
+            local_rank, global_rank, world_size = world_info_from_env()
+        else:
+            local_rank, _, _ = world_info_from_env()
+            world_size = torch.distributed.get_world_size()
+            global_rank = torch.distributed.get_rank()
+        device_type = get_torch_device_type(device)
+        result = {
+            "device": f"{device_type}:{local_rank}" if device_type != "cpu" else "cpu",
+            "global_rank": global_rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
+            "distributed": True,
+        }
+    else:
+        device = get_torch_device(device)
+        result = init_distributed_device_so(device=device, dist_backend=dist_backend, dist_url=dist_url)
+    if return_dict:
+        return result
+    return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
+
+
+def initial_model(model: Any, shapes: dict[str, Any] | None = None) -> tuple[Any, Any]:
     """Initialize the model by creating dummy inputs based on the provided shapes and running a forward pass.
 
     Args:
-        model (T): The model to initialize. Can be any nested structure containing PyTorch modules.
+        model (Any): The model to initialize. Can be any nested structure containing PyTorch modules.
         shapes (dict[str, Any] | None): A dictionary mapping module names to their input shapes.
             If None, the model will not be initialized with dummy inputs.
-        compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
-            An optional function to compile the model after initialization. If None, the model will not be compiled.
 
     Returns:
-        A tuple containing the initialized (and optionally compiled) model, the dummy inputs used for initialization,
-            and the outputs of the forward pass.
+        A tuple containing the inputs created based on the shapes,
+            and the outputs forwarded through the model using the dummy inputs.
     """
     inputs = None if shapes is None else create_torch_inputs(shapes)
-    outputs = {}
 
     def _init(raw: Any) -> Any:
         if isinstance(raw, torch.nn.Module):
-            outputs[raw] = None if inputs is None else raw(**inputs)
-            return raw if compile_fn is None else compile_fn(raw)
+            return None if inputs is None else raw(**inputs)
         if isinstance(raw, Mapping):
             res = {k: _init(v) for k, v in raw.items()}
             return res if (cls := type(raw)) is dict else cls(**res)
@@ -96,24 +160,14 @@ def initial_model(
             return type(raw)(_init(v) for v in raw)
         return raw
 
-    def _construct_outputs(raw: Any) -> Any:
-        if isinstance(raw, torch.nn.Module):
-            return outputs[raw]
-        if isinstance(raw, Mapping):
-            res = {k: _construct_outputs(v) for k, v in raw.items()}
-            return res if (cls := type(raw)) is dict else cls(**res)
-        if isinstance(raw, (list, tuple)):
-            return type(raw)(_construct_outputs(v) for v in raw)
-        return raw
-
-    return _init(model), inputs, _construct_outputs(model)
+    return inputs, _init(model)
 
 
 def get_autocast(mixed_precision_type: str | None, device: str | None) -> Callable[[], AbstractContextManager[None]]:
     """Get the appropriate autocast context manager based on the device and mixed precision type."""
     if mixed_precision_type is None:
         return suppress
-    return partial(torch.autocast, device_type=get_torch_device(device), dtype=DTYPES[mixed_precision_type])
+    return partial(torch.autocast, device_type=get_torch_device_type(device), dtype=DTYPES[mixed_precision_type])
 
 
 @dataclass(kw_only=True, slots=True)
@@ -168,54 +222,55 @@ class ValidationStep(TrainingStep):
 class TorchTracker:
     """A tracker for PyTorch models."""
 
-    losses_tracker: CriteriaTracker
-    """A tracker for the losses of the model."""
+    tracker: CriteriaTracker
+    """The tracker to use for tracking the criteria."""
 
-    metrics_tracker: CriteriaTracker | None = None
-    """A tracker for the metrics of the model."""
+    distributed: bool = field(default_factory=torch.distributed.is_initialized)
+    """Whether the tracker is being used in a distributed training environment."""
 
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_training_begin.register("reset_losses_tracker", lambda i, **kw: self.losses_tracker.reset())  # type: ignore[arg-type]
-        if self.metrics_tracker is not None:
-            _metrics_tracker = self.metrics_tracker  # capture narrowed reference for the lambda
-            GLOBAL_CALLBACKS.on_training_begin.register(
-                "reset_metrics_tracker",
-                lambda i, **kw: _metrics_tracker.reset(),  # type: ignore[arg-type]
-            )
+        GLOBAL_CALLBACKS.on_training_begin.register("reset_tracker", self.reset)
+        GLOBAL_CALLBACKS.on_validation_begin.register("reset_tracker", self.reset)
+
+    def reset(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Reset the trackers at the beginning of training."""
+        self.tracker.reset()
 
     def __call__(self, **criteria: Tensor) -> dict[str, float]:
         """Log the criteria and return the average values."""
-        res: dict[str, Tensor] = self.losses_tracker({k: criteria[k] for k in self.losses_tracker.criteria})
-        if self.metrics_tracker is not None:
-            res.update(self.metrics_tracker({k: criteria[k] for k in self.metrics_tracker.criteria}))
+        res: dict[str, Tensor] = self.tracker(criteria)
+        if self.distributed:
+            for key, tensor in res.items():
+                new_tensor = tensor.clone()
+                torch.distributed.all_reduce(new_tensor, op=torch.distributed.ReduceOp.AVG)
+                res[key] = new_tensor
         return {k: v.item() for k, v in res.items()}
 
     @classmethod
     def from_criteria(
         cls,
-        loss_outputs: list[str],
-        metric_outputs: list[str] | None = None,
+        outputs: list[str],
         compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
+        distributed: bool | None = None,
     ) -> "TorchTracker":
         """Create a tracker from the given loss and metric modules.
 
         Args:
-            loss_outputs (list[str]): The outputs to track for the loss module.
-            metric_outputs (list[str] | None): The outputs to track for the metric module.
+            outputs (list[str]): The names of the outputs to track from the loss and metric modules.
             compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
                 An optional function to compile the loss and metric modules.
+            distributed (bool | None): Whether the tracker will be used in a distributed training environment.
 
         Returns:
             A TorchTracker instance with the specified loss and metric trackers.
         """
-        losses_tracker = CriteriaTracker(loss_outputs)
-        metrics_tracker = None if metric_outputs is None else CriteriaTracker(metric_outputs)
+        tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            losses_tracker = compile_fn(losses_tracker)
-            if metrics_tracker is not None:
-                metrics_tracker = compile_fn(metrics_tracker)
-        return cls(losses_tracker=losses_tracker, metrics_tracker=metrics_tracker)
+            tracker = compile_fn(tracker)
+        if distributed is None:
+            distributed = torch.distributed.is_initialized()
+        return cls(tracker=tracker, distributed=distributed)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -229,18 +284,23 @@ class TimmEmaWrapper:
     ema: dict[str, ModelEmaV3]
     """The EMA model."""
 
+    distributed: bool = field(default_factory=torch.distributed.is_initialized)
+    """Whether the wrapper is being used in a distributed training environment."""
+
     def __post_init__(self) -> None:
         """Post-initialization."""
         GLOBAL_CALLBACKS.on_update.register("ema_update", self.update)
 
     def update(self, info: BaseInfo, **models: torch.nn.Module) -> None:
         """Update the EMA model."""
+        if self.distributed:
+            models = {n: getattr(m, "module", m) for n, m in models.items()}  # unwrap DDP for EMA update
         for name, ema in self.ema.items():
             ema.update(models[name], step=info.update)
 
     def __call__(self, info: BaseInfo, **models: torch.nn.Module) -> dict[str, Any]:
         """Return the EMA model."""
-        return {n: self.ema[n] if n in self.ema and self.is_cross_device[n] else m for n, m in models.items()}
+        return {n: m if n in self.ema and self.is_cross_device[n] else self.ema[n] for n, m in models.items()}
 
     @property
     def models(self) -> dict[str, torch.nn.Module]:
@@ -253,6 +313,7 @@ class TimmEmaWrapper:
         models: dict[str, torch.nn.Module],
         device: torch.device | None = None,
         compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
+        distributed: bool | None = None,
         **kwargs: Any,
     ) -> "TimmEmaWrapper":
         """Create a TimmEmaWrapper from the given models.
@@ -263,6 +324,7 @@ class TimmEmaWrapper:
                 If None, the EMA models will not be moved.
             compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
                 An optional function to compile the EMA models.
+            distributed (bool | None): Whether the wrapper will be used in a distributed training environment.
             **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
 
         Returns:
@@ -279,7 +341,21 @@ class TimmEmaWrapper:
                 ema_model = compile_fn(ema_model)
             ema[name] = ema_model
             is_cross_device[name] = _get_device(model) != _get_device(ema_model.module)
-        return cls(ema=ema, is_cross_device=is_cross_device)
+        if distributed is None:
+            distributed = torch.distributed.is_initialized()
+        return cls(ema=ema, is_cross_device=is_cross_device, distributed=distributed)
+
+
+def _model_train(info: BaseInfo, **models: torch.nn.Module) -> None:
+    """A callback to synchronize the device at the beginning of training."""
+    for model in models.values():
+        model.train()
+
+
+def _model_eval(info: BaseInfo, **models: torch.nn.Module) -> None:
+    """A callback to set the model to evaluation mode at the beginning of validation."""
+    for model in models.values():
+        model.eval()
 
 
 @dataclass(kw_only=True)
@@ -289,10 +365,55 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
     device: str
     """Device to run the model on, e.g., 'cuda' or 'cpu'."""
 
+    def __post_init__(self) -> None:
+        """Post-initialization."""
+        super().__post_init__()
+        self.on_training_begin.register("model_train", _model_train)
+        self.on_validation_begin.register("model_eval", _model_eval)
+
     def sync(self) -> None:
         """Synchronize the device if it is a CUDA device."""
         if "cuda" in self.device:
             torch.cuda.synchronize()
+
+    @contextmanager
+    def no_sync(self, __updated__: bool, **models: torch.nn.Module) -> Generator[None, None, None]:
+        """Context manager to disable gradient synchronizations for DistributedDataParallel models when not updating.
+
+        Args:
+            __updated__ (bool): Whether the model is being updated.
+            **models (torch.nn.Module): The models to potentially disable gradient synchronization for.
+        """
+        if __updated__:
+            yield
+        else:
+            old_values = {}
+            try:
+                for name, model in models.items():
+                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                        old_values[name] = model.require_backward_grad_sync
+                        model.require_backward_grad_sync = False
+                yield
+            finally:
+                for name, value in old_values.items():
+                    models[name].require_backward_grad_sync = value
+
+    def update_models(self, __inputs__: Any, **models: torch.nn.Module) -> tuple[bool, dict[str, Any]]:
+        """Perform a training step and update the models.
+
+        Args:
+            __inputs__ (Any): The inputs for the training step.
+            **models (torch.nn.Module): The models to update.
+
+        Returns:
+            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
+                a dictionary of criteria for tracking.
+        """
+        updated = self.backward.update(self.step)
+        with self.no_sync(__updated__=updated, **models):
+            criteria = self.training_step(__inputs__, **models)
+            self.backward(**criteria)
+            return updated, criteria
 
 
 @dataclass(kw_only=True, slots=True)
@@ -408,6 +529,19 @@ class TimmDataLoaderWrapper(WithExtra):
     channels_last: bool = False
     """Use channels_last memory format for inputs."""
 
+    # for distributed training, will be passed to initial_distributed_env:
+
+    device: str = "cpu"
+    """Device to move data to after loading, e.g. 'cuda' or 'cpu'. If None, data will not be moved."""
+
+    dist_backend: str | None = None
+    """The backend to use for distributed training.
+    If None, the backend will be automatically selected based on the device."""
+
+    dist_url: str | None = None
+    """The URL to use for distributed training initialization.
+    If None, the URL will be automatically generated based on the environment."""
+
     # for mixup
 
     use_prefetcher: bool = True
@@ -463,9 +597,6 @@ class TimmDataLoaderWrapper(WithExtra):
 
     pin_memory: bool = False
     """Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU."""
-
-    device: str = "cpu"
-    """Device to move data to after loading, e.g. 'cuda' or 'cpu'. If None, data will not be moved."""
 
     # only for training / is_training=True kwargs:
 
@@ -557,7 +688,12 @@ class TimmDataLoaderWrapper(WithExtra):
     @cached_property
     def distributed_results(self) -> dict[str, Any]:
         """Distributed results for the data loader."""
-        return init_distributed_device_so(device=self.device)
+        return initial_distributed_env(device=self.device, dist_backend=self.dist_backend, dist_url=self.dist_url)
+
+    @cached_property
+    def distributed(self) -> bool:
+        """Whether the data loader is distributed."""
+        return self.distributed_results["distributed"]
 
     @cached_property
     def default_kwargs(self) -> dict[str, Any]:
@@ -571,7 +707,7 @@ class TimmDataLoaderWrapper(WithExtra):
         kwargs["std"] = self.std
         kwargs["img_dtype"] = DTYPES[self.image_dtype]
         kwargs["device"] = torch.device(self.distributed_results["device"])
-        kwargs["distributed"] = self.distributed_results["distributed"]
+        kwargs["distributed"] = self.distributed
         kwargs["use_prefetcher"] = self.use_prefetcher
         if self.dataset.is_training:
             kwargs["no_aug"] = self.no_aug
@@ -610,18 +746,32 @@ class TimmDataLoaderWrapper(WithExtra):
             self.mixup.mixup_enabled = False
 
     @cached_property
+    def dataset_wrapper(self) -> TimmDatasetWrapper:
+        """Return the dataset wrapper."""
+        dataset = self.dataset.dataset
+        if self.dataset.is_training and self.num_aug_splits > 1:
+            dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
+        return dataset
+
+    def set_dataset_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Set the epoch for the dataset if it has a set_epoch method."""
+        self.dataset_wrapper.set_epoch(info.epoch - 1)
+
+    def set_dataloader_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Set the epoch for the data loader if it has a set_epoch method."""
+        self.dataloader.sampler.set_epoch(info.epoch - 1)
+
+    @cached_property
     def dataloader(self) -> DataLoader:
         """Create a data loader using the timm library."""
-        collate_fn, dataset = None, self.dataset.dataset
+        collate_fn, dataset = None, self.dataset_wrapper
         if self.dataset.is_training:
             if self.mixup_active:
                 if self.use_prefetcher:
                     collate_fn = self.mixup
                 if self.mixup_off_epoch:
-                    GLOBAL_CALLBACKS.on_training_begin.append(self.disable_mixup)
-            if self.num_aug_splits > 1:
-                dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
-        return create_loader(
+                    GLOBAL_CALLBACKS.on_training_begin.register("disable_mixup", self.disable_mixup)
+        loader = create_loader(
             dataset=dataset,
             batch_size=self.dataset.batch_size,
             is_training=self.dataset.is_training,
@@ -629,6 +779,12 @@ class TimmDataLoaderWrapper(WithExtra):
             **self.default_kwargs,
             **self.model_extra,
         )
+        if self.dataset.is_training:
+            if hasattr(dataset, "set_epoch"):
+                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataset_epoch", self.set_dataset_epoch)
+            elif self.distributed and hasattr(loader.sampler, "set_epoch"):
+                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataloader_epoch", self.set_dataloader_epoch)
+        return loader
 
     def __len__(self) -> int:
         """Return the length of the data loader."""
@@ -674,6 +830,7 @@ __all__ = [
     "create_torch_inputs",
     "get_autocast",
     "get_torch_device",
+    "initial_distributed_env",
     "initial_model",
 ]
 

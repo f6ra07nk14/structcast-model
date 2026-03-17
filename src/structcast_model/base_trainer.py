@@ -41,8 +41,11 @@ class Forward(Protocol[ModelT_contra]):
 class Backward(Protocol):
     """Protocol for backward pass configuration."""
 
-    def __call__(self, step: int, *args: Any, **kwargs: Any) -> bool:
-        """Perform the backward pass for the given step and losses, and return whether the model has been updated."""
+    def update(self, step: int) -> bool:
+        """Determine whether to update the model based on the current step and any internal state."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        """Perform the backward pass for the given losses."""
 
 
 @dataclass(kw_only=True)
@@ -80,7 +83,7 @@ class Callback(Protocol, Generic[ModelT_contra]):
 class BestCallback(Protocol[ModelT_contra]):
     """Protocol for best criterion callback."""
 
-    def __call__(self, info: BaseInfo, target: str, best: float, **models: ModelT_contra) -> None:
+    def __call__(self, info: BaseInfo, best: "BestCriterion", **models: ModelT_contra) -> None:
         """Call the callback with the given info, target criterion, and best value."""
 
 
@@ -305,6 +308,22 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
 
+    def update_models(self, __inputs__: Any, **models: ModelT_contra) -> tuple[bool, dict[str, Any]]:
+        """Perform a training step and update the models.
+
+        Args:
+            __inputs__ (Any): The inputs for the training step.
+            **models (ModelT): The models to update.
+
+        Returns:
+            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
+                a dictionary of criteria for tracking.
+        """
+        criteria = self.training_step(__inputs__, **models)
+        updated = self.backward.update(self.step)
+        self.backward(**criteria)
+        return updated, criteria
+
     def train(self, dataset: DatasetLike | Callable[[], DatasetLike], **models: ModelT_contra) -> Mapping[str, Any]:
         """Train the model on the given dataset.
 
@@ -317,20 +336,19 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             Mapping[str, Any]: The logs from training, which may include metrics and other information.
         """
         invoke_callback(self.on_training_begin, self, **models)
-        tracker, training_step, backward, elapsed_time = self.tracker, self.training_step, self.backward, 0.0
+        elapsed_time = 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
             self.step += 1
             invoke_callback(self.on_training_step_begin, self, **models)
             elapsed_time -= time()
-            criteria = training_step(inputs, **models)
-            should_update = backward(self.step, **criteria)
+            updated, criteria = self.update_models(inputs, **models)
             self.sync()
             elapsed_time += time()
-            logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs = self.tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.training_prefix:
                 logs = {f"{self.training_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
-            if should_update:
+            if updated:
                 self.update += 1
                 invoke_callback(self.on_update, self, **models)
             invoke_callback(self.on_training_step_end, self, **models)
@@ -354,14 +372,14 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         if self.inference_wrapper is not None:
             models = self.inference_wrapper(self, **models)
         invoke_callback(self.on_validation_begin, self, **models)
-        tracker, validation_step, elapsed_time = self.tracker, self.validation_step, 0.0
+        elapsed_time = 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
-            criteria = validation_step(data, **models)
+            criteria = self.validation_step(data, **models)
             self.sync()
             elapsed_time += time()
-            logs = tracker(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs = self.tracker(**criteria) | {"elapsed_time": elapsed_time / index}
             if self.validation_prefix:
                 logs = {f"{self.validation_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
@@ -418,9 +436,10 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=NamedCallbackList)  # type: ignore[assignment]
+    on_best: NamedCallbackList[BestCallback[ModelT_contra]] = field(default_factory=NamedCallbackList)  # type: ignore[assignment]
     """Callbacks to be called when a new best criterion is found."""
 
+    _step: int = field(default=0, repr=False)
     _best: float = field(init=False, repr=False)
     _compare: Callable[[float, float], bool] = field(init=False, repr=False)
 
@@ -435,13 +454,24 @@ class BestCriterion(Generic[ModelT_contra]):
                 ncl.append(cb)
             self.on_best = ncl
 
+    @property
+    def step(self) -> int:
+        """Get the step at which the best criterion was found."""
+        return self._step
+
+    @property
+    def value(self) -> float:
+        """Get the best criterion value found."""
+        return self._best
+
     def __call__(self, info: BaseInfo, **models: ModelT_contra) -> None:
         """Check and update the best criterion."""
         current: float | None = info.logs().get(self.target, None)
         if current is not None:
             if self._compare(current, self._best):
+                self._step = info.step
                 self._best = current
-            invoke_callback(self.on_best, info, self.target, self._best, **models)
+            invoke_callback(self.on_best, info, self, **models)
 
 
 __all__ = [

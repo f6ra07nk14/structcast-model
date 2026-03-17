@@ -14,7 +14,7 @@ Key modules:
 - `builders/base_builder.py` → `builders/torch_builder.py` — Template-to-code pipeline
 - `commands/main.py` + `commands/cmd_torch.py` — Typer CLI (`scm` entry point)
 - `base_trainer.py` — Generic trainer, callbacks, best-criterion tracking
-- `torch/trainer.py` — PyTorch training steps, tracker, EMA, timm wrappers
+- `torch/trainer.py` — PyTorch training steps, tracker, EMA, timm wrappers, distributed training via `torchrun` + DDP
 
 ## Build & Test
 
@@ -59,3 +59,4 @@ ruff format src tests           # auto-format
 - Validate inputs at function entry; log warnings for recoverable issues
 - YAML templates in `cfg/` follow StructCast object patterns (`_obj_`, `_addr_`, `_file_`, `_call_`, `_bind_`, `_attr_`)
 - Generated code is re-imported at runtime via `_file_` patterns — do not break this loop
+- `scm torch train` supports distributed training via `torchrun` + `DistributedDataParallel` — use `torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train ...` for multi-GPU

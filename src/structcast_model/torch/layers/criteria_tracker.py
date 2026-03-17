@@ -22,9 +22,8 @@ class CriteriaTracker(Module):
     @no_grad()
     def forward(self, values: dict[str, Tensor]) -> dict[str, Tensor]:
         """Update the total and count for each criterion."""
-        first = next(iter(values.values()))
-        with autocast(device_type=first.device.type, enabled=False):
-            self.total.add_(first.new_ones(1, dtype=float32))
+        with autocast(device_type=self.total.device.type, enabled=False):
+            self.total.add_(self.total.new_ones(1, dtype=float32))
             return {c: v.add_(values[c].to(float32)).div(self.total) for c, v in self.trackers.items()}
 
     @no_grad()

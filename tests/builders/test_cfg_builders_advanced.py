@@ -39,7 +39,7 @@ def test_cfg_convnext_backward_supports_accumulation_and_mp() -> None:
     assert "torch.amp.GradScaler(" in script
     assert "ce_loss = ce_loss / 4" in script
     assert "self.optimizer_scaler.scale(ce_loss).backward()" in script
-    assert "return should_update" in script
+    assert "return self.need_update" in script
 
 
 def test_cfg_convnext_backward_invalid_layer_decay_type_raises() -> None:

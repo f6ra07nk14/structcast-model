@@ -94,7 +94,7 @@ The CLI entry point is defined in `pyproject.toml` as `scm = "structcast_model.c
 - `scm torch create backward`
 - `scm torch ptflops`
 - `scm torch calflops`
-- `scm torch train`
+- `scm torch train` (also supports distributed training via `torchrun`)
 
 ### `scm format`
 
@@ -157,6 +157,24 @@ Key runtime behavior:
 - Mixed precision dtype is taken from the backward object when available; otherwise from the `--mixed-precision` CLI flag.
 - Validation progress uses `tqdm` unless `--ci` is enabled.
 
+Distributed training behavior (when launched through `torchrun`):
+
+- `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
+- Each process is assigned to `cuda:<LOCAL_RANK>`.
+- All models are wrapped with `DistributedDataParallel`.
+- `TimmDataLoaderWrapper` creates `DistributedSampler` automatically; `set_epoch()` is called each epoch.
+- `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
+- MLflow logging, checkpoints, and progress bars are gated to rank 0 only.
+- DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
+- `TimmEmaWrapper` unwraps the DDP module before updating EMA weights.
+- CLI options `--dist-backend` and `--dist-url` (also settable via `DIST_BACKEND` / `DIST_URL` env vars) control the distributed backend.
+
+Launch command for distributed training:
+
+```bash
+torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train ...
+```
+
 ## Builder Architecture
 
 ### Generic builder layer
@@ -217,6 +235,7 @@ Utility functions:
 
 - `create_torch_inputs(shape)`
 - `get_torch_device(device=None)`
+- `initial_distributed_env(device, dist_backend, dist_url)` — detects torchrun env vars, initializes process group, returns per-rank device
 - `initial_model(model, shapes=None, compile_fn=None)`
 - `get_autocast(mixed_precision_type, device)`
 
@@ -242,6 +261,14 @@ timm integrations:
 5. `TorchTracker` is built from declared output names.
 6. `TorchTrainer` runs the loop and invokes callbacks.
 7. MLflow receives arguments, metrics, artifacts, training state, and best-checkpoint snapshots.
+
+When running under `torchrun`, the flow gains additional distributed steps:
+
+8. Process group is initialized and per-rank device is assigned.
+9. Models are wrapped with `DistributedDataParallel`.
+10. Metrics are synchronized across ranks via `all_reduce`.
+11. Only rank 0 writes MLflow logs, checkpoints, and progress output.
+12. `destroy_process_group()` is called during cleanup.
 
 ## Pattern Alias Quick Reference
 
@@ -323,6 +350,8 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 | `ValueError: Invalid tensor shape` | `-s/--shape` was not a tuple/list/dict of integers. | Use shapes like `'image: [3, 224, 224]'`. |
 | `ValueError: Mixup is not active` | Code accessed `TimmDataLoaderWrapper.mixup` while mixup/cutmix settings were disabled. | Enable `mixup_alpha`, `cutmix_alpha`, or `cutmix_minmax` first. |
 | CUDA requested but CPU used | `get_torch_device("cuda")` falls back when CUDA is unavailable. | Verify PyTorch CUDA installation. |
+| `RuntimeError: Address already in use` during distributed training | Another process is using the `MASTER_PORT`. | Change `--master_port` or kill the conflicting process. |
+| All ranks log to MLflow / print progress bars | Rank gating is not working correctly. | Verify `initial_distributed_env()` is called before logging setup. |
 
 ## Key Integration Example
 
@@ -334,3 +363,5 @@ The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 4. Train through `scm torch train` using `_file_`-based StructCast object patterns.
 
 This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the training CLI (execution phase).
+
+For distributed training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation. The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.
