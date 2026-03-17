@@ -297,6 +297,21 @@ class _FakeModule:
         return {"param_size": self._param_size}
 
 
+class _FakeDDP:
+    """Fake DistributedDataParallel for testing distributed code paths."""
+
+    def __init__(self, module: Any, **kwargs: Any) -> None:
+        self.module = module
+
+    def parameters(self) -> list[_FakeParameter]:
+        """Delegate to the wrapped module."""
+        return self.module.parameters()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Delegate to the wrapped module."""
+        return self.module.state_dict()
+
+
 class _FakeBestCriterion:
     def __init__(self, target: str, mode: str, on_best: list[Any] | None = None) -> None:
         self.target = target
@@ -621,3 +636,125 @@ def test_train_raises_when_module_outputs_missing_and_not_provided(tmp_path: Any
 
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
         train_fn(**args)
+
+
+# ---------------------------------------------------------------------------
+# `train` — distributed mode (Strategy 1: mock-based distributed tests)
+# ---------------------------------------------------------------------------
+
+
+def test_train_distributed_wraps_models_with_ddp_and_destroys_pg(tmp_path: Any) -> None:
+    """When distributed=True rank=0, models are wrapped with DDP and process group is destroyed."""
+    train_fn = _train_callback()
+    args = _build_train_args(tmp_path, ci=True, ema=None, loss_outputs=["loss"], metric_outputs=None)
+    backward = SimpleNamespace(
+        learning_rates={"lr": 0.01},
+        optimizers={"opt": _FakeModule()},
+        grad_scalers={"scaler": _FakeModule()},
+    )
+    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
+        loss_module=_FakeModule(outputs=["loss"]),
+        metric_module=None,
+        backward=backward,
+        use_ema=False,
+    )
+    # flip to distributed, rank=0 (is_main)
+    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 2, True)
+    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
+    torch_mock.distributed = MagicMock()
+    torch_mock.distributed.destroy_process_group = MagicMock()
+    with patch_cmd_globals(**deps):
+        train_fn(**args)
+    # MLflow should have run (rank=0)
+    mlflow_mock.set_experiment.assert_called_once()
+    # destroy_process_group called in finally block
+    torch_mock.distributed.destroy_process_group.assert_called_once()
+
+
+def test_train_distributed_non_main_skips_mlflow(tmp_path: Any) -> None:
+    """When global_rank != 0 (non-main), MLflow logging is skipped entirely."""
+    train_fn = _train_callback()
+    args = _build_train_args(tmp_path, ci=True, loss_outputs=["loss"], metric_outputs=None)
+
+    backward = SimpleNamespace(
+        learning_rates={"lr": 0.01},
+        optimizers={"opt": _FakeModule()},
+        grad_scalers={"scaler": _FakeModule()},
+    )
+    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
+        loss_module=_FakeModule(outputs=["loss"]),
+        metric_module=None,
+        backward=backward,
+        use_ema=False,
+    )
+    # rank=1 (not main)
+    trainer_ns.initial_distributed_env.return_value = ("cpu", 1, 1, 2, True)
+    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
+    torch_mock.distributed = MagicMock()
+    torch_mock.distributed.destroy_process_group = MagicMock()
+
+    with patch_cmd_globals(**deps):
+        train_fn(**args)
+
+    # MLflow must NOT have been called for non-main rank
+    mlflow_mock.set_experiment.assert_not_called()
+    mlflow_mock.start_run.assert_not_called()
+    # destroy_process_group still called
+    torch_mock.distributed.destroy_process_group.assert_called_once()
+
+
+def test_train_distributed_seeds_offset_by_rank(tmp_path: Any) -> None:
+    """Seeds must be offset by global_rank for distributed training."""
+    train_fn = _train_callback()
+    seed = 42
+    global_rank = 3
+    args = _build_train_args(tmp_path, ci=True, seed=seed, loss_outputs=["loss"], metric_outputs=None)
+    backward = SimpleNamespace(
+        learning_rates={"lr": 0.01},
+        optimizers={"opt": _FakeModule()},
+        grad_scalers={"scaler": _FakeModule()},
+    )
+    deps, _, _, trainer_ns, torch_mock = _build_train_deps(
+        loss_module=_FakeModule(outputs=["loss"]),
+        metric_module=None,
+        backward=backward,
+        use_ema=False,
+    )
+    # rank=3, world_size=4 (non-main, to avoid MLflow)
+    trainer_ns.initial_distributed_env.return_value = ("cpu", global_rank, 3, 4, True)
+    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
+    torch_mock.distributed = MagicMock()
+    torch_mock.distributed.destroy_process_group = MagicMock()
+    with patch_cmd_globals(**deps):
+        train_fn(**args)
+    torch_mock.manual_seed.assert_called_once_with(seed + global_rank)
+
+
+def test_train_distributed_unwraps_ddp_when_saving_state(tmp_path: Any) -> None:
+    """_save_training_state should unwrap DDP models before saving state dicts."""
+    train_fn = _train_callback()
+    args = _build_train_args(tmp_path, ci=True, ema=None, loss_outputs=["loss"], metric_outputs=None)
+    backward = SimpleNamespace(
+        learning_rates={"lr": 0.01},
+        optimizers={"opt": _FakeModule()},
+        grad_scalers={"scaler": _FakeModule()},
+    )
+    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
+        loss_module=_FakeModule(outputs=["loss"]),
+        metric_module=None,
+        backward=backward,
+        use_ema=False,
+    )
+    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 2, True)
+    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
+    torch_mock.distributed = MagicMock()
+    torch_mock.distributed.destroy_process_group = MagicMock()
+    with patch_cmd_globals(**deps):
+        train_fn(**args)
+    # _save_training_state calls _unwrap_ddp → _get_state_dict → mlflow.pytorch.log_state_dict
+    state_calls = mlflow_mock.pytorch.log_state_dict.call_args_list
+    training_state = [c for c in state_calls if c.kwargs.get("artifact_path") == "training_state"]
+    assert training_state
+    # The saved models dict should contain unwrapped state_dicts (from _FakeModule, not _FakeDDP)
+    saved_models = training_state[0].args[0]["models"]
+    assert "model" in saved_models

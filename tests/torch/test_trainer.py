@@ -24,6 +24,7 @@ from structcast_model.torch.trainer import (
     create_torch_inputs,
     get_autocast,
     get_torch_device,
+    initial_distributed_env,
     initial_model,
 )
 import torch
@@ -796,3 +797,207 @@ def test_timm_dataloader_dunder_call_with_spec(patch_timm_io: _FakeLoader) -> No
     wrapper.__dict__["spec"] = fake_spec
     list(wrapper())
     assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: real gloo process group (single-process distributed tests)
+# ---------------------------------------------------------------------------
+
+# --- initial_distributed_env ---
+
+
+def test_initial_distributed_env_non_distributed_returns_cpu() -> None:
+    """Non-distributed env returns cpu device, rank=0, world_size=1, distributed=False."""
+    result = initial_distributed_env(device="cpu")
+    assert result["device"] == "cpu"
+    assert result["global_rank"] == 0
+    assert result["world_size"] == 1
+    assert result["distributed"] is False
+
+
+def test_initial_distributed_env_return_dict_false_returns_tuple() -> None:
+    """return_dict=False returns a 5-element tuple."""
+    result = initial_distributed_env(device="cpu", return_dict=False)
+    assert isinstance(result, tuple)
+    assert len(result) == 5
+    device, global_rank, local_rank, world_size, distributed = result
+    assert device == "cpu"
+    assert distributed is False
+
+
+def test_initial_distributed_env_with_gloo_non_slurm(
+    single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With gloo PG initialized and env vars set, detects distributed (non-SLURM path)."""
+    # WORLD_SIZE must be > 1 for timm's is_distributed_env() to return True
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.delenv("SLURM_NTASKS", raising=False)
+    result = initial_distributed_env(device="cpu")
+    assert result["distributed"] is True
+    assert result["device"] == "cpu"
+    # world_size and rank come from the actual PG (world_size=1)
+    assert result["world_size"] == 1
+    assert result["global_rank"] == 0
+    assert result["local_rank"] == 0
+
+
+def test_initial_distributed_env_with_gloo_slurm_path(
+    single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With gloo PG initialized and SLURM env vars, takes the SLURM branch."""
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.setenv("SLURM_NTASKS", "2")
+    result = initial_distributed_env(device="cpu")
+    assert result["distributed"] is True
+    assert result["device"] == "cpu"
+
+
+def test_initial_distributed_env_with_gloo_return_tuple(
+    single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """return_dict=False with active gloo PG returns a distributed tuple."""
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.delenv("SLURM_NTASKS", raising=False)
+    device, global_rank, local_rank, world_size, distributed = initial_distributed_env(device="cpu", return_dict=False)
+    assert distributed is True
+    assert world_size == 1
+
+
+# --- get_torch_device_type ---
+
+
+def test_get_torch_device_type_cpu() -> None:
+    """get_torch_device split returns 'cpu' for cpu device."""
+    assert get_torch_device("cpu").split(":")[0] == "cpu"
+
+
+def test_get_torch_device_type_cuda_with_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_torch_device split returns 'cuda' for 'cuda:0'."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert get_torch_device("cuda:0").split(":")[0] == "cuda"
+
+
+# --- TorchTracker distributed all_reduce ---
+
+
+def test_torch_tracker_distributed_all_reduce_identity(single_process_gloo: None) -> None:
+    """all_reduce(AVG) with world_size=1 is identity; verifies distributed branch."""
+    tracker = TorchTracker.from_criteria(["loss"], distributed=True)
+    result = tracker(loss=torch.tensor(0.5))
+    assert "loss" in result
+    assert result["loss"] == pytest.approx(0.5)
+
+
+def test_torch_tracker_distributed_all_reduce_multiple_criteria(single_process_gloo: None) -> None:
+    """Distributed all_reduce works for multiple criteria simultaneously."""
+    tracker = TorchTracker.from_criteria(["loss", "acc"], distributed=True)
+    result = tracker(loss=torch.tensor(0.3), acc=torch.tensor(0.85))
+    assert result["loss"] == pytest.approx(0.3)
+    assert result["acc"] == pytest.approx(0.85)
+
+
+def test_torch_tracker_from_criteria_auto_detects_distributed(single_process_gloo: None) -> None:
+    """from_criteria with distributed=None auto-detects is_initialized() → True."""
+    tracker = TorchTracker.from_criteria(["loss"], distributed=None)
+    assert tracker.distributed is True
+
+
+def test_torch_tracker_from_criteria_auto_detects_non_distributed() -> None:
+    """from_criteria with distributed=None when no PG returns distributed=False."""
+    tracker = TorchTracker.from_criteria(["loss"], distributed=None)
+    assert tracker.distributed is False
+
+
+# --- TimmEmaWrapper distributed DDP unwrap ---
+
+
+def test_timm_ema_wrapper_update_distributed_unwraps_ddp(single_process_gloo: None) -> None:
+    """update() with distributed=True unwraps DDP .module before EMA update."""
+    model = _ParamModel()
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    wrapper = TimmEmaWrapper.from_models({"m": model}, distributed=True)
+    info = BaseInfo(update=1)
+    # Should unwrap ddp_model.module (the original model) and pass to ema.update
+    wrapper.update(info, m=ddp_model)  # must not raise
+
+
+def test_timm_ema_wrapper_from_models_auto_detects_distributed(single_process_gloo: None) -> None:
+    """from_models with distributed=None auto-detects is_initialized() → True."""
+    wrapper = TimmEmaWrapper.from_models({"m": _ParamModel()}, distributed=None)
+    assert wrapper.distributed is True
+
+
+# --- TorchTrainer.no_sync ---
+
+
+def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: None) -> None:
+    """no_sync(__updated__=False) sets require_backward_grad_sync=False on DDP models."""
+    model = torch.nn.Linear(2, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=[], losses=_LossModule()),
+        backward=MagicMock(),
+        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        add_global_callbacks=False,
+    )
+    assert ddp_model.require_backward_grad_sync is True
+    with trainer.no_sync(__updated__=False, m=ddp_model):
+        assert ddp_model.require_backward_grad_sync is False
+    # restored after exiting
+    assert ddp_model.require_backward_grad_sync is True
+
+
+def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo: None) -> None:
+    """no_sync(__updated__=True) yields without touching DDP grad sync flag."""
+    model = torch.nn.Linear(2, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=[], losses=_LossModule()),
+        backward=MagicMock(),
+        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        add_global_callbacks=False,
+    )
+    with trainer.no_sync(__updated__=True, m=ddp_model):
+        assert ddp_model.require_backward_grad_sync is True
+
+
+def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) -> None:
+    """no_sync restores require_backward_grad_sync even when the body raises."""
+    model = torch.nn.Linear(2, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=[], losses=_LossModule()),
+        backward=MagicMock(),
+        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        add_global_callbacks=False,
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        with trainer.no_sync(__updated__=False, m=ddp_model):
+            raise RuntimeError("boom")
+    assert ddp_model.require_backward_grad_sync is True
+
+
+def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
+    """no_sync leaves non-DDP models untouched when __updated__=False."""
+    model = torch.nn.Linear(2, 2)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=[], losses=_LossModule()),
+        backward=MagicMock(),
+        tracker=TorchTracker.from_criteria(["loss"]),
+        add_global_callbacks=False,
+    )
+    with trainer.no_sync(__updated__=False, m=model):
+        assert not hasattr(model, "require_backward_grad_sync")
