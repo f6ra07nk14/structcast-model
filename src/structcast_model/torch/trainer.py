@@ -222,27 +222,24 @@ class ValidationStep(TrainingStep):
 class TorchTracker:
     """A tracker for PyTorch models."""
 
-    losses_tracker: CriteriaTracker
-    """A tracker for the losses of the model."""
-
-    metrics_tracker: CriteriaTracker | None = None
-    """A tracker for the metrics of the model."""
+    tracker: CriteriaTracker
+    """The tracker to use for tracking the criteria."""
 
     distributed: bool = field(default_factory=torch.distributed.is_initialized)
     """Whether the tracker is being used in a distributed training environment."""
 
     def __post_init__(self) -> None:
         """Post-initialization."""
-        GLOBAL_CALLBACKS.on_training_begin.register("reset_losses_tracker", lambda i, **kw: self.losses_tracker.reset())  # type: ignore[arg-type]
-        if self.metrics_tracker is not None:
-            _m_tracker = self.metrics_tracker  # capture narrowed reference for the lambda
-            GLOBAL_CALLBACKS.on_training_begin.register("reset_metrics_tracker", lambda i, **kw: _m_tracker.reset())  # type: ignore[arg-type]
+        GLOBAL_CALLBACKS.on_training_begin.register("reset_tracker", self.reset)
+        GLOBAL_CALLBACKS.on_validation_begin.register("reset_tracker", self.reset)
+
+    def reset(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Reset the trackers at the beginning of training."""
+        self.tracker.reset()
 
     def __call__(self, **criteria: Tensor) -> dict[str, float]:
         """Log the criteria and return the average values."""
-        res: dict[str, Tensor] = self.losses_tracker({k: criteria[k] for k in self.losses_tracker.criteria})
-        if self.metrics_tracker is not None:
-            res.update(self.metrics_tracker({k: criteria[k] for k in self.metrics_tracker.criteria}))
+        res: dict[str, Tensor] = self.tracker(criteria)
         if self.distributed:
             for key, tensor in res.items():
                 new_tensor = tensor.clone()
@@ -253,28 +250,27 @@ class TorchTracker:
     @classmethod
     def from_criteria(
         cls,
-        loss_outputs: list[str],
-        metric_outputs: list[str] | None = None,
+        outputs: list[str],
         compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
+        distributed: bool | None = None,
     ) -> "TorchTracker":
         """Create a tracker from the given loss and metric modules.
 
         Args:
-            loss_outputs (list[str]): The outputs to track for the loss module.
-            metric_outputs (list[str] | None): The outputs to track for the metric module.
+            outputs (list[str]): The names of the outputs to track from the loss and metric modules.
             compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
                 An optional function to compile the loss and metric modules.
+            distributed (bool | None): Whether the tracker will be used in a distributed training environment.
 
         Returns:
             A TorchTracker instance with the specified loss and metric trackers.
         """
-        losses_tracker = CriteriaTracker(loss_outputs)
-        metrics_tracker = None if metric_outputs is None else CriteriaTracker(metric_outputs)
+        tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            losses_tracker = compile_fn(losses_tracker)
-            if metrics_tracker is not None:
-                metrics_tracker = compile_fn(metrics_tracker)
-        return cls(losses_tracker=losses_tracker, metrics_tracker=metrics_tracker)
+            tracker = compile_fn(tracker)
+        if distributed is None:
+            distributed = torch.distributed.is_initialized()
+        return cls(tracker=tracker, distributed=distributed)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -304,7 +300,7 @@ class TimmEmaWrapper:
 
     def __call__(self, info: BaseInfo, **models: torch.nn.Module) -> dict[str, Any]:
         """Return the EMA model."""
-        return {n: self.ema[n] if n in self.ema and self.is_cross_device[n] else m for n, m in models.items()}
+        return {n: m if n in self.ema and self.is_cross_device[n] else self.ema[n] for n, m in models.items()}
 
     @property
     def models(self) -> dict[str, torch.nn.Module]:
@@ -317,6 +313,7 @@ class TimmEmaWrapper:
         models: dict[str, torch.nn.Module],
         device: torch.device | None = None,
         compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
+        distributed: bool | None = None,
         **kwargs: Any,
     ) -> "TimmEmaWrapper":
         """Create a TimmEmaWrapper from the given models.
@@ -327,6 +324,7 @@ class TimmEmaWrapper:
                 If None, the EMA models will not be moved.
             compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
                 An optional function to compile the EMA models.
+            distributed (bool | None): Whether the wrapper will be used in a distributed training environment.
             **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
 
         Returns:
@@ -343,7 +341,9 @@ class TimmEmaWrapper:
                 ema_model = compile_fn(ema_model)
             ema[name] = ema_model
             is_cross_device[name] = _get_device(model) != _get_device(ema_model.module)
-        return cls(ema=ema, is_cross_device=is_cross_device)
+        if distributed is None:
+            distributed = torch.distributed.is_initialized()
+        return cls(ema=ema, is_cross_device=is_cross_device, distributed=distributed)
 
 
 def _model_train(info: BaseInfo, **models: torch.nn.Module) -> None:

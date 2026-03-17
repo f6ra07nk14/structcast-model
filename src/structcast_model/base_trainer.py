@@ -83,7 +83,7 @@ class Callback(Protocol, Generic[ModelT_contra]):
 class BestCallback(Protocol[ModelT_contra]):
     """Protocol for best criterion callback."""
 
-    def __call__(self, info: BaseInfo, target: str, best: float, **models: ModelT_contra) -> None:
+    def __call__(self, info: BaseInfo, best: "BestCriterion", **models: ModelT_contra) -> None:
         """Call the callback with the given info, target criterion, and best value."""
 
 
@@ -436,9 +436,10 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=NamedCallbackList)  # type: ignore[assignment]
+    on_best: NamedCallbackList[BestCallback[ModelT_contra]] = field(default_factory=NamedCallbackList)  # type: ignore[assignment]
     """Callbacks to be called when a new best criterion is found."""
 
+    _step: int = field(default=0, repr=False)
     _best: float = field(init=False, repr=False)
     _compare: Callable[[float, float], bool] = field(init=False, repr=False)
 
@@ -453,13 +454,24 @@ class BestCriterion(Generic[ModelT_contra]):
                 ncl.append(cb)
             self.on_best = ncl
 
+    @property
+    def step(self) -> int:
+        """Get the step at which the best criterion was found."""
+        return self._step
+
+    @property
+    def value(self) -> float:
+        """Get the best criterion value found."""
+        return self._best
+
     def __call__(self, info: BaseInfo, **models: ModelT_contra) -> None:
         """Check and update the best criterion."""
         current: float | None = info.logs().get(self.target, None)
         if current is not None:
             if self._compare(current, self._best):
+                self._step = info.step
                 self._best = current
-            invoke_callback(self.on_best, info, self.target, self._best, **models)
+            invoke_callback(self.on_best, info, self, **models)
 
 
 __all__ = [

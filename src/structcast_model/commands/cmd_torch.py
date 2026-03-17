@@ -3,13 +3,14 @@
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
+import random
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from structcast.utils.base import dump_yaml_to_string
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo, callbacks_session, get_dataset_size
+from structcast_model.base_trainer import BaseInfo, BestCriterion, callbacks_session, get_dataset_size
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
@@ -147,16 +148,22 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
     )
 
 
-def _get_state_dict(**kwargs: Any) -> dict[str, Any]:
+def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return a mapping of name to state dict for all given modules."""
     return {n: m.state_dict() for n, m in kwargs.items()}
 
 
-def _on_best(info: BaseInfo, target: str, value: float, save: bool, **kwargs: Any) -> None:
+def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
+    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
+
+
+def _on_best(info: BaseInfo, best: BestCriterion, save: bool, **kwargs: Any) -> None:
     """Log best metric value and optionally save model state dict to MLflow."""
-    mlflow.log_metric(f"{target}_best", value, step=info.epoch)
-    if save:
-        mlflow.pytorch.log_state_dict(_get_state_dict(**kwargs), f"{target}_best")
+    name = f"best_{best.target}"
+    mlflow.log_metric(name, best.value, step=info.epoch)
+    if save and info.step == best.step:
+        mlflow.pytorch.log_state_dict(_get_state_dict(_unwrap_ddp(kwargs)), name)
 
 
 def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
@@ -164,13 +171,13 @@ def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
     backward = cast("torch_trainer.TorchTrainer", info).backward
     wrapper = cast("torch_trainer.TorchTrainer", info).inference_wrapper
     states: dict[str, Any] = {
-        "models": _get_state_dict(**kwargs),
-        "optimizers": _get_state_dict(**getattr(backward, "optimizers", {})),
-        "grad_scalers": _get_state_dict(**getattr(backward, "grad_scalers", {})),
+        "models": _get_state_dict(_unwrap_ddp(kwargs)),
+        "optimizers": _get_state_dict(getattr(backward, "optimizers", {})),
+        "grad_scalers": _get_state_dict(getattr(backward, "grad_scalers", {})),
         "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
     }
     if wrapper is not None:
-        states["ema"] = _get_state_dict(**cast("torch_trainer.TimmEmaWrapper", wrapper).models)
+        states["ema"] = _get_state_dict(cast("torch_trainer.TimmEmaWrapper", wrapper).models)
     mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
 
 
@@ -404,14 +411,15 @@ def train(  # noqa: PLR0913,PLR0915
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
     configure_security(allowed_modules_check=False)
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision(matmul_precision)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    input_shapes = reduce_dict(shapes)
     device, global_rank, _, world_size, distributed = torch_trainer.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision(matmul_precision)
+    torch.manual_seed(seed + global_rank)
+    np.random.seed(seed + global_rank)
+    random.seed(seed + global_rank)
+    input_shapes = reduce_dict(shapes)
     is_main = global_rank == 0
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
@@ -426,12 +434,12 @@ def train(  # noqa: PLR0913,PLR0915
         print(f"Validation dataset size: {validation_steps} steps.")
     with torch.device(device):
         models = _instantiate_models(model_patterns)
-        torch_trainer.initial_model(_instantiate_models(model_patterns), input_shapes)
+        torch_trainer.initial_model(models, input_shapes)
         loss = compile_fn(_instantiate(loss_pattern))
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
-        metric_outputs = None if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
-        tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs, metric_outputs, compile_fn)
+        metric_outputs = [] if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
+        tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs + metric_outputs, compile_fn, distributed)
         backward = _instantiate(backward_pattern)(**models)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
@@ -439,8 +447,9 @@ def train(  # noqa: PLR0913,PLR0915
     if ema is not None:
         inference_wrapper = torch_trainer.TimmEmaWrapper.from_models(
             models,
-            compile_fn=compile_fn,
             device=None if ema_device is None else torch.device(ema_device),
+            compile_fn=compile_fn,
+            distributed=distributed,
             **instantiator.instantiate(ema),
         )
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
@@ -476,18 +485,14 @@ def train(  # noqa: PLR0913,PLR0915
             trainer.on_validation_end.register("pbar_refresh_validation", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
             trainer.on_epoch_end.register("pbar_log_criteria", lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
         trainer.on_epoch_end.register("save_training_state", _save_training_state)
-        for criterion_name in higher_criteria:
-            on_best = partial(_on_best, save=criterion_name in save_criteria)
-            trainer.on_epoch_end.register(
-                f"best_{criterion_name}",
-                torch_trainer.TorchBestCriterion(target=criterion_name, mode="max", on_best=[on_best]),
-            )
-        for criterion_name in lower_criteria:
-            on_best = partial(_on_best, save=criterion_name in save_criteria)
-            trainer.on_epoch_end.register(
-                f"best_{criterion_name}",
-                torch_trainer.TorchBestCriterion(target=criterion_name, mode="min", on_best=[on_best]),
-            )
+        for target in higher_criteria:
+            best = torch_trainer.TorchBestCriterion(target=target, mode="max")
+            best.on_best.register(f"track_best_{target}", partial(_on_best, save=target in save_criteria))
+            trainer.on_epoch_end.register(f"best_{target}", best)
+        for target in lower_criteria:
+            best = torch_trainer.TorchBestCriterion(target=target, mode="min")
+            best.on_best.register(f"track_best_{target}", partial(_on_best, save=target in save_criteria))
+            trainer.on_epoch_end.register(f"best_{target}", best)
     fit_kwargs: dict[str, Any] = {
         "epochs": epochs,
         "training_dataset": training_dataset,
