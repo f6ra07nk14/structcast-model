@@ -262,7 +262,7 @@ def call_calflops(
 
 @app.command()
 @callbacks_session()
-def train(  # noqa: PLR0913,PLR0915
+def train(  # noqa: PLR0912,PLR0913,PLR0915
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help="The object patterns used to instantiate models. "
