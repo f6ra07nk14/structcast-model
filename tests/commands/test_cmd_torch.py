@@ -13,6 +13,10 @@ from typer.testing import CliRunner
 
 from structcast_model.base_trainer import NamedCallbackList
 from structcast_model.commands.cmd_torch import app
+from tests import ASSETS_DIR
+
+MODEL_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2.yaml")
+BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2Backward.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: patch the real module globals (bypasses LazySelectedImporter proxy)
@@ -60,55 +64,56 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
 
 
 def test_create_model_calls_torch_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model' should delegate to TorchBuilder.from_path."""
-    cfg_file = tmp_path / "model.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "model", str(cfg_file)]).exit_code == 0
-    mock_builder.TorchBuilder.from_path.assert_called_once_with(str(cfg_file))
+    """'create model' should generate a model script from a real configuration."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    content = (tmp_path / "model.py").read_text()
+    assert "class Model" in content
 
 
 def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model --classname' should forward the classname to the builder."""
-    cfg_file = tmp_path / "model.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "model", str(cfg_file), "--classname", "MyNet"]).exit_code == 0
-    assert mock_builder.TorchBuilder.from_path.return_value.call_args[1]["classname"] == "MyNet"
+    """'create model --classname' should generate a script with the given class name."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "my_net.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--classname", "MyNet", "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class MyNet" in (tmp_path / "my_net.py").read_text()
 
 
 def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model' should default structured_output to True."""
-    cfg_file = tmp_path / "model.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "model", str(cfg_file)]).exit_code == 0
-    assert mock_builder.TorchBuilder.from_path.return_value.call_args[1]["forced_structured_output"] is True
+    """'create model' should default structured_output to True (dict return in root class)."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    content = (tmp_path / "model.py").read_text()
+    # Extract the last class (root Model) — its forward should return a dict
+    last_class = content.rsplit("class Model", 1)[-1]
+    assert "return {'" in last_class
 
 
 def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model --no-structured-output' should pass False to the builder."""
-    cfg_file = tmp_path / "model.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "model", str(cfg_file), "--no-structured-output"]).exit_code == 0
-    assert mock_builder.TorchBuilder.from_path.return_value.call_args[1]["forced_structured_output"] is False
+    """'create model --no-structured-output' root class should not return a dict."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--no-structured-output", "--output", out])
+    assert result.exit_code == 0, result.output
+    content = (tmp_path / "model.py").read_text()
+    # Extract the last class (root Model) — its forward should NOT return a dict
+    last_class = content.rsplit("class Model", 1)[-1]
+    assert "return {'" not in last_class
 
 
 def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model --output' should forward the output path to the builder result."""
-    cfg_file = tmp_path / "model.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    out_file = str(tmp_path / "out.py")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "model", str(cfg_file), "--output", out_file]).exit_code == 0
-    # The output path should be passed to the final call: builder(...)(...)(output)
-    assert out_file in mock_builder.TorchBuilder.from_path.return_value.return_value.call_args[0]
+    """'create model --output' should write the generated script to the specified path."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out_file = tmp_path / "nested" / "out.py"
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", str(out_file)])
+    assert result.exit_code == 0, result.output
+    assert out_file.exists()
+    assert "class Model" in out_file.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -117,23 +122,21 @@ def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> 
 
 
 def test_create_backward_calls_torch_backward_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create backward' should delegate to TorchBackwardBuilder.from_path."""
-    cfg_file = tmp_path / "backward.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "backward", str(cfg_file)]).exit_code == 0
-    mock_builder.TorchBackwardBuilder.from_path.assert_called_once_with(str(cfg_file))
+    """'create backward' should generate a backward script from a real configuration."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "backward.py")
+    result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class Backward" in (tmp_path / "backward.py").read_text()
 
 
 def test_create_backward_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create backward' default classname should be 'Backward'."""
-    cfg_file = tmp_path / "backward.yaml"
-    cfg_file.write_text("layer: Linear\n")
-    mock_builder = MagicMock()
-    with patch_cmd_globals(torch_builder=mock_builder):
-        assert cli_runner.invoke(app, ["create", "backward", str(cfg_file)]).exit_code == 0
-    assert mock_builder.TorchBackwardBuilder.from_path.return_value.call_args[1]["classname"] == "Backward"
+    """'create backward' default classname should produce a class named 'Backward'."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "backward.py")
+    result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class Backward" in (tmp_path / "backward.py").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +412,7 @@ def _build_train_args(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
     artifact.write_text("dummy")
     args = {
         "model_patterns": [{"model": "MODEL_PATTERN"}],
+        "initializer_patterns": None,
         "shapes": [{"image": (3, 32, 32)}],
         "device": None,
         "ema": None,
@@ -420,6 +424,8 @@ def _build_train_args(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
         "backward_pattern": "BACKWARD_PATTERN",
         "mixed_precision_type": "float16",
         "compile_pattern": {"fullgraph": True},
+        "training_step_pattern": None,
+        "validation_step_pattern": None,
         "epochs": 2,
         "start_epoch": 1,
         "training_dataset_pattern": "TRAIN_DATASET_PATTERN",
@@ -434,6 +440,8 @@ def _build_train_args(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
         "log_arguments": [{"run": "test"}],
         "log_artifacts": [artifact],
         "ci": False,
+        "dist_backend": None,
+        "dist_url": None,
     }
     args.update(overrides)
     return args
