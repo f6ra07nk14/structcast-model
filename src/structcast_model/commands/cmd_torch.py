@@ -347,12 +347,29 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         help='Whether to compile the model using "torch.compile". '
         'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
     ),
+    training_step_pattern: Any | None = Option(
+        None,
+        "--training-step",
+        parser=path_or_any_parser,
+        help="The object pattern used to instantiate the training step. "
+        "For example, if the training step is defined as `my_package.MyTrainingStep`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyTrainingStep, _file_: my_package.py}]" or '
+        '"[_obj_, [_addr_, my_package.MyTrainingStep, my_package.py]]".',
+    ),
+    validation_step_pattern: Any | None = Option(
+        None,
+        "--validation-step",
+        parser=path_or_any_parser,
+        help="The object pattern used to instantiate the validation step. "
+        "For example, if the validation step is defined as `my_package.MyValidationStep`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyValidationStep, _file_: my_package.py}]" or '
+        '"[_obj_, [_addr_, my_package.MyValidationStep, my_package.py]]".',
+    ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
     training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
-        "-T",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the training dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
@@ -472,8 +489,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     trainer = torch_trainer.TorchTrainer(
         device=device,
         inference_wrapper=inference_wrapper,
-        training_step=torch_trainer.TrainingStep(**step_kw),
-        validation_step=torch_trainer.ValidationStep(**step_kw),
+        training_step=(
+            torch_trainer.TrainingStep
+            if training_step_pattern is None
+            else instantiator.instantiate(training_step_pattern)
+        )(**step_kw),
+        validation_step=(
+            torch_trainer.ValidationStep
+            if validation_step_pattern is None
+            else instantiator.instantiate(validation_step_pattern)
+        )(**step_kw),
         backward=backward,
         tracker=tracker,
     )
@@ -535,6 +560,8 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "backward": backward_pattern,
                 "mixed_precision_type": mixed_precision_type,
                 "compile": compile_pattern,
+                "training_step": training_step_pattern,
+                "validation_step": validation_step_pattern,
                 "epochs": epochs,
                 "start_epoch": start_epoch,
                 "training_dataset": training_dataset_pattern,
