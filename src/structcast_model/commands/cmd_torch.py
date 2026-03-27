@@ -490,14 +490,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         device=device,
         inference_wrapper=inference_wrapper,
         training_step=(
-            torch_trainer.TrainingStep
-            if training_step_pattern is None
-            else instantiator.instantiate(training_step_pattern)
+            torch_trainer.TrainingStep if training_step_pattern is None else _instantiate(training_step_pattern)
         )(**step_kw),
         validation_step=(
-            torch_trainer.ValidationStep
-            if validation_step_pattern is None
-            else instantiator.instantiate(validation_step_pattern)
+            torch_trainer.ValidationStep if validation_step_pattern is None else _instantiate(validation_step_pattern)
         )(**step_kw),
         backward=backward,
         tracker=tracker,
