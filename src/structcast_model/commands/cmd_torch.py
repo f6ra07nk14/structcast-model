@@ -270,6 +270,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
         '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
     ),
+    initializer_patterns: list[dict] | None = Option(
+        None,
+        "--initializer",
+        "-I",
+        parser=dict_parser,
+        help="The object patterns used to instantiate initializers for the models. "
+        "For example, if the initializer is defined as `my_package.initialize_fn`, then the pattern should be "
+        '"model_name: [_obj_, {_addr_: my_package.initialize_fn, _file_: my_package.py}]" or '
+        '"model_name: [_obj_, [_addr_, my_package.initialize_fn, my_package.py]]".',
+    ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
     ema: dict[str, Any] | None = Option(
@@ -420,6 +430,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
     input_shapes = reduce_dict(shapes)
+    initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
     is_main = global_rank == 0
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
@@ -435,6 +446,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     with torch.device(device):
         models = _instantiate_models(model_patterns)
         torch_trainer.initial_model(models, input_shapes)
+        if is_main:
+            for model_name, model in models.items():
+                if model_name in initializers:
+                    model.apply(initializers[model_name])
         loss = compile_fn(_instantiate(loss_pattern))
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
@@ -506,6 +521,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 **reduce_dict(log_arguments),
                 "models": model_patterns,
                 "parameters": {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()},
+                "initializers": initializer_patterns,
                 "shapes": input_shapes,
                 "device": device,
                 "distributed": distributed,
