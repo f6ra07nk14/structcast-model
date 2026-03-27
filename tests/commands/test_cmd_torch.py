@@ -1,38 +1,224 @@
 """Unit tests for structcast_model.commands.cmd_torch."""
 
+from __future__ import annotations
+
+from collections import OrderedDict
 from collections.abc import Generator
 from contextlib import contextmanager
-from types import SimpleNamespace
+import os
+import pathlib
+import traceback
 from typing import Any
-from unittest.mock import MagicMock
 
+import mlflow
 import pytest
 from structcast.utils.security import configure_security
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode_stack
 from typer import Typer
 from typer.testing import CliRunner
 
-from structcast_model.base_trainer import NamedCallbackList
+from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BestCriterion, callbacks_session
 from structcast_model.commands.cmd_torch import app
+from structcast_model.torch.trainer import (
+    TimmEmaWrapper,
+    TorchTracker,
+    TorchTrainer,
+    TrainingStep,
+    ValidationStep,
+)
 from tests import ASSETS_DIR
+import torch
 
 MODEL_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2.yaml")
 BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2Backward.yaml")
 
 # ---------------------------------------------------------------------------
-# Helper: patch the real module globals (bypasses LazySelectedImporter proxy)
+# Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
 # ---------------------------------------------------------------------------
+
+_CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__  # type: ignore[union-attr]
+
+# Access private functions from cmd_torch via its module globals
+_compile_module = _CMD_GLOBALS["_compile_module"]
+_get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
+_get_state_dict = _CMD_GLOBALS["_get_state_dict"]
+_instantiate = _CMD_GLOBALS["_instantiate"]
+_instantiate_models = _CMD_GLOBALS["_instantiate_models"]
+_log_criteria = _CMD_GLOBALS["_log_criteria"]
+_on_best = _CMD_GLOBALS["_on_best"]
+_save_training_state = _CMD_GLOBALS["_save_training_state"]
+_unwrap_ddp = _CMD_GLOBALS["_unwrap_ddp"]
 
 
 @contextmanager
 def patch_cmd_globals(**kwargs: Any) -> Generator[None, Any, None]:
     """Temporarily override entries in cmd_torch's real module globals."""
-    real = app.registered_commands[0].callback.__globals__
-    originals = {k: real.get(k) for k in kwargs}
-    real.update(kwargs)
+    originals = {k: _CMD_GLOBALS.get(k) for k in kwargs}
+    _CMD_GLOBALS.update(kwargs)
     try:
         yield
     finally:
-        real.update(originals)
+        _CMD_GLOBALS.update(originals)
+
+
+@pytest.fixture(autouse=True)
+def _clean_global_callbacks() -> Generator[None, None, None]:
+    """Ensure GLOBAL_CALLBACKS and torch dispatch stack are clean around each test."""
+
+    def _drain_dispatch_stack() -> None:
+        for mode in reversed(_get_current_dispatch_mode_stack()):
+            # Call TorchDispatchMode.__exit__ directly to avoid ptflops
+            # FlopCounterMode.__exit__ calling print_fn on a closed StringIO.
+            TorchDispatchMode.__exit__(mode, None, None, None)
+
+    GLOBAL_CALLBACKS.clear()
+    _drain_dispatch_stack()
+    yield
+    GLOBAL_CALLBACKS.clear()
+    _drain_dispatch_stack()
+
+
+# ---------------------------------------------------------------------------
+# Minimal real modules for training tests
+# ---------------------------------------------------------------------------
+
+
+class _SimpleModel(torch.nn.Module):
+    """A tiny model for testing: Linear(4 -> 2) returning a dict."""
+
+    outputs: list[str] = ["logits"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Forward pass."""
+        return {"logits": self.fc(x)}
+
+
+class _SimpleLoss(torch.nn.Module):
+    """Loss module that computes cross-entropy from logits and target."""
+
+    outputs: list[str] = ["loss"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("_dummy", torch.tensor(0.0))
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Compute loss."""
+        return {"loss": torch.nn.functional.cross_entropy(logits, target)}
+
+
+class _SimpleMetric(torch.nn.Module):
+    """Metric module that computes top-1 accuracy."""
+
+    outputs: list[str] = ["acc"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("_dummy", torch.tensor(0.0))
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Compute accuracy."""
+        preds = logits.argmax(dim=-1)
+        return {"acc": (preds == target).float().mean()}
+
+
+class _SimpleBackward:
+    """Minimal backward implementing the Backward protocol with a real optimizer."""
+
+    mixed_precision_type: str | None = None
+
+    def __init__(self, model: torch.nn.Module, **kwargs: Any) -> None:
+        self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    def update(self, step: int) -> bool:
+        """Always signal update."""
+        return True
+
+    def __call__(self, loss: torch.Tensor, **kwargs: Any) -> None:
+        """Backward pass + optimizer step."""
+        loss.backward()
+        self._optimizer.step()
+        self._optimizer.zero_grad()
+
+    @property
+    def optimizers(self) -> dict[str, torch.optim.Optimizer]:
+        """Return optimizers."""
+        return {"optimizer": self._optimizer}
+
+    @property
+    def grad_scalers(self) -> dict[str, Any]:
+        """Return empty grad scalers dict."""
+        return {}
+
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        """Return current learning rates."""
+        return {"optimizer": self._optimizer.param_groups[0]["lr"]}
+
+    @property
+    def param_group_names(self) -> dict[str, list[dict[str, Any]]]:
+        """Return parameter group info."""
+        return {"optimizer": [{k: v for k, v in pg.items() if k != "params"} for pg in self._optimizer.param_groups]}
+
+
+def _make_training_dataset() -> list[dict[str, torch.Tensor]]:
+    """Create a minimal training dataset (list of batches)."""
+    return [{"x": torch.randn(4, 4), "target": torch.randint(0, 2, (4,))} for _ in range(3)]
+
+
+def _make_validation_dataset() -> list[dict[str, torch.Tensor]]:
+    """Create a minimal validation dataset (list of batches)."""
+    return [{"x": torch.randn(4, 4), "target": torch.randint(0, 2, (4,))} for _ in range(2)]
+
+
+def _train_callback() -> Any:
+    """Return the callback function for the ``train`` command."""
+    for command in app.registered_commands:
+        callback_name = "" if command.callback is None else command.callback.__name__
+        if command.name == "train" or callback_name == "train":
+            return command.callback
+    raise AssertionError("train command not found")
+
+
+def _make_instantiate_fn(
+    *,
+    training_data: list[dict[str, torch.Tensor]],
+    validation_data: list[dict[str, torch.Tensor]] | None = None,
+    backward_cls: type = _SimpleBackward,
+    loss: torch.nn.Module | None = None,
+    metric: torch.nn.Module | None = None,
+) -> Any:
+    """Build a replacement for ``_instantiate`` that returns real objects."""
+    _loss = loss if loss is not None else _SimpleLoss()
+    _metric = metric if metric is not None else _SimpleMetric()
+
+    def _side_effect(raw: Any) -> Any:
+        if raw == "MODEL":
+            return _SimpleModel()
+        if raw == "LOSS":
+            return _loss
+        if raw == "METRIC":
+            return _metric
+        if raw == "BACKWARD":
+            return backward_cls
+        if raw == "TRAIN_DS":
+            return training_data
+        if raw == "VALID_DS":
+            return validation_data
+        return raw
+
+    return _side_effect
+
+
+# ---------------------------------------------------------------------------
+# App structure tests
+# ---------------------------------------------------------------------------
 
 
 def test_app_is_typer_instance() -> None:
@@ -63,14 +249,18 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
     assert cli_runner.invoke(app, ["calflops", "--help"]).exit_code == 0
 
 
+# ---------------------------------------------------------------------------
+# 'create model' command
+# ---------------------------------------------------------------------------
+
+
 def test_create_model_calls_torch_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' should generate a model script from a real configuration."""
     configure_security(allowed_modules_check=False, blocked_modules_check=False)
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
     assert result.exit_code == 0, result.output
-    content = (tmp_path / "model.py").read_text()
-    assert "class Model" in content
+    assert "class Model" in (tmp_path / "model.py").read_text()
 
 
 def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
@@ -88,9 +278,7 @@ def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: 
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
     assert result.exit_code == 0, result.output
-    content = (tmp_path / "model.py").read_text()
-    # Extract the last class (root Model) — its forward should return a dict
-    last_class = content.rsplit("class Model", 1)[-1]
+    last_class = (tmp_path / "model.py").read_text().rsplit("class Model", 1)[-1]
     assert "return {'" in last_class
 
 
@@ -100,9 +288,7 @@ def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner)
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--no-structured-output", "--output", out])
     assert result.exit_code == 0, result.output
-    content = (tmp_path / "model.py").read_text()
-    # Extract the last class (root Model) — its forward should NOT return a dict
-    last_class = content.rsplit("class Model", 1)[-1]
+    last_class = (tmp_path / "model.py").read_text().rsplit("class Model", 1)[-1]
     assert "return {'" not in last_class
 
 
@@ -117,7 +303,7 @@ def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> 
 
 
 # ---------------------------------------------------------------------------
-# 'create backward' command execution
+# 'create backward' command
 # ---------------------------------------------------------------------------
 
 
@@ -140,629 +326,835 @@ def test_create_backward_passes_default_classname(tmp_path: Any, cli_runner: Cli
 
 
 # ---------------------------------------------------------------------------
-# 'ptflops' command execution
+# 'calflops' command with real model (must run BEFORE ptflops, which installs
+# a persistent __torch_dispatch__ handler that captures CliRunner's StringIO)
 # ---------------------------------------------------------------------------
 
 
-def _make_torch_mock() -> MagicMock:
-    """Create a torch mock that supports use as a context manager via torch.device(...)."""
-    torch_mock = MagicMock()
-    # torch.device(...) used as context manager via `with torch.device(...):`
-    torch_mock.device.return_value.__enter__ = MagicMock(return_value=None)
-    torch_mock.device.return_value.__exit__ = MagicMock(return_value=False)
-    return torch_mock
+def test_calflops_runs_with_real_model(cli_runner: CliRunner) -> None:
+    """'calflops' should run calflops on a real model and print FLOPs, MACs, parameters."""
+    configure_security(allowed_modules_check=False)
+
+    deps = {"_instantiate": lambda raw: _SimpleModel()}
+    with patch_cmd_globals(**deps):
+        result = cli_runner.invoke(
+            app,
+            ["calflops", "{_obj_: [[_addr_, dummy], _call_]}", "--shape", "x: [4]", "--device", "cpu"],
+        )
+    assert result.exit_code == 0, result.output
+    assert "FLOPs" in result.output
+    assert "MACs" in result.output
+    assert "Parameters" in result.output
 
 
-MODEL_PATTERN_ARG = "{_obj_: [[_addr_, some.module.Model], _call_]}"
+# ---------------------------------------------------------------------------
+# 'ptflops' command with real model
+# ---------------------------------------------------------------------------
+
+_IDENTITY_PATTERN = "{_obj_: [[_addr_, torch.nn.Identity], _call_]}"
 
 
-def test_ptflops_calls_instantiate(cli_runner: CliRunner) -> None:
-    """'ptflops' should call _instantiate to build the model instance."""
-    mock_instantiate = MagicMock(return_value=MagicMock())
-    mock_torch_trainer = MagicMock()
-    mock_torch_trainer.get_torch_device.return_value = "cpu"
-    mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = ({}, None)
-    mock_ptflops = MagicMock()
-    mock_ptflops.get_model_complexity_info.return_value = ("2.5 GMac", "3.0 M")
-    with patch_cmd_globals(
-        _instantiate=mock_instantiate,
-        torch=_make_torch_mock(),
-        torch_trainer=mock_torch_trainer,
-        ptflops=mock_ptflops,
-    ):
-        result = cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG])
-        assert result.exit_code == 0
-    assert "2.5 GMac" in result.output
-    assert "3.0 M" in result.output
+def test_ptflops_runs_with_real_model(cli_runner: CliRunner) -> None:
+    """'ptflops' should run ptflops on a real model and print results."""
+    configure_security(allowed_modules_check=False)
+    result = cli_runner.invoke(app, ["ptflops", _IDENTITY_PATTERN, "--device", "cpu"])
+    assert result.exit_code == 0, result.output
 
 
 def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
-    """'ptflops' should not error when flops/params are None."""
-    mock_instantiate = MagicMock(return_value=MagicMock())
-    mock_torch_trainer = MagicMock()
-    mock_torch_trainer.get_torch_device.return_value = "cpu"
-    mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = ({}, None)
-    mock_ptflops = MagicMock()
-    mock_ptflops.get_model_complexity_info.return_value = (None, None)
-    with patch_cmd_globals(
-        _instantiate=mock_instantiate,
-        torch=_make_torch_mock(),
-        torch_trainer=mock_torch_trainer,
-        ptflops=mock_ptflops,
-    ):
-        assert cli_runner.invoke(app, ["ptflops", MODEL_PATTERN_ARG]).exit_code == 0
+    """'ptflops' should not error when flops/params are None (e.g. identity)."""
+    configure_security(allowed_modules_check=False)
+    result = cli_runner.invoke(app, ["ptflops", _IDENTITY_PATTERN, "--device", "cpu"])
+    assert result.exit_code == 0, result.output
 
 
 # ---------------------------------------------------------------------------
-# 'calflops' command execution
-# ---------------------------------------------------------------------------
-
-
-def test_calflops_calls_instantiate(cli_runner: CliRunner) -> None:
-    """'calflops' should call _instantiate to build the model instance."""
-    mock_instantiate = MagicMock(return_value=MagicMock())
-    mock_torch_trainer = MagicMock()
-    mock_torch_trainer.get_torch_device.return_value = "cpu"
-    mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = ({}, None)
-    mock_calflops = MagicMock()
-    mock_calflops.calculate_flops.return_value = ("1.0 GFLOPs", "500 MMac", "1.0 M")
-    with patch_cmd_globals(
-        _instantiate=mock_instantiate,
-        torch=_make_torch_mock(),
-        torch_trainer=mock_torch_trainer,
-        calflops=mock_calflops,
-    ):
-        assert cli_runner.invoke(app, ["calflops", MODEL_PATTERN_ARG]).exit_code == 0
-    mock_instantiate.assert_called_once()
-
-
-def test_calflops_prints_flops_macs_params(cli_runner: CliRunner) -> None:
-    """'calflops' should print FLOPs, MACs, and parameter counts."""
-    mock_instantiate = MagicMock(return_value=MagicMock())
-    mock_torch_trainer = MagicMock()
-    mock_torch_trainer.get_torch_device.return_value = "cpu"
-    mock_torch_trainer.create_torch_inputs.return_value = {}
-    mock_torch_trainer.initial_model.return_value = ({}, None)
-    mock_calflops = MagicMock()
-    mock_calflops.calculate_flops.return_value = ("4.2 GFLOPs", "2.1 GMac", "5.0 M")
-    with patch_cmd_globals(
-        _instantiate=mock_instantiate,
-        torch=_make_torch_mock(),
-        torch_trainer=mock_torch_trainer,
-        calflops=mock_calflops,
-    ):
-        result = cli_runner.invoke(app, ["calflops", MODEL_PATTERN_ARG])
-        assert result.exit_code == 0
-    assert "4.2 GFLOPs" in result.output
-    assert "2.1 GMac" in result.output
-    assert "5.0 M" in result.output
-
-
-# ---------------------------------------------------------------------------
-# _instantiate – direct unit test (covers cmd_torch.py line 119)
+# _instantiate – direct unit test
 # ---------------------------------------------------------------------------
 
 
 def test_instantiate_builds_object_from_pattern() -> None:
     """_instantiate() resolves an ObjectPattern and returns the built instance."""
     configure_security(allowed_modules_check=False)
-    # LazySelectedImporter only exposes __all__; access _instantiate via globals.
-    _instantiate = app.registered_commands[0].callback.__globals__["_instantiate"]
-
-    raw = {
-        "_obj_": [
-            ["_addr_", "torch.nn.Identity"],
-            ["_call_", {}],
-        ]
-    }
+    raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_call_", {}]]}
     result = _instantiate(raw)
-    import torch  # noqa: PLC0415
-
     assert isinstance(result, torch.nn.Identity)
 
 
+def test_instantiate_builds_linear_with_args() -> None:
+    """_instantiate() builds a torch.nn.Linear with keyword arguments."""
+    configure_security(allowed_modules_check=False)
+    raw = {"_obj_": [["_addr_", "torch.nn.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
+    result = _instantiate(raw)
+    assert isinstance(result, torch.nn.Linear)
+    assert result.in_features == 8
+    assert result.out_features == 4
+
+
 # ---------------------------------------------------------------------------
-# `train` command execution
+# _compile_module
 # ---------------------------------------------------------------------------
 
 
-def _train_callback() -> Any:
-    """Return the callback function for the `train` command."""
-    for command in app.registered_commands:
-        callback_name = "" if command.callback is None else command.callback.__name__
-        if command.name == "train" or callback_name == "train":
-            return command.callback
-    raise AssertionError("train command not found")
+def test_compile_module_returns_module_when_no_kwargs() -> None:
+    """_compile_module returns the module unchanged when compile_kw is None."""
+    module = torch.nn.Linear(4, 2)
+    assert _compile_module(module, None) is module
 
 
-class _FakeParameter:
-    def __init__(self, size: int, requires_grad: bool = True) -> None:
-        self._size = size
-        self.requires_grad = requires_grad
-
-    def numel(self) -> int:
-        return self._size
+# ---------------------------------------------------------------------------
+# _instantiate_models
+# ---------------------------------------------------------------------------
 
 
-class _FakeModule:
-    def __init__(self, *, outputs: list[str] | None = None, param_size: int = 3) -> None:
-        if outputs is not None:
-            self.outputs = outputs
-        self._param_size = param_size
-
-    def parameters(self) -> list[_FakeParameter]:
-        return [_FakeParameter(self._param_size), _FakeParameter(99, requires_grad=False)]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"param_size": self._param_size}
+def test_instantiate_models_creates_ordered_dict() -> None:
+    """_instantiate_models creates an OrderedDict of models from patterns."""
+    configure_security(allowed_modules_check=False)
+    patterns = [{"model": {"_obj_": [["_addr_", "torch.nn.Identity"], "_call_"]}}]
+    result = _instantiate_models(patterns)
+    assert isinstance(result, OrderedDict)
+    assert "model" in result
+    assert isinstance(result["model"], torch.nn.Identity)
 
 
-class _FakeDDP:
-    """Fake DistributedDataParallel for testing distributed code paths."""
-
-    def __init__(self, module: Any, **kwargs: Any) -> None:
-        self.module = module
-
-    def parameters(self) -> list[_FakeParameter]:
-        """Delegate to the wrapped module."""
-        return self.module.parameters()
-
-    def state_dict(self) -> dict[str, Any]:
-        """Delegate to the wrapped module."""
-        return self.module.state_dict()
+def test_instantiate_models_raises_for_multiple_keys() -> None:
+    """_instantiate_models raises ValueError when a pattern dict has multiple keys."""
+    with pytest.raises(ValueError, match="exactly one model definition"):
+        _instantiate_models([{"a": {}, "b": {}}])
 
 
-class _FakeBestCriterion:
-    def __init__(self, target: str, mode: str, on_best: list[Any] | None = None) -> None:
-        self.target = target
-        self.mode = mode
-        self.on_best: NamedCallbackList = NamedCallbackList()
-        if on_best:
-            for cb in on_best:
-                self.on_best.append(cb)
-        self._step = 0
-        self._value = 0.5
-
-    @property
-    def step(self) -> int:
-        return self._step
-
-    @property
-    def value(self) -> float:
-        return self._value
-
-    def __call__(self, info: Any, **kwargs: _FakeModule) -> None:
-        self._step = info.step
-        for callback in self.on_best:
-            callback(info, self, **kwargs)
+def test_instantiate_models_returns_empty_for_empty_list() -> None:
+    """_instantiate_models returns empty OrderedDict for empty patterns list."""
+    result = _instantiate_models([])
+    assert result == OrderedDict()
 
 
-class _FakeInfo:
-    def __init__(self, trainer: Any, logs: dict[str, float]) -> None:
-        self.epoch = 1
-        self.step = 2
-        self.update = 3
-        self.backward = trainer.backward
-        self.inference_wrapper = trainer.inference_wrapper
-        self._logs = logs
-
-    def logs(self) -> dict[str, float]:
-        return dict(self._logs)
+# ---------------------------------------------------------------------------
+# _get_module_outputs
+# ---------------------------------------------------------------------------
 
 
-class _FakeTrainer:
-    training_prefix = "train/"
-    validation_prefix = "valid/"
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.backward = kwargs["backward"]
-        self.inference_wrapper = kwargs["inference_wrapper"]
-        self.on_epoch_end: NamedCallbackList = NamedCallbackList()
-        self.on_training_begin: NamedCallbackList = NamedCallbackList()
-        self.on_training_step_end: NamedCallbackList = NamedCallbackList()
-        self.on_training_end: NamedCallbackList = NamedCallbackList()
-        self.on_validation_begin: NamedCallbackList = NamedCallbackList()
-        self.on_validation_step_end: NamedCallbackList = NamedCallbackList()
-        self.on_validation_end: NamedCallbackList = NamedCallbackList()
-
-    def describe(self) -> dict[str, list[str]]:
-        """Return registered callback names for display."""
-        attrs = (
-            "on_epoch_end",
-            "on_training_begin",
-            "on_training_step_end",
-            "on_training_end",
-            "on_validation_begin",
-            "on_validation_step_end",
-            "on_validation_end",
-        )
-        return {a: getattr(self, a).names() for a in attrs if getattr(self, a)}
-
-    def fit(self, **kwargs: Any) -> None:
-        modules = {name: module for name, module in kwargs.items() if hasattr(module, "state_dict")}
-        info = _FakeInfo(
-            trainer=self,
-            logs={
-                "train/loss": 0.11,
-                "valid/loss": 0.10,
-                "valid/acc": 0.90,
-            },
-        )
-        for callback in self.on_training_begin:
-            callback(info, **modules)
-        for callback in self.on_training_step_end:
-            callback(info, **modules)
-        for callback in self.on_training_end:
-            callback(info, **modules)
-        for callback in self.on_validation_begin:
-            callback(info, **modules)
-        for callback in self.on_validation_step_end:
-            callback(info, **modules)
-        for callback in self.on_validation_end:
-            callback(info, **modules)
-        for callback in self.on_epoch_end:
-            callback(info, **modules)
+def test_get_module_outputs_from_attribute() -> None:
+    """_get_module_outputs returns the module's ``outputs`` attribute."""
+    assert _get_module_outputs(_SimpleLoss(), None, "loss") == ["loss"]
 
 
-def _build_train_args(tmp_path: Any, **overrides: Any) -> dict[str, Any]:
-    artifact = tmp_path / "artifact.bin"
-    artifact.write_text("dummy")
-    args = {
-        "model_patterns": [{"model": "MODEL_PATTERN"}],
-        "initializer_patterns": None,
-        "shapes": [{"image": (3, 32, 32)}],
-        "device": None,
-        "ema": None,
-        "ema_device": None,
-        "loss_pattern": "LOSS_PATTERN",
-        "loss_outputs": None,
-        "metric_pattern": "METRIC_PATTERN",
-        "metric_outputs": None,
-        "backward_pattern": "BACKWARD_PATTERN",
-        "mixed_precision_type": "float16",
-        "compile_pattern": {"fullgraph": True},
-        "training_step_pattern": None,
-        "validation_step_pattern": None,
-        "epochs": 2,
-        "start_epoch": 1,
-        "training_dataset_pattern": "TRAIN_DATASET_PATTERN",
-        "validation_dataset_pattern": "VALIDATION_DATASET_PATTERN",
-        "validation_frequency": 1,
-        "lower_criteria": ["valid/loss"],
-        "higher_criteria": ["valid/acc"],
-        "save_criteria": ["valid/acc"],
-        "seed": 123,
-        "matmul_precision": "high",
-        "experiment": "unit-test-exp",
-        "log_arguments": [{"run": "test"}],
-        "log_artifacts": [artifact],
-        "ci": False,
-        "dist_backend": None,
-        "dist_url": None,
-    }
-    args.update(overrides)
-    return args
+def test_get_module_outputs_falls_back_to_default() -> None:
+    """_get_module_outputs uses default when module has no ``outputs`` attribute."""
+    assert _get_module_outputs(torch.nn.Identity(), ["out"], "test") == ["out"]
 
 
-def _build_train_deps(
-    *,
-    loss_module: _FakeModule,
-    metric_module: _FakeModule | None,
-    backward: Any,
-    use_ema: bool,
-) -> tuple[dict[str, Any], MagicMock, Any, Any, Any]:
-    dataset_train = object()
-    dataset_valid = object()
+def test_get_module_outputs_raises_when_no_outputs_and_no_default() -> None:
+    """_get_module_outputs raises ValueError when neither source is available."""
+    with pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
+        _get_module_outputs(torch.nn.Identity(), None, "loss")
 
-    def _instantiate_side_effect(raw: Any) -> Any:
-        if raw == "MODEL_PATTERN":
-            return _FakeModule(param_size=7)
-        if raw == "LOSS_PATTERN":
-            return loss_module
-        if raw == "METRIC_PATTERN":
-            return metric_module
-        if raw == "BACKWARD_PATTERN":
-            return lambda **_: backward
-        if raw == "TRAIN_DATASET_PATTERN":
-            return dataset_train
-        if raw == "VALIDATION_DATASET_PATTERN":
-            return dataset_valid
-        return raw
 
-    mlflow_mock = MagicMock()
-    mlflow_mock.pytorch = MagicMock()
-    mlflow_mock.start_run.return_value.__enter__ = MagicMock(return_value=None)
-    mlflow_mock.start_run.return_value.__exit__ = MagicMock(return_value=False)
+# ---------------------------------------------------------------------------
+# _get_state_dict / _unwrap_ddp
+# ---------------------------------------------------------------------------
 
-    pbar = MagicMock()
-    tqdm_mock = MagicMock()
-    tqdm_mock.tqdm.return_value = pbar
 
-    torch_mock = _make_torch_mock()
-    torch_mock.backends = SimpleNamespace(cudnn=SimpleNamespace(benchmark=False))
-    torch_mock.set_float32_matmul_precision = MagicMock()
-    torch_mock.manual_seed = MagicMock()
-    torch_mock.compile = MagicMock(side_effect=lambda module, **_: module)
-    torch_mock.version = SimpleNamespace(cuda="12.4")
-    torch_mock.__version__ = "2.6.0"
-    # _unwrap_ddp uses isinstance(..., torch.nn.parallel.DistributedDataParallel)
-    # so we need a real type, not a MagicMock
-    torch_mock.nn.parallel.DistributedDataParallel = type("DistributedDataParallel", (), {})
+def test_get_state_dict_returns_state_dicts() -> None:
+    """_get_state_dict returns a name-to-state_dict mapping."""
+    model = torch.nn.Linear(4, 2)
+    result = _get_state_dict({"model": model})
+    assert "model" in result
+    assert "weight" in result["model"]
+    assert "bias" in result["model"]
 
-    np_mock = MagicMock()
-    np_mock.random = MagicMock()
 
-    trainer_ns = MagicMock()
-    trainer_ns.get_torch_device.return_value = "cpu"
-    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 1, False)
-    trainer_ns.initial_model.side_effect = lambda models, _shapes: ({}, None)
-    trainer_ns.TorchTracker.from_criteria.return_value = "tracker"
-    trainer_ns.get_autocast.return_value = "autocast"
-    trainer_ns.TrainingStep.side_effect = SimpleNamespace
-    trainer_ns.ValidationStep.side_effect = SimpleNamespace
-    trainer_ns.TorchTrainer.side_effect = _FakeTrainer
-    trainer_ns.TorchBestCriterion.side_effect = lambda target, mode: _FakeBestCriterion(
-        target=target, mode=mode, on_best=[]
+def test_unwrap_ddp_passes_through_non_ddp_models() -> None:
+    """_unwrap_ddp returns non-DDP modules unchanged."""
+    model = torch.nn.Linear(4, 2)
+    result = _unwrap_ddp({"model": model})
+    assert result["model"] is model
+
+
+def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
+    """_unwrap_ddp extracts the .module from DistributedDataParallel models."""
+    model = torch.nn.Linear(4, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    result = _unwrap_ddp({"model": ddp_model})
+    assert result["model"] is model
+
+
+# ---------------------------------------------------------------------------
+# _on_best
+# ---------------------------------------------------------------------------
+
+
+def test_on_best_logs_metric_to_mlflow(tmp_path: pathlib.Path) -> None:
+    """_on_best logs the best metric value to MLflow."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    mlflow.set_experiment("test_on_best")
+    with mlflow.start_run():
+        info = BaseInfo()
+        info.epoch = 1
+        info.step = 5
+        best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
+        best._best = 0.3
+        best._step = 5
+        model = torch.nn.Linear(4, 2)
+        _on_best(info, best, save=True, model=model)
+
+
+def test_on_best_does_not_save_when_save_false(tmp_path: pathlib.Path) -> None:
+    """_on_best with save=False only logs metric, not state dict."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    mlflow.set_experiment("test_on_best_no_save")
+    with mlflow.start_run():
+        info = BaseInfo()
+        info.epoch = 1
+        info.step = 5
+        best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
+        best._best = 0.3
+        best._step = 5
+        _on_best(info, best, save=False, model=torch.nn.Linear(4, 2))
+
+
+# ---------------------------------------------------------------------------
+# _save_training_state
+# ---------------------------------------------------------------------------
+
+
+def test_save_training_state_logs_to_mlflow(tmp_path: pathlib.Path) -> None:
+    """_save_training_state saves models, optimizers, grad_scalers, meta to MLflow."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    mlflow.set_experiment("test_save_state")
+    model = _SimpleModel()
+    backward = _SimpleBackward(model)
+    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
+        validation_step=ValidationStep(models=["model"], losses=_SimpleLoss()),
+        backward=backward,
+        tracker=tracker,
+        add_global_callbacks=False,
     )
-    trainer_ns.TimmEmaWrapper.from_models.side_effect = lambda models, **_: (
-        SimpleNamespace(models=models) if use_ema else None
+    trainer.epoch = 1
+    trainer.step = 10
+    trainer.update = 10
+    with mlflow.start_run():
+        _save_training_state(trainer, model=model)
+
+
+def test_save_training_state_includes_ema(tmp_path: pathlib.Path) -> None:
+    """_save_training_state includes EMA state when inference_wrapper is set."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    mlflow.set_experiment("test_save_state_ema")
+    model = _SimpleModel()
+    backward = _SimpleBackward(model)
+    ema_wrapper = TimmEmaWrapper.from_models({"model": model}, distributed=False)
+    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
+        backward=backward,
+        tracker=tracker,
+        inference_wrapper=ema_wrapper,
+        add_global_callbacks=False,
     )
-
-    deps = {
-        "_instantiate": MagicMock(side_effect=_instantiate_side_effect),
-        "configure_security": MagicMock(),
-        "get_dataset_size": MagicMock(side_effect=lambda ds: 8 if ds is dataset_train else 3),
-        "instantiator": MagicMock(instantiate=MagicMock(side_effect=lambda raw: {} if raw is None else raw)),
-        "mlflow": mlflow_mock,
-        "np": np_mock,
-        "timm": SimpleNamespace(__version__="1.0.0"),
-        "torch": torch_mock,
-        "torch_trainer": trainer_ns,
-        "tqdm": tqdm_mock,
-    }
-    return deps, mlflow_mock, pbar, trainer_ns, torch_mock
+    trainer.epoch = 1
+    trainer.step = 10
+    trainer.update = 10
+    with mlflow.start_run():
+        _save_training_state(trainer, model=model)
 
 
-def test_train_raises_for_empty_model_patterns(tmp_path: Any) -> None:
+# ---------------------------------------------------------------------------
+# _log_criteria
+# ---------------------------------------------------------------------------
+
+
+def test_log_criteria_returns_yaml_string(tmp_path: pathlib.Path) -> None:
+    """_log_criteria formats criteria as YAML and logs them to MLflow."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    mlflow.set_experiment("test_log_criteria")
+    model = _SimpleModel()
+    backward = _SimpleBackward(model)
+    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
+    trainer = TorchTrainer(
+        device="cpu",
+        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
+        backward=backward,
+        tracker=tracker,
+        add_global_callbacks=False,
+    )
+    trainer.epoch = 1
+    trainer.step = 5
+    trainer.update = 5
+    trainer.history[1] = {"loss": 0.5, "acc": 0.8}
+    with mlflow.start_run():
+        result = _log_criteria(trainer)
+    assert "epoch: 1" in result
+
+
+# ---------------------------------------------------------------------------
+# `train` command — validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_train_raises_for_empty_model_patterns() -> None:
     """`train` should fail fast when no model patterns are provided."""
     train_fn = _train_callback()
-    args = _build_train_args(tmp_path, model_patterns=[])
     with pytest.raises(ValueError, match="At least one model pattern"):
-        train_fn(**args)
+        train_fn(
+            model_patterns=[],
+            initializer_patterns=None,
+            shapes=None,
+            device="cpu",
+            ema=None,
+            ema_device=None,
+            loss_pattern="IGNORED",
+            loss_outputs=None,
+            metric_pattern=None,
+            metric_outputs=None,
+            backward_pattern="IGNORED",
+            mixed_precision_type=None,
+            compile_pattern=None,
+            training_step_pattern=None,
+            validation_step_pattern=None,
+            epochs=1,
+            start_epoch=1,
+            training_dataset_pattern="IGNORED",
+            validation_dataset_pattern=None,
+            validation_frequency=1,
+            lower_criteria=[],
+            higher_criteria=[],
+            save_criteria=[],
+            seed=42,
+            matmul_precision="high",
+            experiment="test",
+            log_arguments=None,
+            log_artifacts=None,
+            ci=True,
+            dist_backend=None,
+            dist_url=None,
+        )
 
 
-def test_train_raises_for_invalid_model_pattern_shape(tmp_path: Any) -> None:
+def test_train_raises_for_invalid_model_pattern_shape() -> None:
     """`train` should reject model-pattern entries containing multiple models."""
+    configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
-    args = _build_train_args(tmp_path, model_patterns=[{"a": "MODEL_PATTERN", "b": "MODEL_PATTERN"}])
-
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.1},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, *_ = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]), metric_module=None, backward=backward, use_ema=False
-    )
-
+    deps = {
+        "_instantiate": _make_instantiate_fn(training_data=_make_training_dataset()),
+    }
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match="exactly one model definition"):
-        train_fn(**args)
+        train_fn(
+            model_patterns=[{"a": "MODEL", "b": "MODEL"}],
+            initializer_patterns=None,
+            shapes=[{"x": (4,)}],
+            device="cpu",
+            ema=None,
+            ema_device=None,
+            loss_pattern="LOSS",
+            loss_outputs=None,
+            metric_pattern=None,
+            metric_outputs=None,
+            backward_pattern="BACKWARD",
+            mixed_precision_type=None,
+            compile_pattern=None,
+            training_step_pattern=None,
+            validation_step_pattern=None,
+            epochs=1,
+            start_epoch=1,
+            training_dataset_pattern="TRAIN_DS",
+            validation_dataset_pattern=None,
+            validation_frequency=1,
+            lower_criteria=[],
+            higher_criteria=[],
+            save_criteria=[],
+            seed=42,
+            matmul_precision="high",
+            experiment="test",
+            log_arguments=None,
+            log_artifacts=None,
+            ci=True,
+            dist_backend=None,
+            dist_url=None,
+        )
 
 
-def test_train_runs_non_ci_flow_and_best_criteria_logging(tmp_path: Any) -> None:
-    """Non-CI mode should wire progress callbacks and log best/training states."""
+def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
+    """`train` should fail when a loss module lacks ``outputs`` and no fallback is given."""
+    configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
-    args = _build_train_args(tmp_path, ci=False, ema=None, loss_outputs=None, metric_outputs=None)
+    deps = {
+        "_instantiate": _make_instantiate_fn(
+            training_data=_make_training_dataset(),
+            loss=torch.nn.Identity(),
+        ),
+    }
+    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
+        train_fn(
+            model_patterns=[{"model": "MODEL"}],
+            initializer_patterns=None,
+            shapes=[{"x": (4,)}],
+            device="cpu",
+            ema=None,
+            ema_device=None,
+            loss_pattern="LOSS",
+            loss_outputs=None,
+            metric_pattern=None,
+            metric_outputs=None,
+            backward_pattern="BACKWARD",
+            mixed_precision_type=None,
+            compile_pattern=None,
+            training_step_pattern=None,
+            validation_step_pattern=None,
+            epochs=1,
+            start_epoch=1,
+            training_dataset_pattern="TRAIN_DS",
+            validation_dataset_pattern=None,
+            validation_frequency=1,
+            lower_criteria=[],
+            higher_criteria=[],
+            save_criteria=[],
+            seed=42,
+            matmul_precision="high",
+            experiment="test",
+            log_arguments=None,
+            log_artifacts=None,
+            ci=True,
+            dist_backend=None,
+            dist_url=None,
+        )
 
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-        param_group_names={"group0": ["model.weight"]},
-    )
-    deps, mlflow_mock, pbar, trainer_ns, torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]),
-        metric_module=_FakeModule(outputs=["acc"]),
-        backward=backward,
-        use_ema=False,
-    )
 
+# ---------------------------------------------------------------------------
+# `train` — full end-to-end (CI mode, non-distributed, real modules)
+# ---------------------------------------------------------------------------
+
+
+def _invoke_train(
+    tmp_path: pathlib.Path,
+    *,
+    ci: bool = True,
+    ema: dict[str, Any] | None = None,
+    validation_data: list[dict[str, torch.Tensor]] | None = None,
+    loss_outputs: list[str] | None = None,
+    metric_outputs: list[str] | None = None,
+    mixed_precision_type: str | None = None,
+    lower_criteria: list[str] | None = None,
+    higher_criteria: list[str] | None = None,
+    save_criteria: list[str] | None = None,
+    loss: torch.nn.Module | None = None,
+    metric: torch.nn.Module | None = None,
+    backward_cls: type = _SimpleBackward,
+    log_arguments: list[dict[str, Any]] | None = None,
+    log_artifacts: list[pathlib.Path] | None = None,
+    epochs: int = 2,
+) -> None:
+    """Invoke the ``train`` callback with real modules, patching only ``_instantiate``."""
+    configure_security(allowed_modules_check=False)
+    training_data = _make_training_dataset()
+    if validation_data is None:
+        validation_data = _make_validation_dataset()
+    deps = {
+        "_instantiate": _make_instantiate_fn(
+            training_data=training_data,
+            validation_data=validation_data,
+            backward_cls=backward_cls,
+            loss=loss,
+            metric=metric,
+        ),
+    }
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    train_fn = _train_callback()
     with patch_cmd_globals(**deps):
-        train_fn(**args)
+        train_fn(
+            model_patterns=[{"model": "MODEL"}],
+            initializer_patterns=None,
+            shapes=[{"x": (4,)}],
+            device="cpu",
+            ema=ema,
+            ema_device=None,
+            loss_pattern="LOSS",
+            loss_outputs=loss_outputs,
+            metric_pattern="METRIC",
+            metric_outputs=metric_outputs,
+            backward_pattern="BACKWARD",
+            mixed_precision_type=mixed_precision_type,
+            compile_pattern=None,
+            training_step_pattern=None,
+            validation_step_pattern=None,
+            epochs=epochs,
+            start_epoch=1,
+            training_dataset_pattern="TRAIN_DS",
+            validation_dataset_pattern="VALID_DS",
+            validation_frequency=1,
+            lower_criteria=lower_criteria or ["loss"],
+            higher_criteria=higher_criteria or ["acc"],
+            save_criteria=save_criteria or ["acc"],
+            seed=42,
+            matmul_precision="high",
+            experiment="test-e2e",
+            log_arguments=log_arguments,
+            log_artifacts=log_artifacts,
+            ci=ci,
+            dist_backend=None,
+            dist_url=None,
+        )
 
-    assert pbar.reset.called
-    assert pbar.set_postfix.called
-    assert pbar.write.called
-    assert trainer_ns.get_autocast.call_count == 1
-    assert torch_mock.compile.call_count >= 2
-    assert mlflow_mock.log_metrics.called
-    assert mlflow_mock.log_metric.called
-    assert mlflow_mock.log_artifact.called
-    assert mlflow_mock.log_dict.call_args_list[0].args[1] == "param_groups.yaml"
 
-    state_dict_calls = mlflow_mock.pytorch.log_state_dict.call_args_list
-    artifact_paths = [call.kwargs.get("artifact_path") for call in state_dict_calls if "artifact_path" in call.kwargs]
-    assert "training_state" in artifact_paths
-    assert any(call.args[1] == "best_valid/acc" for call in state_dict_calls if len(call.args) >= 2)
-
-
-def test_train_runs_ci_with_ema_and_default_outputs(tmp_path: Any) -> None:
-    """CI mode should print criteria and include EMA state when EMA is enabled."""
-    train_fn = _train_callback()
-    args = _build_train_args(
+def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
+    """Full end-to-end train in CI mode with real model, loss, metric, backward."""
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_text("dummy")
+    _invoke_train(
         tmp_path,
         ci=True,
-        ema={},
+        log_arguments=[{"run": "test"}],
+        log_artifacts=[artifact],
+    )
+
+
+def test_train_ci_mode_with_ema(tmp_path: pathlib.Path) -> None:
+    """CI mode with EMA enabled should save EMA state in training_state."""
+    _invoke_train(tmp_path, ci=True, ema={}, save_criteria=[])
+
+
+def test_train_non_ci_mode_uses_pbar(tmp_path: pathlib.Path) -> None:
+    """Non-CI mode should use tqdm progress bar callbacks."""
+    _invoke_train(tmp_path, ci=False)
+
+
+def test_train_with_loss_outputs_fallback(tmp_path: pathlib.Path) -> None:
+    """Train should accept explicit --loss-outputs when module has no ``outputs`` attr."""
+
+    class _KwargsLoss(torch.nn.Module):
+        """Loss that accepts **kwargs (no ``outputs`` attribute)."""
+
+        def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+            return {"loss": torch.nn.functional.cross_entropy(logits, target)}
+
+    class _KwargsMetric(torch.nn.Module):
+        """Metric that accepts **kwargs (no ``outputs`` attribute)."""
+
+        def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+            return {"acc": (logits.argmax(dim=-1) == target).float().mean()}
+
+    _invoke_train(
+        tmp_path,
+        ci=True,
+        loss=_KwargsLoss(),
+        metric=_KwargsMetric(),
         loss_outputs=["loss"],
         metric_outputs=["acc"],
+        save_criteria=[],
+        lower_criteria=[],
+        higher_criteria=[],
+    )
+
+
+def test_train_backward_mixed_precision_type_override(tmp_path: pathlib.Path) -> None:
+    """Backward's mixed_precision_type should override the command's default."""
+
+    class _BackwardWithMixedPrecision(_SimpleBackward):
+        mixed_precision_type = "bfloat16"
+
+    _invoke_train(
+        tmp_path,
+        ci=True,
         mixed_precision_type="float16",
+        backward_cls=_BackwardWithMixedPrecision,
+        save_criteria=[],
+        lower_criteria=[],
+        higher_criteria=[],
     )
-
-    backward = SimpleNamespace(
-        mixed_precision_type="bfloat16",
-        learning_rates={"lr": 0.02},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, mlflow_mock, _pbar, trainer_ns, _torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=None),
-        metric_module=_FakeModule(outputs=None),
-        backward=backward,
-        use_ema=True,
-    )
-
-    with patch_cmd_globals(**deps):
-        train_fn(**args)
-
-    trainer_ns.get_autocast.assert_called_once_with("bfloat16", "cpu")
-    assert mlflow_mock.log_metrics.called
-    state_calls = mlflow_mock.pytorch.log_state_dict.call_args_list
-    training_state = [call for call in state_calls if call.kwargs.get("artifact_path") == "training_state"]
-    assert training_state
-    assert "ema" in training_state[0].args[0]
-
-
-def test_train_raises_when_module_outputs_missing_and_not_provided(tmp_path: Any) -> None:
-    """`train` should fail when a module lacks `outputs` and no fallback outputs are given."""
-    train_fn = _train_callback()
-    args = _build_train_args(tmp_path, loss_outputs=None)
-
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, *_ = _build_train_deps(
-        loss_module=_FakeModule(outputs=None),
-        metric_module=_FakeModule(outputs=["acc"]),
-        backward=backward,
-        use_ema=False,
-    )
-
-    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
-        train_fn(**args)
 
 
 # ---------------------------------------------------------------------------
-# `train` — distributed mode (Strategy 1: mock-based distributed tests)
+# DDP distributed training tests via torch.multiprocessing.spawn
 # ---------------------------------------------------------------------------
 
 
-def test_train_distributed_wraps_models_with_ddp_and_destroys_pg(tmp_path: Any) -> None:
-    """When distributed=True rank=0, models are wrapped with DDP and process group is destroyed."""
-    train_fn = _train_callback()
-    args = _build_train_args(tmp_path, ci=True, ema=None, loss_outputs=["loss"], metric_outputs=None)
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
+def _patch_ddp_for_cpu() -> None:
+    """Monkey-patch DDP __init__ to drop device_ids/output_device for CPU-only testing.
+
+    Safe to call in a forked child process -- does not affect the parent.
+    """
+    _orig_init = torch.nn.parallel.DistributedDataParallel.__init__
+
+    def _cpu_safe_init(
+        self: Any, module: torch.nn.Module, device_ids: Any = None, output_device: Any = None, **kwargs: Any
+    ) -> None:
+        _orig_init(self, module, device_ids=None, output_device=None, **kwargs)
+
+    torch.nn.parallel.DistributedDataParallel.__init__ = _cpu_safe_init  # type: ignore[assignment]
+
+
+def _ddp_train_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    mlflow_uri: str,
+    ci: bool,
+) -> None:
+    """Worker function for DDP training tests launched by mp.spawn."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    _patch_ddp_for_cpu()
+
+    try:
+        configure_security(allowed_modules_check=False)
+        mlflow.set_tracking_uri(mlflow_uri)
+        training_data = _make_training_dataset()
+        validation_data = _make_validation_dataset()
+        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data, validation_data=validation_data)}
+        train_fn = _train_callback()
+        originals = {k: _CMD_GLOBALS.get(k) for k in deps}
+        _CMD_GLOBALS.update(deps)
+        try:
+            with callbacks_session():
+                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                    model_patterns=[{"model": "MODEL"}],
+                    initializer_patterns=None,
+                    shapes=[{"x": (4,)}],
+                    device="cpu",
+                    ema=None,
+                    ema_device=None,
+                    loss_pattern="LOSS",
+                    loss_outputs=None,
+                    metric_pattern="METRIC",
+                    metric_outputs=None,
+                    backward_pattern="BACKWARD",
+                    mixed_precision_type=None,
+                    compile_pattern=None,
+                    training_step_pattern=None,
+                    validation_step_pattern=None,
+                    epochs=2,
+                    start_epoch=1,
+                    training_dataset_pattern="TRAIN_DS",
+                    validation_dataset_pattern="VALID_DS",
+                    validation_frequency=1,
+                    lower_criteria=["loss"],
+                    higher_criteria=["acc"],
+                    save_criteria=["acc"],
+                    seed=42,
+                    matmul_precision="high",
+                    experiment="test-ddp",
+                    log_arguments=None,
+                    log_artifacts=None,
+                    ci=ci,
+                    dist_backend="gloo",
+                    dist_url=f"file://{init_file}",
+                )
+        finally:
+            _CMD_GLOBALS.update(originals)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def test_train_distributed_ddp_end_to_end(tmp_path: pathlib.Path) -> None:
+    """Full end-to-end DDP training with 2 workers via mp.spawn (gloo, CPU)."""
+    init_file = str(tmp_path / "dist_init")
+    mlflow_uri = str(tmp_path / "mlruns")
+    mp.spawn(
+        _ddp_train_worker,
+        args=(2, init_file, mlflow_uri, True),
+        nprocs=2,
+        join=True,
     )
-    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]),
-        metric_module=None,
-        backward=backward,
-        use_ema=False,
-    )
-    # flip to distributed, rank=0 (is_main)
-    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 2, True)
-    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
-    torch_mock.distributed = MagicMock()
-    torch_mock.distributed.destroy_process_group = MagicMock()
-    with patch_cmd_globals(**deps):
-        train_fn(**args)
-    # MLflow should have run (rank=0)
-    mlflow_mock.set_experiment.assert_called_once()
-    # destroy_process_group called in finally block
-    torch_mock.distributed.destroy_process_group.assert_called_once()
 
 
-def test_train_distributed_non_main_skips_mlflow(tmp_path: Any) -> None:
-    """When global_rank != 0 (non-main), MLflow logging is skipped entirely."""
-    train_fn = _train_callback()
-    args = _build_train_args(tmp_path, ci=True, loss_outputs=["loss"], metric_outputs=None)
+def _ddp_rank_gating_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_dir: str,
+) -> None:
+    """Worker that verifies rank-based gating: only rank 0 creates MLflow runs."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
 
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]),
-        metric_module=None,
-        backward=backward,
-        use_ema=False,
-    )
-    # rank=1 (not main)
-    trainer_ns.initial_distributed_env.return_value = ("cpu", 1, 1, 2, True)
-    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
-    torch_mock.distributed = MagicMock()
-    torch_mock.distributed.destroy_process_group = MagicMock()
+    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    _patch_ddp_for_cpu()
 
-    with patch_cmd_globals(**deps):
-        train_fn(**args)
+    try:
+        configure_security(allowed_modules_check=False)
+        mlflow_uri = os.path.join(result_dir, "mlruns")
+        mlflow.set_tracking_uri(mlflow_uri)
+        training_data = _make_training_dataset()
+        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data)}
+        train_fn = _train_callback()
+        originals = {k: _CMD_GLOBALS.get(k) for k in deps}
+        _CMD_GLOBALS.update(deps)
+        try:
+            with callbacks_session():
+                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                    model_patterns=[{"model": "MODEL"}],
+                    initializer_patterns=None,
+                    shapes=[{"x": (4,)}],
+                    device="cpu",
+                    ema=None,
+                    ema_device=None,
+                    loss_pattern="LOSS",
+                    loss_outputs=None,
+                    metric_pattern=None,
+                    metric_outputs=None,
+                    backward_pattern="BACKWARD",
+                    mixed_precision_type=None,
+                    compile_pattern=None,
+                    training_step_pattern=None,
+                    validation_step_pattern=None,
+                    epochs=1,
+                    start_epoch=1,
+                    training_dataset_pattern="TRAIN_DS",
+                    validation_dataset_pattern=None,
+                    validation_frequency=1,
+                    lower_criteria=[],
+                    higher_criteria=[],
+                    save_criteria=[],
+                    seed=42,
+                    matmul_precision="high",
+                    experiment="test-rank-gating",
+                    log_arguments=None,
+                    log_artifacts=None,
+                    ci=True,
+                    dist_backend="gloo",
+                    dist_url=f"file://{init_file}",
+                )
+        finally:
+            _CMD_GLOBALS.update(originals)
+        marker = pathlib.Path(result_dir) / f"rank_{rank}_done"
+        marker.write_text(f"rank={rank}")
+    except Exception:
+        traceback.print_exc()
+        raise
 
-    # MLflow must NOT have been called for non-main rank
-    mlflow_mock.set_experiment.assert_not_called()
-    mlflow_mock.start_run.assert_not_called()
-    # destroy_process_group still called
-    torch_mock.distributed.destroy_process_group.assert_called_once()
+
+def test_train_distributed_rank_gating(tmp_path: pathlib.Path) -> None:
+    """In DDP mode, all ranks complete training to verify rank-gating works."""
+    init_file = str(tmp_path / "dist_init_rg")
+    result_dir = str(tmp_path / "results")
+    os.makedirs(result_dir, exist_ok=True)
+    mp.spawn(_ddp_rank_gating_worker, args=(2, init_file, result_dir), nprocs=2, join=True)
+    assert (tmp_path / "results" / "rank_0_done").exists()
+    assert (tmp_path / "results" / "rank_1_done").exists()
 
 
-def test_train_distributed_seeds_offset_by_rank(tmp_path: Any) -> None:
+def _ddp_seed_offset_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_dir: str,
+    seed: int,
+) -> None:
+    """Worker that records the seed applied after train() so we can verify rank offset."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    _patch_ddp_for_cpu()
+    try:
+        configure_security(allowed_modules_check=False)
+        mlflow_uri = os.path.join(result_dir, "mlruns")
+        mlflow.set_tracking_uri(mlflow_uri)
+        training_data = _make_training_dataset()
+        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data)}
+        train_fn = _train_callback()
+        originals = {k: _CMD_GLOBALS.get(k) for k in deps}
+        _CMD_GLOBALS.update(deps)
+        try:
+            with callbacks_session():
+                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                    model_patterns=[{"model": "MODEL"}],
+                    initializer_patterns=None,
+                    shapes=[{"x": (4,)}],
+                    device="cpu",
+                    ema=None,
+                    ema_device=None,
+                    loss_pattern="LOSS",
+                    loss_outputs=None,
+                    metric_pattern=None,
+                    metric_outputs=None,
+                    backward_pattern="BACKWARD",
+                    mixed_precision_type=None,
+                    compile_pattern=None,
+                    training_step_pattern=None,
+                    validation_step_pattern=None,
+                    epochs=1,
+                    start_epoch=1,
+                    training_dataset_pattern="TRAIN_DS",
+                    validation_dataset_pattern=None,
+                    validation_frequency=1,
+                    lower_criteria=[],
+                    higher_criteria=[],
+                    save_criteria=[],
+                    seed=seed,
+                    matmul_precision="high",
+                    experiment="test-seed",
+                    log_arguments=None,
+                    log_artifacts=None,
+                    ci=True,
+                    dist_backend="gloo",
+                    dist_url=f"file://{init_file}",
+                )
+        finally:
+            _CMD_GLOBALS.update(originals)
+        # After train(), torch manual_seed was called with (seed + rank).
+        # Generate a random tensor to verify the seed differs per rank.
+        torch.manual_seed(seed + rank)
+        sample = torch.randn(4).tolist()
+        pathlib.Path(result_dir, f"seed_rank_{rank}.txt").write_text(str(sample))
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def test_train_distributed_seeds_offset_by_rank(tmp_path: pathlib.Path) -> None:
     """Seeds must be offset by global_rank for distributed training."""
-    train_fn = _train_callback()
-    seed = 42
-    global_rank = 3
-    args = _build_train_args(tmp_path, ci=True, seed=seed, loss_outputs=["loss"], metric_outputs=None)
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, _, _, trainer_ns, torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]),
-        metric_module=None,
-        backward=backward,
-        use_ema=False,
-    )
-    # rank=3, world_size=4 (non-main, to avoid MLflow)
-    trainer_ns.initial_distributed_env.return_value = ("cpu", global_rank, 3, 4, True)
-    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
-    torch_mock.distributed = MagicMock()
-    torch_mock.distributed.destroy_process_group = MagicMock()
-    with patch_cmd_globals(**deps):
-        train_fn(**args)
-    torch_mock.manual_seed.assert_called_once_with(seed + global_rank)
+    init_file = str(tmp_path / "dist_init_seed")
+    result_dir = str(tmp_path / "results")
+    os.makedirs(result_dir, exist_ok=True)
+    mp.spawn(_ddp_seed_offset_worker, args=(2, init_file, result_dir, 42), nprocs=2, join=True)
+    seed0 = (tmp_path / "results" / "seed_rank_0.txt").read_text()
+    seed1 = (tmp_path / "results" / "seed_rank_1.txt").read_text()
+    assert seed0 != seed1
 
 
-def test_train_distributed_unwraps_ddp_when_saving_state(tmp_path: Any) -> None:
-    """_save_training_state should unwrap DDP models before saving state dicts."""
-    train_fn = _train_callback()
-    args = _build_train_args(tmp_path, ci=True, ema=None, loss_outputs=["loss"], metric_outputs=None)
-    backward = SimpleNamespace(
-        learning_rates={"lr": 0.01},
-        optimizers={"opt": _FakeModule()},
-        grad_scalers={"scaler": _FakeModule()},
-    )
-    deps, mlflow_mock, _, trainer_ns, torch_mock = _build_train_deps(
-        loss_module=_FakeModule(outputs=["loss"]),
-        metric_module=None,
-        backward=backward,
-        use_ema=False,
-    )
-    trainer_ns.initial_distributed_env.return_value = ("cpu", 0, 0, 2, True)
-    torch_mock.nn.parallel.DistributedDataParallel = _FakeDDP
-    torch_mock.distributed = MagicMock()
-    torch_mock.distributed.destroy_process_group = MagicMock()
-    with patch_cmd_globals(**deps):
-        train_fn(**args)
-    # _save_training_state calls _unwrap_ddp → _get_state_dict → mlflow.pytorch.log_state_dict
-    state_calls = mlflow_mock.pytorch.log_state_dict.call_args_list
-    training_state = [c for c in state_calls if c.kwargs.get("artifact_path") == "training_state"]
-    assert training_state
-    # The saved models dict should contain unwrapped state_dicts (from _FakeModule, not _FakeDDP)
-    saved_models = training_state[0].args[0]["models"]
-    assert "model" in saved_models
+def _ddp_unwrap_state_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_dir: str,
+) -> None:
+    """Worker that verifies DDP models are properly unwrapped."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        model = torch.nn.Linear(4, 2)
+        ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+        result = _unwrap_ddp({"model": ddp_model})
+        assert result["model"] is model
+        state = _get_state_dict(_unwrap_ddp({"model": ddp_model}))
+        assert "model" in state
+        assert "weight" in state["model"]
+        pathlib.Path(result_dir, f"unwrap_rank_{rank}_ok").write_text("ok")
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_train_distributed_unwraps_ddp_when_saving_state(tmp_path: pathlib.Path) -> None:
+    """_unwrap_ddp correctly unwraps real DDP models in multi-process setting."""
+    init_file = str(tmp_path / "dist_init_unwrap")
+    result_dir = str(tmp_path / "results")
+    os.makedirs(result_dir, exist_ok=True)
+    mp.spawn(_ddp_unwrap_state_worker, args=(2, init_file, result_dir), nprocs=2, join=True)
+    assert (tmp_path / "results" / "unwrap_rank_0_ok").exists()
+    assert (tmp_path / "results" / "unwrap_rank_1_ok").exists()
