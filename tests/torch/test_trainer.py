@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import suppress
 import functools
+from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
+import numpy as np
+from PIL import Image
 import pytest
-from timm.data import FastCollateMixup, Mixup
+from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 from timm.utils import ModelEmaV3
 from torch.nn import Module
 
@@ -73,6 +75,17 @@ class _LossModule(Module):
         return {"loss": torch.tensor(0.5)}
 
 
+class _StubBackward:
+    """A minimal stub implementing the Backward protocol for tests that don't exercise the backward pass."""
+
+    def update(self, step: int) -> bool:
+        """Always signal that an update should occur."""
+        return True
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        """No-op backward pass."""
+
+
 class _MetricModule(Module):
     """A metric module that always returns a fixed accuracy tensor."""
 
@@ -80,13 +93,19 @@ class _MetricModule(Module):
         return {"acc": torch.tensor(0.9)}
 
 
-def _patch_global(monkeypatch: pytest.MonkeyPatch, func: Any, name: str, value: Any) -> None:
-    """Patch a global referenced by a function.
+def _populate_image_folder(root: Path, *, num_classes: int = 2, images_per_class: int = 4) -> Path:
+    """Create an ImageFolder-compatible directory tree with random PNG images.
 
-    The trainer module is exposed via a lazy module wrapper, so patching module
-    attributes by string path is unreliable for non-exported names.
+    Returns the *root* path so callers can pass it directly to ``TimmDatasetWrapper(root=...)``.
     """
-    monkeypatch.setitem(func.__globals__, name, value)
+    rng = np.random.default_rng(0)
+    for cls_idx in range(num_classes):
+        cls_dir = root / f"class_{cls_idx}"
+        cls_dir.mkdir(parents=True, exist_ok=True)
+        for img_idx in range(images_per_class):
+            arr = rng.integers(0, 255, (32, 32, 3), dtype=np.uint8)
+            Image.fromarray(arr).save(cls_dir / f"{img_idx}.png")
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -511,21 +530,13 @@ def test_timm_dataset_wrapper_default_kwargs_contains_all_keys() -> None:
 
 
 def test_timm_dataset_wrapper_dataset_calls_create_dataset(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Dataset cached_property delegates to create_dataset (line 388)."""
-    sentinel = object()
-    calls: list[dict[str, Any]] = []
-
-    def fake_create_dataset(**kw: Any) -> object:
-        calls.append(kw)
-        return sentinel
-
-    _patch_global(monkeypatch, TimmDatasetWrapper.dataset.func, "create_dataset", fake_create_dataset)
-    ds = TimmDatasetWrapper()
-    assert ds.dataset is sentinel
-    assert len(calls) == 1
-    assert calls[0]["name"] == "imagenet"
+    _populate_image_folder(tmp_path)
+    ds = TimmDatasetWrapper(name="", root=str(tmp_path))
+    assert isinstance(ds.dataset, ImageDataset)
+    assert len(ds.dataset) == 8  # 2 classes × 4 images
 
 
 # ---------------------------------------------------------------------------
@@ -569,46 +580,22 @@ def test_timm_dataloader_mixup_kwargs_contains_expected_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_timm_dataloader_distributed_results(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_timm_dataloader_distributed_results() -> None:
     """distributed_results calls init_distributed_device_so (line 552)."""
-    _patch_global(
-        monkeypatch,
-        TimmDataLoaderWrapper.distributed_results.func,
-        "init_distributed_device_so",
-        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
-    )
     result = TimmDataLoaderWrapper().distributed_results
     assert result["device"] == "cpu"
     assert result["distributed"] is False
 
 
-def test_timm_dataloader_default_kwargs_validation_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_timm_dataloader_default_kwargs_validation_branch() -> None:
     """default_kwargs includes crop_pct (not training kwargs) when is_training=False (lines 557–568, 589)."""
-    _patch_global(
-        monkeypatch,
-        TimmDataLoaderWrapper.distributed_results.func,
-        "init_distributed_device_so",
-        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
-    )
     kwargs = TimmDataLoaderWrapper().default_kwargs
     assert "crop_pct" in kwargs
     assert "no_aug" not in kwargs
 
 
-def test_timm_dataloader_default_kwargs_training_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_timm_dataloader_default_kwargs_training_branch() -> None:
     """default_kwargs includes training-specific keys when is_training=True (lines 568–587)."""
-    _patch_global(
-        monkeypatch,
-        TimmDataLoaderWrapper.distributed_results.func,
-        "init_distributed_device_so",
-        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
-    )
     kwargs = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True)).default_kwargs
     assert "no_aug" in kwargs
     assert "re_prob" in kwargs
@@ -664,129 +651,157 @@ def test_timm_dataloader_disable_mixup_noop_before_epoch() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeLoader:
-    """Minimal DataLoader stand-in that yields one fixed batch."""
-
-    _data = [(torch.zeros(2, 3, 4, 4), torch.zeros(2, dtype=torch.long))]
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-    def __iter__(self) -> Any:
-        return iter(self._data)
+_LOADER_BASE_KWARGS: dict[str, Any] = {
+    "input_size": (3, 32, 32),
+    "num_workers": 0,
+    "persistent_workers": False,
+}
+"""Shared kwargs for all ``TimmDataLoaderWrapper`` instances in tests that need a real loader."""
 
 
 @pytest.fixture
-def patch_timm_io(monkeypatch: pytest.MonkeyPatch) -> _FakeLoader:
-    """Monkeypatch timm I/O so no real dataset or DataLoader is created."""
-    loader = _FakeLoader()
-    _patch_global(
-        monkeypatch,
-        TimmDataLoaderWrapper.distributed_results.func,
-        "init_distributed_device_so",
-        lambda device, dist_backend, dist_url: {"device": "cpu", "distributed": False},
-    )
-    _patch_global(monkeypatch, TimmDatasetWrapper.dataset.func, "create_dataset", lambda **kw: MagicMock())
-    _patch_global(monkeypatch, TimmDataLoaderWrapper.dataloader.func, "create_loader", lambda **kw: loader)
-    return loader
+def image_folder(tmp_path: Path) -> Path:
+    """Create a minimal ImageFolder tree and return its root."""
+    return _populate_image_folder(tmp_path)
 
 
-def test_timm_dataloader_wrapper_dataloader_validation(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_wrapper_dataloader_validation(image_folder: Path) -> None:
     """Dataloader property returns the object from create_loader in validation mode (lines 607–608)."""
-    assert TimmDataLoaderWrapper().dataloader is patch_timm_io
+    loader = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        **_LOADER_BASE_KWARGS,
+    ).dataloader
+    assert len(loader) > 0
 
 
 def test_timm_dataloader_wrapper_dataloader_training_no_mixup(
-    patch_timm_io: _FakeLoader,
+    image_folder: Path,
 ) -> None:
     """Dataloader is obtained in training mode without mixup (line 608)."""
-    assert TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True)).dataloader is patch_timm_io
+    loader = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
+        **_LOADER_BASE_KWARGS,
+    ).dataloader
+    assert len(loader) > 0
 
 
-def test_timm_dataloader_wrapper_dataloader_training_with_mixup_off_epoch(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_wrapper_dataloader_training_with_mixup_off_epoch(image_folder: Path) -> None:
     """Dataloader with mixup and mixup_off_epoch>0 registers disable_mixup callback (lines 609–613)."""
     before = len(GLOBAL_CALLBACKS.on_training_begin)
     _ = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(is_training=True),
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
         mixup_alpha=0.5,
         mixup_off_epoch=3,
         use_prefetcher=True,
+        num_classes=2,
+        **_LOADER_BASE_KWARGS,
     ).dataloader
     assert len(GLOBAL_CALLBACKS.on_training_begin) > before
 
 
-def test_timm_dataloader_wrapper_dataloader_with_aug_splits(
-    patch_timm_io: _FakeLoader, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_timm_dataloader_wrapper_dataloader_with_aug_splits(image_folder: Path) -> None:
     """num_aug_splits>1 wraps the dataset in AugMixDataset (lines 614–615)."""
-    aug_ds_created: list[tuple[Any, int]] = []
-
-    class _FakeAugMix:
-        def __init__(self, dataset: Any, num_splits: int) -> None:
-            aug_ds_created.append((dataset, num_splits))
-
-    _patch_global(monkeypatch, TimmDataLoaderWrapper.dataloader.func, "AugMixDataset", _FakeAugMix)
-    _ = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True), num_aug_splits=2).dataloader
-    assert len(aug_ds_created) == 1
-    assert aug_ds_created[0][1] == 2
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
+        num_aug_splits=2,
+        **_LOADER_BASE_KWARGS,
+    )
+    assert isinstance(wrapper.dataset_wrapper, AugMixDataset)
 
 
-def test_timm_dataloader_wrapper_len(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_wrapper_len(image_folder: Path) -> None:
     """__len__ delegates to the underlying dataloader (line 627)."""
-    assert len(TimmDataLoaderWrapper()) == len(patch_timm_io)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        **_LOADER_BASE_KWARGS,
+    )
+    assert len(wrapper) == len(wrapper.dataloader)
 
 
-def test_timm_dataloader_call_prefetcher_no_channels_last(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_call_prefetcher_no_channels_last(image_folder: Path) -> None:
     """_call with prefetcher=True channels_last=False yields from dataloader directly (line 636)."""
-    wrapper = TimmDataLoaderWrapper(use_prefetcher=True, channels_last=False)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        use_prefetcher=True,
+        channels_last=False,
+        **_LOADER_BASE_KWARGS,
+    )
     batches = list(wrapper._call())
-    assert len(batches) == 1
+    assert len(batches) > 0
     inp, _ = batches[0]
-    assert inp.shape == (2, 3, 4, 4)
+    assert inp.shape[1:] == (3, 32, 32)
 
 
-def test_timm_dataloader_call_prefetcher_channels_last(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_call_prefetcher_channels_last(image_folder: Path) -> None:
     """_call with prefetcher=True channels_last=True yields channels_last tensors (lines 633–634)."""
-    wrapper = TimmDataLoaderWrapper(use_prefetcher=True, channels_last=True)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        use_prefetcher=True,
+        channels_last=True,
+        **_LOADER_BASE_KWARGS,
+    )
     batches = list(wrapper._call())
-    assert len(batches) == 1
+    assert len(batches) > 0
     inp, _ = batches[0]
     assert inp.is_contiguous(memory_format=torch.channels_last)
 
 
-def test_timm_dataloader_call_no_prefetcher(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_call_no_prefetcher(image_folder: Path) -> None:
     """_call with prefetcher=False moves tensors to device/dtype (lines 638–641, 646)."""
-    wrapper = TimmDataLoaderWrapper(use_prefetcher=False)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        use_prefetcher=False,
+        **_LOADER_BASE_KWARGS,
+    )
     batches = list(wrapper._call())
-    assert len(batches) == 1
+    assert len(batches) > 0
 
 
-def test_timm_dataloader_call_no_prefetcher_with_mixup(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_call_no_prefetcher_with_mixup(image_folder: Path) -> None:
     """_call with prefetcher=False and mixup_alpha>0 applies Mixup to each batch (lines 639, 642–643)."""
-    wrapper = TimmDataLoaderWrapper(use_prefetcher=False, mixup_alpha=0.4)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
+        use_prefetcher=False,
+        mixup_alpha=0.4,
+        num_classes=2,
+        **_LOADER_BASE_KWARGS,
+    )
     batches = list(wrapper._call())
-    assert len(batches) == 1
+    assert len(batches) > 0
 
 
-def test_timm_dataloader_call_no_prefetcher_channels_last(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_call_no_prefetcher_channels_last(image_folder: Path) -> None:
     """_call with prefetcher=False channels_last=True applies channels_last format (lines 644–645)."""
-    wrapper = TimmDataLoaderWrapper(use_prefetcher=False, channels_last=True)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        use_prefetcher=False,
+        channels_last=True,
+        **_LOADER_BASE_KWARGS,
+    )
     inp, _ = next(iter(wrapper._call()))
     assert inp.is_contiguous(memory_format=torch.channels_last)
 
 
-def test_timm_dataloader_dunder_call_no_spec(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_dunder_call_no_spec(image_folder: Path) -> None:
     """__call__ with spec=None yields raw (inp, target) pairs (lines 650–651)."""
-    wrapper = TimmDataLoaderWrapper(spec=None)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        spec=None,
+        **_LOADER_BASE_KWARGS,
+    )
     batches = list(wrapper())
-    assert len(batches) == 1
+    assert len(batches) > 0
     inp, target = batches[0]
     assert isinstance(inp, torch.Tensor)
 
 
-def test_timm_dataloader_dunder_call_with_spec(patch_timm_io: _FakeLoader) -> None:
+def test_timm_dataloader_dunder_call_with_spec(image_folder: Path) -> None:
     """__call__ with a spec applies map(spec, _call()) (lines 652–653)."""
-    wrapper = TimmDataLoaderWrapper(spec=None)
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        spec=None,
+        **_LOADER_BASE_KWARGS,
+    )
     results: list[Any] = []
 
     def fake_spec(x: Any) -> Any:
@@ -796,7 +811,7 @@ def test_timm_dataloader_dunder_call_with_spec(patch_timm_io: _FakeLoader) -> No
     # bypass Pydantic validation to set a plain callable
     wrapper.__dict__["spec"] = fake_spec
     list(wrapper())
-    assert len(results) == 1
+    assert len(results) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -946,7 +961,7 @@ def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: N
     trainer = TorchTrainer(
         device="cpu",
         training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=MagicMock(),
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
@@ -964,7 +979,7 @@ def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo:
     trainer = TorchTrainer(
         device="cpu",
         training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=MagicMock(),
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
@@ -979,7 +994,7 @@ def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) 
     trainer = TorchTrainer(
         device="cpu",
         training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=MagicMock(),
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
@@ -995,7 +1010,7 @@ def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
     trainer = TorchTrainer(
         device="cpu",
         training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=MagicMock(),
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"]),
         add_global_callbacks=False,
     )
