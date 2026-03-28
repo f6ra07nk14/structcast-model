@@ -152,6 +152,12 @@ addopts = """\
 """
 testpaths = ["tests/", "src/structcast_model/"]
 
+[tool.coverage.run]
+source = ["src/"]
+concurrency = ["multiprocessing"]
+patch = ["subprocess"]
+relative_files = true
+
 [tool.mypy]
 python_version = "3.11"
 disallow_untyped_defs = true

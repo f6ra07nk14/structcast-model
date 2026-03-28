@@ -270,6 +270,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
         '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
     ),
+    initializer_patterns: list[dict] | None = Option(
+        None,
+        "--initializer",
+        "-I",
+        parser=dict_parser,
+        help="The object patterns used to instantiate initializers for the models. "
+        "For example, if the initializer is defined as `my_package.initialize_fn`, then the pattern should be "
+        '"model_name: [_obj_, {_addr_: my_package.initialize_fn, _file_: my_package.py}]" or '
+        '"model_name: [_obj_, [_addr_, my_package.initialize_fn, my_package.py]]".',
+    ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
     ema: dict[str, Any] | None = Option(
@@ -337,12 +347,29 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         help='Whether to compile the model using "torch.compile". '
         'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
     ),
+    training_step_pattern: Any | None = Option(
+        None,
+        "--training-step",
+        parser=path_or_any_parser,
+        help="The object pattern used to instantiate the training step. "
+        "For example, if the training step is defined as `my_package.MyTrainingStep`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyTrainingStep, _file_: my_package.py}]" or '
+        '"[_obj_, [_addr_, my_package.MyTrainingStep, my_package.py]]".',
+    ),
+    validation_step_pattern: Any | None = Option(
+        None,
+        "--validation-step",
+        parser=path_or_any_parser,
+        help="The object pattern used to instantiate the validation step. "
+        "For example, if the validation step is defined as `my_package.MyValidationStep`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyValidationStep, _file_: my_package.py}]" or '
+        '"[_obj_, [_addr_, my_package.MyValidationStep, my_package.py]]".',
+    ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
     training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
-        "-T",
         parser=path_or_any_parser,
         help="The object pattern used to instantiate the training dataset. "
         "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
@@ -420,6 +447,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
     input_shapes = reduce_dict(shapes)
+    initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
     is_main = global_rank == 0
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
@@ -435,6 +463,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     with torch.device(device):
         models = _instantiate_models(model_patterns)
         torch_trainer.initial_model(models, input_shapes)
+        if is_main:
+            for model_name, model in models.items():
+                if model_name in initializers:
+                    model.apply(initializers[model_name])
         loss = compile_fn(_instantiate(loss_pattern))
         metric = compile_fn(_instantiate(metric_pattern)) if metric_pattern else None
         loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
@@ -457,8 +489,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     trainer = torch_trainer.TorchTrainer(
         device=device,
         inference_wrapper=inference_wrapper,
-        training_step=torch_trainer.TrainingStep(**step_kw),
-        validation_step=torch_trainer.ValidationStep(**step_kw),
+        training_step=(
+            torch_trainer.TrainingStep if training_step_pattern is None else _instantiate(training_step_pattern)
+        )(**step_kw),
+        validation_step=(
+            torch_trainer.ValidationStep if validation_step_pattern is None else _instantiate(validation_step_pattern)
+        )(**step_kw),
         backward=backward,
         tracker=tracker,
     )
@@ -506,6 +542,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 **reduce_dict(log_arguments),
                 "models": model_patterns,
                 "parameters": {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()},
+                "initializers": initializer_patterns,
                 "shapes": input_shapes,
                 "device": device,
                 "distributed": distributed,
@@ -519,6 +556,8 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "backward": backward_pattern,
                 "mixed_precision_type": mixed_precision_type,
                 "compile": compile_pattern,
+                "training_step": training_step_pattern,
+                "validation_step": validation_step_pattern,
                 "epochs": epochs,
                 "start_epoch": start_epoch,
                 "training_dataset": training_dataset_pattern,

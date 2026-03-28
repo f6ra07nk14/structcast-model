@@ -7,7 +7,7 @@ from logging import getLogger
 from math import inf
 from operator import gt, lt
 from time import time
-from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 logger = getLogger(__name__)
 
@@ -31,6 +31,7 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
     return sum(1 for _ in dataset)
 
 
+@runtime_checkable
 class Forward(Protocol[ModelT_contra]):
     """Protocol for forward pass configuration."""
 
@@ -38,6 +39,7 @@ class Forward(Protocol[ModelT_contra]):
         """Perform the forward pass for the given inputs and return the outputs and any additional information."""
 
 
+@runtime_checkable
 class Backward(Protocol):
     """Protocol for backward pass configuration."""
 
@@ -73,6 +75,7 @@ class BaseInfo:
         raise KeyError(f"No logs found for key: {epoch}.")
 
 
+@runtime_checkable
 class Callback(Protocol, Generic[ModelT_contra]):
     """Protocol for callbacks."""
 
@@ -80,6 +83,7 @@ class Callback(Protocol, Generic[ModelT_contra]):
         """Call the callback with the given information."""
 
 
+@runtime_checkable
 class BestCallback(Protocol[ModelT_contra]):
     """Protocol for best criterion callback."""
 

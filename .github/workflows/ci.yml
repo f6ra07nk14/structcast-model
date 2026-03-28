@@ -187,7 +187,7 @@ jobs:
           export HOME="$(pwd)"
           # Ensure UV uses the pre-populated cache from Docker image
           export XDG_CACHE_HOME=/app/.cache
-          tox run-parallel --parallel all
+          tox
 
   # Delete Branch Job: Automatically delete PR branch after successful merge
   delete-branch:
