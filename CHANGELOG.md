@@ -1,3 +1,33 @@
+## [1.3.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.2.0...v1.3.0) (2026-03-28)
+
+
+### 👷 Build
+
+* add mlflow and flops as extra dependencies in Dockerfile ([7fa3847](https://github.com/f6ra07nk14/structcast-model/commit/7fa3847fe320112abd1a28339ecafbee0390e4da))
+
+
+### 🦊 CI/CD
+
+* add coverage configuration for testing with multiprocessing support ([3d2348d](https://github.com/f6ra07nk14/structcast-model/commit/3d2348d972b01cbcf11b7d10c111e10afaa2b203))
+* add mlflow and flops dependencies to tox configuration ([ab087be](https://github.com/f6ra07nk14/structcast-model/commit/ab087be0c138533ae832c122f2a464647ff0bcc5))
+* update tox command to run without parallel execution ([85c0036](https://github.com/f6ra07nk14/structcast-model/commit/85c00366d207d7f06e35d4435e919ff79e491682))
+
+
+### 💎 Features
+
+* add initializer patterns option for model instantiation in train function ([75ec398](https://github.com/f6ra07nk14/structcast-model/commit/75ec3981346a3bff9c2181087aa7792e6f53fa45))
+* add options for training and validation step patterns in train function ([eeb8cdb](https://github.com/f6ra07nk14/structcast-model/commit/eeb8cdb62a8f7039d01378f94b9939d9f3ca0591))
+
+
+### 🔧 Fixes
+
+* add runtime_checkable decorator to protocol classes for enhanced type checking ([d4bb823](https://github.com/f6ra07nk14/structcast-model/commit/d4bb823f67de546a117b70235717259a437878e3))
+
+
+### 🔨 Refactor
+
+* streamline training and validation step instantiation in train function ([606cca4](https://github.com/f6ra07nk14/structcast-model/commit/606cca42b0a8eb9cff32942c3f0eb20f41adaf99))
+
 ## [1.2.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.1.0...v1.2.0) (2026-03-17)
 
 
