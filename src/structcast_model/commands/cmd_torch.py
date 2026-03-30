@@ -347,6 +347,15 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         help='Whether to compile the model using "torch.compile". '
         'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
     ),
+    trainer_pattern: Any | None = Option(
+        None,
+        "--trainer",
+        parser=path_or_any_parser,
+        help="The object pattern used to instantiate the trainer. "
+        "For example, if the trainer is defined as `my_package.MyTrainer`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyTrainer, _file_: my_package.py}]" or '
+        '"[_obj_, [_addr_, my_package.MyTrainer, my_package.py]]".',
+    ),
     training_step_pattern: Any | None = Option(
         None,
         "--training-step",
@@ -486,7 +495,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         )
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
     step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
-    trainer = torch_trainer.TorchTrainer(
+    trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else _instantiate(trainer_pattern))(
         device=device,
         inference_wrapper=inference_wrapper,
         training_step=(
@@ -556,6 +565,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "backward": backward_pattern,
                 "mixed_precision_type": mixed_precision_type,
                 "compile": compile_pattern,
+                "trainer": trainer_pattern,
                 "training_step": training_step_pattern,
                 "validation_step": validation_step_pattern,
                 "epochs": epochs,
