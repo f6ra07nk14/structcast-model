@@ -13,11 +13,11 @@ Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 
 **Install runtime extras**: `uv sync --extra torch-cu130 --extra mlflow --extra flops`
 
-**Format config**: `scm format cfg/datasets/default_timm.yaml -o dataset.yaml -p 'DEFAULT: {...}'`
+**Format config**: `scm format cfg/torch/datasets/default_timm.yaml -o dataset.yaml -p 'DEFAULT: {...}'`
 
-**Generate model**: `scm torch create model cfg/models/ConvNeXtV2.yaml -o model.py`
+**Generate model**: `scm torch create model cfg/torch/models/ConvNeXtV2.yaml -o model.py`
 
-**Generate backward**: `scm torch create backward cfg/backwards/ConvNeXtV2.yaml -o backward.py`
+**Generate backward**: `scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -o backward.py`
 
 **Inspect FLOPs**: `scm torch ptflops '[_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' -s 'image: [3, 224, 224]'`
 
@@ -30,7 +30,7 @@ Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 ### Workflow 1: Generate a Model from YAML
 
 ```bash
-scm torch create model cfg/models/ConvNeXtV2.yaml \
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml \
   -p 'DEFAULT: {backbone: femto}' \
   -c Model \
   -o model.py
@@ -46,9 +46,9 @@ What happens:
 ### Workflow 2: Generate Loss, Metric, and Backward Code
 
 ```bash
-scm torch create model cfg/losses/cls.yaml -c Loss -o loss.py
-scm torch create model cfg/metrics/topk.yaml -c Metric -o metric.py
-scm torch create backward cfg/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
+scm torch create model cfg/torch/losses/cls.yaml -c Loss -o loss.py
+scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
+scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 ```
 
 Use this when the training workflow should remain fully declarative.
@@ -56,7 +56,7 @@ Use this when the training workflow should remain fully declarative.
 ### Workflow 3: Format a Reusable Dataset Template
 
 ```bash
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
   -o dataset_train.yaml \
   -p 'DEFAULT: {training: true, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], download: true}'
 ```
@@ -89,11 +89,11 @@ scm torch train \
   'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
   -s 'image: [3, 224, 224]' \
   -d cuda \
-  --ema cfg/others/ema.yaml \
+  --ema cfg/torch/others/ema.yaml \
   -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
   -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
   -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-  -c cfg/others/compile_default.yaml \
+  -c cfg/torch/others/compile_default.yaml \
   -T dataset_train.yaml \
   -V dataset_valid.yaml \
   -LC ce_loss -LC val_ce_loss \
@@ -120,11 +120,11 @@ torchrun --nproc_per_node=gpu \
   'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
   -s 'image: [3, 224, 224]' \
   -d cuda \
-  --ema cfg/others/ema.yaml \
+  --ema cfg/torch/others/ema.yaml \
   -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
   -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
   -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-  -c cfg/others/compile_default.yaml \
+  -c cfg/torch/others/compile_default.yaml \
   -T dataset_train.yaml \
   -V dataset_valid.yaml \
   -LC ce_loss -LC val_ce_loss \
@@ -192,7 +192,7 @@ What happens:
 ```python
 from structcast_model.builders.torch_builder import TorchBuilder
 
-built = TorchBuilder.from_path("cfg/models/ConvNeXtV2.yaml")(
+built = TorchBuilder.from_path("cfg/torch/models/ConvNeXtV2.yaml")(
     parameters={"DEFAULT": {"backbone": "femto"}},
     classname="Model",
     forced_structured_output=True,
@@ -270,9 +270,9 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 
 ### Signature config examples in this repo
 
-- `cfg/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks.
-- `cfg/backwards/ConvNeXtV2.yaml` uses optimizer factories, scheduler settings, optional clipping, and gradient accumulation.
-- `cfg/datasets/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
+- `cfg/torch/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks.
+- `cfg/torch/backwards/ConvNeXtV2.yaml` uses optimizer factories, scheduler settings, optional clipping, and gradient accumulation.
+- `cfg/torch/datasets/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
 
 ## Base Trainer and Callback System
 
