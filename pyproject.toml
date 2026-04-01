@@ -157,6 +157,7 @@ source = ["src/"]
 concurrency = ["multiprocessing"]
 patch = ["subprocess"]
 relative_files = true
+data_file = ".pytest_cache/.coverage"
 
 [tool.mypy]
 python_version = "3.11"
