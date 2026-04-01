@@ -138,10 +138,10 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
 
 def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
     """Return output names from a module attribute or the provided default, raising if neither is available."""
-    if hasattr(module, "outputs"):
-        return module.outputs
     if default:
         return default
+    if hasattr(module, "outputs"):
+        return module.outputs
     raise ValueError(
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
