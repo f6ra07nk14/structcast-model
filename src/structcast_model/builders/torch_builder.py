@@ -37,6 +37,8 @@ class TorchLayerIntermediate(LayerIntermediate):
             ]
         else:
             codes = self._forward_training_flow
+        inputs = self._forward_inputs
+        inputs += ", " if inputs else ""
         return f"""\
 class {class_name}(torch.nn.Module):
 
@@ -46,7 +48,7 @@ class {class_name}(torch.nn.Module):
         self.outputs = {self.outputs}
         {sep.join([f"self.{v}" for v in initialized_layers])}
 
-    def forward(self, {self._forward_inputs}, **kwargs):
+    def forward(self, {inputs}**kwargs):
         {sep.join(codes)}
         return {self._forward_outputs}
 """
