@@ -346,9 +346,10 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             invoke_callback(self.on_training_step_begin, self, **models)
             elapsed_time -= time()
             updated, criteria = self.update_models(inputs, **models)
+            logs = self.tracker(**criteria)
             self.sync()
             elapsed_time += time()
-            logs = self.tracker(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs["elapsed_time"] = elapsed_time / index
             if self.training_prefix:
                 logs = {f"{self.training_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
@@ -381,9 +382,10 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
             criteria = self.validation_step(data, **models)
+            logs = self.tracker(**criteria)
             self.sync()
             elapsed_time += time()
-            logs = self.tracker(**criteria) | {"elapsed_time": elapsed_time / index}
+            logs["elapsed_time"] = elapsed_time / index
             if self.validation_prefix:
                 logs = {f"{self.validation_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
