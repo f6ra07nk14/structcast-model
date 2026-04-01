@@ -1,3 +1,27 @@
+## [1.4.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.3.0...v1.4.0) (2026-04-01)
+
+
+### 👷 Build
+
+* upgrade package dependencies ([63590e9](https://github.com/f6ra07nk14/structcast-model/commit/63590e9c8553a338153a378e5452651b24c703b2))
+
+
+### 📦 Other
+
+* add data_file configuration for pytest coverage ([2b8d14b](https://github.com/f6ra07nk14/structcast-model/commit/2b8d14b8a4ac7c1a43d15432de566f8e0fc33719))
+
+
+### 💎 Features
+
+* add trainer pattern option for model training configuration ([af8da80](https://github.com/f6ra07nk14/structcast-model/commit/af8da8061ac404147723716d21b90c0405dd0c4a))
+
+
+### 🔧 Fixes
+
+* correct elapsed_time calculation in training and validation steps ([857a637](https://github.com/f6ra07nk14/structcast-model/commit/857a6374a1dea4af7841947343d95f63cf12bb8f))
+* correct forward method input handling in TorchLayerIntermediate ([29417b9](https://github.com/f6ra07nk14/structcast-model/commit/29417b95533a689dd5731a2c72862198202ebd48))
+* reorder output attribute check in _get_module_outputs function ([7e1c838](https://github.com/f6ra07nk14/structcast-model/commit/7e1c838439d367ef6a0baeebbfe2151d786651e3))
+
 ## [1.3.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.2.0...v1.3.0) (2026-03-28)
 
 
