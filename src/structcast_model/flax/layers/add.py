@@ -9,7 +9,7 @@ class Add:
     use in generated Flax model scripts.
     """
 
-    def __call__(self, tensors: list, **kwargs: object) -> object:
+    def __call__(self, tensors: list[object], **kwargs: object) -> object:
         """Return the element-wise sum of *tensors*.
 
         Args:

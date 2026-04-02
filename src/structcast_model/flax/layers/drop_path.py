@@ -29,6 +29,12 @@ class DropPath:
         Returns:
             Array of the same shape as *x* with paths randomly zeroed during
             training.
+
+        Note:
+            This is a simplified implementation that generates the random key
+            from a hash of the input sum.  For production use, inject a proper
+            ``jax.random.PRNGKey`` via an ``rngs`` argument or replace this
+            layer with a ``flax.nnx``-aware implementation.
         """
         import jax  # noqa: PLC0415
         import jax.numpy as jnp  # noqa: PLC0415
@@ -36,8 +42,10 @@ class DropPath:
         if not training or self.drop_prob == 0.0:
             return x
         keep_prob = 1.0 - self.drop_prob
+        # Shape (B, 1, ..., 1): one mask value per sample, broadcast over spatial/channel dims.
         shape = (jnp.shape(x)[0],) + (1,) * (jnp.ndim(x) - 1)  # type: ignore[arg-type]
-        rng = jax.random.PRNGKey(0)
+        seed = int(jnp.sum(jnp.asarray(x, dtype=jnp.float32)).item()) % (2**31)  # type: ignore[arg-type]
+        rng = jax.random.PRNGKey(seed)
         random_tensor = jax.random.bernoulli(rng, keep_prob, shape=shape)
         return jnp.where(random_tensor, x / keep_prob, jnp.zeros_like(x))  # type: ignore[arg-type]
 
