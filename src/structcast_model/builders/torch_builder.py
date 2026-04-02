@@ -2,7 +2,6 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from structcast_model.builders.base_builder import (
@@ -64,46 +63,85 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
 class TorchBackwardIntermediate(BackwardIntermediate):
     """Intermediate representation of a PyTorch backward layer."""
 
-    @cached_property
-    def _backward_flow(self) -> list[str]:
-        return [
-            f"{L if self.mixed_precision is None else f'self.{n}_scaler.scale({L})'}.backward({kw})"
-            for L, kw, opts in self.backwards
-            for n in opts
-        ]
+    def _entry_optimizer_steps(self, opts: list[str], *, indent: str) -> list[str]:
+        """Generate unscale / clip / step / scaler-update lines for one backward entry."""
+        has_mp = self.mixed_precision is not None
+        scaler_opt = opts[0]
+        lines: list[str] = []
+        for n in opts:
+            if has_mp:
+                lines.append(f"{indent}self.{scaler_opt}_scaler.unscale_(self.{n})")
+            if self.optimizers[n][2]:
+                param = f"[p for pg in self.{n}.param_groups for p in pg['params']]"
+                lines.append(f"{indent}self.{n}_clip({param})")
+        for n in opts:
+            if has_mp:
+                lines.append(f"{indent}self.{scaler_opt}_scaler.step(self.{n})")
+            else:
+                lines.append(f"{indent}self.{n}.step()")
+        if has_mp:
+            lines.append(f"{indent}self.{scaler_opt}_scaler.update()")
+        return lines
+
+    def _build_flow_no_accumulation(self) -> list[str]:
+        """Build per-entry flow (zero_grad → backward → step) for non-accumulation mode.
+
+        This ordering prevents gradient contamination across independent backward entries,
+        which is required for multi-optimizer training such as GAN.
+        """
+        has_mp = self.mixed_precision is not None
+        flow: list[str] = []
+        for L, kw, opts in self.backwards:
+            scaler_opt = opts[0]
+            for n in opts:
+                flow.append(f"self.{n}.zero_grad()")
+            backward_target = f"self.{scaler_opt}_scaler.scale({L})" if has_mp else L
+            flow.append(f"{backward_target}.backward({kw})")
+            flow.extend(self._entry_optimizer_steps(opts, indent=""))
+        return flow
+
+    def _build_flow_accumulation(self, indent: str) -> list[str]:
+        """Build all-backward-first flow for gradient-accumulation mode."""
+        has_mp = self.mixed_precision is not None
+        flow: list[str] = []
+        for L, _, _ in self.backwards:
+            flow.append(f"{L} = {L} / {self.accumulate_gradients}")
+        for L, kw, opts in self.backwards:
+            scaler_opt = opts[0]
+            backward_target = f"self.{scaler_opt}_scaler.scale({L})" if has_mp else L
+            flow.append(f"{backward_target}.backward({kw})")
+        flow.append("if self.need_update:")
+        for _, _, opts in self.backwards:
+            flow.extend(self._entry_optimizer_steps(opts, indent=indent))
+            for n in opts:
+                flow.append(f"{indent}self.{n}.zero_grad()")
+        return flow
+
+    def _build_init_opts(self) -> list[str]:
+        """Build __init__ statements for optimizers, clips and grad scalers."""
+        has_mp = self.mixed_precision is not None
+        init_opts = [f"self.{n} = {o}(_get_param([{', '.join(L)}]))" for n, (o, L, _) in self.optimizers.items()]
+        for n, (_, _, clip) in self.optimizers.items():
+            if clip:
+                init_opts.append(f"self.{n}_clip = {clip}")
+        if has_mp:
+            for scaler_opt in {opts[0] for _, _, opts in self.backwards}:
+                init_opts.append(f"self.{scaler_opt}_scaler = {self.mixed_precision}")
+        return init_opts
 
     def _get_scripts(self) -> list[str]:
         indent = " " * 4
         sep = "\n" + indent * 2
-        init_opts = [f"self.{n} = {o}(_get_param([{', '.join(L)}]))" for n, (o, L, _) in self.optimizers.items()]
-        flow = []
+        has_mp = self.mixed_precision is not None
+        init_opts = self._build_init_opts()
         if self.accumulate_gradients:
-            flow += [f"{L} = {L} / {self.accumulate_gradients}" for L, _, _ in self.backwards]
-            flow += self._backward_flow
-            flow += ["if self.need_update:"]
-            flow_indent = indent
+            flow = self._build_flow_accumulation(indent)
         else:
-            flow += self._backward_flow
-            flow_indent = ""
-        for name in [n for _, _, opts in self.backwards for n in opts]:
-            if has_mp := self.mixed_precision is not None:
-                init_opts.append(f"self.{name}_scaler = {self.mixed_precision}")
-            flow.append(f"{flow_indent}self.{name}_scaler.unscale_(self.{name})")
-            if clip := self.optimizers[name][2]:  # if clip_grad is not None
-                init_opts.append(f"self.{name}_clip = {clip}")
-                param = f"[p for pg in self.{name}.param_groups for p in pg['params']]"
-                flow.append(f"{flow_indent}self.{name}_clip({param})")
-            if has_mp:
-                flow.append(f"{flow_indent}self.{name}_scaler.step(self.{name})")
-                flow.append(f"{flow_indent}self.{name}_scaler.update()")
-            else:
-                flow.append(f"{flow_indent}self.{name}.step()")
-            flow.append(f"{flow_indent}self.{name}.zero_grad()")
-        opts = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
-        if self.mixed_precision is None:
-            grad_scalers = ""
-        else:
-            grad_scalers = ", ".join([f'"{n}": self.{n}_scaler' for n in self.optimizers])
+            flow = self._build_flow_no_accumulation()
+        opts_repr = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
+        grad_scalers = (
+            ", ".join([f'"{opts[0]}": self.{opts[0]}_scaler' for _, _, opts in self.backwards]) if has_mp else ""
+        )
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
@@ -126,7 +164,7 @@ class {self.classname}:
 
     @property
     def optimizers(self):
-        return {{{opts}}}
+        return {{{opts_repr}}}
 
     @property
     def grad_scalers(self):

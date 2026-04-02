@@ -187,12 +187,19 @@ class TrainingStep:
     """A context manager for automatic mixed precision (AMP). By default, it does nothing."""
 
     def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
-        """Perform the forward pass for the given inputs and return the outputs and any additional information."""
+        """Perform the forward pass for the given inputs and return the outputs and any additional information.
+
+        Model objects are forwarded to the losses module via keyword arguments so that complex multi-model
+        training flows (e.g. GAN) can perform additional forward passes inside the loss computation.
+        Model names that collide with tensor output keys will be overridden by the tensor values.
+        """
         with self.autocast():
             outputs = inputs.copy()
             for name in self.models:
                 outputs.update(models[name](**outputs))
-            criteria = self.losses(**outputs)
+            # Merge models first, then tensor outputs: if a model and a tensor output share the same name
+            # (e.g. a model named "image" and an output key "image"), the tensor value wins.
+            criteria = self.losses(**{**models, **outputs})
             if self.metrics is None:
                 return criteria
             with torch.no_grad():
@@ -205,13 +212,20 @@ class ValidationStep(TrainingStep):
     """A validation step for a PyTorch model."""
 
     def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
-        """Perform the forward pass for the given inputs and return the outputs and any additional information."""
+        """Perform the forward pass for the given inputs and return the outputs and any additional information.
+
+        Model objects are forwarded to the losses module via keyword arguments so that complex multi-model
+        training flows (e.g. GAN) can perform additional forward passes inside the loss computation.
+        Model names that collide with tensor output keys will be overridden by the tensor values.
+        """
         with torch.no_grad():
             with self.autocast():
                 outputs = inputs.copy()
                 for name in self.models:
                     outputs.update(models[name](**outputs))
-                criteria = self.losses(**outputs)
+                # Merge models first, then tensor outputs: if a model and a tensor output share the same name
+                # (e.g. a model named "image" and an output key "image"), the tensor value wins.
+                criteria = self.losses(**{**models, **outputs})
                 if self.metrics is None:
                     return criteria
                 criteria.update(self.metrics(**outputs))

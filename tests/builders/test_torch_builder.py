@@ -95,3 +95,148 @@ def test_torch_backward_builder_renders_non_accumulation_without_mixed_precision
     assert "ce_loss.backward(" in script
     assert "return self.need_update" in script
     assert "self.SGD.step()" in script
+
+
+def test_torch_backward_builder_no_accumulation_zero_grad_before_backward() -> None:
+    """Without accumulation, zero_grad is emitted before backward in each entry.
+
+    This per-entry ordering (zero_grad → backward → step) is what enables correct
+    multi-entry GAN training: when there is more than one BACKWARDS entry the
+    zero_grad at the start of entry N clears any gradients that accumulated in
+    shared models during entry N-1's backward pass.
+    """
+    raw = {
+        "MIXED_PRECISION": False,
+        "BACKWARDS": [["ce_loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]],
+    }
+    script = TorchBackwardBuilder(raw=raw)(classname="BackwardZeroGrad").scripts[0]
+    zero_pos = script.index("self.SGD.zero_grad()")
+    backward_pos = script.index("ce_loss.backward(")
+    step_pos = script.index("self.SGD.step()")
+    assert zero_pos < backward_pos < step_pos
+
+
+def test_torch_backward_builder_gan_multi_entry_per_entry_flow() -> None:
+    """GAN: multiple BACKWARDS entries each get their own zero_grad → backward → step cycle."""
+    raw = {
+        "MIXED_PRECISION": False,
+        "BACKWARDS": [
+            ["loss_G", [["optimizer_G", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["G"]]]],
+            ["loss_D", [["optimizer_D", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["D"]]]],
+        ],
+    }
+    script = TorchBackwardBuilder(raw=raw)(classname="GANBackward").scripts[0]
+
+    # Both losses must be present
+    assert "loss_G.backward(" in script
+    assert "loss_D.backward(" in script
+
+    # backward is called exactly once per loss (no duplicate backward calls)
+    assert script.count("loss_G.backward(") == 1
+    assert script.count("loss_D.backward(") == 1
+
+    # Per-entry ordering: G cycle comes before D cycle
+    g_zero = script.index("self.optimizer_G.zero_grad()")
+    g_back = script.index("loss_G.backward(")
+    g_step = script.index("self.optimizer_G.step()")
+    d_zero = script.index("self.optimizer_D.zero_grad()")
+    d_back = script.index("loss_D.backward(")
+    d_step = script.index("self.optimizer_D.step()")
+
+    assert g_zero < g_back < g_step, "G entry must follow zero_grad → backward → step order"
+    assert d_zero < d_back < d_step, "D entry must follow zero_grad → backward → step order"
+    # D entry comes after G entry's step (sequential per-entry processing)
+    assert g_step < d_zero, "D entry must start after G entry completes"
+
+
+def test_torch_backward_builder_gan_multi_entry_with_mixed_precision() -> None:
+    """GAN: multiple BACKWARDS entries with AMP — each entry uses its own GradScaler."""
+    raw = {
+        "MIXED_PRECISION": True,
+        "MIXED_PRECISION_TYPE": "float16",
+        "BACKWARDS": [
+            ["loss_G", [["optimizer_G", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["G"]]]],
+            ["loss_D", [["optimizer_D", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["D"]]]],
+        ],
+    }
+    backward = TorchBackwardBuilder(raw=raw)(classname="GANAmpBackward")
+    script = backward.scripts[0]
+
+    # Each entry has its own scaler
+    assert "self.optimizer_G_scaler" in script
+    assert "self.optimizer_D_scaler" in script
+
+    # Scalers scale the correct loss
+    assert "self.optimizer_G_scaler.scale(loss_G)" in script
+    assert "self.optimizer_D_scaler.scale(loss_D)" in script
+
+    # grad_scalers property exposes per-entry scalers
+    assert '"optimizer_G": self.optimizer_G_scaler' in script
+    assert '"optimizer_D": self.optimizer_D_scaler' in script
+
+    # backward called once per entry (not per optimizer); with AMP the call is scaler.scale(loss).backward()
+    assert script.count(".backward(") == 2
+
+
+def test_torch_backward_builder_multi_optimizer_single_entry_shared_scaler() -> None:
+    """Single backward entry with multiple optimizers shares one GradScaler for the whole entry."""
+    raw = {
+        "MIXED_PRECISION": True,
+        "MIXED_PRECISION_TYPE": "float16",
+        "BACKWARDS": [
+            [
+                "loss_D",
+                [
+                    ["optimizer_D_A", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["D_A"]],
+                    ["optimizer_D_B", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["D_B"]],
+                ],
+            ]
+        ],
+    }
+    backward = TorchBackwardBuilder(raw=raw)(classname="SharedScalerBackward")
+    script = backward.scripts[0]
+
+    # Only one scaler created (for the first optimizer of the entry)
+    assert "self.optimizer_D_A_scaler = torch.amp.GradScaler()" in script
+    assert "self.optimizer_D_B_scaler" not in script
+
+    # backward called exactly once (with AMP: scaler.scale(loss).backward())
+    assert script.count(".backward(") == 1
+    assert "self.optimizer_D_A_scaler.scale(loss_D)" in script
+
+    # Both optimizers are unscaled and stepped using the shared (first-opt) scaler
+    assert "self.optimizer_D_A_scaler.unscale_(self.optimizer_D_A)" in script
+    assert "self.optimizer_D_A_scaler.unscale_(self.optimizer_D_B)" in script
+    assert "self.optimizer_D_A_scaler.step(self.optimizer_D_A)" in script
+    assert "self.optimizer_D_A_scaler.step(self.optimizer_D_B)" in script
+
+    # scaler.update() called once per entry (not once per optimizer)
+    assert script.count("self.optimizer_D_A_scaler.update()") == 1
+
+
+def test_torch_backward_builder_gan_accumulation_all_backwards_first() -> None:
+    """GAN with gradient accumulation: all backward passes run first, steps are deferred."""
+    raw = {
+        "MIXED_PRECISION": False,
+        "ACCUMULATE_GRADIENTS": 4,
+        "BACKWARDS": [
+            ["loss_G", [["optimizer_G", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["G"]]]],
+            ["loss_D", [["optimizer_D", {"_obj_": [["_addr_", "torch.optim.Adam"]]}, ["D"]]]],
+        ],
+    }
+    script = TorchBackwardBuilder(raw=raw)(classname="GANAccumBackward").scripts[0]
+
+    # Loss scaling applied
+    assert "loss_G = loss_G / 4" in script
+    assert "loss_D = loss_D / 4" in script
+
+    # Both backward calls appear before 'if self.need_update:'
+    need_update_pos = script.index("if self.need_update:")
+    assert script.index("loss_G.backward(") < need_update_pos
+    assert script.index("loss_D.backward(") < need_update_pos
+
+    # Steps appear inside the conditional block
+    g_step_pos = script.index("self.optimizer_G.step()")
+    d_step_pos = script.index("self.optimizer_D.step()")
+    assert g_step_pos > need_update_pos
+    assert d_step_pos > need_update_pos
