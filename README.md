@@ -26,9 +26,9 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
     - [Dataset Configuration](#dataset-configuration)
     - [Distributed Training Notes](#distributed-training-notes)
   - [Configuration Examples](#configuration-examples)
-    - [`cfg/models/ConvNeXtV2.yaml`](#cfgmodelsconvnextv2yaml)
-    - [`cfg/backwards/ConvNeXtV2.yaml`](#cfgbackwardsconvnextv2yaml)
-    - [`cfg/datasets/default_timm.yaml`](#cfgdatasetsdefault_timmyaml)
+    - [`cfg/torch/models/ConvNeXtV2.yaml`](#cfgtorchmodelsconvnextv2yaml)
+    - [`cfg/torch/backwards/ConvNeXtV2.yaml`](#cfgtorchbackwardsconvnextv2yaml)
+    - [`cfg/torch/datasets/default_timm.yaml`](#cfgtorchdatasetsdefault_timmyaml)
   - [Schema Reference](#schema-reference)
     - [Template Parameters](#template-parameters)
       - [`PARAMETERS`](#parameters)
@@ -123,7 +123,7 @@ Omit any extra you do not need. For example, `uv sync --extra torch-cu130` is su
 
 ```text
 structcast-model/
-├── cfg/
+├── cfg/torch/
 │   ├── backwards/     # backward, optimizer, scheduler templates
 │   ├── datasets/      # reusable dataset/dataloader templates
 │   ├── losses/        # loss module templates
@@ -147,13 +147,13 @@ The main package areas are:
 | `builders/` | Converts validated YAML templates into intermediate representations, then renders Python source code.                                 |
 | `commands/` | Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)).                                                              |
 | `torch/`    | Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers. |
-| `cfg/`      | Declarative source of truth: YAML templates for models, backward logic, datasets, and runtime presets.                                |
+| `cfg/torch/`      | Declarative source of truth: YAML templates for models, backward logic, datasets, and runtime presets.                                |
 
 ## Core Workflow
 
 The repository follows a repeatable five-step workflow:
 
-1. **Write or reuse** YAML templates under `cfg/`.
+1. **Write or reuse** YAML templates under `cfg/torch/`.
 2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
 3. **Generate** Python source files for the model, loss, metric, and backward logic using `scm torch create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
@@ -198,14 +198,14 @@ This pattern is the bridge between generated source files and runtime commands l
 
 ### 1. Format Templates
 
-Use `scm format` to render a parameterized YAML template (such as [`cfg/datasets/default_timm.yaml`](cfg/datasets/default_timm.yaml)) into a concrete configuration file.
+Use `scm format` to render a parameterized YAML template (such as [`cfg/torch/datasets/default_timm.yaml`](cfg/torch/datasets/default_timm.yaml)) into a concrete configuration file.
 
 ```bash
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
     -o dataset_train.yaml \
     -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
     -o dataset_valid.yaml \
     -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 ```
@@ -219,12 +219,12 @@ What this does:
 
 ### 2. Generate a Model Class
 
-Generate a Python `nn.Module` from a YAML layer template (such as [`cfg/models/ConvNeXtV2.yaml`](cfg/models/ConvNeXtV2.yaml)).
+Generate a Python `nn.Module` from a YAML layer template (such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml)).
 
 ```bash
-scm torch create model cfg/models/ConvNeXtV2.yaml
-scm torch create model cfg/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
-scm torch create model cfg/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
 ```
 
 Useful options:
@@ -242,9 +242,9 @@ The ConvNeXtV2 template uses Jinja parameter groups to switch between backbone v
 Losses and metrics use the same `scm torch create model` command because they are also layer graphs.
 
 ```bash
-scm torch create model cfg/losses/cls.yaml -c Loss -o loss.py
-scm torch create model cfg/metrics/topk.yaml -c Metric -o metric.py
-scm torch create backward cfg/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
+scm torch create model cfg/torch/losses/cls.yaml -c Loss -o loss.py
+scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
+scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 ```
 
 The `scm torch create backward` command turns a backward template into a class that manages:
@@ -285,11 +285,11 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/others/ema.yaml \
+    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-    -c cfg/others/compile_default.yaml \
+    -c cfg/torch/others/compile_default.yaml \
     -e 5 \
     -T dataset_train.yaml \
     -V dataset_valid.yaml \
@@ -304,11 +304,11 @@ scm torch train \
     --matmul-precision high \
     -E Test \
     -A model.py \
-    -A cfg/others/ema.yaml \
+    -A cfg/torch/others/ema.yaml \
     -A loss.py \
     -A metric.py \
     -A backward.py \
-    -A cfg/others/compile_default.yaml \
+    -A cfg/torch/others/compile_default.yaml \
     -A dataset_train.yaml \
     -A dataset_valid.yaml
 ```
@@ -374,11 +374,11 @@ torchrun --nproc_per_node=gpu \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/others/ema.yaml \
+    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-    -c cfg/others/compile_default.yaml \
+    -c cfg/torch/others/compile_default.yaml \
     -e 5 \
     -T dataset_train.yaml \
     -V dataset_valid.yaml \
@@ -453,7 +453,7 @@ Dataset YAML files do **not** need per-rank customization. A single `device: cud
 
 ```bash
 # The same dataset YAML works for single-GPU and distributed training
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
     -o dataset_train.yaml \
     -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 ```
@@ -470,9 +470,9 @@ scm format cfg/datasets/default_timm.yaml \
 
 ## Configuration Examples
 
-The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow.
+The `cfg/torch/` directory contains working YAML templates that demonstrate each part of the workflow.
 
-### `cfg/models/ConvNeXtV2.yaml`
+### `cfg/torch/models/ConvNeXtV2.yaml`
 
 Demonstrates the model-building style used throughout the project:
 
@@ -482,7 +482,7 @@ Demonstrates the model-building style used throughout the project:
 - separate training and inference flow support
 - structured outputs such as `{cls: torch.tensor(...), ...}`
 
-### `cfg/backwards/ConvNeXtV2.yaml`
+### `cfg/torch/backwards/ConvNeXtV2.yaml`
 
 Demonstrates how backward logic is configured declaratively:
 
@@ -492,7 +492,7 @@ Demonstrates how backward logic is configured declaratively:
 - optimizer creation through `structcast_model.torch.optimizers.create_with_scheduler`
 - optional gradient clipping via `timm.utils.clip_grad.dispatch_clip_grad`
 
-### `cfg/datasets/default_timm.yaml`
+### `cfg/torch/datasets/default_timm.yaml`
 
 Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Covers:
 
@@ -595,7 +595,7 @@ When `backbone` resolves to `atto`, the `atto` group from `PARAMETERS` (merged w
 
 ### Model Template Schema
 
-The following keys appear in model configuration files such as [`cfg/models/ConvNeXtV2.yaml`](cfg/models/ConvNeXtV2.yaml). Each top-level key that is not `PARAMETERS` or a Jinja directive defines either the **root model** (using the reserved keys below) or a **named sublayer** (an arbitrary key whose value follows the same schema).
+The following keys appear in model configuration files such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml). Each top-level key that is not `PARAMETERS` or a Jinja directive defines either the **root model** (using the reserved keys below) or a **named sublayer** (an arbitrary key whose value follows the same schema).
 
 #### `IMPORTS`
 
@@ -718,7 +718,7 @@ The fourth (or third) element of a `FLOW` entry. Defines how the submodule for t
   ```yaml
   {TYPE: Backbone}
   {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}
-  {CFG: cfg/models/my_sublayer.yaml, TYPE: MySublayer}
+  {CFG: cfg/torch/models/my_sublayer.yaml, TYPE: MySublayer}
   ```
 
 #### `TYPE`, `PARAM`, and `CFG`
@@ -743,7 +743,7 @@ These three keys form the `UserLayer` dict that activates a named sublayer:
 
 ### Backward Template Schema
 
-The following keys appear in backward configuration files such as [`cfg/backwards/ConvNeXtV2.yaml`](cfg/backwards/ConvNeXtV2.yaml).
+The following keys appear in backward configuration files such as [`cfg/torch/backwards/ConvNeXtV2.yaml`](cfg/torch/backwards/ConvNeXtV2.yaml).
 
 #### `IMPORTS`
 
@@ -1082,7 +1082,7 @@ Builds a timm dataloader with support for:
 - Distributed device initialization
 - Optional `FlexSpec` output remapping
 
-The dataset template at `cfg/datasets/default_timm.yaml` formats into this wrapper.
+The dataset template at `cfg/torch/datasets/default_timm.yaml` formats into this wrapper.
 
 #### `TimmEmaWrapper`
 
@@ -1093,16 +1093,16 @@ Creates and updates `timm.utils.ModelEmaV3` instances and swaps them into infere
 ```bash
 uv sync --extra torch-cu130 --extra mlflow --extra flops
 
-scm torch create model cfg/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
-scm torch create model cfg/losses/cls.yaml -c Loss -o loss.py
-scm torch create model cfg/metrics/topk.yaml -c Metric -o metric.py
-scm torch create backward cfg/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm torch create model cfg/torch/losses/cls.yaml -c Loss -o loss.py
+scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
+scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
     -o dataset_train.yaml \
     -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 
-scm format cfg/datasets/default_timm.yaml \
+scm format cfg/torch/datasets/default_timm.yaml \
     -o dataset_valid.yaml \
     -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 
@@ -1110,11 +1110,11 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/others/ema.yaml \
+    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-    -c cfg/others/compile_default.yaml \
+    -c cfg/torch/others/compile_default.yaml \
     -e 5 \
     -T dataset_train.yaml \
     -V dataset_valid.yaml \
