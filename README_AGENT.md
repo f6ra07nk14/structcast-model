@@ -16,7 +16,7 @@ The active implementation is PyTorch-first. JAX and TensorFlow extras exist in `
 ## Repository Map
 
 ```text
-cfg/
+cfg/torch/
 ├── backwards/                 # Backward, optimizer, scheduler templates
 ├── datasets/                  # Reusable timm dataset/dataloader templates
 ├── losses/                    # Loss layer templates
@@ -54,7 +54,7 @@ tests/
 The following diagram shows how data moves through the system. Use this to understand which module to inspect when debugging or modifying a specific stage.
 
 ```text
-YAML template in cfg/
+YAML template in cfg/torch/
   |  TemplateLayer / TemplateBackward validation     <- builders/schema.py
   v
 Builder intermediate objects
@@ -296,7 +296,7 @@ These are [StructCast](https://github.com/f6ra07nk14/structcast) object pattern 
 
 ### Spec usage in the dataset template
 
-`cfg/datasets/default_timm.yaml` uses a `FlexSpec`-compatible mapping so dataloader batches can be transformed from positional `(input, target)` tuples into structured dictionaries such as `{image: ..., label: ...}`.
+`cfg/torch/datasets/default_timm.yaml` uses a `FlexSpec`-compatible mapping so dataloader batches can be transformed from positional `(input, target)` tuples into structured dictionaries such as `{image: ..., label: ...}`.
 
 ## Dynamic Import and Security Notes
 
@@ -357,9 +357,9 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 
-1. Generate `model.py` from `cfg/models/ConvNeXtV2.yaml`.
+1. Generate `model.py` from `cfg/torch/models/ConvNeXtV2.yaml`.
 2. Generate `loss.py`, `metric.py`, and `backward.py` from their respective templates.
-3. Format `dataset_train.yaml` and `dataset_valid.yaml` from `cfg/datasets/default_timm.yaml`.
+3. Format `dataset_train.yaml` and `dataset_valid.yaml` from `cfg/torch/datasets/default_timm.yaml`.
 4. Train through `scm torch train` using `_file_`-based StructCast object patterns.
 
 This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the training CLI (execution phase).
