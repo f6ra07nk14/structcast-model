@@ -84,20 +84,16 @@ class TorchBackwardIntermediate(BackwardIntermediate):
         return lines
 
     def _build_flow_no_accumulation(self) -> list[str]:
-        """Build per-entry flow (zero_grad → backward → step) for non-accumulation mode.
-
-        This ordering prevents gradient contamination across independent backward entries,
-        which is required for multi-optimizer training such as GAN.
-        """
+        """Build per-entry flow (backward → step → zero_grad) for non-accumulation mode."""
         has_mp = self.mixed_precision is not None
         flow: list[str] = []
         for L, kw, opts in self.backwards:
             scaler_opt = opts[0]
-            for n in opts:
-                flow.append(f"self.{n}.zero_grad()")
             backward_target = f"self.{scaler_opt}_scaler.scale({L})" if has_mp else L
             flow.append(f"{backward_target}.backward({kw})")
             flow.extend(self._entry_optimizer_steps(opts, indent=""))
+            for n in opts:
+                flow.append(f"self.{n}.zero_grad()")
         return flow
 
     def _build_flow_accumulation(self, indent: str) -> list[str]:

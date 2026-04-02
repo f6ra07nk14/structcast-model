@@ -97,27 +97,21 @@ def test_torch_backward_builder_renders_non_accumulation_without_mixed_precision
     assert "self.SGD.step()" in script
 
 
-def test_torch_backward_builder_no_accumulation_zero_grad_before_backward() -> None:
-    """Without accumulation, zero_grad is emitted before backward in each entry.
-
-    This per-entry ordering (zero_grad → backward → step) is what enables correct
-    multi-entry GAN training: when there is more than one BACKWARDS entry the
-    zero_grad at the start of entry N clears any gradients that accumulated in
-    shared models during entry N-1's backward pass.
-    """
+def test_torch_backward_builder_no_accumulation_zero_grad_after_step() -> None:
+    """Without accumulation, zero_grad is emitted after step in each entry (backward → step → zero_grad)."""
     raw = {
         "MIXED_PRECISION": False,
         "BACKWARDS": [["ce_loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]],
     }
     script = TorchBackwardBuilder(raw=raw)(classname="BackwardZeroGrad").scripts[0]
-    zero_pos = script.index("self.SGD.zero_grad()")
     backward_pos = script.index("ce_loss.backward(")
     step_pos = script.index("self.SGD.step()")
-    assert zero_pos < backward_pos < step_pos
+    zero_pos = script.index("self.SGD.zero_grad()")
+    assert backward_pos < step_pos < zero_pos
 
 
 def test_torch_backward_builder_gan_multi_entry_per_entry_flow() -> None:
-    """GAN: multiple BACKWARDS entries each get their own zero_grad → backward → step cycle."""
+    """GAN: multiple BACKWARDS entries each get their own backward → step → zero_grad cycle."""
     raw = {
         "MIXED_PRECISION": False,
         "BACKWARDS": [
@@ -136,17 +130,17 @@ def test_torch_backward_builder_gan_multi_entry_per_entry_flow() -> None:
     assert script.count("loss_D.backward(") == 1
 
     # Per-entry ordering: G cycle comes before D cycle
-    g_zero = script.index("self.optimizer_G.zero_grad()")
     g_back = script.index("loss_G.backward(")
     g_step = script.index("self.optimizer_G.step()")
-    d_zero = script.index("self.optimizer_D.zero_grad()")
+    g_zero = script.index("self.optimizer_G.zero_grad()")
     d_back = script.index("loss_D.backward(")
     d_step = script.index("self.optimizer_D.step()")
+    d_zero = script.index("self.optimizer_D.zero_grad()")
 
-    assert g_zero < g_back < g_step, "G entry must follow zero_grad → backward → step order"
-    assert d_zero < d_back < d_step, "D entry must follow zero_grad → backward → step order"
-    # D entry comes after G entry's step (sequential per-entry processing)
-    assert g_step < d_zero, "D entry must start after G entry completes"
+    assert g_back < g_step < g_zero, "G entry must follow backward → step → zero_grad order"
+    assert d_back < d_step < d_zero, "D entry must follow backward → step → zero_grad order"
+    # D entry comes after G entry's zero_grad (sequential per-entry processing)
+    assert g_zero < d_back, "D entry must start after G entry completes"
 
 
 def test_torch_backward_builder_gan_multi_entry_with_mixed_precision() -> None:
