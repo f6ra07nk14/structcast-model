@@ -29,6 +29,33 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
     - [`cfg/models/ConvNeXtV2.yaml`](#cfgmodelsconvnextv2yaml)
     - [`cfg/backwards/ConvNeXtV2.yaml`](#cfgbackwardsconvnextv2yaml)
     - [`cfg/datasets/default_timm.yaml`](#cfgdatasetsdefault_timmyaml)
+  - [Schema Reference](#schema-reference)
+    - [Template Parameters](#template-parameters)
+      - [`PARAMETERS`](#parameters)
+      - [`DEFAULT`](#default)
+      - [`SHARED`](#shared)
+      - [Named groups](#named-groups)
+      - [`_jinja_yaml_`](#_jinja_yaml_)
+      - [`_jinja_group_`](#_jinja_group_)
+    - [Model Template Schema](#model-template-schema)
+      - [`IMPORTS`](#imports)
+      - [`INPUTS`](#inputs)
+      - [`OUTPUTS`](#outputs)
+      - [`STRUCTURED_OUTPUT`](#structured_output)
+      - [`FLOW` and `INFERENCE_FLOW`](#flow-and-inference_flow)
+      - [`FLOW` entry format](#flow-entry-format)
+      - [`NAME`](#name)
+      - [`LAYER`](#layer)
+      - [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)
+    - [Backward Template Schema](#backward-template-schema)
+      - [`IMPORTS`](#imports-1)
+      - [`MIXED_PRECISION`](#mixed_precision)
+      - [`MIXED_PRECISION_TYPE`](#mixed_precision_type)
+      - [`ACCUMULATE_GRADIENTS`](#accumulate_gradients)
+      - [`BACKWARDS`](#backwards)
+      - [`LOSSES` and `MODELS`](#losses-and-models)
+      - [`BACKWARDS` entry keys](#backwards-entry-keys)
+      - [`OPTIMIZERS` entry keys](#optimizers-entry-keys)
   - [API Reference: `base_trainer.py`](#api-reference-base_trainerpy)
     - [Utility functions](#utility-functions)
       - [`get_dataset(dataset)`](#get_datasetdataset)
@@ -474,6 +501,376 @@ Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Cov
 - device and prefetch settings
 - mixup and cutmix options
 - train or validation split generation from one template
+
+## Schema Reference
+
+All configuration templates under `cfg/` follow a shared schema that controls how YAML files are parsed, rendered, and validated by the code generators. This section explains every top-level key and sub-key that appears in these templates.
+
+### Template Parameters
+
+Every YAML template may begin with an optional top-level `PARAMETERS` block that declares named sets of values consumed by the Jinja rendering engine.
+
+#### `PARAMETERS`
+
+The top-level container for all template variable groups. Any key nested inside `PARAMETERS` (other than `DEFAULT` and `SHARED`) is treated as a named group that can be selected at render time.
+
+```yaml
+PARAMETERS:
+  DEFAULT:
+    backbone: atto
+  SHARED:
+    drop_path_rate: 0.0
+    num_classes: 1000
+  atto:
+    dims: [40, 80, 160, 320]
+    depths: [2, 2, 6, 2]
+  femto:
+    dims: [48, 96, 192, 384]
+    depths: [2, 2, 6, 2]
+```
+
+#### `DEFAULT`
+
+Defines the default template variables. These values are active when no named group is selected and can be overridden at the command line with `-p 'DEFAULT: {key: value}'`.
+
+```yaml
+DEFAULT:
+  backbone: atto
+  epochs: 300
+  lr: 4.0e-3
+```
+
+#### `SHARED`
+
+Defines variables that are merged into **every** named group (including `DEFAULT`). Use `SHARED` for constants that apply to all backbone or variant choices.
+
+```yaml
+SHARED:
+  stem_kernel_size: 4
+  kernel_size: 7
+  norm_eps: 1.0e-6
+```
+
+#### Named groups
+
+Any key in `PARAMETERS` that is not `DEFAULT` or `SHARED` is a named parameter group — for example `atto`, `femto`, `tiny`, or `base`. A named group is activated via `_jinja_group_` and its variables (merged with `SHARED`) replace the template variables for that rendering scope.
+
+```yaml
+atto:
+  dims: [40, 80, 160, 320]
+  depths: [2, 2, 6, 2]
+femto:
+  dims: [48, 96, 192, 384]
+  depths: [2, 2, 6, 2]
+```
+
+#### `_jinja_yaml_`
+
+Embeds an inline Jinja template that is rendered and merged back into the surrounding YAML. The rendered result must itself be valid YAML. `_jinja_yaml_` blocks are evaluated with the currently active template variables and can emit any number of sibling YAML keys or list entries.
+
+```yaml
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+```
+
+Inside a `_jinja_yaml_` block you can also use standard Jinja control structures (`{% for %}`, `{% if %}`, `{% set %}`, etc.) as well as the custom filter `cumsum` (provided by `structcast_model.builders.jinja_filters`).
+
+#### `_jinja_group_`
+
+Selects a named parameter group from `PARAMETERS`, merging its values (together with `SHARED`) into the template variable scope for the enclosing block. `_jinja_group_` must appear alongside a `_jinja_yaml_` sibling that consumes the newly activated variables.
+
+```yaml
+- _jinja_group_: {{backbone}}
+  _jinja_yaml_: |-
+    - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+```
+
+When `backbone` resolves to `atto`, the `atto` group from `PARAMETERS` (merged with `SHARED`) becomes the local variable scope for the inner `_jinja_yaml_` block.
+
+---
+
+### Model Template Schema
+
+The following keys appear in model configuration files such as [`cfg/models/ConvNeXtV2.yaml`](cfg/models/ConvNeXtV2.yaml). Each top-level key that is not `PARAMETERS` or a Jinja directive defines either the **root model** (using the reserved keys below) or a **named sublayer** (an arbitrary key whose value follows the same schema).
+
+#### `IMPORTS`
+
+Additional Python imports to inject at the top of the generated file. Accepts a dict mapping module names to lists of names to import, or an empty dict `{}` when no extra imports are needed.
+
+```yaml
+IMPORTS: {}
+# or
+IMPORTS:
+  torch.nn: [Module, Linear]
+  my_package.utils: null  # imports the entire module
+```
+
+#### `INPUTS`
+
+Ordered list of tensor names that the generated `forward()` method accepts as keyword arguments. These names correspond to the first element of each `FLOW` entry and to the keys in the `inputs` dict passed at runtime.
+
+```yaml
+INPUTS: [image]
+```
+
+#### `OUTPUTS`
+
+Ordered list of tensor names produced by the generated `forward()` method. When `STRUCTURED_OUTPUT` is `true`, these names become the keys of the returned dict; otherwise, they determine the order of the returned tuple.
+
+```yaml
+OUTPUTS: [cls]
+# or, for a multi-output model:
+OUTPUTS: [feat1, feat2, feat3, feat4]
+```
+
+#### `STRUCTURED_OUTPUT`
+
+Controls the return type of the generated `forward()` method.
+
+| Value | Behavior |
+| ----- | -------- |
+| `true` | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
+| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`. |
+
+```yaml
+STRUCTURED_OUTPUT: true
+```
+
+#### `FLOW` and `INFERENCE_FLOW`
+
+`FLOW` is the training-time execution graph: an ordered list of `LayerBehavior` entries (see [`FLOW` entry format](#flow-entry-format) below) that describes how tensors are routed through the model's submodules.
+
+`INFERENCE_FLOW` is an optional alternative graph used only during inference — for example, to skip `DropPath` or other training-only layers. When `INFERENCE_FLOW` is absent, inference uses `FLOW` unchanged. Both fields must produce the same `INPUTS` and `OUTPUTS`.
+
+```yaml
+FLOW:
+  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+  - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 1000}}]]
+
+# DropPath sublayer uses a simpler inference path
+DropPath:
+  FLOW: [[inp, out, [_obj_, {_addr_: timm.layers.DropPath}, {_call_: {drop_prob: 0.1}}]]]
+  INFERENCE_FLOW: [[inp, out]]
+```
+
+#### `FLOW` entry format
+
+Each entry in `FLOW` or `INFERENCE_FLOW` is a `LayerBehavior` — a list of 2 to 4 elements:
+
+```
+[INPUTS, OUTPUTS]
+[INPUTS, OUTPUTS, NAME_or_LAYER]
+[INPUTS, OUTPUTS, NAME, LAYER]
+```
+
+| Position | Field | Description |
+| -------- | ----- | ----------- |
+| 0 | `INPUTS` | Input variable name(s) for this step. A plain string (`image`, `feat1`) reads a named tensor from the current scope. Use `_` to pass the previous step's output forward. A nested list `[[a, b]]` collects tensors from multiple sources (e.g., for residual additions). |
+| 1 | `OUTPUTS` | Output variable name(s) produced by this step. Use `_` for intermediate values that need not be named. A dict `{alias: real_name}` renames the output in the current scope. |
+| 2 | `NAME` | (optional) A unique identifier for the generated submodule attribute. Auto-generated when omitted. Must be a valid Python identifier. |
+| 2 or 3 | `LAYER` | (optional) The layer definition — either a StructCast `ObjectPattern` (e.g., `[_obj_, {_addr_: torch.nn.ReLU}, _call_]`) or a `UserLayer` dict (see [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)). |
+
+```yaml
+FLOW:
+  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+  - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
+  - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 1000}}]]
+```
+
+#### `NAME`
+
+`NAME` appears in two contexts:
+
+1. **As the third element of a `FLOW` entry** — sets the Python attribute name of the generated submodule (e.g., `"block0"`, `"head"`). Must be a valid Python identifier.
+2. **As a key in a `BACKWARDS` or `OPTIMIZERS` entry** — sets the generated method name for that backward or optimizer step.
+
+```yaml
+# In FLOW:
+- [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40}}}]
+
+# In BACKWARDS:
+BACKWARDS:
+  - NAME: backward
+    LOSS: ce_loss
+    OPTIMIZERS:
+      - NAME: optimizer
+        ...
+```
+
+#### `LAYER`
+
+The fourth (or third) element of a `FLOW` entry. Defines how the submodule for this step is constructed. Two forms are accepted:
+
+- **StructCast `ObjectPattern`** — an `[_obj_, ...]` list that constructs a standard PyTorch module:
+
+  ```yaml
+  [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: 40, kernel_size: 4, stride: 4}}]
+  ```
+
+- **`UserLayer` dict** — references a sublayer defined elsewhere in the same file (via `TYPE`) or in an external file (via `CFG`):
+
+  ```yaml
+  {TYPE: Backbone}
+  {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}
+  {CFG: cfg/models/my_sublayer.yaml, TYPE: MySublayer}
+  ```
+
+#### `TYPE`, `PARAM`, and `CFG`
+
+These three keys form the `UserLayer` dict that activates a named sublayer:
+
+| Key | Type | Description |
+| --- | ---- | ----------- |
+| `TYPE` | `str` | Name of a sublayer defined as a top-level key in the same YAML file (e.g., `Backbone`, `Block`, `Stem`). The code generator expands it into a nested `nn.Module` subclass. |
+| `PARAM` | `PARAMETERS` dict | Template variable overrides passed when rendering the sublayer. Uses the same `DEFAULT` / `SHARED` / named-group structure as the top-level `PARAMETERS` block. |
+| `CFG` | file path | Path to an external YAML file that defines the sublayer. Allows sublayer reuse across multiple model templates. When `CFG` is set, `TYPE` selects the sublayer name within that file. |
+
+```yaml
+# References Backbone sublayer defined in the same file, no parameter overrides
+- [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+
+# References Block sublayer with per-instance parameter overrides
+- [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}]
+```
+
+---
+
+### Backward Template Schema
+
+The following keys appear in backward configuration files such as [`cfg/backwards/ConvNeXtV2.yaml`](cfg/backwards/ConvNeXtV2.yaml).
+
+#### `IMPORTS`
+
+Same format as in the model schema. Injects additional Python imports into the generated backward file.
+
+```yaml
+IMPORTS: {}
+```
+
+#### `MIXED_PRECISION`
+
+Controls `torch.amp.GradScaler` for automatic mixed-precision training.
+
+| Value | Behavior |
+| ----- | -------- |
+| `false` (default) | AMP disabled; no `GradScaler` is created. |
+| `true` | AMP enabled with default `GradScaler` settings. |
+| `dict` | AMP enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler(...)`. |
+
+```yaml
+MIXED_PRECISION:
+  init_scale: "eval: 2.0**16"
+  growth_factor: 2.0
+  backoff_factor: 0.5
+  growth_interval: 2000
+  enabled: True
+```
+
+#### `MIXED_PRECISION_TYPE`
+
+The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Has no effect when `MIXED_PRECISION` is `false`.
+
+```yaml
+MIXED_PRECISION_TYPE: bfloat16
+```
+
+#### `ACCUMULATE_GRADIENTS`
+
+The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches.
+
+```yaml
+ACCUMULATE_GRADIENTS: null   # disabled
+ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
+```
+
+#### `BACKWARDS`
+
+An ordered list of `BackwardBehavior` entries. Each entry defines one backward pass — i.e., one loss to differentiate and one set of optimizers to update. Multiple entries are used for multi-loss or GAN-style training where different optimizers are stepped independently.
+
+```yaml
+BACKWARDS:
+  - NAME: backward
+    LOSS: ce_loss
+    OPTIMIZERS:
+      - NAME: optimizer
+        OPTIMIZER: [_obj_, ...]
+        LAYERS: model
+        CLIP: null
+```
+
+#### `LOSSES` and `MODELS`
+
+Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `BACKWARDS` entries.
+
+| Key | Type | Description |
+| --- | ---- | ----------- |
+| `LOSSES` | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`. |
+| `MODELS` | `list[str]` | Explicit list of model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].OPTIMIZERS[*].LAYERS` when left as `[]`. |
+
+```yaml
+LOSSES: []   # auto-inferred
+MODELS: []   # auto-inferred
+```
+
+#### `BACKWARDS` entry keys
+
+Each entry in `BACKWARDS` is a `BackwardBehavior` with the following fields:
+
+| Key | Type | Description |
+| --- | ---- | ----------- |
+| `NAME` | `str` | Optional identifier for this backward pass. Used as the generated class or method name. Must be a valid Python identifier. |
+| `LOSS` | `str` | The loss key (matching a key returned by the loss module) that this backward pass differentiates. |
+| `OPTIMIZERS` | `list` | One or more `OptimizerBehavior` entries that are executed in order during each training step (see [`OPTIMIZERS` entry keys](#optimizers-entry-keys)). |
+
+```yaml
+BACKWARDS:
+  - NAME: backward
+    LOSS: ce_loss
+    OPTIMIZERS:
+      - NAME: optimizer
+        OPTIMIZER: [_obj_, ...]
+        LAYERS: model
+```
+
+#### `OPTIMIZERS` entry keys
+
+Each entry in `OPTIMIZERS` is an `OptimizerBehavior` with the following fields:
+
+| Key | Type | Description |
+| --- | ---- | ----------- |
+| `NAME` | `str` | Optional identifier for this optimizer entry. Used as the generated attribute name. Must be a valid Python identifier. |
+| `OPTIMIZER` | StructCast pattern | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`. |
+| `LAYERS` | `str` or `list[str]` | Model parameter paths that this optimizer manages. Each value must be a valid Python attribute expression (e.g., `model` or `model.backbone`). The generated backward class calls `optimizer.param_groups` over these paths. |
+| `CLIP` | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `LAYERS`. Set to `null` to disable gradient clipping. |
+
+```yaml
+OPTIMIZERS:
+  - NAME: optimizer
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _bind_:
+          optimizer_kwargs:
+            opt: adamw
+            lr: 4.0e-3
+            weight_decay: 0.001
+          scheduler_kwargs:
+            name: cosine
+            num_epochs: 300
+    LAYERS: model
+    CLIP:
+      - _obj_
+      - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+      - _bind_: {value: 1.0, mode: norm, norm_type: 2.0}
+```
+
+---
 
 ## API Reference: `base_trainer.py`
 
