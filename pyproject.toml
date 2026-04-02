@@ -199,6 +199,7 @@ exclude = []
 [tool.ruff.lint.per-file-ignores]
 "src/structcast_model/**" = ["PT", "B028"]
 "src/structcast_model/commands/**" = ["PT", "B028", "B008"]
+"src/structcast_model/flax/layers/**" = ["PLC0415"]
 "tests/**" = ["S"]
 
 [tool.ruff.format]

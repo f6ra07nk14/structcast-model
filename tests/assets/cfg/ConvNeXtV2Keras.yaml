@@ -1,0 +1,45 @@
+PARAMETERS:
+  DEFAULT:
+    backbone: tiny
+  SHARED:
+    norm_eps: 1.0e-6
+    num_classes: 10
+  tiny:
+    dims: [8, 16]
+    depths: [1, 1]
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [cls]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - [image, {feature: feat2}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: keras.layers.GlobalAveragePooling2D}, _call_]]
+  - [_, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: 1.0e-6}}]]
+  - [_, cls, head, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: 10}}]]
+Backbone:
+  INPUTS: [image]
+  OUTPUTS: [feat1, feat2]
+  STRUCTURED_OUTPUT: true
+  FLOW:
+    - _jinja_yaml_: |-
+        - _jinja_group_: {{backbone}}
+        {% raw %}
+          _jinja_yaml_: |-
+            - [image, feat1, stem, {TYPE: Stem, PARAM: {DEFAULT: {fout: {{dims[0]}}}}}]
+            - [feat1, feat2, downsample, {TYPE: DownSample, PARAM: {DEFAULT: {fout: {{dims[1]}}}}}]
+        {% endraw %}
+Stem:
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - INPUTS: inp
+          OUTPUTS: out
+          LAYER:
+            - _obj_
+            - _addr_: keras.layers.Conv2D
+            - _call_: {filters: {{fout}}, kernel_size: 4, strides: 4, padding: same}
+DownSample:
+  OUTPUTS: [out]
+  FLOW:
+    - _jinja_yaml_: |-
+        - [inp, out, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{fout}}, kernel_size: 2, strides: 2, padding: same}}]]
