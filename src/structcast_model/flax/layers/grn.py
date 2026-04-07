@@ -3,16 +3,14 @@
 from types import MappingProxyType
 import typing as tp
 
-from flax.nnx import rnglib
+from flax.nnx import Module, Param, rnglib
 from flax.nnx.nn import dtypes, initializers
 from flax.typing import Axes, Dtype, Initializer, PromoteDtypeFn
 import jax
 import jax.numpy as jnp
 
-import flax
 
-
-class GlobalResponseNorm(flax.nnx.Module):
+class GlobalResponseNorm(Module):
     """Global Response Normalization (GRN) layer."""
 
     def __init__(
@@ -33,8 +31,8 @@ class GlobalResponseNorm(flax.nnx.Module):
     ) -> None:
         """Initializes the GRN layer."""
         feature_shape = (num_features,)
-        self.scale = flax.nnx.Param(scale_init(rngs.params(), feature_shape, param_dtype), **scale_metadata)
-        self.bias = flax.nnx.Param(bias_init(rngs.params(), feature_shape, param_dtype), **bias_metadata)
+        self.scale = Param(scale_init(rngs.params(), feature_shape, param_dtype), **scale_metadata)
+        self.bias = Param(bias_init(rngs.params(), feature_shape, param_dtype), **bias_metadata)
         self.num_features = num_features
         self.epsilon = epsilon
         self.dtype = dtype
