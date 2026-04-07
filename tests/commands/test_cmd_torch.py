@@ -31,8 +31,8 @@ from structcast_model.torch.trainer import (
 from tests import ASSETS_DIR
 import torch
 
-MODEL_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2.yaml")
-BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2Backward.yaml")
+MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
+BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
