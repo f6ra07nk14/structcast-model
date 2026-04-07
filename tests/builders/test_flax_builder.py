@@ -22,7 +22,7 @@ def test_flax_layer_intermediate_generates_call_method_without_inference_flow() 
         structured_output=False,
     )._get_layer_script("Unit", [])
     assert "class Unit(flax.nnx.Module):" in script
-    assert "def __call__(self, x, *, training: bool = True, **kwargs):" in script
+    assert "def __call__(self, x, *, training: bool | None = None, **kwargs):" in script
     assert "if training:" not in script
     assert "return y" in script
 
@@ -58,7 +58,7 @@ def test_flax_layer_intermediate_init_accepts_rngs() -> None:
         inference_flow=[],
         structured_output=False,
     )._get_layer_script("Unit", [])
-    assert "def __init__(self, rngs: flax.nnx.Rngs):" in script
+    assert "def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):" in script
 
 
 def test_flax_layer_intermediate_uses_inputs_outputs_attributes() -> None:
