@@ -21,8 +21,8 @@ def test_keras_layer_intermediate_generates_call_method_without_inference_flow()
         inference_flow=[],
         structured_output=False,
     )._get_layer_script("Unit", [])
-    assert "class Unit(keras.Layer):" in script
-    assert "def call(self, x, training=None, **kwargs):" in script
+    assert "class Unit(keras.layers.Layer):" in script
+    assert "def call(self, inputs, training=None, mask=None):" in script
     assert "if training:" not in script
     assert "return y" in script
 
@@ -39,7 +39,7 @@ def test_keras_layer_intermediate_generates_training_inference_branches() -> Non
         inference_flow=[("x", "y", None)],
         structured_output=False,
     )._get_layer_script("Unit", ["proj = keras.layers.Dense(units=4)"])
-    assert "class Unit(keras.Layer):" in script
+    assert "class Unit(keras.layers.Layer):" in script
     assert "if training:" in script
     assert "else:" in script
     assert "self.proj = keras.layers.Dense(units=4)" in script
@@ -89,7 +89,7 @@ def test_keras_builder_builds_intermediate_and_scripts() -> None:
     assert built.classname == "TinyNet"
     assert "keras" in built.collected_imports
     assert len(built.scripts) == 1
-    assert "class TinyNet(keras.Layer):" in built.scripts[0]
+    assert "class TinyNet(keras.layers.Layer):" in built.scripts[0]
 
 
 def test_keras_builder_structured_output_returns_dict() -> None:
@@ -116,7 +116,7 @@ def test_keras_builder_cfg_convnext_builds_expected_topology() -> None:
     assert "backbone" in built.layers
     assert "head" in built.layers
     assert len(built.scripts) > 0
-    assert "class ConvNeXtKerasTiny(keras.Layer):" in built.scripts[-1]
+    assert "class ConvNeXtKerasTiny(keras.layers.Layer):" in built.scripts[-1]
 
 
 @pytest.mark.parametrize("backbone", ["tiny"])
