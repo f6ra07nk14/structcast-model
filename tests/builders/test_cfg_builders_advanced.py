@@ -9,7 +9,7 @@ from tests import ASSETS_DIR
 def test_cfg_convnext_model_builds_expected_topology() -> None:
     """Build ConvNeXt model from cfg and check key topology outputs."""
     parameters = {"DEFAULT": {"backbone": "atto", "num_classes": 8}}
-    builder = TorchBuilder.from_path(ASSETS_DIR / "cfg/ConvNeXtV2.yaml")
+    builder = TorchBuilder.from_path(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
     built = builder(parameters=parameters, classname="ConvNeXtAtto")
     assert built.classname == "ConvNeXtAtto"
     assert built.structured_output is True
@@ -30,7 +30,7 @@ def test_cfg_convnext_backward_supports_accumulation_and_mp() -> None:
             "clip_grad_norm": 2.0,
         }
     }
-    builder = TorchBackwardBuilder.from_path(ASSETS_DIR / "cfg/ConvNeXtV2Backward.yaml")
+    builder = TorchBackwardBuilder.from_path(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")
     built = builder(parameters=parameters, classname="ConvNeXtBackward")
     script = built.scripts[0]
     assert built.classname == "ConvNeXtBackward"
@@ -46,4 +46,4 @@ def test_cfg_convnext_backward_invalid_layer_decay_type_raises() -> None:
     """Raise from Jinja filter when unsupported layer_decay_type is provided."""
     parameters = {"DEFAULT": {"layer_decay_type": "not-supported"}}
     with pytest.raises(ValueError, match="Invalid layer_decay_type"):
-        TorchBackwardBuilder.from_path(ASSETS_DIR / "cfg/ConvNeXtV2Backward.yaml")(parameters=parameters)
+        TorchBackwardBuilder.from_path(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")(parameters=parameters)

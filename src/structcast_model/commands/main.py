@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from structcast.utils.base import dump_yaml, dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-from structcast_model.commands import cmd_torch
+from structcast_model.commands import cmd_flax, cmd_keras, cmd_torch
 from structcast_model.commands.utils import dict_parser, reduce_dict
 
 if TYPE_CHECKING:
@@ -22,6 +22,8 @@ else:
 
 app = Typer(invoke_without_command=True, no_args_is_help=True, help="StructCast Model CLI application.")
 app.add_typer(cmd_torch.app, name="torch", help="PyTorch related commands.")
+app.add_typer(cmd_keras.app, name="keras", help="Keras related commands.")
+app.add_typer(cmd_flax.app, name="flax", help="Flax nnx related commands.")
 
 
 @app.command(name="format")

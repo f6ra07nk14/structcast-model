@@ -116,8 +116,8 @@ def test_resolve_getter_rejects_unknown_identifier(monkeypatch: pytest.MonkeyPat
 
 def test_base_model_builder_from_path_and_user_defined_entry() -> None:
     """Build from path and resolve a named user-defined layer."""
-    builder = BaseModelBuilder.from_path(ASSETS_DIR / "cfg/ConvNeXtV2.yaml")
-    assert builder.current_path.endswith("cfg/ConvNeXtV2.yaml")
+    builder = BaseModelBuilder.from_path(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
+    assert builder.current_path.endswith("cfg/torch/ConvNeXtV2.yaml")
     assert builder.from_references[builder.current_path] == ["__root__"]
     sublayer = builder(classname="BackboneOnly", user_defined_layer="Backbone")
     assert sublayer.classname == "BackboneOnly"
