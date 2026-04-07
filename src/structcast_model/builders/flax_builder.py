@@ -60,14 +60,20 @@ class FlaxLayerIntermediate(LayerIntermediate):
         return f"""\
 class {class_name}(flax.nnx.Module):
 
-    def __init__(self, rngs: flax.nnx.Rngs):
+    def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
+        self.training = training
         {init_body}
 
-    def __call__(self, {inputs}*, training: bool = True, **kwargs):
+    def __call__(self, {inputs}*, training: bool | None = None, **kwargs):
+        training = self.training if training is None else training
         {sep.join(codes)}
         return {self._forward_outputs}
+
+    def set_view(self, training: bool | None = None):
+        if training is not None:
+            self.training = training
 """
 
 
