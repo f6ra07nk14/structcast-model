@@ -51,8 +51,8 @@ FLOW:
       {% raw %}
         _jinja_yaml_: |-
           - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dims[-1]}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+          - [_, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dims[-1]}}, out_features: {{num_classes}}, rngs: "eval: rngs"}}]]
       {% endraw %}
-      - [_, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dims[-1]}}, out_features: {{num_classes}}, rngs: "eval: rngs"}}]]
 Backbone:
   INPUTS: [image]
   OUTPUTS: [feat1, feat2, feat3, feat4]
@@ -152,9 +152,9 @@ Block:
           - {_addr_: flax.nnx.Linear}
           - {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"}}
       - INPUTS: _
-        OUTPUTS: _
+        OUTPUTS: feat
         LAYER:
           - _obj_
           - {_addr_: flax.nnx.Dropout}
-          - {_call_: {rate: {{drop_prob}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}
+          - {_call_: {rate: {{drop_path}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}
       - ["eval: inp + feat", out, null]
