@@ -3,18 +3,14 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
-from structcast_model.builders.base_builder import (
-    BaseModelBuilder,
-    LayerIntermediate,
-)
+from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
 
 
 class KerasLayerIntermediate(LayerIntermediate):
     """Intermediate representation of a Keras layer.
 
-    Generates a ``keras.Layer`` subclass with a ``call`` method that
-    accepts a ``training`` keyword argument, propagating it to every
-    sub-layer call to support Keras's standard training/inference mode.
+    Generates a ``keras.Layer`` subclass with a ``call`` method that accepts a ``training`` keyword argument,
+    propagating it to every sub-layer call to support Keras's standard training/inference mode.
 
     Example:
         >>> from structcast_model.builders.keras_builder import KerasLayerIntermediate
@@ -28,7 +24,7 @@ class KerasLayerIntermediate(LayerIntermediate):
         ...     inference_flow=[],
         ...     structured_output=False,
         ... )._get_layer_script("Unit", [])
-        >>> "class Unit(keras.Layer):" in script
+        >>> "class Unit(keras.layers.Layer):" in script
         True
     """
 
@@ -60,7 +56,7 @@ class KerasLayerIntermediate(LayerIntermediate):
         inputs += ", " if inputs else ""
         init_body = sep.join([f"self.{v}" for v in initialized_layers]) if initialized_layers else "pass"
         return f"""\
-class {class_name}(keras.Layer):
+class {class_name}(keras.layers.Layer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -68,7 +64,13 @@ class {class_name}(keras.Layer):
         self.output_names = {self.outputs}
         {init_body}
 
-    def call(self, {inputs}training=None, **kwargs):
+    def call(self, inputs, training=None, mask=None):
+        if isinstance(inputs, dict):
+            {(sep + indent).join([f"{i} = inputs.pop({i!r}, None)" for i in self.inputs])}
+            kwargs = inputs
+        else:
+            {self._forward_inputs or "inputs"} = inputs
+            kwargs = {{}}
         {sep.join(codes)}
         return {self._forward_outputs}
 """
@@ -78,9 +80,8 @@ class {class_name}(keras.Layer):
 class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
     """Builder for Keras models.
 
-    Generates Python scripts containing ``keras.Layer`` subclasses from a
-    YAML template, following the same template-to-code pipeline as
-    :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
+    Generates Python scripts containing ``keras.Layer`` subclasses from a YAML template,
+    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
 
     Example:
         >>> from structcast_model.builders.keras_builder import KerasBuilder
