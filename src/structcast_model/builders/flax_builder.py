@@ -3,20 +3,15 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
-from structcast_model.builders.base_builder import (
-    BaseModelBuilder,
-    LayerIntermediate,
-)
+from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
 
 
 class FlaxLayerIntermediate(LayerIntermediate):
     """Intermediate representation of a Flax nnx module.
 
-    Generates a ``flax.nnx.Module`` subclass whose ``__init__`` accepts a
-    ``rngs: flax.nnx.Rngs`` argument (passed down to sub-module constructors
-    via ``eval: rngs`` in the YAML template) and whose ``__call__`` accepts a
-    ``training: bool`` keyword argument for toggling training vs. inference
-    behaviour.
+    Generates a ``flax.nnx.Module`` subclass whose ``__init__`` accepts a ``rngs: flax.nnx.Rngs`` argument
+    (passed down to sub-module constructors via ``eval: rngs`` in the YAML template) and
+    whose ``__call__`` accepts a ``training: bool`` keyword argument for toggling training vs. inference behaviour.
 
     Example:
         >>> from structcast_model.builders.flax_builder import FlaxLayerIntermediate
@@ -81,13 +76,11 @@ class {class_name}(flax.nnx.Module):
 class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     """Builder for Flax nnx models.
 
-    Generates Python scripts containing ``flax.nnx.Module`` subclasses from
-    a YAML template, following the same template-to-code pipeline as
-    :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
+    Generates Python scripts containing ``flax.nnx.Module`` subclasses from a YAML template,
+    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
 
-    Sub-modules that require a random-number generator should receive
-    ``rngs: "eval: rngs"`` in their ``_call_`` arguments so that the
-    builder emits ``rngs=rngs`` in the generated ``__init__`` body.
+    Sub-modules that require a random-number generator should receive ``rngs: "eval: rngs"`` in
+    their ``_call_`` arguments so that the builder emits ``rngs=rngs`` in the generated ``__init__`` body.
 
     Example:
         >>> from structcast_model.builders.flax_builder import FlaxBuilder
