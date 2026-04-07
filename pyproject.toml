@@ -62,6 +62,7 @@ keras-torch-cu128 = ["keras>=3.13.2", "structcast-model[torch-cu128]"]
 keras-torch-cu130 = ["keras>=3.13.2", "structcast-model[torch-cu130]"]
 keras-tf-cpu = ["keras>=3.13.2", "structcast-model[tf-cpu]"]
 keras-tf-cu12 = ["keras>=3.13.2", "structcast-model[tf-cu12]"]
+all-cpu = ["structcast-model[jax-cpu]", "structcast-model[torch-cpu]", "structcast-model[tf-cpu]"]
 ptflops = ["ptflops>=0.7.5"]
 calflops = ["calflops>=0.3.2", "transformers[torch]>=4.56.1"]
 flops = ["structcast-model[ptflops,calflops]"]
@@ -90,6 +91,7 @@ conflicts = [
         { extra = "keras-torch-cu130" },
         { extra = "keras-tf-cpu" },
         { extra = "keras-tf-cu12" },
+        { extra = "all-cpu" },
     ],
 ]
 
@@ -199,7 +201,6 @@ exclude = []
 [tool.ruff.lint.per-file-ignores]
 "src/structcast_model/**" = ["PT", "B028"]
 "src/structcast_model/commands/**" = ["PT", "B028", "B008"]
-"src/structcast_model/flax/layers/**" = ["PLC0415"]
 "tests/**" = ["S"]
 
 [tool.ruff.format]
