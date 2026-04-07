@@ -119,7 +119,7 @@ Block:
         - [_, _, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{fout}}}}]]
         - [_, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelFirst}, _call_]]
         - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
-        - [[[inp, feat]], out, [_obj_, {_addr_: structcast_model.torch.layers.Add}, _call_]]
+        - ["eval: inp + feat", out, null]
 LayerNorm: # support channel first
   OUTPUTS: [out]
   FLOW:
