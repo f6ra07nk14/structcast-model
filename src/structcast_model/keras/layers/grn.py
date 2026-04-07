@@ -35,7 +35,7 @@ class GlobalResponseNormalization(keras.layers.Layer):
         gamma_regularizer: Any | None = None,
         beta_constraint: Any | None = None,
         gamma_constraint: Any | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Initializes the GRN layer."""
         super().__init__(**kwargs)
