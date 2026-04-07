@@ -2,50 +2,42 @@ PARAMETERS:
   DEFAULT:
     backbone: atto
   SHARED:
+    image_channels: 3
     stem_kernel_size: 4
     kernel_size: 7
     drop_path_rate: 0.
     norm_eps: 1.0e-6
-    activation: flax.nnx.gelu
+    activation: gelu
     mlp_ratio: 4
     num_classes: 1000
   # backbone model parameters
   atto:
     dims: [40, 80, 160, 320]
     depths: [2, 2, 6, 2]
-    fin: 3
   femto:
     dims: [48, 96, 192, 384]
     depths: [2, 2, 6, 2]
-    fin: 3
   pico:
     dims: [64, 128, 256, 512]
     depths: [2, 2, 6, 2]
-    fin: 3
   nano:
     dims: [80, 160, 320, 640]
     depths: [2, 2, 8, 2]
-    fin: 3
   tiny:
     dims: [96, 192, 384, 768]
     depths: [3, 3, 9, 3]
-    fin: 3
   small:
     dims: [96, 192, 384, 768]
     depths: [3, 3, 27, 3]
-    fin: 3
   base:
     dims: [128, 256, 512, 1024]
     depths: [3, 3, 27, 3]
-    fin: 3
   large:
     dims: [192, 384, 768, 1536]
     depths: [3, 3, 27, 3]
-    fin: 3
   huge:
     dims: [352, 704, 1408, 2816]
     depths: [3, 3, 27, 3]
-    fin: 3
 IMPORTS: {}
 INPUTS: [image]
 OUTPUTS: [cls]
@@ -53,7 +45,7 @@ STRUCTURED_OUTPUT: true
 FLOW:
   - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
   # Global average pool: mean over spatial axes (H, W) → (B, C)
-  - [feature, _, [_obj_, {_addr_: structcast_model.flax.layers.GlobalAveragePool2D}, _call_]]
+  - ["eval: feature.mean(axis=(1, 2))", _, null]
   - _jinja_yaml_: |-
       - _jinja_group_: {{backbone}}
       {% raw %}
@@ -71,7 +63,7 @@ Backbone:
         {% raw %}
           _jinja_yaml_: |-
             {% set cum_depths = [0] + depths | cumsum %}
-            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fin: {{fin}}, fout: {{dims[0]}}}}}]
+            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fin: {{image_channels}}, fout: {{dims[0]}}}}}]
             {% for i in range(cum_depths[0], cum_depths[1]) %}
             - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}}}}]
             {% endfor %}
@@ -104,52 +96,64 @@ Stem:
                 strides: [{{stem_kernel_size}}, {{stem_kernel_size}}]
                 padding: SAME
                 rngs: "eval: rngs"
-        - [_, out, {TYPE: LayerNorm, PARAM: {DEFAULT: {fout: {{fout}}, norm_eps: {{norm_eps}}}}}]
+        - [_, out, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
 DownSample:
   OUTPUTS: [out]
-  FLOW:
-    - _jinja_yaml_: |-
-        - [inp, _, {TYPE: LayerNorm, PARAM: {DEFAULT: {fout: {{fin}}, norm_eps: {{norm_eps}}}}}]
-        - [_, out, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [2, 2], strides: [2, 2], padding: SAME, rngs: "eval: rngs"}}]]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fin}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - INPUTS: _
+        OUTPUTS: out
+        LAYER:
+          - _obj_
+          - _addr_: flax.nnx.Conv
+          - _call_:
+              in_features: {{fin}}
+              out_features: {{fout}}
+              kernel_size: [2, 2]
+              strides: [2, 2]
+              padding: SAME
+              rngs: "eval: rngs"
 Block:
   OUTPUTS: [out]
-  FLOW:
-    - _jinja_yaml_: |-
-        - INPUTS: inp
-          OUTPUTS: _
-          LAYER:
-            - _obj_
-            - _addr_: flax.nnx.Conv
-            - _call_:
-                in_features: {{fout}}
-                out_features: {{fout}}
-                kernel_size: [{{kernel_size}}, {{kernel_size}}]
-                strides: [1, 1]
-                padding: SAME
-                feature_group_count: {{fout}}
-                rngs: "eval: rngs"
-        - [_, _, {TYPE: LayerNorm, PARAM: {DEFAULT: {fout: {{fout}}, norm_eps: {{norm_eps}}}}}]
-        - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"}}]]
-        - [_, _, [_obj_, {_addr_: "{{activation}}"}]]
-        - [_, _, {TYPE: GlobalResponseNorm, PARAM: {DEFAULT: {units: "eval: {{fout}} * {{mlp_ratio}}", norm_eps: {{norm_eps}}}}}]
-        - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"}}]]
-        - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
-        - [[[inp, feat]], out, [_obj_, {_addr_: structcast_model.flax.layers.Add}, _call_]]
-LayerNorm:
-  OUTPUTS: [out]
-  FLOW:
-    - _jinja_yaml_: |-
-        - [inp, out, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-GlobalResponseNorm:
-  # Simplified Global Response Normalization:
-  # applies a learnable linear transform over the channel dimension.
-  OUTPUTS: [out]
-  FLOW:
-    - _jinja_yaml_: |-
-        - [inp, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{units}}, out_features: {{units}}, rngs: "eval: rngs"}}]]
-        - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{units}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-        - [[[inp, _]], out, [_obj_, {_addr_: structcast_model.flax.layers.Add}, _call_]]
+  _jinja_yaml_: |-
+    FLOW: 
+      - INPUTS: inp
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - _addr_: flax.nnx.Conv
+          - _call_:
+              in_features: {{fout}}
+              out_features: {{fout}}
+              kernel_size: [{{kernel_size}}, {{kernel_size}}]
+              strides: [1, 1]
+              padding: SAME
+              feature_group_count: {{fout}}
+              rngs: "eval: rngs"
+      - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - INPUTS: _
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - {_addr_: flax.nnx.Linear}
+          - {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"}}
+      - [_, _, [_obj_, {_addr_: "flax.nnx.{{activation}}"}]]
+      - INPUTS: _
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - {_addr_: structcast_model.flax.layers.GlobalResponseNorm}
+          - {_call_: {num_features: "eval: {{fout}} * {{mlp_ratio}}", epsilon: {{norm_eps}}, rngs: "eval: rngs"}}
+      - INPUTS: _
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - {_addr_: flax.nnx.Linear}
+          - {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"}}
+      - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: inp + feat", out, null]
 DropPath:
   _jinja_yaml_: |-
-    FLOW: [[inp, out, [_obj_, {_addr_: structcast_model.flax.layers.DropPath}, {_call_: {drop_prob: {{drop_prob}}}}]]]
+    FLOW: [[inp, out, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{drop_prob}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}]]]
   INFERENCE_FLOW: [[inp, out]]
