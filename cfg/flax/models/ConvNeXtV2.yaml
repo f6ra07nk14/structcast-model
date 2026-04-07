@@ -151,9 +151,10 @@ Block:
           - _obj_
           - {_addr_: flax.nnx.Linear}
           - {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"}}
-      - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - INPUTS: _
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - {_addr_: flax.nnx.Dropout}
+          - {_call_: {rate: {{drop_prob}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}
       - ["eval: inp + feat", out, null]
-DropPath:
-  _jinja_yaml_: |-
-    FLOW: [[inp, out, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{drop_prob}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}]]]
-  INFERENCE_FLOW: [[inp, out]]
