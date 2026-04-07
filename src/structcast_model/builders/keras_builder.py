@@ -41,10 +41,7 @@ class KerasLayerIntermediate(LayerIntermediate):
 
     def _forward_flow(self, flow: list[tuple[str, str, str | None]]) -> list[str]:
         """Generate call expressions that forward the ``training`` flag to sub-layers."""
-        return [
-            f"{o} = {self._get_layer(L)}({i}, training=training)" if L else f"{o} = {i}"
-            for i, o, L in flow
-        ]
+        return [f"{o} = {self._get_layer(L)}({i}, training=training)" if L else f"{o} = {i}" for i, o, L in flow]
 
     def _get_layer_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Return the Python class script for a Keras layer."""
