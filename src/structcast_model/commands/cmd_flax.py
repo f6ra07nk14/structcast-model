@@ -1,17 +1,35 @@
 """Flax related commands for the StructCast Model CLI application."""
 
-from typing import TYPE_CHECKING
+from time import time
+from typing import TYPE_CHECKING, Any
 
+from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.commands.utils import dict_parser, reduce_dict
+from structcast_model.commands.utils import (
+    bool_or_path_or_dict_parser,
+    dict_parser,
+    instantiate,
+    path_or_any_parser,
+    reduce_dict,
+    tensor_shape_parser,
+)
 
 if TYPE_CHECKING:
+    import jax
+    from structcast.core import instantiator
+
+    from flax import nnx
     from structcast_model.builders import flax_builder
+    from structcast_model.flax import trainer as flax_trainer
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
+    jax = LazyModuleImporter("jax")
+    instantiator = LazyModuleImporter("structcast.core.instantiator")
+    nnx = LazyModuleImporter("flax.nnx")
     flax_builder = LazyModuleImporter("structcast_model.builders.flax_builder")
+    flax_trainer = LazyModuleImporter("structcast_model.flax.trainer")
 
 
 app = Typer(no_args_is_help=True)
@@ -29,6 +47,31 @@ template_param = Option(
     'For example: --parameter "model: {input_size: 128, output_size: 10}"',
 )
 output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
+model_pattern = Argument(
+    parser=path_or_any_parser,
+    help="The object pattern used to instantiate models. "
+    "For example, if the model is defined as `my_package.MyModel(...)`, "
+    'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
+    '"[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+)
+shapes = Option(
+    None,
+    "--shape",
+    "-s",
+    parser=tensor_shape_parser,
+    help="Input tensor shapes as a dictionary, e.g., 'image: [224, 224, 3]'.",
+)
+device = Option(
+    None,
+    "--device",
+    "-d",
+)
+compile_pattern: dict[str, Any] | None = Option(
+    None,
+    "--compile",
+    "-c",
+    parser=bool_or_path_or_dict_parser,
+)
 
 
 @creator.command(name="model")
@@ -49,6 +92,51 @@ def create_model(
         forced_structured_output=structured_output,
         user_defined_layer=sublayer,
     )(output)
+
+
+@app.command(name="time")
+def measure_inference_time(
+    model_pattern: Any = model_pattern,
+    shapes: dict | None = shapes,
+    device: str | None = device,
+    compile_pattern: dict[str, Any] | None = compile_pattern,
+    training_mode: bool = Option(
+        False,
+        help="Whether to set the model to training mode during inference time measurement. "
+        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
+    ),
+    training_mode_kwargs_pattern: dict[str, Any] | None = Option(
+        None,
+        "--training-mode-kwargs",
+        parser=bool_or_path_or_dict_parser,
+        help="Additional keyword arguments for the model view when `--training-mode` is set. "
+        "This should be a dictionary of keyword arguments for `nnx.view` when `--training-mode` is true. "
+        'For example: --training-mode-kwargs "{deterministic: false, use_running_average: false}"',
+    ),
+    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
+    batch_size: int = Option(
+        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
+    ),
+) -> None:
+    """Measure the average inference time of a Flax model."""
+    configure_security(allowed_modules_check=False)
+    jax_device = flax_trainer.get_jax_device(device)
+    training_mode_kw = (
+        {"training": training_mode, "deterministic": not training_mode, "use_running_average": not training_mode}
+        if training_mode_kwargs_pattern is None
+        else instantiate(training_mode_kwargs_pattern)
+    )
+    model = nnx.view(instantiate(model_pattern), **training_mode_kw)
+    if compile_pattern:
+        model = nnx.jit(model, device=jax_device, **instantiator.instantiate(compile_pattern))(model)
+    elapsed_time = 0.0
+    for _ in range(times):
+        inputs = jax.device_put(flax_trainer.create_jax_inputs(shapes, batch_size=batch_size), device=jax_device)
+        elapsed_time -= time()
+        jax.block_until_ready(model(**inputs))
+        elapsed_time += time()
+    mode_str = "training" if training_mode else "evaluation"
+    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
 
 
 __all__ = ["app"]
