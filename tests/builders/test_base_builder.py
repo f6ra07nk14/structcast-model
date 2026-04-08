@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from pathlib import Path
+from typing import TypeAlias
 
 import pytest
 from structcast.core.exceptions import SpecError
@@ -244,7 +245,7 @@ def test_base_backward_builder_mixed_precision_default_raises() -> None:
 def test_intermediate_get_scripts_raises_not_implemented() -> None:
     """_Intermediate._get_scripts must be overridden; calling it bare raises."""
     # LazySelectedImporter only exposes __all__; get _Intermediate via function globals.
-    _Intermediate = resolve_object.__globals__["_Intermediate"]
+    _Intermediate: TypeAlias = resolve_object.__globals__["_Intermediate"]
 
     class _BareIntermediate(_Intermediate):
         """Subclass that does NOT override _get_scripts."""
