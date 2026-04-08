@@ -17,14 +17,16 @@ from structcast_model.commands.utils import (
 )
 
 if TYPE_CHECKING:
+    from structcast.core import instantiator
+
     import keras
     from structcast_model.builders import keras_builder
     from structcast_model.keras import trainer as keras_trainer
     import torch
-
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
+    instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
     keras_builder = LazyModuleImporter("structcast_model.builders.keras_builder")
     keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
@@ -131,7 +133,7 @@ def measure_inference_time(
     elif device not in devices:
         raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices}")
     model = keras_trainer.initial_model(instantiate(model_pattern), shapes)
-    model.compile(optimizer=None, **(instantiate(compile_pattern) if compile_pattern else {}))
+    model.compile(optimizer=None, **(instantiator.instantiate(compile_pattern) if compile_pattern else {}))
     sync = _get_sync_fn(device)
     elapsed_time = 0.0
     for _ in range(times):
