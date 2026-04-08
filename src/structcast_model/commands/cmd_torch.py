@@ -217,7 +217,7 @@ def measure_inference_time(
         model = instantiate(model_pattern)
         torch_trainer.initial_model(model, shapes)
 
-    model = _compile_module(model, instantiator.instantiate(compile_pattern))
+    model = _compile_module(model, instantiate(compile_pattern))
     if training_mode:
         model.train()
     else:
