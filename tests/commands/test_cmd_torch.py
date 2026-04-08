@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BestCriterion, callbacks_session
 from structcast_model.commands.cmd_torch import app
+from structcast_model.commands.utils import instantiate
 from structcast_model.torch.trainer import (
     TimmEmaWrapper,
     TorchTracker,
@@ -31,20 +32,19 @@ from structcast_model.torch.trainer import (
 from tests import ASSETS_DIR
 import torch
 
-MODEL_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2.yaml")
-BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "ConvNeXtV2Backward.yaml")
+MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
+BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
 # ---------------------------------------------------------------------------
 
-_CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__  # type: ignore[union-attr]
+_CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 
 # Access private functions from cmd_torch via its module globals
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _get_state_dict = _CMD_GLOBALS["_get_state_dict"]
-_instantiate = _CMD_GLOBALS["_instantiate"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 _log_criteria = _CMD_GLOBALS["_log_criteria"]
 _on_best = _CMD_GLOBALS["_on_best"]
@@ -194,7 +194,7 @@ def _make_instantiate_fn(
     loss: torch.nn.Module | None = None,
     metric: torch.nn.Module | None = None,
 ) -> Any:
-    """Build a replacement for ``_instantiate`` that returns real objects."""
+    """Build a replacement for ``instantiate`` that returns real objects."""
     _loss = loss if loss is not None else _SimpleLoss()
     _metric = metric if metric is not None else _SimpleMetric()
 
@@ -335,7 +335,7 @@ def test_calflops_runs_with_real_model(cli_runner: CliRunner) -> None:
     """'calflops' should run calflops on a real model and print FLOPs, MACs, parameters."""
     configure_security(allowed_modules_check=False)
 
-    deps = {"_instantiate": lambda raw: _SimpleModel()}
+    deps = {"instantiate": lambda raw: _SimpleModel()}
     with patch_cmd_globals(**deps):
         result = cli_runner.invoke(
             app,
@@ -369,23 +369,23 @@ def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _instantiate – direct unit test
+# instantiate – direct unit test (now in commands.utils)
 # ---------------------------------------------------------------------------
 
 
 def test_instantiate_builds_object_from_pattern() -> None:
-    """_instantiate() resolves an ObjectPattern and returns the built instance."""
+    """instantiate() resolves an ObjectPattern and returns the built instance."""
     configure_security(allowed_modules_check=False)
     raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_call_", {}]]}
-    result = _instantiate(raw)
+    result = instantiate(raw)
     assert isinstance(result, torch.nn.Identity)
 
 
 def test_instantiate_builds_linear_with_args() -> None:
-    """_instantiate() builds a torch.nn.Linear with keyword arguments."""
+    """instantiate() builds a torch.nn.Linear with keyword arguments."""
     configure_security(allowed_modules_check=False)
     raw = {"_obj_": [["_addr_", "torch.nn.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
-    result = _instantiate(raw)
+    result = instantiate(raw)
     assert isinstance(result, torch.nn.Linear)
     assert result.in_features == 8
     assert result.out_features == 4
@@ -641,7 +641,7 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
     configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
     deps = {
-        "_instantiate": _make_instantiate_fn(training_data=_make_training_dataset()),
+        "instantiate": _make_instantiate_fn(training_data=_make_training_dataset()),
     }
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match="exactly one model definition"):
         train_fn(
@@ -685,7 +685,7 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
     configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
     deps = {
-        "_instantiate": _make_instantiate_fn(
+        "instantiate": _make_instantiate_fn(
             training_data=_make_training_dataset(),
             loss=torch.nn.Identity(),
         ),
@@ -751,13 +751,13 @@ def _invoke_train(
     log_artifacts: list[pathlib.Path] | None = None,
     epochs: int = 2,
 ) -> None:
-    """Invoke the ``train`` callback with real modules, patching only ``_instantiate``."""
+    """Invoke the ``train`` callback with real modules, patching only ``instantiate``."""
     configure_security(allowed_modules_check=False)
     training_data = _make_training_dataset()
     if validation_data is None:
         validation_data = _make_validation_dataset()
     deps = {
-        "_instantiate": _make_instantiate_fn(
+        "instantiate": _make_instantiate_fn(
             training_data=training_data,
             validation_data=validation_data,
             backward_cls=backward_cls,
@@ -888,7 +888,7 @@ def _patch_ddp_for_cpu() -> None:
     ) -> None:
         _orig_init(self, module, device_ids=None, output_device=None, **kwargs)
 
-    torch.nn.parallel.DistributedDataParallel.__init__ = _cpu_safe_init  # type: ignore[assignment]
+    torch.nn.parallel.DistributedDataParallel.__init__ = _cpu_safe_init
 
 
 def _ddp_train_worker(
@@ -911,13 +911,13 @@ def _ddp_train_worker(
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
         validation_data = _make_validation_dataset()
-        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data, validation_data=validation_data)}
+        deps = {"instantiate": _make_instantiate_fn(training_data=training_data, validation_data=validation_data)}
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
             with callbacks_session():
-                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                train_fn.__wrapped__(
                     model_patterns=[{"model": "MODEL"}],
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],
@@ -989,13 +989,13 @@ def _ddp_rank_gating_worker(
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
-        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data)}
+        deps = {"instantiate": _make_instantiate_fn(training_data=training_data)}
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
             with callbacks_session():
-                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                train_fn.__wrapped__(
                     model_patterns=[{"model": "MODEL"}],
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],
@@ -1066,13 +1066,13 @@ def _ddp_seed_offset_worker(
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
-        deps = {"_instantiate": _make_instantiate_fn(training_data=training_data)}
+        deps = {"instantiate": _make_instantiate_fn(training_data=training_data)}
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
             with callbacks_session():
-                train_fn.__wrapped__(  # type: ignore[attr-defined]
+                train_fn.__wrapped__(
                     model_patterns=[{"model": "MODEL"}],
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],

@@ -1,4 +1,4 @@
-"""Unit tests for structcast_model.torch.trainer – utility functions and classes."""
+"""Unit tests for structcast_model.torch.trainer - utility functions and classes."""
 
 from __future__ import annotations
 
