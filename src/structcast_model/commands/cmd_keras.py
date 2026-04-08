@@ -133,7 +133,8 @@ def measure_inference_time(
     elif device not in devices:
         raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices}")
     model = keras_trainer.initial_model(instantiate(model_pattern), shapes)
-    model.compile(optimizer=None, **(instantiator.instantiate(compile_pattern) if compile_pattern else {}))
+    if compile_pattern is not None:
+        model.compile(optimizer=None, **compile_pattern)
     sync = _get_sync_fn(device)
     elapsed_time = 0.0
     for _ in range(times):

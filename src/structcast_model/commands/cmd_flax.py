@@ -127,7 +127,7 @@ def measure_inference_time(
         else instantiate(training_mode_kwargs_pattern)
     )
     model = nnx.view(instantiate(model_pattern), **training_mode_kw)
-    if compile_pattern:
+    if compile_pattern is not None:
         model = nnx.jit(model, device=jax_device, **instantiator.instantiate(compile_pattern))(model)
     elapsed_time = 0.0
     for _ in range(times):
