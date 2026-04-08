@@ -22,7 +22,7 @@ def test_keras_layer_intermediate_generates_call_method_without_inference_flow()
         structured_output=False,
     )._get_layer_script("Unit", [])
     assert "class Unit(keras.layers.Layer):" in script
-    assert "def call(self, inputs, training=None, mask=None):" in script
+    assert "def call(self, x, *, training = None, **kwargs):" in script
     assert "if training:" not in script
     assert "return y" in script
 

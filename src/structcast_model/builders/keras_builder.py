@@ -64,13 +64,7 @@ class {class_name}(keras.layers.Layer):
         self.output_names = {self.outputs}
         {init_body}
 
-    def call(self, inputs, training=None, mask=None):
-        if isinstance(inputs, dict):
-            {(sep + indent).join([f"{i} = inputs.pop({i!r}, None)" for i in self.inputs])}
-            kwargs = inputs
-        else:
-            {self._forward_inputs or "inputs"} = inputs
-            kwargs = {{}}
+    def call(self, {inputs}*, training = None, **kwargs):
         {sep.join(codes)}
         return {self._forward_outputs}
 """

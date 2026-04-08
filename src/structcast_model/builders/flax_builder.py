@@ -61,12 +61,12 @@ class {class_name}(flax.nnx.Module):
         self.training = training
         {init_body}
 
-    def __call__(self, {inputs}*, training: bool | None = None, **kwargs):
+    def __call__(self, {inputs}*, training = None, **kwargs):
         training = self.training if training is None else training
         {sep.join(codes)}
         return {self._forward_outputs}
 
-    def set_view(self, training: bool | None = None):
+    def set_view(self, training = None):
         if training is not None:
             self.training = training
 """
