@@ -4,6 +4,7 @@ from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 import random
+from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from structcast.utils.base import dump_yaml_to_string
@@ -81,6 +82,14 @@ device = Option(
     "-d",
     help='Computation device to use, either "cpu" or "cuda". '
     'If not specified, it will use "cuda" if available, otherwise "cpu".',
+)
+compile_pattern: dict[str, Any] | None = Option(
+    None,
+    "--compile",
+    "-c",
+    parser=bool_or_path_or_dict_parser,
+    help='Whether to compile the model using "torch.compile". '
+    'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
 )
 
 
@@ -186,6 +195,46 @@ def _log_criteria(info: BaseInfo) -> str:
     values = {**getattr(cast("torch_trainer.TorchTrainer", info).backward, "learning_rates", {}), **info.logs()}
     mlflow.log_metrics(values, step=info.epoch)
     return f"epoch: {info.epoch}\n{dump_yaml_to_string(values)}"
+
+
+@app.command(name="time")
+def measure_inference_time(
+    model_pattern: Any = model_pattern,
+    shapes: dict | None = shapes,
+    device: str | None = device,
+    compile_pattern: dict[str, Any] | None = compile_pattern,
+    training_mode: bool = Option(
+        False,
+        help="Whether to set the model to training mode during inference time measurement. "
+        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
+    ),
+    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
+    batch_size: int = Option(
+        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
+    ),
+) -> None:
+    """Measure the average inference time of a PyTorch model."""
+    configure_security(allowed_modules_check=False)
+    device = torch_trainer.get_torch_device(device)
+    with torch.device(device):
+        model = _instantiate(model_pattern)
+        torch_trainer.initial_model(model, shapes)
+
+    model = _compile_module(model, instantiator.instantiate(compile_pattern))
+    if training_mode:
+        model.train()
+    else:
+        model.eval()
+    elapsed_time = 0.0
+    cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
+    for _ in range(times):
+        inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
+        elapsed_time -= time()
+        model(**inputs)
+        cuda_sync()
+        elapsed_time += time()
+    mode_str = "training" if training_mode else "evaluation"
+    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
 
 
 @app.command(name="ptflops")
@@ -339,14 +388,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         help="Default mixed precision type to use during training when mixed precision is enabled. "
         "This can be overridden by the backward class if it has its own mixed precision type specified.",
     ),
-    compile_pattern: dict[str, Any] | None = Option(
-        None,
-        "--compile",
-        "-c",
-        parser=bool_or_path_or_dict_parser,
-        help='Whether to compile the model using "torch.compile". '
-        'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
-    ),
+    compile_pattern: dict[str, Any] | None = compile_pattern,
     trainer_pattern: Any | None = Option(
         None,
         "--trainer",

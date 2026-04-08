@@ -40,16 +40,26 @@ DTYPES = {
 T = TypeVar("T")
 
 
-def create_torch_inputs(shape: Any) -> Any:
-    """Create dummy inputs based on the provided shape."""
+def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
+    """Create dummy inputs based on the provided shape.
+
+    Args:
+        shape (Any): The shape of the inputs to create. This can be a tuple of integers,
+            a dictionary of shapes, or a list/tuple of shapes.
+        batch_size (int): The batch size to use for the inputs.
+            This will be prepended to the shape if the shape is a tuple of integers.
+
+    Returns:
+        Any: The created inputs, which can be a tensor, a dictionary of tensors, or a list/tuple of tensors.
+    """
     try:
-        return torch.rand((1, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=torch.float32)
+        return torch.rand((batch_size, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=torch.float32)
     except ValidationError:
         pass
     if isinstance(shape, dict):
-        return {k: create_torch_inputs(v) for k, v in shape.items()}
+        return {k: create_torch_inputs(v, batch_size=batch_size) for k, v in shape.items()}
     if isinstance(shape, (list, tuple)):
-        return [create_torch_inputs(v) for v in shape]
+        return [create_torch_inputs(v, batch_size=batch_size) for v in shape]
     raise ValueError(f"Invalid tensor shape: {shape}")
 
 
