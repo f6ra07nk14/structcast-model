@@ -3,7 +3,6 @@
 from time import time
 from typing import TYPE_CHECKING, Any
 
-import jax
 from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
@@ -17,6 +16,7 @@ from structcast_model.commands.utils import (
 )
 
 if TYPE_CHECKING:
+    import jax
     from structcast.core import instantiator
 
     import keras
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
+    jax = LazyModuleImporter("jax")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
     keras_builder = LazyModuleImporter("structcast_model.builders.keras_builder")
@@ -134,7 +135,7 @@ def measure_inference_time(
         raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices}")
     model = keras_trainer.initial_model(instantiate(model_pattern), shapes)
     if compile_pattern is not None:
-        model.compile(optimizer=None, **compile_pattern)
+        model.compile(optimizer=None, **instantiator.instantiate(compile_pattern))
     sync = _get_sync_fn(device)
     elapsed_time = 0.0
     for _ in range(times):
