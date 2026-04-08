@@ -56,7 +56,7 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
         return torch.rand((batch_size, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=torch.float32)
     except ValidationError:
         pass
-    if isinstance(shape, dict):
+    if isinstance(shape, Mapping):
         return {k: create_torch_inputs(v, batch_size=batch_size) for k, v in shape.items()}
     if isinstance(shape, (list, tuple)):
         return [create_torch_inputs(v, batch_size=batch_size) for v in shape]
