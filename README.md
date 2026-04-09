@@ -1,8 +1,8 @@
 # StructCast-Model
 
-StructCast-Model is a configuration-driven toolkit that generates PyTorch models and training workflows from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
+StructCast-Model is a configuration-driven toolkit that generates [PyTorch](https://pytorch.org/), [Flax (JAX)](https://flax.readthedocs.io/en/stable/), and [Keras](https://keras.io/) models — plus PyTorch training workflows — from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
 
-The current implementation focuses on PyTorch. JAX and TensorFlow support is planned (see [Roadmap](#roadmap)), but all active CLI commands, code generators, and tests target the PyTorch stack.
+Model code generation is available for all three frameworks. Training workflow generation and the full training CLI (`scm torch train`) are currently PyTorch-only; Flax and Keras training support is planned (see [Roadmap](#roadmap)).
 
 ## Table of Contents
 
@@ -10,15 +10,29 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
   - [Table of Contents](#table-of-contents)
   - [What This Project Does](#what-this-project-does)
   - [Installation](#installation)
+      - [PyTorch](#pytorch)
+      - [JAX / Flax](#jax--flax)
+      - [TensorFlow](#tensorflow)
+      - [Keras (multi-backend)](#keras-multi-backend)
+      - [Bundles](#bundles)
+      - [Tools](#tools)
   - [Project Structure](#project-structure)
   - [Core Workflow](#core-workflow)
   - [StructCast Pattern Basics](#structcast-pattern-basics)
   - [Command Guide](#command-guide)
     - [1. Format Templates](#1-format-templates)
     - [2. Generate a Model Class](#2-generate-a-model-class)
+      - [PyTorch](#pytorch-1)
+      - [Flax](#flax)
+      - [Keras](#keras)
+      - [Common options](#common-options)
     - [3. Generate Loss, Metric, and Backward Classes](#3-generate-loss-metric-and-backward-classes)
     - [4. Inspect FLOPs and Parameters](#4-inspect-flops-and-parameters)
-    - [5. Train a Generated Model](#5-train-a-generated-model)
+    - [5. Measure Inference Time](#5-measure-inference-time)
+      - [PyTorch](#pytorch-2)
+      - [Flax](#flax-1)
+      - [Keras](#keras-1)
+    - [6. Train a Generated Model](#6-train-a-generated-model)
   - [Distributed Training with `torchrun`](#distributed-training-with-torchrun)
     - [How It Works](#how-it-works)
     - [Single-Node Multi-GPU](#single-node-multi-gpu)
@@ -26,9 +40,14 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
     - [Dataset Configuration](#dataset-configuration)
     - [Distributed Training Notes](#distributed-training-notes)
   - [Configuration Examples](#configuration-examples)
-    - [`cfg/torch/models/ConvNeXtV2.yaml`](#cfgtorchmodelsconvnextv2yaml)
-    - [`cfg/torch/backwards/ConvNeXtV2.yaml`](#cfgtorchbackwardsconvnextv2yaml)
-    - [`cfg/torch/datasets/default_timm.yaml`](#cfgtorchdatasetsdefault_timmyaml)
+    - [PyTorch](#pytorch-3)
+      - [`cfg/torch/models/ConvNeXtV2.yaml`](#cfgtorchmodelsconvnextv2yaml)
+      - [`cfg/torch/backwards/ConvNeXtV2.yaml`](#cfgtorchbackwardsconvnextv2yaml)
+      - [`cfg/torch/datasets/default_timm.yaml`](#cfgtorchdatasetsdefault_timmyaml)
+    - [Flax](#flax-2)
+      - [`cfg/flax/models/ConvNeXtV2.yaml`](#cfgflaxmodelsconvnextv2yaml)
+    - [Keras](#keras-2)
+      - [`cfg/keras/models/ConvNeXtV2.yaml`](#cfgkerasmodelsconvnextv2yaml)
   - [Schema Reference](#schema-reference)
     - [Template Parameters](#template-parameters)
       - [`PARAMETERS`](#parameters)
@@ -95,11 +114,12 @@ The current implementation focuses on PyTorch. JAX and TensorFlow support is pla
 
 ## What This Project Does
 
-- **Generate model code** — Produce PyTorch `nn.Module` classes from YAML layer templates.
-- **Generate training code** — Produce backward-pass, optimizer, and scheduler orchestration classes from YAML templates.
+- **Generate model code** — Produce PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html), Flax [`nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html), and Keras [`Layer`](https://keras.io/api/layers/base_layer/) classes from YAML layer templates.
+- **Generate training code** — Produce backward-pass, optimizer, and scheduler orchestration classes from YAML templates (PyTorch only).
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
-- **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch).
-- **Train end-to-end** — Run training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
+- **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
+- **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
 
 ## Installation
 
@@ -109,31 +129,94 @@ StructCast-Model is installed with [uv](https://docs.astral.sh/uv/) and exposes 
 uv sync --extra torch-cu130 --extra mlflow --extra flops
 ```
 
-Each extra installs a group of optional dependencies:
+Each extra installs a group of optional dependencies. Pick the extras that match your target framework and accelerator.
 
-| Extra         | What it provides                                              |
-| ------------- | ------------------------------------------------------------- |
-| `torch-cu130` | PyTorch and torchvision with CUDA 13.0 support                |
-| `mlflow`      | Experiment tracking for `scm torch train`                     |
-| `flops`       | Both `ptflops` and `calflops` for model complexity inspection |
+#### PyTorch
 
-Omit any extra you do not need. For example, `uv sync --extra torch-cu130` is sufficient if you only want to generate and train models without FLOPs analysis or MLflow logging.
+| Extra         | What it provides                               |
+| ------------- | ---------------------------------------------- |
+| `torch-cpu`   | PyTorch and torchvision (CPU only)             |
+| `torch-cu118` | PyTorch and torchvision with CUDA 11.8 support |
+| `torch-cu126` | PyTorch and torchvision with CUDA 12.6 support |
+| `torch-cu128` | PyTorch and torchvision with CUDA 12.8 support |
+| `torch-cu130` | PyTorch and torchvision with CUDA 13.0 support |
+
+#### JAX / Flax
+
+| Extra      | What it provides                                                                                     |
+| ---------- | ---------------------------------------------------------------------------------------------------- |
+| `jax-cpu`  | [JAX](https://docs.jax.dev/en/latest/) and [Flax](https://flax.readthedocs.io/en/stable/) (CPU only) |
+| `jax-cu12` | JAX and Flax with CUDA 12 support                                                                    |
+| `jax-cu13` | JAX and Flax with CUDA 13 support                                                                    |
+
+#### TensorFlow
+
+| Extra     | What it provides                |
+| --------- | ------------------------------- |
+| `tf-cpu`  | TensorFlow (CPU only)           |
+| `tf-cu12` | TensorFlow with CUDA 12 support |
+
+#### Keras (multi-backend)
+
+[Keras](https://keras.io/) runs on top of JAX, PyTorch, or TensorFlow. Choose the extra that matches your preferred backend:
+
+| Extra               | Backend + accelerator           |
+| ------------------- | ------------------------------- |
+| `keras-jax-cpu`     | Keras with JAX (CPU)            |
+| `keras-jax-cu12`    | Keras with JAX (CUDA 12)        |
+| `keras-jax-cu13`    | Keras with JAX (CUDA 13)        |
+| `keras-torch-cpu`   | Keras with PyTorch (CPU)        |
+| `keras-torch-cu118` | Keras with PyTorch (CUDA 11.8)  |
+| `keras-torch-cu126` | Keras with PyTorch (CUDA 12.6)  |
+| `keras-torch-cu128` | Keras with PyTorch (CUDA 12.8)  |
+| `keras-torch-cu130` | Keras with PyTorch (CUDA 13.0)  |
+| `keras-tf-cpu`      | Keras with TensorFlow (CPU)     |
+| `keras-tf-cu12`     | Keras with TensorFlow (CUDA 12) |
+
+#### Bundles
+
+| Extra      | What it provides                                                               |
+| ---------- | ------------------------------------------------------------------------------ |
+| `all-cpu`  | JAX + Flax, PyTorch + torchvision + timm, TensorFlow, and Keras — all CPU-only |
+| `all-cuda` | Same as `all-cpu` but with CUDA acceleration for every backend                 |
+
+#### Tools
+
+| Extra      | What it provides                                                                                                |
+| ---------- | --------------------------------------------------------------------------------------------------------------- |
+| `ptflops`  | [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) for model complexity inspection                  |
+| `calflops` | [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) and Transformers for model complexity inspection |
+| `flops`    | Both `ptflops` and `calflops`                                                                                   |
+| `mlflow`   | [MLflow](https://mlflow.org/) experiment tracking for `scm torch train`                                         |
+
+Omit any extra you do not need. For example, `uv sync --extra torch-cu130` is sufficient if you only want to generate and train PyTorch models without FLOPs analysis or MLflow logging. To work with all three model frameworks on CPU:
+
+```bash
+uv sync --extra all-cpu
+```
 
 ## Project Structure
 
 ```text
 structcast-model/
-├── cfg/torch/
-│   ├── backwards/     # backward, optimizer, scheduler templates
-│   ├── datasets/      # reusable dataset/dataloader templates
-│   ├── losses/        # loss module templates
-│   ├── metrics/       # metric module templates
-│   ├── models/        # model architecture templates
-│   └── others/        # compile and EMA presets
+├── cfg/
+│   ├── torch/
+│   │   ├── backwards/     # backward, optimizer, scheduler templates
+│   │   ├── datasets/      # reusable dataset/dataloader templates
+│   │   ├── losses/        # loss module templates
+│   │   ├── metrics/       # metric module templates
+│   │   ├── models/        # model architecture templates
+│   │   └── others/        # compile and EMA presets
+│   ├── flax/
+│   │   └── models/        # Flax model architecture templates
+│   └── keras/
+│       └── models/        # Keras model architecture templates
 ├── src/structcast_model/
-│   ├── builders/      # generic and torch-specific code generators
+│   ├── builders/      # generic and framework-specific code generators
 │   ├── commands/      # Typer CLI entry points
 │   ├── torch/         # trainer, layers, optimizer helpers
+│   ├── flax/          # Flax layers and inference utilities
+│   ├── keras/         # Keras layers and inference utilities
 │   ├── utils/         # shared helpers
 │   └── base_trainer.py
 ├── tests/             # CLI, builder, trainer, and layer tests
@@ -142,30 +225,36 @@ structcast-model/
 
 The main package areas are:
 
-| Directory   | Purpose                                                                                                                               |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `builders/` | Converts validated YAML templates into intermediate representations, then renders Python source code.                                 |
-| `commands/` | Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)).                                                              |
-| `torch/`    | Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers. |
-| `cfg/torch/`      | Declarative source of truth: YAML templates for models, backward logic, datasets, and runtime presets.                                |
+| Directory    | Purpose                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `builders/`  | Converts validated YAML templates into intermediate representations, then renders Python source code for PyTorch, Flax, and Keras.    |
+| `commands/`  | Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)) with `torch`, `flax`, and `keras` sub-commands.               |
+| `torch/`     | Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers. |
+| `flax/`      | Flax-specific layers (e.g. `GlobalResponseNorm`) and JAX inference helpers.                                                           |
+| `keras/`     | Keras-specific layers (e.g. `GlobalResponseNormalization`) and backend-agnostic inference helpers.                                    |
+| `cfg/torch/` | Declarative source of truth: YAML templates for PyTorch models, backward logic, datasets, and runtime presets.                        |
+| `cfg/flax/`  | YAML templates for Flax model architectures.                                                                                          |
+| `cfg/keras/` | YAML templates for Keras model architectures.                                                                                         |
 
 ## Core Workflow
 
-The repository follows a repeatable five-step workflow:
+The repository follows a repeatable workflow:
 
-1. **Write or reuse** YAML templates under `cfg/torch/`.
+1. **Write or reuse** YAML templates under `cfg/[torch/flax/keras]/`.
 2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
-3. **Generate** Python source files for the model, loss, metric, and backward logic using `scm torch create`.
+3. **Generate** Python source files for the model (and, for PyTorch, loss, metric, and backward logic) using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
-5. **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow.
+5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
+6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow.
 
 ```text
-YAML templates  --->  scm format / scm torch create  --->  Generated .py files
-                                                                 |
-StructCast patterns  <-------------------------------------------+
+YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
+                                                                              |
+StructCast patterns  <--------------------------------------------------------+
        |
        v
-scm torch train  --->  MLflow logs + model checkpoints
+scm [torch/flax/keras] time  --->  Inference benchmarks
+scm torch train              --->  MLflow logs + model checkpoints
 ```
 
 ## StructCast Pattern Basics
@@ -219,15 +308,41 @@ What this does:
 
 ### 2. Generate a Model Class
 
-Generate a Python `nn.Module` from a YAML layer template (such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml)).
+Each framework has its own `create model` command that reads a YAML layer template and generates a framework-native module.
+
+#### PyTorch
+
+Generate a PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html) from a YAML layer template (such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml)).
 
 ```bash
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
-scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o torch_model.py
 ```
 
-Useful options:
+#### Flax
+
+Generate a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) from a YAML layer template (such as [`cfg/flax/models/ConvNeXtV2.yaml`](cfg/flax/models/ConvNeXtV2.yaml)).
+
+```bash
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o flax_model.py
+```
+
+#### Keras
+
+Generate a [Keras `Layer`](https://keras.io/api/layers/base_layer/) from a YAML layer template (such as [`cfg/keras/models/ConvNeXtV2.yaml`](cfg/keras/models/ConvNeXtV2.yaml)).
+
+```bash
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o keras_model.py
+```
+
+#### Common options
+
+All three commands share the same options:
 
 - `-p/--parameter`: override template parameters
 - `-c/--classname`: set the generated class name, default `Model`
@@ -276,7 +391,74 @@ What these commands do internally:
 3. Run one initialization forward pass via [`initial_model(...)`](src/structcast_model/torch/trainer.py).
 4. Pass the initialized model to `ptflops` or `calflops` for complexity analysis.
 
-### 5. Train a Generated Model
+### 5. Measure Inference Time
+
+Use `scm [torch/flax/keras] time` to benchmark the average forward-pass latency of a generated model. All three frameworks share the same basic options:
+
+| Option             | Description                                                       |
+| ------------------ | ----------------------------------------------------------------- |
+| positional pattern | StructCast object pattern to instantiate the model                |
+| `-s/--shape`       | Input tensor shapes, e.g. `'image: [3, 224, 224]'`                |
+| `-d/--device`      | Computation device (`cpu`, `cuda`, `gpu:0`, …)                    |
+| `-c/--compile`     | Compile the model before measurement (`true`, YAML path, or dict) |
+| `--training-mode`  | Measure in training mode instead of evaluation mode               |
+| `-w/--warmup-runs` | Number of warmup iterations (default: 2)                          |
+| `-t/--times`       | Number of timed iterations (default: 10)                          |
+| `-b/--batch-size`  | Batch size for dummy inputs (default: 1)                          |
+
+#### PyTorch
+
+```bash
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml \
+    -p 'DEFAULT: {backbone: atto}' -o torch_model.py
+
+scm torch time \
+    '[_obj_, {_addr_: model.Model, _file_: torch_model.py}, _call_]' \
+    -s 'image: [3, 224, 224]' \
+    -c cfg/torch/others/compile_default.yaml \
+    -d cuda
+```
+
+PyTorch-specific option: `--matmul-precision` (`highest`, `high`, `medium`) controls [`torch.set_float32_matmul_precision`](https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html).
+
+#### Flax
+
+```bash
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml \
+    -p 'DEFAULT: {backbone: atto}' -o flax_model.py
+
+scm flax time \
+    '[_obj_, {_addr_: model.Model, _file_: flax_model.py}, {_call_: {rngs: [_obj_, _addr_: flax.nnx.Rngs, _call_: {params: 0, dropout: 1}]}}]' \
+    -s 'image: [224, 224, 3]' \
+    -c true \
+    -d gpu:0
+```
+
+Flax-specific option: `--training-mode-kwargs` lets you override the keyword arguments passed to [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) when `--training-mode` is set (e.g. `'{deterministic: false, use_running_average: false}'`).
+
+> **Note:** Flax uses channel-last tensor layout. The shape `'image: [224, 224, 3]'` corresponds to *H × W × C*.
+
+#### Keras
+
+```bash
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml \
+    -p 'DEFAULT: {backbone: atto}' -o keras_model.py
+
+# Keras with JAX backend may need NVIDIA shared libraries on the path
+export LD_LIBRARY_PATH=$(find .venv -name "*.so*" | grep nvidia | xargs dirname | sort -u | paste -d ":" -s -)
+
+scm keras time \
+    '[_obj_, {_addr_: model.Model, _file_: keras_model.py}, _call_]' \
+    -s 'image: [224, 224, 3]' \
+    -c true \
+    -d gpu:0
+```
+
+Compilation for Keras uses [`keras.Model.compile`](https://keras.io/api/models/model_training_apis/#compile-method). The `--compile/-c` option accepts `true`/`false`, a YAML file path, or an inline dict of keyword arguments.
+
+> **Note:** Keras also uses channel-last layout by default. The shape `'image: [224, 224, 3]'` corresponds to *H × W × C*.
+
+### 6. Train a Generated Model
 
 Below is the complete training command from the included ConvNeXtV2 example.
 
@@ -464,15 +646,17 @@ scm format cfg/torch/datasets/default_timm.yaml \
 
 - **Seed reproducibility** — Each rank's random seed is offset by `global_rank` to ensure different data augmentation across processes while remaining reproducible.
 - **Learning rate scaling** — When scaling to multiple GPUs, consider adjusting the learning rate. A common practice is [linear scaling](https://arxiv.org/abs/1706.02677): multiply the base learning rate by the number of GPUs. This must be configured in the backward template or optimizer settings — `scm torch train` does not scale the learning rate automatically.
-- **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#5-train-a-generated-model) for details.
+- **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#6-train-a-generated-model) for details.
 - **`torch.compile` and DDP** — When both `--compile` and DDP are active, `torch.compile` is applied **before** DDP wrapping.
 - **Checkpoint saving** — Only rank 0 saves checkpoints and logs to MLflow. When resuming from a checkpoint in a distributed setting, all ranks load the same checkpoint.
 
 ## Configuration Examples
 
-The `cfg/torch/` directory contains working YAML templates that demonstrate each part of the workflow.
+The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow. Templates are organized by framework under `cfg/torch/`, `cfg/flax/`, and `cfg/keras/`.
 
-### `cfg/torch/models/ConvNeXtV2.yaml`
+### PyTorch
+
+#### `cfg/torch/models/ConvNeXtV2.yaml`
 
 Demonstrates the model-building style used throughout the project:
 
@@ -482,7 +666,7 @@ Demonstrates the model-building style used throughout the project:
 - separate training and inference flow support
 - structured outputs such as `{cls: torch.tensor(...), ...}`
 
-### `cfg/torch/backwards/ConvNeXtV2.yaml`
+#### `cfg/torch/backwards/ConvNeXtV2.yaml`
 
 Demonstrates how backward logic is configured declaratively:
 
@@ -492,7 +676,7 @@ Demonstrates how backward logic is configured declaratively:
 - optimizer creation through `structcast_model.torch.optimizers.create_with_scheduler`
 - optional gradient clipping via `timm.utils.clip_grad.dispatch_clip_grad`
 
-### `cfg/torch/datasets/default_timm.yaml`
+#### `cfg/torch/datasets/default_timm.yaml`
 
 Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Covers:
 
@@ -501,6 +685,26 @@ Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Cov
 - device and prefetch settings
 - mixup and cutmix options
 - train or validation split generation from one template
+
+### Flax
+
+#### `cfg/flax/models/ConvNeXtV2.yaml`
+
+Generates a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) equivalent of the PyTorch ConvNeXtV2 model. The template mirrors the same parameter groups (`atto` through `huge`) and uses [`GlobalResponseNorm`](src/structcast_model/flax/layers/grn.py) as a custom Flax layer. Key differences from the PyTorch variant:
+
+- uses channel-last tensor layout (*H × W × C*)
+- constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization
+- `__call__` propagates a `training` flag to sub-modules
+
+### Keras
+
+#### `cfg/keras/models/ConvNeXtV2.yaml`
+
+Generates a [Keras `Layer`](https://keras.io/api/layers/base_layer/) equivalent of the ConvNeXtV2 model. Shares the same backbone parameter groups and uses [`GlobalResponseNormalization`](src/structcast_model/keras/layers/grn.py) as a custom Keras layer. Key differences:
+
+- uses channel-last tensor layout (*H × W × C*)
+- follows the Keras `call(self, ..., *, training=None, **kwargs)` convention
+- runs on any [Keras backend](https://keras.io/getting_started/#configuring-your-backend) (JAX, PyTorch, or TensorFlow)
 
 ## Schema Reference
 
@@ -631,10 +835,10 @@ OUTPUTS: [feat1, feat2, feat3, feat4]
 
 Controls the return type of the generated `forward()` method.
 
-| Value | Behavior |
-| ----- | -------- |
-| `true` | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
-| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`. |
+| Value             | Behavior                                                                 |
+| ----------------- | ------------------------------------------------------------------------ |
+| `true`            | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
+| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`.                         |
 
 ```yaml
 STRUCTURED_OUTPUT: true
@@ -668,12 +872,12 @@ Each entry in `FLOW` or `INFERENCE_FLOW` is a `LayerBehavior` — a list of 2 to
 [INPUTS, OUTPUTS, NAME, LAYER]
 ```
 
-| Position | Field | Description |
-| -------- | ----- | ----------- |
-| 0 | `INPUTS` | Input variable name(s) for this step. A plain string (`image`, `feat1`) reads a named tensor from the current scope. Use `_` to pass the previous step's output forward. A nested list `[[a, b]]` collects tensors from multiple sources (e.g., for residual additions). |
-| 1 | `OUTPUTS` | Output variable name(s) produced by this step. Use `_` for intermediate values that need not be named. A dict `{alias: real_name}` renames the output in the current scope. |
-| 2 | `NAME` | (optional) A unique identifier for the generated submodule attribute. Auto-generated when omitted. Must be a valid Python identifier. |
-| 2 or 3 | `LAYER` | (optional) The layer definition — either a StructCast `ObjectPattern` (e.g., `[_obj_, {_addr_: torch.nn.ReLU}, _call_]`) or a `UserLayer` dict (see [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)). |
+| Position | Field     | Description                                                                                                                                                                                                                                                              |
+| -------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0        | `INPUTS`  | Input variable name(s) for this step. A plain string (`image`, `feat1`) reads a named tensor from the current scope. Use `_` to pass the previous step's output forward. A nested list `[[a, b]]` collects tensors from multiple sources (e.g., for residual additions). |
+| 1        | `OUTPUTS` | Output variable name(s) produced by this step. Use `_` for intermediate values that need not be named. A dict `{alias: real_name}` renames the output in the current scope.                                                                                              |
+| 2        | `NAME`    | (optional) A unique identifier for the generated submodule attribute. Auto-generated when omitted. Must be a valid Python identifier.                                                                                                                                    |
+| 2 or 3   | `LAYER`   | (optional) The layer definition — either a StructCast `ObjectPattern` (e.g., `[_obj_, {_addr_: torch.nn.ReLU}, _call_]`) or a `UserLayer` dict (see [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)).                                                                  |
 
 ```yaml
 FLOW:
@@ -725,11 +929,11 @@ The fourth (or third) element of a `FLOW` entry. Defines how the submodule for t
 
 These three keys form the `UserLayer` dict that activates a named sublayer:
 
-| Key | Type | Description |
-| --- | ---- | ----------- |
-| `TYPE` | `str` | Name of a sublayer defined as a top-level key in the same YAML file (e.g., `Backbone`, `Block`, `Stem`). The code generator expands it into a nested `nn.Module` subclass. |
-| `PARAM` | `PARAMETERS` dict | Template variable overrides passed when rendering the sublayer. Uses the same `DEFAULT` / `SHARED` / named-group structure as the top-level `PARAMETERS` block. |
-| `CFG` | file path | Path to an external YAML file that defines the sublayer. Allows sublayer reuse across multiple model templates. When `CFG` is set, `TYPE` selects the sublayer name within that file. |
+| Key     | Type              | Description                                                                                                                                                                           |
+| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TYPE`  | `str`             | Name of a sublayer defined as a top-level key in the same YAML file (e.g., `Backbone`, `Block`, `Stem`). The code generator expands it into a nested `nn.Module` subclass.            |
+| `PARAM` | `PARAMETERS` dict | Template variable overrides passed when rendering the sublayer. Uses the same `DEFAULT` / `SHARED` / named-group structure as the top-level `PARAMETERS` block.                       |
+| `CFG`   | file path         | Path to an external YAML file that defines the sublayer. Allows sublayer reuse across multiple model templates. When `CFG` is set, `TYPE` selects the sublayer name within that file. |
 
 ```yaml
 # References Backbone sublayer defined in the same file, no parameter overrides
@@ -757,11 +961,11 @@ IMPORTS: {}
 
 Controls `torch.amp.GradScaler` for automatic mixed-precision training.
 
-| Value | Behavior |
-| ----- | -------- |
-| `false` (default) | AMP disabled; no `GradScaler` is created. |
-| `true` | AMP enabled with default `GradScaler` settings. |
-| `dict` | AMP enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler(...)`. |
+| Value             | Behavior                                                                                |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `false` (default) | AMP disabled; no `GradScaler` is created.                                               |
+| `true`            | AMP enabled with default `GradScaler` settings.                                         |
+| `dict`            | AMP enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler(...)`. |
 
 ```yaml
 MIXED_PRECISION:
@@ -808,9 +1012,9 @@ BACKWARDS:
 
 Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `BACKWARDS` entries.
 
-| Key | Type | Description |
-| --- | ---- | ----------- |
-| `LOSSES` | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`. |
+| Key      | Type        | Description                                                                                                                                                           |
+| -------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOSSES` | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`.                                   |
 | `MODELS` | `list[str]` | Explicit list of model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].OPTIMIZERS[*].LAYERS` when left as `[]`. |
 
 ```yaml
@@ -822,10 +1026,10 @@ MODELS: []   # auto-inferred
 
 Each entry in `BACKWARDS` is a `BackwardBehavior` with the following fields:
 
-| Key | Type | Description |
-| --- | ---- | ----------- |
-| `NAME` | `str` | Optional identifier for this backward pass. Used as the generated class or method name. Must be a valid Python identifier. |
-| `LOSS` | `str` | The loss key (matching a key returned by the loss module) that this backward pass differentiates. |
+| Key          | Type   | Description                                                                                                                                           |
+| ------------ | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NAME`       | `str`  | Optional identifier for this backward pass. Used as the generated class or method name. Must be a valid Python identifier.                            |
+| `LOSS`       | `str`  | The loss key (matching a key returned by the loss module) that this backward pass differentiates.                                                     |
 | `OPTIMIZERS` | `list` | One or more `OptimizerBehavior` entries that are executed in order during each training step (see [`OPTIMIZERS` entry keys](#optimizers-entry-keys)). |
 
 ```yaml
@@ -842,12 +1046,12 @@ BACKWARDS:
 
 Each entry in `OPTIMIZERS` is an `OptimizerBehavior` with the following fields:
 
-| Key | Type | Description |
-| --- | ---- | ----------- |
-| `NAME` | `str` | Optional identifier for this optimizer entry. Used as the generated attribute name. Must be a valid Python identifier. |
-| `OPTIMIZER` | StructCast pattern | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`. |
-| `LAYERS` | `str` or `list[str]` | Model parameter paths that this optimizer manages. Each value must be a valid Python attribute expression (e.g., `model` or `model.backbone`). The generated backward class calls `optimizer.param_groups` over these paths. |
-| `CLIP` | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `LAYERS`. Set to `null` to disable gradient clipping. |
+| Key         | Type                         | Description                                                                                                                                                                                                                                       |
+| ----------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NAME`      | `str`                        | Optional identifier for this optimizer entry. Used as the generated attribute name. Must be a valid Python identifier.                                                                                                                            |
+| `OPTIMIZER` | StructCast pattern           | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`. |
+| `LAYERS`    | `str` or `list[str]`         | Model parameter paths that this optimizer manages. Each value must be a valid Python attribute expression (e.g., `model` or `model.backbone`). The generated backward class calls `optimizer.param_groups` over these paths.                      |
+| `CLIP`      | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `LAYERS`. Set to `null` to disable gradient clipping.                                       |
 
 ```yaml
 OPTIMIZERS:
@@ -1177,7 +1381,7 @@ The repository includes tests for:
 
 - [x] PyTorch model construction from YAML configuration files
 - [x] PyTorch training workflow generation from YAML configuration files
-- [ ] JAX model construction from YAML configuration files
-- [ ] JAX training workflow generation from YAML configuration files
-- [ ] TensorFlow model construction from YAML configuration files
-- [ ] TensorFlow training workflow generation from YAML configuration files
+- [x] JAX (Flax) model construction from YAML configuration files
+- [ ] JAX (Flax) training workflow generation from YAML configuration files
+- [x] Keras model construction from YAML configuration files
+- [ ] Keras training workflow generation from YAML configuration files
