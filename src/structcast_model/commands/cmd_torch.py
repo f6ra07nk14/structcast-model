@@ -208,7 +208,7 @@ def measure_inference_time(
         help="Whether to set the model to training mode during inference time measurement. "
         "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
     ),
-    warnup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
+    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
@@ -240,8 +240,8 @@ def measure_inference_time(
         cuda_sync()
         return time() - start_time
 
-    print(f"Running {warnup_runs} warmup runs...")
-    for _ in range(warnup_runs):
+    print(f"Running {warmup_runs} warmup runs...")
+    for _ in range(warmup_runs):
         _measure_single_run()
     elapsed_time = 0.0
     for ind in range(times):

@@ -113,7 +113,7 @@ def measure_inference_time(
         "This should be a dictionary of keyword arguments for `nnx.view` when `--training-mode` is true. "
         'For example: --training-mode-kwargs "{deterministic: false, use_running_average: false}"',
     ),
-    warnup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
+    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
@@ -142,8 +142,8 @@ def measure_inference_time(
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), model(**inputs))
         return time() - start_time
 
-    print(f"Running {warnup_runs} warmup runs...")
-    for _ in range(warnup_runs):
+    print(f"Running {warmup_runs} warmup runs...")
+    for _ in range(warmup_runs):
         _measure_single_run()
     elapsed_time = 0.0
     for ind in range(times):

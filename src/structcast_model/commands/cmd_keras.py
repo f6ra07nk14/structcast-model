@@ -104,7 +104,7 @@ def _get_sync_fn(device: str) -> Any:
     """Return a synchronization function appropriate for the current Keras backend."""
     backend = keras.backend.backend()
     if backend == "jax":
-        return jax.block_until_ready
+        return lambda xs: jax.tree_util.tree_map(lambda x: x.block_until_ready(), xs)
     if backend == "torch" and "gpu" in device:
         return lambda _: torch.cuda.synchronize()
     return lambda _: None
@@ -121,6 +121,7 @@ def measure_inference_time(
         help="Whether to set the model to training mode during inference time measurement. "
         "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
     ),
+    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
@@ -128,23 +129,31 @@ def measure_inference_time(
 ) -> None:
     """Measure the average inference time of a Keras model."""
     configure_security(allowed_modules_check=False)
-    devices = keras.distribution.list_devices()
-    if device is None:
-        device = devices[0]
-    elif device not in devices:
-        raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices}")
+    device = keras_trainer.get_keras_device(device)
+    print("Initializing the model...")
     model = keras_trainer.initial_model(instantiate_object(model_pattern), shapes)
-    if compile_pattern is not None:
+    if compile_pattern is None:
+        print("Skipping compilation...")
+    else:
+        print("Compiling the model...")
         model.compile(optimizer=None, **instantiator.instantiate(compile_pattern))
     sync = _get_sync_fn(device)
-    elapsed_time = 0.0
-    for _ in range(times):
+
+    def _measure_single_run() -> float:
         inputs = keras_trainer.create_numpy_inputs(shapes, batch_size=batch_size)
-        elapsed_time -= time()
-        sync(model(**inputs, training=training_mode))
-        elapsed_time += time()
+        start_time = time()
+        sync(model(inputs, training=training_mode))
+        return time() - start_time
+
+    print(f"Running {warmup_runs} warmup runs...")
+    for _ in range(warmup_runs):
+        _measure_single_run()
+    elapsed_time = 0.0
+    for ind in range(times):
+        print(f"Running inference iteration {ind + 1}/{times}...")
+        elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
-    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
+    print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
 
 
 __all__ = ["app"]
