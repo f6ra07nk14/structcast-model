@@ -281,6 +281,10 @@ class LayerIntermediate(_Intermediate):
         raise NotImplementedError("The _get_layer_script method must be implemented in the subclass.")
 
     @classmethod
+    def _get_class_instance(cls, classname: str) -> str:
+        return f"{classname}()"
+
+    @classmethod
     def _get_layer_scripts(cls, cfg: "LayerIntermediate") -> list[str]:
         naming = AutoName("")
         classnames: dict[str, str] = {}
@@ -293,11 +297,11 @@ class LayerIntermediate(_Intermediate):
 
         def _scripts(sub: LayerIntermediate) -> str:
             if (hash_id := _hash(sub)) in classnames:
-                return f"{classnames[hash_id]}()"
+                return cls._get_class_instance(classnames[hash_id])
             classnames[hash_id] = (classname := naming(sub.classname))
             layers: list[str] = [f"{k} = {v if isinstance(v, str) else _scripts(v)}" for k, v in sub.layers.items()]
             scripts.append(sub._get_layer_script(classname, layers))
-            return f"{classname}()"
+            return cls._get_class_instance(classname)
 
         _scripts(cfg)
         return scripts

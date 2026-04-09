@@ -36,6 +36,10 @@ class FlaxLayerIntermediate(LayerIntermediate):
         """Get the sub-module with the given name."""
         return f"self.{layername}"
 
+    @classmethod
+    def _get_class_instance(cls, classname: str) -> str:
+        return f"{classname}(rngs=rngs, training=training)"
+
     def _get_layer_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Return the Python class script for a Flax nnx module."""
         indent = " " * 4
