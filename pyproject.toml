@@ -68,7 +68,7 @@ all-cpu = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
     "structcast-model[tf-cpu]",
-    "structcast-model[keras-tf-cpu]",
+    "keras>=3.13.2",
 ]
 all-cuda = [
     "structcast-model[jax-cu12]",
@@ -76,7 +76,7 @@ all-cuda = [
     "torch>=2.7.0",
     "torchvision>=0.22.0",
     "structcast-model[tf-cu12]",
-    "structcast-model[keras-tf-cu12]",
+    "keras>=3.13.2",
 ]
 ptflops = ["ptflops>=0.7.5"]
 calflops = ["calflops>=0.3.2", "transformers[torch]>=4.56.1"]
