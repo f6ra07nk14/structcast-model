@@ -113,7 +113,7 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
     return _check(pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
 
 
-def instantiate(raw: Any) -> Any:
+def instantiate_object(raw: Any) -> Any:
     """Instantiate an object from a raw pattern using the structcast instantiator.
 
     Args:
@@ -128,7 +128,7 @@ def instantiate(raw: Any) -> Any:
 __all__ = [
     "bool_or_path_or_dict_parser",
     "dict_parser",
-    "instantiate",
+    "instantiate_object",
     "path_or_any_parser",
     "reduce_dict",
     "tensor_shape_parser",

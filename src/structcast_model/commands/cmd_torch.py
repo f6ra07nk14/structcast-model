@@ -15,7 +15,7 @@ from structcast_model.base_trainer import BaseInfo, BestCriterion, callbacks_ses
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
-    instantiate,
+    instantiate_object,
     path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
@@ -92,6 +92,9 @@ compile_pattern: dict[str, Any] | None = Option(
     help='Whether to compile the model using "torch.compile". '
     'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
 )
+matmul_precision: Literal["highest", "high", "medium"] = Option(
+    "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
+)
 
 
 @creator.command(name="model")
@@ -138,7 +141,7 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
         if len(raw) != 1:
             raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
         model_name, ptn = list(raw.items())[0]
-        res[model_name] = instantiate(ptn)
+        res[model_name] = instantiate_object(ptn)
     return res
 
 
@@ -205,33 +208,47 @@ def measure_inference_time(
         help="Whether to set the model to training mode during inference time measurement. "
         "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
     ),
+    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
     ),
+    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
     configure_security(allowed_modules_check=False)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision(matmul_precision)
     device = torch_trainer.get_torch_device(device)
+    print("Initializing the model...")
     with torch.device(device):
-        model = instantiate(model_pattern)
+        model = instantiate_object(model_pattern)
         torch_trainer.initial_model(model, shapes)
-
-    model = _compile_module(model, instantiate(compile_pattern))
+    print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
+    model = _compile_module(model, instantiator.instantiate(compile_pattern))
     if training_mode:
         model.train()
     else:
         model.eval()
-    elapsed_time = 0.0
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
-    for _ in range(times):
-        inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
-        elapsed_time -= time()
+
+    def _measure_single_run() -> float:
+        with torch.device(device):
+            inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
+        start_time = time()
         model(**inputs)
         cuda_sync()
-        elapsed_time += time()
+        return time() - start_time
+
+    print(f"Running {warmup_runs} warmup runs...")
+    for _ in range(warmup_runs):
+        _measure_single_run()
+    elapsed_time = 0.0
+    for ind in range(times):
+        print(f"Running inference iteration {ind + 1}/{times}...")
+        elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
-    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
+    print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
 
 
 @app.command(name="ptflops")
@@ -251,7 +268,7 @@ def call_ptflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        model = instantiate(model_pattern)
+        model = instantiate_object(model_pattern)
         inputs, _ = torch_trainer.initial_model(model, shapes)
         flops, params = ptflops.get_model_complexity_info(
             model=model,
@@ -284,7 +301,7 @@ def call_calflops(
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
     configure_security(allowed_modules_check=False)
     with torch.device(torch_trainer.get_torch_device(device)):
-        model = instantiate(model_pattern)
+        model = instantiate_object(model_pattern)
         inputs, _ = torch_trainer.initial_model(model, shapes)
         flops, macs, params = calflops.calculate_flops(
             model=model,
@@ -458,9 +475,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         "Should be a subset of lower_criteria and higher_criteria.",
     ),
     seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
-    matmul_precision: Literal["highest", "high", "medium"] = Option(
-        "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
-    ),
+    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
     experiment: str = Option(
         "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for MLflow logging."
     ),
@@ -499,8 +514,8 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     is_main = global_rank == 0
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
-    training_dataset = instantiate(training_dataset_pattern)
-    validation_dataset = instantiate(validation_dataset_pattern) if validation_dataset_pattern else None
+    training_dataset = instantiate_object(training_dataset_pattern)
+    validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
     if is_main:
         print("Count the dataset sizes...")
     steps_per_epoch = get_dataset_size(training_dataset)
@@ -515,12 +530,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             for model_name, model in models.items():
                 if model_name in initializers:
                     model.apply(initializers[model_name])
-        loss = compile_fn(instantiate(loss_pattern))
-        metric = compile_fn(instantiate(metric_pattern)) if metric_pattern else None
+        loss = compile_fn(instantiate_object(loss_pattern))
+        metric = compile_fn(instantiate_object(metric_pattern)) if metric_pattern else None
         loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
         metric_outputs = [] if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
         tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs + metric_outputs, compile_fn, distributed)
-        backward = instantiate(backward_pattern)(**models)
+        backward = instantiate_object(backward_pattern)(**models)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
     inference_wrapper = None
@@ -534,14 +549,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         )
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
     step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
-    trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else instantiate(trainer_pattern))(
+    trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern))(
         device=device,
         inference_wrapper=inference_wrapper,
         training_step=(
-            torch_trainer.TrainingStep if training_step_pattern is None else instantiate(training_step_pattern)
+            torch_trainer.TrainingStep if training_step_pattern is None else instantiate_object(training_step_pattern)
         )(**step_kw),
         validation_step=(
-            torch_trainer.ValidationStep if validation_step_pattern is None else instantiate(validation_step_pattern)
+            torch_trainer.ValidationStep
+            if validation_step_pattern is None
+            else instantiate_object(validation_step_pattern)
         )(**step_kw),
         backward=backward,
         tracker=tracker,

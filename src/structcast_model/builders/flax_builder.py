@@ -29,12 +29,16 @@ class FlaxLayerIntermediate(LayerIntermediate):
         True
     """
 
-    default_imports: ClassVar[dict[str, set[str | None]]] = {"flax": {None}}
+    default_imports: ClassVar[dict[str, set[str | None]]] = {"flax.nnx": {None}}
     """Default imports for Flax nnx modules."""
 
     def _get_layer(self, layername: str) -> str:
         """Get the sub-module with the given name."""
         return f"self.{layername}"
+
+    @classmethod
+    def _get_class_instance(cls, classname: str) -> str:
+        return f"{classname}(rngs=rngs, training=training)"
 
     def _get_layer_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Return the Python class script for a Flax nnx module."""

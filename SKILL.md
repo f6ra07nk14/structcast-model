@@ -1,6 +1,6 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch models and training workflows from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch create, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, MLflow-integrated training runs, or distributed multi-GPU training with torchrun and DistributedDataParallel (DDP).
+description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus PyTorch training workflows — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchBackwardBuilder, PyTorch training orchestration through TrainingStep, ValidationStep, TorchTracker, TorchTrainer, timm dataset wrappers, MLflow-integrated training runs, or distributed multi-GPU training with torchrun and DistributedDataParallel (DDP).
 ---
 
 # StructCast-Model
@@ -11,15 +11,21 @@ Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 
 ## Quick Reference
 
-**Install runtime extras**: `uv sync --extra torch-cu130 --extra mlflow --extra flops`
+**Install runtime extras**: `uv sync --extra torch-cu130 --extra mlflow --extra flops` (PyTorch) or `uv sync --extra all-cpu` (all frameworks)
 
 **Format config**: `scm format cfg/torch/datasets/default_timm.yaml -o dataset.yaml -p 'DEFAULT: {...}'`
 
-**Generate model**: `scm torch create model cfg/torch/models/ConvNeXtV2.yaml -o model.py`
+**Generate PyTorch model**: `scm torch create model cfg/torch/models/ConvNeXtV2.yaml -o model.py`
+
+**Generate Flax model**: `scm flax create model cfg/flax/models/ConvNeXtV2.yaml -o model.py`
+
+**Generate Keras model**: `scm keras create model cfg/keras/models/ConvNeXtV2.yaml -o model.py`
 
 **Generate backward**: `scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -o backward.py`
 
 **Inspect FLOPs**: `scm torch ptflops '[_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' -s 'image: [3, 224, 224]'`
+
+**Measure inference time**: `scm [torch/flax/keras] time '[_obj_, ...]' -s 'image: [3, 224, 224]' -d cuda`
 
 **Train**: `scm torch train 'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' ...`
 
@@ -29,18 +35,27 @@ Upstream library: [StructCast](https://github.com/f6ra07nk14/structcast)
 
 ### Workflow 1: Generate a Model from YAML
 
+Each framework has its own `create model` command. The pipeline is the same — only the builder and output class differ.
+
 ```bash
+# PyTorch → torch.nn.Module
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml \
-  -p 'DEFAULT: {backbone: femto}' \
-  -c Model \
-  -o model.py
+  -p 'DEFAULT: {backbone: femto}' -o torch_model.py
+
+# Flax → flax.nnx.Module
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml \
+  -p 'DEFAULT: {backbone: femto}' -o flax_model.py
+
+# Keras → keras.layers.Layer
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml \
+  -p 'DEFAULT: {backbone: femto}' -o keras_model.py
 ```
 
 What happens:
 
-1. `TorchBuilder.from_path(...)` loads and validates the YAML template.
+1. `[Torch/Flax/Keras]Builder.from_path(...)` loads and validates the YAML template.
 2. `BaseModelBuilder` resolves user-defined layers, imports, inputs, outputs, and flow.
-3. `TorchLayerIntermediate` renders a `torch.nn.Module` implementation.
+3. Framework-specific intermediate renders the corresponding module implementation.
 4. The intermediate writes the generated source file.
 
 ### Workflow 2: Generate Loss, Metric, and Backward Code
@@ -108,7 +123,35 @@ What happens:
 4. `TorchTracker` is built from output names.
 5. `TorchTrainer` runs the loop and MLflow logging is attached.
 
-### Workflow 6: Distributed Training with `torchrun`
+### Workflow 6: Measure Inference Time
+
+All three frameworks support inference benchmarking via `scm [torch/flax/keras] time`:
+
+```bash
+# PyTorch
+scm torch time \
+  '[_obj_, {_addr_: model.Model, _file_: torch_model.py}, _call_]' \
+  -s 'image: [3, 224, 224]' -c cfg/torch/others/compile_default.yaml -d cuda
+
+# Flax (channel-last layout: H×W×C)
+scm flax time \
+  '[_obj_, {_addr_: model.Model, _file_: flax_model.py}, {_call_: {rngs: [_obj_, _addr_: flax.nnx.Rngs, _call_: {params: 0, dropout: 1}]}}]' \
+  -s 'image: [224, 224, 3]' -c true -d gpu:0
+
+# Keras (channel-last layout: H×W×C)
+scm keras time \
+  '[_obj_, {_addr_: model.Model, _file_: keras_model.py}, _call_]' \
+  -s 'image: [224, 224, 3]' -c true -d gpu:0
+```
+
+What happens:
+
+1. The model is instantiated from the StructCast pattern.
+2. Dummy inputs are created (`create_torch_inputs`, `create_jax_inputs`, or `create_numpy_inputs`).
+3. Optional compilation is applied (`torch.compile`, `nnx.jit`, or `keras.Model.compile`).
+4. Warmup runs are executed, then timed iterations are averaged.
+
+### Workflow 7: Distributed Training with `torchrun`
 
 The same `scm torch train` command supports multi-GPU and multi-node distributed training when launched through `torchrun`:
 
@@ -156,17 +199,23 @@ What happens:
 | `scm torch create backward` | `commands.cmd_torch` | `create_backward()` |
 | `scm torch ptflops` | `commands.cmd_torch` | `call_ptflops()` |
 | `scm torch calflops` | `commands.cmd_torch` | `call_calflops()` |
+| `scm torch time` | `commands.cmd_torch` | `measure_inference_time()` |
 | `scm torch train` | `commands.cmd_torch` | `train()` |
+| `scm flax create model` | `commands.cmd_flax` | `create_model()` |
+| `scm flax time` | `commands.cmd_flax` | `measure_inference_time()` |
+| `scm keras create model` | `commands.cmd_keras` | `create_model()` |
+| `scm keras time` | `commands.cmd_keras` | `measure_inference_time()` |
 
 ### Important CLI conventions
 
-- Model arguments for `ptflops`, `calflops`, and `train` are [StructCast](https://github.com/f6ra07nk14/structcast) object patterns, not plain import strings.
+- Model arguments for `ptflops`, `calflops`, `time`, and `train` are [StructCast](https://github.com/f6ra07nk14/structcast) object patterns, not plain import strings.
 - Dataset arguments can be rendered YAML files or inline StructCast patterns.
 - `configure_security(allowed_modules_check=False)` is called in CLI paths because generated local modules are imported via `_file_`.
+- Flax and Keras use channel-last tensor layout (*H × W × C*); PyTorch uses channel-first (*C × H × W*).
 
 ## Builder APIs
 
-**Modules**: `structcast_model.builders.base_builder`, `structcast_model.builders.torch_builder`
+**Modules**: `structcast_model.builders.base_builder`, `structcast_model.builders.torch_builder`, `structcast_model.builders.flax_builder`, `structcast_model.builders.keras_builder`
 
 ### Generic generation layer
 
@@ -187,6 +236,20 @@ What happens:
 | Render `torch.nn.Module` code | `TorchLayerIntermediate._get_layer_script(...)` | Emit model class source |
 | Render backward runtime code | `TorchBackwardIntermediate._get_scripts()` | Emit backward/optimizer class source |
 
+### Flax generation layer
+
+| Capability | Entry point | Purpose |
+| -- | -- | -- |
+| Generate model intermediate | `FlaxBuilder.from_path(path)(...)` | Build `FlaxLayerIntermediate` |
+| Render `flax.nnx.Module` code | `FlaxLayerIntermediate._get_layer_script(...)` | Emit Flax module class source |
+
+### Keras generation layer
+
+| Capability | Entry point | Purpose |
+| -- | -- | -- |
+| Generate model intermediate | `KerasBuilder.from_path(path)(...)` | Build `KerasLayerIntermediate` |
+| Render `keras.layers.Layer` code | `KerasLayerIntermediate._get_layer_script(...)` | Emit Keras layer class source |
+
 ### Builder usage pattern
 
 ```python
@@ -201,6 +264,8 @@ built = TorchBuilder.from_path("cfg/torch/models/ConvNeXtV2.yaml")(
 print(built.scripts[0])
 built("model.py")
 ```
+
+The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` and `KerasBuilder`.
 
 ## Training Runtime APIs
 
@@ -270,7 +335,9 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 
 ### Signature config examples in this repo
 
-- `cfg/torch/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks.
+- `cfg/torch/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks (PyTorch channel-first).
+- `cfg/flax/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Flax `nnx.Module` (channel-last, `rngs` constructor arg).
+- `cfg/keras/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Keras `Layer` (channel-last, multi-backend).
 - `cfg/torch/backwards/ConvNeXtV2.yaml` uses optimizer factories, scheduler settings, optional clipping, and gradient accumulation.
 - `cfg/torch/datasets/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
 
@@ -339,7 +406,9 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 The repository operates as a two-phase system:
 
-1. **Generation phase**: YAML templates are transformed into Python modules through the builders.
-2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by the training CLI.
+1. **Generation phase**: YAML templates under `cfg/[torch/flax/keras]/` are transformed into Python modules through framework-specific builders (`TorchBuilder`, `FlaxBuilder`, `KerasBuilder`).
+2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm torch train` (training, PyTorch only).
 
-If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, or the training command, this skill is the correct reference.
+Model code generation is available for all three frameworks. Training workflow generation and `scm torch train` are currently PyTorch-only; Flax and Keras training support is planned.
+
+If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, inference benchmarking, or the training command, this skill is the correct reference.
