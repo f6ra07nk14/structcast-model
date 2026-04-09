@@ -92,6 +92,9 @@ compile_pattern: dict[str, Any] | None = Option(
     help='Whether to compile the model using "torch.compile". '
     'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
 )
+matmul_precision: Literal["highest", "high", "medium"] = Option(
+    "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
+)
 
 
 @creator.command(name="model")
@@ -205,33 +208,47 @@ def measure_inference_time(
         help="Whether to set the model to training mode during inference time measurement. "
         "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
     ),
+    warnup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
     ),
+    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
     configure_security(allowed_modules_check=False)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision(matmul_precision)
     device = torch_trainer.get_torch_device(device)
+    print("Initializing the model...")
     with torch.device(device):
         model = instantiate_object(model_pattern)
         torch_trainer.initial_model(model, shapes)
-
+    print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
     model = _compile_module(model, instantiator.instantiate(compile_pattern))
     if training_mode:
         model.train()
     else:
         model.eval()
-    elapsed_time = 0.0
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
-    for _ in range(times):
-        inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
-        elapsed_time -= time()
+
+    def _measure_single_run() -> float:
+        with torch.device(device):
+            inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
+        start_time = time()
         model(**inputs)
         cuda_sync()
-        elapsed_time += time()
+        return time() - start_time
+
+    print(f"Running {warnup_runs} warmup runs...")
+    for _ in range(warnup_runs):
+        _measure_single_run()
+    elapsed_time = 0.0
+    for ind in range(times):
+        print(f"Running inference iteration {ind + 1}/{times}...")
+        elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
-    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
+    print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
 
 
 @app.command(name="ptflops")
@@ -458,9 +475,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         "Should be a subset of lower_criteria and higher_criteria.",
     ),
     seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
-    matmul_precision: Literal["highest", "high", "medium"] = Option(
-        "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
-    ),
+    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
     experiment: str = Option(
         "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for MLflow logging."
     ),
