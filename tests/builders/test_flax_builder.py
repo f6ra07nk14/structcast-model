@@ -97,7 +97,7 @@ def test_flax_builder_builds_intermediate_and_scripts() -> None:
     }
     built = FlaxBuilder(raw=raw)(classname="TinyNet")
     assert built.classname == "TinyNet"
-    assert "flax" in built.collected_imports
+    assert "flax.nnx" in built.collected_imports
     assert len(built.scripts) == 1
     assert "class TinyNet(flax.nnx.Module):" in built.scripts[0]
 
