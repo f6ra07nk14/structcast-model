@@ -65,7 +65,7 @@ def get_jax_device(device: str | None = None) -> jax.Device:
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
-__all__ = ["create_jax_inputs"]
+__all__ = ["create_jax_inputs", "get_jax_device", "get_jax_devices"]
 
 
 if not TYPE_CHECKING:
