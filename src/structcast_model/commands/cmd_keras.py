@@ -9,7 +9,7 @@ from typer import Argument, Option, Typer
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
-    instantiate,
+    instantiate_object,
     path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
@@ -133,7 +133,7 @@ def measure_inference_time(
         device = devices[0]
     elif device not in devices:
         raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices}")
-    model = keras_trainer.initial_model(instantiate(model_pattern), shapes)
+    model = keras_trainer.initial_model(instantiate_object(model_pattern), shapes)
     if compile_pattern is not None:
         model.compile(optimizer=None, **instantiator.instantiate(compile_pattern))
     sync = _get_sync_fn(device)

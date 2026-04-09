@@ -21,7 +21,7 @@ from typer.testing import CliRunner
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BestCriterion, callbacks_session
 from structcast_model.commands.cmd_torch import app
-from structcast_model.commands.utils import instantiate
+from structcast_model.commands.utils import instantiate_object
 from structcast_model.torch.trainer import (
     TimmEmaWrapper,
     TorchTracker,
@@ -377,7 +377,7 @@ def test_instantiate_builds_object_from_pattern() -> None:
     """instantiate() resolves an ObjectPattern and returns the built instance."""
     configure_security(allowed_modules_check=False)
     raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_call_", {}]]}
-    result = instantiate(raw)
+    result = instantiate_object(raw)
     assert isinstance(result, torch.nn.Identity)
 
 
@@ -385,7 +385,7 @@ def test_instantiate_builds_linear_with_args() -> None:
     """instantiate() builds a torch.nn.Linear with keyword arguments."""
     configure_security(allowed_modules_check=False)
     raw = {"_obj_": [["_addr_", "torch.nn.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
-    result = instantiate(raw)
+    result = instantiate_object(raw)
     assert isinstance(result, torch.nn.Linear)
     assert result.in_features == 8
     assert result.out_features == 4

@@ -9,7 +9,7 @@ from typer import Argument, Option, Typer
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
-    instantiate,
+    instantiate_object,
     path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
@@ -124,9 +124,9 @@ def measure_inference_time(
     training_mode_kw = (
         {"training": training_mode, "deterministic": not training_mode, "use_running_average": not training_mode}
         if training_mode_kwargs_pattern is None
-        else instantiate(training_mode_kwargs_pattern)
+        else instantiate_object(training_mode_kwargs_pattern)
     )
-    model = nnx.view(instantiate(model_pattern), **training_mode_kw)
+    model = nnx.view(instantiate_object(model_pattern), **training_mode_kw)
     if compile_pattern is not None:
         model = nnx.jit(model, device=jax_device, **instantiator.instantiate(compile_pattern))(model)
     elapsed_time = 0.0
