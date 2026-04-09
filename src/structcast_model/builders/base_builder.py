@@ -423,10 +423,10 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
         if user_defined_layer:
             return self.get_user_defined_layer(split_attribute(user_defined_layer), parameters, classname)
-        layer = self.template(parameters, merged=False)
+        module = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
-        imports.update(layer.IMPORTS)
-        sublayers: dict[str, LayerIntermediate | str] = {}
+        imports.update(module.IMPORTS)
+        layers: dict[str, LayerIntermediate | str] = {}
         naming = AutoName("_")
 
         def _inputs(raw: Any) -> str:
@@ -443,7 +443,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME and unit.NAME not in sublayers:
+                    if unit.NAME and unit.NAME not in layers:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
                     name = unit.NAME
                 else:
@@ -451,9 +451,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
                         subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)
-                    if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
+                    if (name := unit.NAME or naming(to_snake(subclassname))) in layers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
-                    sublayers[name] = subinst
+                    layers[name] = subinst
                 if unit.INPUTS is not None and unit.OUTPUTS is not None:
                     inp = _inputs(unit.INPUTS.model_dump())
                     if isinstance(unit.OUTPUTS.spec, dict):
@@ -469,15 +469,16 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     )
             return flow
 
+        structured_output = module.STRUCTURED_OUTPUT if forced_structured_output is None else forced_structured_output
         return self.user_defined_layer_type(
             imports=imports,
             classname=classname,
-            inputs=layer.INPUTS,
-            outputs=layer.OUTPUTS,
-            layers=sublayers,
-            flow=_create_flow(layer.FLOW),
-            inference_flow=_create_flow(layer.INFERENCE_FLOW),
-            structured_output=layer.STRUCTURED_OUTPUT if forced_structured_output is None else forced_structured_output,
+            inputs=module.INPUTS,
+            outputs=module.OUTPUTS,
+            layers=layers,
+            flow=_create_flow(module.FLOW),
+            inference_flow=_create_flow(module.INFERENCE_FLOW),
+            structured_output=structured_output,
         )
 
 
@@ -537,6 +538,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
 
     raw: Any
     template: TemplateBackward = field(init=False)
+    user_defined_layers: dict[str, Any] = field(init=False)
 
     @classmethod
     def from_path(cls, path: PathLike) -> "BaseBackwardBuilder[BackwardIntermediateT]":
@@ -546,6 +548,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateBackward.model_validate(self.raw)
+        self.user_defined_layers = self.template.others
 
     def _get_mixed_precision(
         self,
@@ -574,34 +577,37 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         backward = self.template(parameters)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(backward.IMPORTS)
+        layers: dict[str, LayerIntermediate | str] = {}
         naming = AutoName("_")
-        opts: dict[str, tuple[str, list[str], str | None]] = {}
-        backward_names = set()
-        backwards: list[tuple[str, str, list[str]]] = []
-        for unit in backward.BACKWARDS:
-            if (backward_name := unit.NAME or naming("backward")) in backward_names:
-                raise SpecError(f'Duplicate backward name "{backward_name}" found in the backwards.')
-            backward_names.add(backward_name)
-            repr_backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in unit.model_extra.items())
-            backwards.append((unit.LOSS, repr_backward_kw, []))
-            for opt in unit.OPTIMIZERS:
-                optinst, optclassname = resolve_object(imports, opt.OPTIMIZER)
-                optname = opt.NAME or naming(optclassname)
-                if optname in opts:
-                    raise SpecError(f'Duplicate optimizer name "{optname}" found in the backwards.')
-                opt_clip = resolve_object(imports, opt.OPTIMIZER)[0] if opt.CLIP else None
-                opts[optname] = (optinst, opt.LAYERS, opt_clip)
-                backwards[-1][-1].append(optname)
+        # todo: support multi-optimizer training like GAN
+        # opts: dict[str, tuple[str, list[str], str | None]] = {}
+        # backward_names = set()
+        # backwards: list[tuple[str, str, list[str]]] = []
+        # for unit in backward.BACKWARDS:
+        #     if (backward_name := unit.NAME or naming("backward")) in backward_names:
+        #         raise SpecError(f'Duplicate backward name "{backward_name}" found in the backwards.')
+        #     backward_names.add(backward_name)
+        #     repr_backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in unit.model_extra.items())
+        #     backwards.append((unit.LOSS, repr_backward_kw, []))
+        #     for opt in unit.OPTIMIZERS:
+        #         optinst, optclassname = resolve_object(imports, opt.OPTIMIZER)
+        #         optname = opt.NAME or naming(optclassname)
+        #         if optname in opts:
+        #             raise SpecError(f'Duplicate optimizer name "{optname}" found in the backwards.')
+        #         opt_clip = resolve_object(imports, opt.OPTIMIZER)[0] if opt.CLIP else None
+        #         opts[optname] = (optinst, opt.LAYERS, opt_clip)
+        #         backwards[-1][-1].append(optname)
+        mixed_precision = self._get_mixed_precision(imports, backward.MIXED_PRECISION)
         return self.user_defined_backward_layer_type(
             imports=imports,
             classname=classname,
-            mixed_precision=self._get_mixed_precision(imports, backward.MIXED_PRECISION),
+            mixed_precision=mixed_precision,
             mixed_precision_type=backward.MIXED_PRECISION_TYPE,
             accumulate_gradients=backward.ACCUMULATE_GRADIENTS,
-            losses=backward.LOSSES,
-            models=backward.MODELS,
-            optimizers=opts,
-            backwards=backwards,
+            # losses=backward.LOSSES,
+            # models=backward.MODELS,
+            # optimizers=opts,
+            # backwards=backwards,
         )
 
 
