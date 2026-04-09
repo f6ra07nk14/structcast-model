@@ -90,7 +90,20 @@ def initial_model(model: Any, shapes: Any) -> Any:
     return keras.Model(inputs=inputs, outputs=outputs)
 
 
-__all__ = ["create_keras_inputs", "create_numpy_inputs", "initial_model"]
+def get_keras_device(device: str | None = None) -> str:
+    """Get a list of available Keras devices."""
+    devices = keras.distribution.list_devices()
+    if not devices:
+        raise ValueError("No Keras devices are available.")
+    if device is None:
+        device = next(iter(devices))
+    if device in devices:
+        return device
+    devices_str = ", ".join(f"{d!r}" for d in devices)
+    raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
+
+
+__all__ = ["create_keras_inputs", "create_numpy_inputs", "get_keras_device", "initial_model"]
 
 
 if not TYPE_CHECKING:
