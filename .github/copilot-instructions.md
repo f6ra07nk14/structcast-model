@@ -41,6 +41,7 @@ ruff format src tests           # auto-format
 - **Absolute imports** — `from structcast_model.xxx import yyy`
 - **Lazy imports** in `__init__.py` via `LazySelectedImporter` (guarded by `TYPE_CHECKING`)
 - **Type annotations on all functions** — enforced by `mypy` (`disallow_untyped_defs = true`)
+- When using `mypy`, `ruff check`, and `ruff format`, avoid `# noqa: ...` and `# type: ignore[...]` unless they are genuinely necessary
 - Use `collections.abc` types (`Mapping`, `Iterable`, `Callable`) and union syntax (`X | Y`)
 - Logger per module: `logger = getLogger(__name__)`
 

@@ -8,6 +8,7 @@ References:
 from typing import Any
 
 from torch.autograd import Function
+from torch.autograd.function import FunctionCtx
 from torch.jit import unused
 
 from structcast_model.torch.types import Tensor
@@ -18,7 +19,7 @@ class ReinMaxCore(Function):
     """ReinMax gradient estimator."""
 
     @staticmethod
-    def forward(ctx: Any, logits: Tensor, tau: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(ctx: FunctionCtx, logits: Tensor, tau: Tensor) -> tuple[Tensor, Tensor]:
         """Forward method."""
         y_soft = logits.softmax(dim=-1)
         sample = torch.multinomial(y_soft, num_samples=1, replacement=True)
@@ -27,7 +28,7 @@ class ReinMaxCore(Function):
         return one_hot, y_soft
 
     @staticmethod
-    def backward(ctx: Any, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:  # type: ignore[override]
+    def backward(ctx: FunctionCtx, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:
         """Backward method."""
         one_hot_sample, logits, y_soft, tau = ctx.saved_tensors
 
