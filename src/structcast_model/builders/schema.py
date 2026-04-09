@@ -23,7 +23,6 @@ from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate, register_resolver
 from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
-from structcast.utils.security import split_attribute, validate_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders import jinja_filters
@@ -190,16 +189,18 @@ def resolve_outputs(outputs: FlexSpec) -> list[str]:
     return _resolve(outputs.spec)
 
 
-def resolve_flow(flow: list[LayerBehavior]) -> tuple[list[str], list[str]]:
+def resolve_flow(flow: list[LayerBehavior], *, existing_values: list[str] | None = None) -> tuple[list[str], list[str]]:
     """Resolve the input and output layer names from the given flow.
 
     Args:
         flow (list[LayerBehavior]): The flow to resolve.
+        existing_values (list[str] | None, optional):
+            The existing input or output layer names to consider when resolving the flow.
 
     Returns:
         tuple[list[str], list[str]]: A tuple containing the list of resolved input/output names.
     """
-    inputs, outputs = [], []
+    inputs, outputs = [], ([] if existing_values is None else existing_values.copy())
     for unit in flow:
         if unit.INPUTS is not None:
             inputs += [n for n in resolve_inputs(unit.INPUTS) if n not in outputs]
@@ -280,47 +281,36 @@ class UserDefinedLayer(Serializable):
         return self
 
 
-class OptimizerBehavior(Serializable):
-    """Optimizer behavior configuration."""
+class BackwardBehavior(Serializable):
+    """Backward behavior configuration."""
 
-    NAME: str | None = None
-    """The name of the optimizer class or an instance of the optimizer."""
+    LOSS: str
+    """The target loss to optimize."""
+
+    TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
+    """The trainable layers to apply the optimizer to."""
+
+    FLOW: list[LayerBehavior] = Field(default_factory=list)
+    """Flow of the layer."""
+
+    INFERENCE_FLOW: list[LayerBehavior] = Field(default_factory=list)
+    """Inference flow of the layer. If not specified, the inference flow will be the same as the flow."""
 
     OPTIMIZER: ObjectPattern
     """The name of the optimizer class or an instance of the optimizer."""
 
-    LAYERS: list[str] = Field(default_factory=list, min_length=1)
-    """The trainable layers to apply the optimizer to."""
+    NAME: str | None = None
+    """The name of the backward layer class or an instance of the backward layer."""
 
     CLIP: ObjectPattern | None = None
     """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
     or a pattern to instantiate the gradient clipping configuration."""
 
-    @model_validator(mode="before")
-    @classmethod
-    def _validate_raw(cls, raw: Any) -> Any:
-        """Validate the object data."""
-        if isinstance(raw, OptimizerBehavior):
-            return raw
-        if isinstance(raw, (list, tuple)):
-            if len(raw) == 4:
-                name, opt, layers, clip = raw
-            elif len(raw) == 3:
-                if isinstance(raw[0], str) or raw[0] is None:
-                    name, opt, layers = raw
-                    clip = None
-                else:
-                    opt, layers, clip = raw
-                    name = None
-            elif len(raw) == 2:
-                opt, layers = raw
-                name, clip = None, None
-            else:
-                raise SpecError(f"The tuple/list for OptimizerBehavior must have 2, 3, or 4 elements but got: {raw}.")
-            return {"NAME": name, "OPTIMIZER": opt, "LAYERS": layers, "CLIP": clip}
-        return raw
+    EXTRA: dict[str, Any] = Field(default_factory=dict)
+    """Extra fields for the backward behavior,
+    which will be passed to the optimizer or the backward process in general."""
 
-    @field_validator("LAYERS", mode="before")
+    @field_validator("TRAINABLE_LAYERS", mode="before")
     @classmethod
     def _validate_trainable_layers(cls, data: Any) -> Any:
         """Validate the trainable layers."""
@@ -332,85 +322,13 @@ class OptimizerBehavior(Serializable):
         """Validate the layer name."""
         return _validate_name(data)
 
-    @field_validator("LAYERS", mode="after")
+    @field_validator("TRAINABLE_LAYERS", mode="after")
     @classmethod
     def _validate_trainable_layers_legal(cls, data: list[str]) -> list[str]:
         """Validate that the trainable layers are legal."""
         for layer in data:
-            validate_attribute(layer)
+            _validate_name(layer)
         return data
-
-    @model_serializer(mode="wrap")
-    def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
-        """Serialize the model."""
-        res = [handler(self.OPTIMIZER), handler(self.LAYERS)]
-        if self.CLIP:
-            res.append(handler(self.CLIP))
-        if self.NAME:
-            res = [self.NAME] + res
-        return res
-
-    @cached_property
-    def models(self) -> set[str]:
-        """Get the models to apply the optimizer behavior to."""
-        return {split_attribute(L)[0] for L in self.LAYERS}
-
-
-class BackwardBehavior(WithExtra):
-    """Backward behavior configuration."""
-
-    NAME: str | None = None
-    """The name of the backward layer class or an instance of the backward layer."""
-
-    LOSS: str
-    """The target loss to optimize."""
-
-    OPTIMIZERS: list[OptimizerBehavior] = Field(default_factory=list, min_length=1)
-    """The ordered list of optimizer behaviors to apply during backward pass."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _validate_raw(cls, raw: Any) -> Any:
-        """Validate the object data."""
-        if isinstance(raw, BackwardBehavior):
-            return raw
-        if isinstance(raw, (list, tuple)):
-            if len(raw) == 4:
-                name, loss, opts, others = raw
-            elif len(raw) == 3:
-                if isinstance(raw[0], str) or raw[0] is None:
-                    name, loss, opts = raw
-                    others = {}
-                else:
-                    loss, opts, others = raw
-                    name = None
-            elif len(raw) == 2:
-                loss, opts = raw
-                name, others = None, {}
-            else:
-                raise SpecError(f"The tuple/list for BackwardBehavior must have 2, 3, or 4 elements but got: {raw}.")
-            return {"NAME": name, "LOSS": loss, "OPTIMIZERS": opts, **others}
-        return raw
-
-    @field_validator("NAME", mode="after")
-    @classmethod
-    def _validate_name(cls, data: str | None) -> str | None:
-        """Validate the layer name."""
-        return _validate_name(data)
-
-    @model_serializer(mode="wrap")
-    def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> list[Any]:
-        """Serialize the model."""
-        res = [handler(self.LOSS), handler(self.OPTIMIZERS)]
-        if self.NAME:
-            res = [self.NAME] + res
-        res.extend(handler(self.model_extra))
-        return res
-
-    @cached_property
-    def models(self) -> set[str]:
-        """Get the models to apply the backward behavior to."""
-        return {m for b in self.OPTIMIZERS for m in b.models}
 
 
 class UserDefinedBackward(Serializable):
@@ -423,17 +341,20 @@ class UserDefinedBackward(Serializable):
     The imported names can be `None`, which indicates that the entire module is imported.
     """
 
-    BACKWARDS: list[BackwardBehavior] = Field(default_factory=list, min_length=1)
-    """Backward behavior configuration."""
+    INPUTS: list[str] = Field(default_factory=list)
+    """Inputs of the layer."""
+
+    OUTPUTS: list[str] = Field(default_factory=list)
+    """Outputs of the layer."""
 
     LOSSES: list[str] = Field(default_factory=list)
-    """The losses to optimize. If not specified, the losses will be inferred from the BACKWARDS field."""
+    """Losses to optimize."""
 
-    MODELS: list[str] = Field(default_factory=list)
-    """The models to apply the backward behavior to.
+    TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
+    """Trainable layer names required for the backward behavior."""
 
-    If not specified, the backward behavior will be applied to all models involved in the flows of the layers
-    defined in the same user-defined layer configuration."""
+    BACKWARDS: list[BackwardBehavior] = Field(default_factory=list, min_length=1)
+    """Backward behavior configuration."""
 
     MIXED_PRECISION: bool | dict[str, Any] = False
     """Whether to use mixed precision during backward pass.
@@ -454,31 +375,59 @@ class UserDefinedBackward(Serializable):
         """Validate the imports."""
         return _validate_imports(data)
 
-    @field_validator("LOSSES", "MODELS", mode="before")
-    @classmethod
-    def _validate_losses_models(cls, data: Any) -> Any:
-        """Validate the losses and models."""
-        return check_elements(data)
+    def _validate_trainable_layers(self) -> None:
+        """Validate that the trainable layers exist in the backwards."""
+        layers = unique([L for b in self.BACKWARDS for L in b.TRAINABLE_LAYERS])
+        if not self.TRAINABLE_LAYERS:
+            self.TRAINABLE_LAYERS.extend(layers)
+        if unknown := set(self.TRAINABLE_LAYERS) - set(layers):
+            raise SpecError(f"Unknown trainable layers found: {unknown}.")
+        if missing := set(layers) - set(self.TRAINABLE_LAYERS):
+            raise SpecError(f"Missing trainable layers found: {missing}.")
 
     @model_validator(mode="after")
     def _validate_user_defined_backward(self) -> Self:
         """Validate the user-defined backward configuration."""
-        losses = {b.LOSS for b in self.BACKWARDS}
+        self._validate_trainable_layers()
+        train_inputs, train_outputs = [], []
+        for backward in self.BACKWARDS:
+            backward_inputs, backward_outputs = resolve_flow(backward.FLOW, existing_values=train_outputs)
+            train_inputs += backward_inputs
+            train_outputs += backward_outputs
+        train_inputs, train_outputs = unique(train_inputs), unique(train_outputs)
+        losses = unique([b.LOSS for b in self.BACKWARDS])
+        if not self.INPUTS:
+            self.INPUTS.extend(train_inputs)
+        if not self.OUTPUTS:
+            self.OUTPUTS.extend(train_outputs)
         if not self.LOSSES:
-            self.LOSSES.extend(list(losses))
-        if unknown := set(self.LOSSES) - losses:
-            raise SpecError(f"Unknown losses found in LOSSES: {unknown}.")
-        if missing := losses - set(self.LOSSES):
-            raise SpecError(f"Missing losses found in LOSSES: {missing}.")
-        models = {m for b in self.BACKWARDS for m in b.models}
-        if not self.MODELS:
-            self.MODELS.extend(list(models))
-        if unknown := set(self.MODELS) - models:
-            raise SpecError(f"Unknown models found in MODELS: {unknown}.")
-        if missing := models - set(self.MODELS):
-            raise SpecError(f"Missing models found in MODELS: {missing}.")
-        if (isinstance(self.MIXED_PRECISION, dict) or self.MIXED_PRECISION) and self.MIXED_PRECISION_TYPE is None:
-            raise SpecError("MIXED_PRECISION_TYPE must be specified when MIXED_PRECISION is enabled.")
+            self.LOSSES.extend(losses)
+        if unknown := set(self.INPUTS) - set(train_inputs):
+            raise SpecError(f"Unknown inputs found: {unknown}.")
+        if missing := set(train_inputs) - set(self.INPUTS):
+            raise SpecError(f"Missing inputs found: {missing}.")
+        if unknown := set(self.OUTPUTS) - set(train_outputs):
+            raise SpecError(f"Unknown outputs found: {unknown}.")
+        if unknown := set(self.LOSSES) - set(losses):
+            raise SpecError(f"Unknown losses found: {unknown}.")
+        if missing := set(losses) - set(self.LOSSES):
+            raise SpecError(f"Missing losses found: {missing}.")
+        if missing := (set(self.LOSSES) - set(self.OUTPUTS)):
+            raise SpecError(f"Missing losses found: {missing}.")
+        infer_inputs, infer_outputs = [], []
+        for backward in self.BACKWARDS:
+            backward_inputs, backward_outputs = resolve_flow(
+                backward.INFERENCE_FLOW if backward.INFERENCE_FLOW else backward.FLOW,
+                existing_values=infer_outputs,
+            )
+            infer_inputs += backward_inputs
+            infer_outputs += backward_outputs
+        if unknown := set(self.INPUTS) - set(infer_inputs):
+            raise SpecError(f"Unknown inputs found in inference flow: {unknown}.")
+        if missing := set(infer_inputs) - set(self.INPUTS):
+            raise SpecError(f"Missing inputs found in inference flow: {missing}.")
+        if unknown := set(self.OUTPUTS) - set(infer_outputs):
+            raise SpecError(f"Unknown outputs found in inference flow: {unknown}.")
         return self
 
 
@@ -562,7 +511,6 @@ __all__ = [
     "SPEC_EVAL",
     "BackwardBehavior",
     "LayerBehavior",
-    "OptimizerBehavior",
     "Parameters",
     "Template",
     "TemplateBackward",
