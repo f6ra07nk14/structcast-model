@@ -113,6 +113,7 @@ def measure_inference_time(
         "This should be a dictionary of keyword arguments for `nnx.view` when `--training-mode` is true. "
         'For example: --training-mode-kwargs "{deterministic: false, use_running_average: false}"',
     ),
+    warnup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
     times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
     batch_size: int = Option(
         1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
@@ -126,17 +127,30 @@ def measure_inference_time(
         if training_mode_kwargs_pattern is None
         else instantiate_object(training_mode_kwargs_pattern)
     )
-    model = nnx.view(instantiate_object(model_pattern), **training_mode_kw)
-    if compile_pattern is not None:
-        model = nnx.jit(model, device=jax_device, **instantiator.instantiate(compile_pattern))(model)
-    elapsed_time = 0.0
-    for _ in range(times):
+    print("Initializing the model...")
+    model = instantiate_object(model_pattern)
+    model = nnx.view(model, raise_if_not_found=False, **training_mode_kw)
+    if compile_pattern is None:
+        print("Skipping compilation...")
+    else:
+        print("Compiling the model...")
+        model = nnx.jit(model, **instantiator.instantiate(compile_pattern))
+
+    def _measure_single_run() -> float:
         inputs = jax.device_put(flax_trainer.create_jax_inputs(shapes, batch_size=batch_size), device=jax_device)
-        elapsed_time -= time()
-        jax.block_until_ready(model(**inputs))
-        elapsed_time += time()
+        start_time = time()
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), model(**inputs))
+        return time() - start_time
+
+    print(f"Running {warnup_runs} warmup runs...")
+    for _ in range(warnup_runs):
+        _measure_single_run()
+    elapsed_time = 0.0
+    for ind in range(times):
+        print(f"Running inference iteration {ind + 1}/{times}...")
+        elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
-    print(f"Average inference time over {times} runs ({mode_str!r} mode): {elapsed_time / times:.6f} seconds.")
+    print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
 
 
 __all__ = ["app"]
