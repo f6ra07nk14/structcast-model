@@ -1,3 +1,104 @@
+## [1.5.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.4.0...v1.5.0) (2026-04-09)
+
+
+### 👷 Build
+
+* add all-cpu dependency for unified installation of JAX, Torch, and TensorFlow support ([de187f0](https://github.com/f6ra07nk14/structcast-model/commit/de187f0c45a3add66515bc994c62fbc0cb932902))
+* add support for additional structcast-model configurations for Keras and CUDA ([ba20716](https://github.com/f6ra07nk14/structcast-model/commit/ba20716a8eb5bad7c6d171c2da2c54db3aef5f93))
+* update Keras dependencies for Torch integration and enhance all-cpu configuration ([50e0c81](https://github.com/f6ra07nk14/structcast-model/commit/50e0c8195a116ee88874fbfc74d84788d8e0daf6))
+
+
+### 📦 Other
+
+* correct flow structure and output definitions in ConvNeXtV2 YAML configurations ([6cf1284](https://github.com/f6ra07nk14/structcast-model/commit/6cf1284bbaf267fec41e6af69f538d8e67979f28))
+* reorganize configuration files under cfg/torch/ directory ([dab047f](https://github.com/f6ra07nk14/structcast-model/commit/dab047f229e6a5a67c6d8f6c2aa5ff45929983bc))
+* update Block flow to use string expression for addition operation ([398b0e4](https://github.com/f6ra07nk14/structcast-model/commit/398b0e4305f6710c2a80dbcd41960b85f9d9cdf1))
+
+
+### 🦊 CI/CD
+
+* update extras in tox.ini to replace 'torch-cpu' with 'all-cpu' ([2cc6c0b](https://github.com/f6ra07nk14/structcast-model/commit/2cc6c0ba7f13f8ba897b2e3a379dc706b36887e2))
+
+
+### 📔 Docs
+
+* add clarification on avoiding unnecessary noqa and type ignore comments ([264805a](https://github.com/f6ra07nk14/structcast-model/commit/264805ae1223be0c1ba67400681d06078481fb9d))
+* add Schema Reference section to README.md ([3e686b3](https://github.com/f6ra07nk14/structcast-model/commit/3e686b3122701acaf9dacf203496ce62013a298d))
+* update README files to reflect multi-framework support for PyTorch, Flax, and Keras ([499cdf9](https://github.com/f6ra07nk14/structcast-model/commit/499cdf932e57e971cddf7cce1703cb37b05be7e1))
+
+
+### 💎 Features
+
+* add class method to get class instance with rngs and training parameters ([99397b0](https://github.com/f6ra07nk14/structcast-model/commit/99397b013f6562ab7a718d992849cf5f4ce0b889))
+* add command to measure average inference time of Flax models ([7aeb480](https://github.com/f6ra07nk14/structcast-model/commit/7aeb480d1133e700fca21a1183910ff01c53c7a1))
+* add functions to retrieve available JAX devices and specific device by string ([a1d7e38](https://github.com/f6ra07nk14/structcast-model/commit/a1d7e38f60e6d054530984ba66154b0b43b133da))
+* add get_keras_device function to retrieve available Keras devices ([164825d](https://github.com/f6ra07nk14/structcast-model/commit/164825dce3fcba308ec6e490de575cc09b738a07))
+* add inference time measurement command and compile option for PyTorch models ([c1881c6](https://github.com/f6ra07nk14/structcast-model/commit/c1881c63c45bdc7bdfe222e2ba9b2a97f2ceac44))
+* add inference time measurement command for Keras models with compile options ([14a8ae3](https://github.com/f6ra07nk14/structcast-model/commit/14a8ae369ecf81fe6d038d30f9ba3f7e0fe279c0))
+* add Keras module and Global Response Normalization layer implementation ([59b9711](https://github.com/f6ra07nk14/structcast-model/commit/59b9711b9f69e0988611ff32936b00f13abdaf29))
+* add keras to module exports and import structure ([9daba40](https://github.com/f6ra07nk14/structcast-model/commit/9daba40f4d0bdf3c62d488d790c3b4c050e79ed1))
+* add KerasBuilder, FlaxBuilder, CLI commands, and ConvNeXtV2 YAML configs ([ae3cecc](https://github.com/f6ra07nk14/structcast-model/commit/ae3cecc8c4e5c5292fb8d74a25910f27dd6d8eb8))
+* add matmul_precision option and warmup runs for inference time measurement ([4b2517e](https://github.com/f6ra07nk14/structcast-model/commit/4b2517e81e2a76e6bdfc414a4e8a876728f99b40))
+* add trainer helpers for Keras models with input creation functions ([737a11c](https://github.com/f6ra07nk14/structcast-model/commit/737a11c574788f6fe3503ba858878c10f3ff6476))
+* add warmup runs for inference time measurement ([df24075](https://github.com/f6ra07nk14/structcast-model/commit/df2407595fd8bc878f326b72863b442d15bb9865))
+* implement Global Response Normalization (GRN) layer in Flax ([548d8ea](https://github.com/f6ra07nk14/structcast-model/commit/548d8ea9ead60df528a9c5524529d8447ca240e6))
+
+
+### 🔧 Fixes
+
+* add training parameter to FlaxLayerIntermediate constructor and call method ([662ee94](https://github.com/f6ra07nk14/structcast-model/commit/662ee9469e5a48e1291118996c0bc93261dad2dd))
+* add TypeAlias annotation for _Intermediate in test_intermediate_get_scripts ([c7b8626](https://github.com/f6ra07nk14/structcast-model/commit/c7b862666ee46ff1a9145ecbf1c48c5271f3f94d))
+* address code review - list type annotation, drop_path RNG seed, and shape comment ([401ec89](https://github.com/f6ra07nk14/structcast-model/commit/401ec8967c2cc62d92d5c98a090571cac2d676df))
+* correct instantiation method for compile pattern in measure_inference_time function ([49474f7](https://github.com/f6ra07nk14/structcast-model/commit/49474f770ddaf1f1d579e9dee49dc2ff42bb6d61))
+* correct variable name from 'warnup_runs' to 'warmup_runs' in cmd_flax.py, cmd_keras.py, and cmd_torch.py ([13172f0](https://github.com/f6ra07nk14/structcast-model/commit/13172f0ad23397197311919574f8cd57a64d1c43))
+* expose get_jax_device and get_jax_devices in module exports ([67d8665](https://github.com/f6ra07nk14/structcast-model/commit/67d8665b95b38eeedc5d18de057b5cabe9c8dc36))
+* expose GlobalResponseNorm in module exports ([fde565b](https://github.com/f6ra07nk14/structcast-model/commit/fde565b6bf2b972bcb6237cfe23e8b145f47b6b7))
+* expose GlobalResponseNorm in module exports ([efef061](https://github.com/f6ra07nk14/structcast-model/commit/efef0610da07cc1824592a617c0b0213369c89fd))
+* update compile pattern check to ensure it's not None before compilation ([3d0bb8e](https://github.com/f6ra07nk14/structcast-model/commit/3d0bb8e6fbe955d0e1c99a6beac4b4c9f1ee0ce1))
+* update default imports to include flax.nnx module ([9089c81](https://github.com/f6ra07nk14/structcast-model/commit/9089c815d951590a7a5ee8db4f1f45a519bc39de))
+* update dockerfile to use all-cpu dependency for consistent environment setup ([81c34ab](https://github.com/f6ra07nk14/structcast-model/commit/81c34ab6884da40a52181aec226432784756590a))
+* update GlobalResponseNormalization to GlobalResponseNorm in ConvNeXtV2.yaml ([1813014](https://github.com/f6ra07nk14/structcast-model/commit/1813014408afec4e26c20edd332b5a494f8ceb2a))
+* update GlobalResponseNormalization to GlobalResponseNorm in ConvNeXtV2.yaml ([f8852ee](https://github.com/f6ra07nk14/structcast-model/commit/f8852ee1a37012168a21fd457a049dfb56431928))
+* update import for GlobalResponseNormalization in layers module ([f9f9ea1](https://github.com/f6ra07nk14/structcast-model/commit/f9f9ea1e7f0786647130e08f551a58b9c91d0315))
+* update jax import handling and instantiate compile pattern in measure_inference_time function ([60cedc4](https://github.com/f6ra07nk14/structcast-model/commit/60cedc4125b6044ddf0e5f20f63bbaf43c8c249c))
+* update keras dependency to version 3.13.2 in pyproject.toml ([c78d40d](https://github.com/f6ra07nk14/structcast-model/commit/c78d40d6e9b55d1292d8ebc2efafe0f47bf18f6f))
+* update model compilation to use instantiator for compile pattern ([0a9e4b9](https://github.com/f6ra07nk14/structcast-model/commit/0a9e4b973e5675644028bd8b11713be40de1e97e))
+
+
+### 🔨 Refactor
+
+* remove unused Add, Multiply, ReduceSum, and ScaleIdentity layers ([04c14d0](https://github.com/f6ra07nk14/structcast-model/commit/04c14d0a5dec64fb2d28f96a4ea434876beeb0fa))
+* remove unused Flax layer classes and update module exports ([52d7b96](https://github.com/f6ra07nk14/structcast-model/commit/52d7b9665b2c8f1c417bda24443498a33e588ab9))
+* rename instantiate function to instantiate_object for clarity ([29791c1](https://github.com/f6ra07nk14/structcast-model/commit/29791c1fbf1848851467a064bf734bfb7aca77c9))
+* replace _instantiate with instantiate in cmd_torch and update utils with detailed docstrings ([dd60a05](https://github.com/f6ra07nk14/structcast-model/commit/dd60a05dd0534a4ac24b66df4d3d75ddf3604dc5))
+* replace DropPath layer with Dropout layer in ConvNeXtV2.yaml ([7a68465](https://github.com/f6ra07nk14/structcast-model/commit/7a6846562c3237a32ea3007934eac872ae970cc7))
+* simplify _forward_flow method in KerasLayerIntermediate ([fcf3863](https://github.com/f6ra07nk14/structcast-model/commit/fcf386346f396174d0e3aaf3b63a829de19cdd0f))
+* simplify import statements and improve docstring formatting in flax_builder.py ([3982f78](https://github.com/f6ra07nk14/structcast-model/commit/3982f781a7cd926178c6a009041757b30b087c47))
+* simplify training parameter handling in Flax and Keras model call methods ([449ae01](https://github.com/f6ra07nk14/structcast-model/commit/449ae01d35c970c061dd6d92c9b13ff4bf65a4c8))
+* streamline GlobalResponseNorm class by removing redundant imports and simplifying parameter initialization ([087e514](https://github.com/f6ra07nk14/structcast-model/commit/087e514802eeab1cb0d8e6fb9fe20415e13d6aaf))
+* streamline import statements and improve formatting in keras_builder.py ([4a555fb](https://github.com/f6ra07nk14/structcast-model/commit/4a555fbbb26da5fa9df025defd16d216b184a4f5))
+* update configuration paths for ConvNeXtV2 models to include 'torch' directory ([b68b762](https://github.com/f6ra07nk14/structcast-model/commit/b68b762081250ef24def5ec3fe47392b9693fe99))
+* update configuration paths for Flax and Keras ConvNeXt models to include respective directories ([a1d66ec](https://github.com/f6ra07nk14/structcast-model/commit/a1d66ec843cfcab61ac04ff08f48ce191446d7d0))
+* update ConvNeXtV2.yaml structure and layer configurations ([a745980](https://github.com/f6ra07nk14/structcast-model/commit/a74598072362b259e544d0739e9b534324baaec4))
+* update ConvNeXtV2.yaml to enhance layer configurations and streamline flow definitions ([2a97154](https://github.com/f6ra07nk14/structcast-model/commit/2a971549f85b88797707ff0ca06bf8b98fe8843f))
+* update type annotations for ReinMaxCore methods to use FunctionCtx ([69fd891](https://github.com/f6ra07nk14/structcast-model/commit/69fd8918e1a2d4caed67f0953d4d040c285ec0e1))
+* update type check for shape parameter in create_torch_inputs function ([10526ad](https://github.com/f6ra07nk14/structcast-model/commit/10526adc0ab04a865e923999e27b6497f3a3d384))
+* update YAML structure for Backbone, Stem, DownSample, Block, LayerNorm, and DropPath layers ([0191737](https://github.com/f6ra07nk14/structcast-model/commit/0191737d652450210107b1151f0e95a1b882a73a))
+
+
+### ✨ Style
+
+* add type hint for kwargs parameter in GlobalResponseNormalization initializer ([0c6348d](https://github.com/f6ra07nk14/structcast-model/commit/0c6348d4d81312a6509986cf23352c9e6270cb40))
+* remove unnecessary noqa comment in test_intermediate_get_scripts_raises_not_implemented ([672aed2](https://github.com/f6ra07nk14/structcast-model/commit/672aed225520ced014bf8f02611d9c3479314bc8))
+
+
+### 🚨 Tests
+
+* add unit tests for cmd_flax command structure and help functionality ([5c28193](https://github.com/f6ra07nk14/structcast-model/commit/5c28193dc4647bb63ef495ff968287d2eb02de2e))
+* add unit tests for cmd_keras command structure and help functionality ([9bac46b](https://github.com/f6ra07nk14/structcast-model/commit/9bac46b398a361947562222be582c25e6d611a94))
+* update dependency key from 'instantiate' to 'instantiate_object' in test_cmd_torch.py ([32078c5](https://github.com/f6ra07nk14/structcast-model/commit/32078c50416021fc13abb6d122e1039434e2046c))
+* update import assertion for FlaxBuilder to include 'flax.nnx' ([b7aa904](https://github.com/f6ra07nk14/structcast-model/commit/b7aa90468746ca653de8708e3666041e5a006bc7))
+
 ## [1.4.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.3.0...v1.4.0) (2026-04-01)
 
 
