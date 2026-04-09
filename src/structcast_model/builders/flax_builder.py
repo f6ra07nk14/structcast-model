@@ -29,7 +29,7 @@ class FlaxLayerIntermediate(LayerIntermediate):
         True
     """
 
-    default_imports: ClassVar[dict[str, set[str | None]]] = {"flax": {None}}
+    default_imports: ClassVar[dict[str, set[str | None]]] = {"flax.nnx": {None}}
     """Default imports for Flax nnx modules."""
 
     def _get_layer(self, layername: str) -> str:
