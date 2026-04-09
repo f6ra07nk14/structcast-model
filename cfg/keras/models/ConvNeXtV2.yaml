@@ -111,7 +111,7 @@ Block:
           - {_addr_: keras.layers.Conv2D}
           - {_call_: {filters: "eval: {{fout}} * {{mlp_ratio}}", kernel_size: 1, padding: same, data_format: channels_last}}
       - [_, _, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: {{activation}}}}]]
-      - [_, _, [_obj_, {_addr_: keras.layers.GlobalResponseNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: structcast_model.keras.layers.GlobalResponseNorm}, {_call_: {epsilon: {{norm_eps}}}}]]
       - INPUTS: _
         OUTPUTS: _
         LAYER: 
