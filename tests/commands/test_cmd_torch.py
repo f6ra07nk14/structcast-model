@@ -335,7 +335,7 @@ def test_calflops_runs_with_real_model(cli_runner: CliRunner) -> None:
     """'calflops' should run calflops on a real model and print FLOPs, MACs, parameters."""
     configure_security(allowed_modules_check=False)
 
-    deps = {"instantiate": lambda raw: _SimpleModel()}
+    deps = {"instantiate_object": lambda raw: _SimpleModel()}
     with patch_cmd_globals(**deps):
         result = cli_runner.invoke(
             app,
@@ -641,7 +641,7 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
     configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
     deps = {
-        "instantiate": _make_instantiate_fn(training_data=_make_training_dataset()),
+        "instantiate_object": _make_instantiate_fn(training_data=_make_training_dataset()),
     }
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match="exactly one model definition"):
         train_fn(
@@ -685,7 +685,7 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
     configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
     deps = {
-        "instantiate": _make_instantiate_fn(
+        "instantiate_object": _make_instantiate_fn(
             training_data=_make_training_dataset(),
             loss=torch.nn.Identity(),
         ),
@@ -757,7 +757,7 @@ def _invoke_train(
     if validation_data is None:
         validation_data = _make_validation_dataset()
     deps = {
-        "instantiate": _make_instantiate_fn(
+        "instantiate_object": _make_instantiate_fn(
             training_data=training_data,
             validation_data=validation_data,
             backward_cls=backward_cls,
@@ -911,7 +911,9 @@ def _ddp_train_worker(
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
         validation_data = _make_validation_dataset()
-        deps = {"instantiate": _make_instantiate_fn(training_data=training_data, validation_data=validation_data)}
+        deps = {
+            "instantiate_object": _make_instantiate_fn(training_data=training_data, validation_data=validation_data)
+        }
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
@@ -989,7 +991,7 @@ def _ddp_rank_gating_worker(
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
-        deps = {"instantiate": _make_instantiate_fn(training_data=training_data)}
+        deps = {"instantiate_object": _make_instantiate_fn(training_data=training_data)}
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
@@ -1066,7 +1068,7 @@ def _ddp_seed_offset_worker(
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
-        deps = {"instantiate": _make_instantiate_fn(training_data=training_data)}
+        deps = {"instantiate_object": _make_instantiate_fn(training_data=training_data)}
         train_fn = _train_callback()
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
