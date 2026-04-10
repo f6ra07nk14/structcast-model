@@ -385,9 +385,18 @@ class UserDefinedBackward(Serializable):
         if missing := set(layers) - set(self.TRAINABLE_LAYERS):
             raise SpecError(f"Missing trainable layers found: {missing}.")
 
+    def _validate_mixed_precision(self) -> None:
+        """Validate the mixed precision configuration."""
+        if isinstance(self.MIXED_PRECISION, bool) and not self.MIXED_PRECISION:
+            if self.MIXED_PRECISION_TYPE is not None:
+                raise SpecError("MIXED_PRECISION_TYPE must be None when MIXED_PRECISION is False.")
+        elif self.MIXED_PRECISION is None:
+            raise SpecError("MIXED_PRECISION must be a boolean or a dictionary when MIXED_PRECISION_TYPE is not None.")
+
     @model_validator(mode="after")
     def _validate_user_defined_backward(self) -> Self:
         """Validate the user-defined backward configuration."""
+        self._validate_mixed_precision()
         self._validate_trainable_layers()
         train_inputs, train_outputs, losses = [], [], []
         infer_inputs, infer_outputs = [], []
