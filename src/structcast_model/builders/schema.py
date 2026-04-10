@@ -60,9 +60,9 @@ class UserLayer(Serializable):
 
 def _validate_name(data: str | None) -> str | None:
     """Validate the layer name."""
-    if data and not data.isidentifier():
-        raise SpecError(f"NAME must be a valid identifier but got: {data!r}.")
-    return data
+    if data is None or data.isidentifier():
+        return data
+    raise SpecError(f"NAME must be a valid identifier but got: {data!r}.")
 
 
 class LayerBehavior(Serializable):
