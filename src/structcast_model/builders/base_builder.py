@@ -443,9 +443,10 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME not in layers:
+                    if unit.NAME in layers:
+                        name = unit.NAME
+                    else:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
-                    name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
