@@ -374,7 +374,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             from_references={**self.from_references, self.current_path: current_parts},
         ).get_user_defined_layer(parts, parameters, classname)
 
-    def _get_sublayer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
+    def _get_layer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
         if unit.CFG is not None:
             current_path = str(unit.CFG)
             current_parts = self.from_references.get(current_path, None) or []
@@ -450,7 +450,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
-                        subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)
+                        subclassname, subinst = self._get_layer(parameters, unit.LAYER)
                     if (name := unit.NAME or naming(to_snake(subclassname))) in layers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                     layers[name] = subinst

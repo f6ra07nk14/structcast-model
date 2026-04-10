@@ -188,7 +188,7 @@ def test_base_model_builder_get_sublayer_cfg_with_type(tmp_path: Path) -> None:
     cfg_unit = UserLayer.model_validate({"CFG": cfg_path, "TYPE": "Backbone"})
     try:
         configure_security(working_dir_check=False)
-        subclassname, _sub = builder._get_sublayer(Parameters(), cfg_unit)
+        subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
         assert subclassname.endswith("Backbone")
     finally:
         configure_security()
