@@ -70,6 +70,18 @@ class TorchBackwardIntermediate(BackwardIntermediate):
         """Get the sub-layer with the given name."""
         return f"self.{layername}"
 
+    def _with_autocast(self, flow: list[str]) -> list[str]:
+        if not self.mixed_precision_type:
+            return flow
+        if self.mixed_precision_device is None:
+            raise ValueError("Mixed precision device must be specified when mixed precision type is specified.")
+        autocast = f"with torch.autocast({self.mixed_precision_device!r}, torch.{self.mixed_precision_type}):"
+        return [autocast] + [f"{' ' * 4}{L}" for L in flow]
+
+    def _get_forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return self._with_autocast(super()._get_forward_inference_flow())
+
     def _get_forward_training_flow(self) -> list[str]:
         scripts, start = [], 0
 
@@ -89,7 +101,7 @@ class TorchBackwardIntermediate(BackwardIntermediate):
             if clip_name is not None:
                 clip_name = self._get_layer(clip_name)
             preset = [f"{self._get_layer(m)}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
-            scripts = scripts[:start] + preset + scripts[start:]
+            scripts = scripts[:start] + preset + self._with_autocast(scripts[start:])
             if self.accumulate_gradients:
                 scripts.append(f"{loss} = {loss} / {self.accumulate_gradients}")
             if mixed_precision_name is None:

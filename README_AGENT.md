@@ -21,7 +21,7 @@ cfg/torch/
 ├── losses/                    # Loss layer templates
 ├── metrics/                   # Metric layer templates
 ├── models/                    # Model architecture templates
-└── others/                    # Runtime presets such as compile and EMA
+└── others/                    # Other templates (e.g. compile settings)
 cfg/flax/
 └── models/                    # Flax model architecture templates
 cfg/keras/
@@ -42,7 +42,7 @@ src/structcast_model/
 │   ├── cmd_keras.py           # Keras CLI commands
 │   └── utils.py               # CLI argument parsers and reducers
 ├── torch/
-│   ├── trainer.py             # Training steps, tracker, EMA, timm wrappers, trainer
+│   ├── trainer.py             # Training steps, tracker, timm wrappers, trainer
 │   ├── optimizers.py          # Optimizer/scheduler helpers used by backward templates
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
@@ -196,7 +196,7 @@ Key options are the same as `scm torch create model`: `-p`, `-c`, `--structured-
 
 Purpose:
 
-- Instantiate models, losses, metrics, backward logic, datasets, compile settings, and EMA.
+- Instantiate models, losses, metrics, backward logic, datasets, and compile settings.
 - Run a training loop via `TorchTrainer`.
 - Log metrics and states to MLflow.
 
@@ -216,7 +216,6 @@ Distributed training behavior (when launched through `torchrun`):
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - MLflow logging, checkpoints, and progress bars are gated to rank 0 only.
 - DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
-- `TimmEmaWrapper` unwraps the DDP module before updating EMA weights.
 - CLI options `--dist-backend` and `--dist-url` (also settable via `DIST_BACKEND` / `DIST_URL` env vars) control the distributed backend.
 
 Launch command for distributed training:
@@ -330,7 +329,6 @@ timm integrations:
 
 - `TimmDatasetWrapper`
 - `TimmDataLoaderWrapper`
-- `TimmEmaWrapper`
 
 ### Flax runtime layer
 

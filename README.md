@@ -84,7 +84,6 @@ Model code generation is available for all three frameworks. Training workflow g
       - [`Forward`](#forward)
       - [`Backward`](#backward)
       - [`Callback` and `BestCallback`](#callback-and-bestcallback)
-      - [`InferenceWrapper`](#inferencewrapper)
     - [State and callbacks](#state-and-callbacks)
       - [`BaseInfo`](#baseinfo)
       - [`Callbacks`](#callbacks)
@@ -107,7 +106,6 @@ Model code generation is available for all three frameworks. Training workflow g
     - [timm integrations](#timm-integrations)
       - [`TimmDatasetWrapper`](#timmdatasetwrapper)
       - [`TimmDataLoaderWrapper`](#timmdataloaderwrapper)
-      - [`TimmEmaWrapper`](#timmemawrapper)
   - [Minimal End-to-End Example](#minimal-end-to-end-example)
   - [Development](#development)
   - [Roadmap](#roadmap)
@@ -119,7 +117,7 @@ Model code generation is available for all three frameworks. Training workflow g
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
-- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
 
 ## Installation
 
@@ -206,7 +204,7 @@ structcast-model/
 │   │   ├── losses/        # loss module templates
 │   │   ├── metrics/       # metric module templates
 │   │   ├── models/        # model architecture templates
-│   │   └── others/        # compile and EMA presets
+│   │   └── others/        # misc templates (e.g. for `torch.compile` options)
 │   ├── flax/
 │   │   └── models/        # Flax model architecture templates
 │   └── keras/
@@ -245,7 +243,7 @@ The repository follows a repeatable workflow:
 3. **Generate** Python source files for the model (and, for PyTorch, loss, metric, and backward logic) using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
 5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
-6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow.
+6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, and MLflow.
 
 ```text
 YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
@@ -467,7 +465,6 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -486,7 +483,6 @@ scm torch train \
     --matmul-precision high \
     -E Test \
     -A model.py \
-    -A cfg/torch/others/ema.yaml \
     -A loss.py \
     -A metric.py \
     -A backward.py \
@@ -500,7 +496,6 @@ Key arguments:
 - positional model patterns: one or more named model definitions
 - `-s/--shape`: dummy input shapes used for model initialization
 - `-d/--device`: `cpu` or `cuda`
-- `--ema`: boolean, YAML file, or inline dict for `timm.utils.ModelEmaV3`
 - `-L/--loss`: StructCast pattern for the loss module
 - `-M/--metric`: StructCast pattern for the metric module
 - `-B/--backward`: StructCast pattern for the backward class
@@ -517,7 +512,7 @@ What the train command does internally:
 
 1. Instantiates datasets and determines their lengths.
 2. Initializes models with optional dummy-input forward passes.
-3. Instantiates loss, metric, backward, compile, and EMA objects.
+3. Instantiates loss, metric, backward, and compile objects.
 4. Builds a `TorchTracker` from the declared output names.
 5. Creates a `TorchTrainer` with training and validation step objects.
 6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
@@ -541,8 +536,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — MLflow logging, progress bars, and checkpoint saving are performed only on rank 0.
 7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
-8. **EMA handling** — `TimmEmaWrapper` automatically unwraps the DDP module before updating EMA weights.
-9. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
+8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
 
 ### Single-Node Multi-GPU
 
@@ -556,7 +550,6 @@ torchrun --nproc_per_node=gpu \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -1108,9 +1101,6 @@ Called once per training step. Receives the step index and criterion keyword arg
 
 Lifecycle hooks called with `(info: BaseInfo, **models)`. `BestCallback` additionally receives `target: str` and `best: float` arguments.
 
-#### `InferenceWrapper`
-
-Applied to models before each validation epoch. Returns a remapped model dictionary, e.g., swapping a trained model for its EMA copy.
 
 ### State and callbacks
 
@@ -1288,10 +1278,6 @@ Builds a timm dataloader with support for:
 
 The dataset template at `cfg/torch/datasets/default_timm.yaml` formats into this wrapper.
 
-#### `TimmEmaWrapper`
-
-Creates and updates `timm.utils.ModelEmaV3` instances and swaps them into inference-time evaluation when appropriate.
-
 ## Minimal End-to-End Example
 
 ```bash
@@ -1314,7 +1300,6 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
