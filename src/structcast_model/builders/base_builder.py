@@ -576,10 +576,14 @@ class BackwardIntermediate(_Intermediate):
         """Get the code for the training flow in the forward method."""
         return self._get_forward_training_flow()
 
+    def _get_forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
+
     @cached_property
     def _forward_inference_flow(self) -> list[str]:
         """Get the code for the inference flow in the forward method."""
-        return [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
+        return self._get_forward_inference_flow()
 
     def _get_backward_script(self, initialized_layers: list[str]) -> str:
         """Get the script for the backward layer."""

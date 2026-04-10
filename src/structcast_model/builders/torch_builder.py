@@ -73,9 +73,7 @@ class TorchBackwardIntermediate(BackwardIntermediate):
     def _with_autocast(self, flow: list[str]) -> list[str]:
         if not self.mixed_precision_type:
             return flow
-        if self.mixed_precision_device is None:
-            raise ValueError("Mixed precision device must be specified when mixed precision type is specified.")
-        autocast = f"with torch.autocast({self.mixed_precision_device!r}, torch.{self.mixed_precision_type}):"
+        autocast = f"with torch.autocast(self.device_type, torch.{self.mixed_precision_type}):"
         return [autocast] + [f"{' ' * 4}{L}" for L in flow]
 
     def _get_forward_inference_flow(self) -> list[str]:
@@ -151,6 +149,7 @@ class {self.classname}:
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
         self.mixed_precision_type = "{self.mixed_precision_type}"
         self.need_update = True
+        self.device_type = next({self._get_layer(self.models[0])}.parameters()).device.type
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
