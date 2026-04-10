@@ -287,7 +287,7 @@ class BackwardBehavior(Serializable):
     LOSS: str
     """The target loss to optimize."""
 
-    TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
+    TRAINABLE_LAYERS: list[str] = Field(default_factory=list, min_length=1)
     """The trainable layers to apply the optimizer to."""
 
     FLOW: list[LayerBehavior] = Field(default_factory=list)
@@ -399,7 +399,7 @@ class UserDefinedBackward(Serializable):
                 msg = f'Loss "{backward.LOSS}" must be in the outputs of the backward flow but got: {train_outputs}.'
                 raise SpecError(msg)
             losses.append(backward.LOSS)
-            flow = backward.INFERENCE_FLOW if backward.INFERENCE_FLOW else backward.FLOW
+            flow = backward.INFERENCE_FLOW or backward.FLOW
             backward_inputs, backward_outputs = resolve_flow(flow, existing_values=infer_outputs)
             infer_inputs += backward_inputs
             infer_outputs += backward_outputs
