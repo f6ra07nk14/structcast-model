@@ -4,12 +4,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from structcast.core.instantiator import ObjectPattern
+
 from structcast_model.builders.base_builder import (
     BackwardIntermediate,
     BaseBackwardBuilder,
     BaseModelBuilder,
     LayerIntermediate,
     resolve_getter,
+    resolve_object,
 )
 
 
@@ -45,7 +48,7 @@ class {class_name}(torch.nn.Module):
         super().__init__()
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
-        {sep.join([f"self.{v}" for v in initialized_layers])}
+        {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
     def forward(self, {inputs}**kwargs):
         {sep.join(codes)}
@@ -63,100 +66,94 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
 class TorchBackwardIntermediate(BackwardIntermediate):
     """Intermediate representation of a PyTorch backward layer."""
 
-    def _entry_optimizer_steps(self, opts: list[str], *, indent: str) -> list[str]:
-        """Generate unscale / clip / step / scaler-update lines for one backward entry."""
-        has_mp = self.mixed_precision is not None
-        scaler_opt = opts[0]
-        lines: list[str] = []
-        for n in opts:
-            if has_mp:
-                lines.append(f"{indent}self.{scaler_opt}_scaler.unscale_(self.{n})")
-            if self.optimizers[n][2]:
-                param = f"[p for pg in self.{n}.param_groups for p in pg['params']]"
-                lines.append(f"{indent}self.{n}_clip({param})")
-        for n in opts:
-            if has_mp:
-                lines.append(f"{indent}self.{scaler_opt}_scaler.step(self.{n})")
+    def _get_layer(self, layername: str) -> str:
+        """Get the sub-layer with the given name."""
+        return f"self.{layername}"
+
+    def _get_forward_training_flow(self) -> list[str]:
+        scripts, start = [], 0
+
+        def _param(layers: list[str]) -> str:
+            if len(layers) == 1:
+                return f"{self._get_layer(layers[0])}.parameters()"
+            return f"(p for m in ({', '.join(self._get_layer(L) for L in layers)}) for p in m.parameters())"
+
+        for unit in self.flow:
+            if len(unit) == 3:
+                scripts.append(self._get_regular_step(*unit))
+                continue
+            loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = unit
+            optimizer_name = self._get_layer(optimizer_name)
+            if mixed_precision_name is not None:
+                mixed_precision_name = self._get_layer(mixed_precision_name)
+            if clip_name is not None:
+                clip_name = self._get_layer(clip_name)
+            preset = [f"{self._get_layer(m)}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
+            scripts = scripts[:start] + preset + scripts[start:]
+            if self.accumulate_gradients:
+                scripts.append(f"{loss} = {loss} / {self.accumulate_gradients}")
+            if mixed_precision_name is None:
+                scripts.append(f"{loss}.backward({backward_kwargs})")
             else:
-                lines.append(f"{indent}self.{n}.step()")
-        if has_mp:
-            lines.append(f"{indent}self.{scaler_opt}_scaler.update()")
-        return lines
+                scripts.append(f"{mixed_precision_name}.scale({loss}).backward({backward_kwargs})")
+            if self.accumulate_gradients:
+                scripts.append("if self.need_update:")
+                indent = " " * 4
+            else:
+                indent = ""
+            if mixed_precision_name is None:
+                if clip_name is not None:
+                    scripts.append(f"{indent}{mixed_precision_name}.unscale_({optimizer_name})")
+                    scripts.append(f"{indent}{clip_name}({_param(trainable_layers)})")
+                scripts.append(f"{indent}{mixed_precision_name}.step({optimizer_name})")
+                scripts.append(f"{indent}{mixed_precision_name}.update()")
+            else:
+                if clip_name is not None:
+                    scripts.append(f"{indent}{clip_name}({_param(trainable_layers)})")
+                scripts.append(f"{indent}{optimizer_name}.step()")
+            scripts.append(f"{indent}{optimizer_name}.zero_grad()")
+            start = len(scripts)
+        return scripts
 
-    def _build_flow_no_accumulation(self) -> list[str]:
-        """Build per-entry flow (backward → step → zero_grad) for non-accumulation mode."""
-        has_mp = self.mixed_precision is not None
-        flow: list[str] = []
-        for L, kw, opts in self.backwards:
-            scaler_opt = opts[0]
-            backward_target = f"self.{scaler_opt}_scaler.scale({L})" if has_mp else L
-            flow.append(f"{backward_target}.backward({kw})")
-            flow.extend(self._entry_optimizer_steps(opts, indent=""))
-            for n in opts:
-                flow.append(f"self.{n}.zero_grad()")
-        return flow
-
-    def _build_flow_accumulation(self, indent: str) -> list[str]:
-        """Build all-backward-first flow for gradient-accumulation mode."""
-        has_mp = self.mixed_precision is not None
-        flow: list[str] = []
-        for L, _, _ in self.backwards:
-            flow.append(f"{L} = {L} / {self.accumulate_gradients}")
-        for L, kw, opts in self.backwards:
-            scaler_opt = opts[0]
-            backward_target = f"self.{scaler_opt}_scaler.scale({L})" if has_mp else L
-            flow.append(f"{backward_target}.backward({kw})")
-        flow.append("if self.need_update:")
-        for _, _, opts in self.backwards:
-            flow.extend(self._entry_optimizer_steps(opts, indent=indent))
-            for n in opts:
-                flow.append(f"{indent}self.{n}.zero_grad()")
-        return flow
-
-    def _build_init_opts(self) -> list[str]:
-        """Build __init__ statements for optimizers, clips and grad scalers."""
-        has_mp = self.mixed_precision is not None
-        init_opts = [f"self.{n} = {o}(_get_param([{', '.join(L)}]))" for n, (o, L, _) in self.optimizers.items()]
-        for n, (_, _, clip) in self.optimizers.items():
-            if clip:
-                init_opts.append(f"self.{n}_clip = {clip}")
-        if has_mp:
-            for scaler_opt in {opts[0] for _, _, opts in self.backwards}:
-                init_opts.append(f"self.{scaler_opt}_scaler = {self.mixed_precision}")
-        return init_opts
-
-    def _get_scripts(self) -> list[str]:
+    def _get_backward_script(self, initialized_layers: list[str]) -> str:
+        """Get the script for the backward layer."""
         indent = " " * 4
         sep = "\n" + indent * 2
-        has_mp = self.mixed_precision is not None
-        init_opts = self._build_init_opts()
-        if self.accumulate_gradients:
-            flow = self._build_flow_accumulation(indent)
-        else:
-            flow = self._build_flow_no_accumulation()
-        opts_repr = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
-        grad_scalers = (
-            ", ".join([f'"{opts[0]}": self.{opts[0]}_scaler' for _, _, opts in self.backwards]) if has_mp else ""
-        )
+        models_zero_grad = [f"{m}.zero_grad()" for m in self.models]
+        models_repr = ", ".join([f'"{m}": {self._get_layer(m)}' for m in self.models])
+        opts_repr = ", ".join([f'"{n}": {self._get_layer(n)}' for n in self.optimizers])
+        grad_scalers_repr = ", ".join([f'"{n}": {self._get_layer(n)}' for n in self.mixed_precision_scales])
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
-        res = f"""\
+        inputs = self._forward_inputs
+        inputs += ", " if inputs else ""
+        return f"""\
 class {self.classname}:
 
     def __init__(self, {self._backward_models}, **kwargs):
         def _get_param(models):
             return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
 
-        {sep.join(init_opts)}
+        {sep.join(models_zero_grad)}
+        {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
         self.mixed_precision_type = "{self.mixed_precision_type}"
         self.need_update = True
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
 
-    def __call__(self, {self._backward_losses}, **kwargs):
-        {sep.join(flow)}
+    def training_step(self, {inputs}**kwargs):
+        {sep.join(self._forward_training_flow)}
+        return {self._forward_outputs}
+
+    def inference_step(self, {inputs}**kwargs):
+        {sep.join(self._forward_inference_flow)}
+        return {self._forward_outputs}
+
+    @property
+    def models(self):
+        return {{{models_repr}}}
 
     @property
     def optimizers(self):
@@ -164,7 +161,7 @@ class {self.classname}:
 
     @property
     def grad_scalers(self):
-        return {{{grad_scalers}}}
+        return {{{grad_scalers_repr}}}
 
     @property
     def learning_rates(self):
@@ -180,7 +177,6 @@ class {self.classname}:
 
         return {{k: _get_param_groups(v) for k, v in self.optimizers.items()}}
 """
-        return [res]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -188,19 +184,29 @@ class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
     """Builder for PyTorch backward layers."""
 
     user_defined_backward_layer_type: ClassVar[type[TorchBackwardIntermediate]] = TorchBackwardIntermediate
+    layer_builder_type: ClassVar[type[TorchBuilder]] = TorchBuilder
 
     def _get_mixed_precision(
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
-    ) -> str | None:
+    ) -> tuple[str, str] | tuple[None, None]:
         if isinstance(mixed_precision, bool):
             if not mixed_precision:
-                return None
+                return None, None
             mixed_precision = {}
         imports["torch.amp"].add(None)
         repr_mp_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
-        return f"torch.amp.GradScaler({repr_mp_kw})"
+        return f"torch.amp.GradScaler({repr_mp_kw})", "GradScaler"
+
+    def _get_optimizer(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        optimizer: ObjectPattern,
+        trainable_layers: list[str],
+    ) -> tuple[str, str]:
+        opt_inst, opt_cls = resolve_object(imports, optimizer)
+        return f"{opt_inst}(_get_param([{', '.join(trainable_layers)}]))", opt_cls
 
 
 __all__ = ["TorchBackwardBuilder", "TorchBackwardIntermediate", "TorchBuilder", "TorchLayerIntermediate"]
