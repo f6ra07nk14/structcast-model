@@ -1139,7 +1139,7 @@ The main training loop driver. Inherits both `BaseInfo` and `Callbacks`.
 
 Required fields: `training_step` (`Forward`), `backward` (`Backward`), `tracker` (callable returning `dict[str, float]`).
 
-Optional fields: `validation_step`, `inference_wrapper`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
+Optional fields: `validation_step`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
 
 Key methods:
 

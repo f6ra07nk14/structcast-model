@@ -294,9 +294,6 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     tracker: Callable[..., dict[str, float]]
     """The tracker to log training and validation information."""
 
-    inference_wrapper: InferenceWrapper[ModelT_contra] | None = None
-    """An optional wrapper to apply to the model during inference, e.g., for quantization or ONNX export."""
-
     validation_step: Forward[ModelT_contra] | None = None
     """The forward pass configuration for validation."""
 
@@ -374,8 +371,6 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         if self.validation_step is None:
             logger.warning("Validation step is not defined. Skipping evaluation.")
             return {}
-        if self.inference_wrapper is not None:
-            models = self.inference_wrapper(self, **models)
         invoke_callback(self.on_validation_begin, self, **models)
         elapsed_time = 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):

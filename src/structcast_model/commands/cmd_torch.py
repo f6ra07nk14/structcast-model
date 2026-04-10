@@ -176,17 +176,14 @@ def _on_best(info: BaseInfo, best: BestCriterion, save: bool, **kwargs: Any) -> 
 
 
 def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
-    """Save full training state (models, optimizers, grad scalers, EMA, meta) to MLflow."""
+    """Save full training state (models, optimizers, grad scalers, meta) to MLflow."""
     backward = cast("torch_trainer.TorchTrainer", info).backward
-    wrapper = cast("torch_trainer.TorchTrainer", info).inference_wrapper
     states: dict[str, Any] = {
         "models": _get_state_dict(_unwrap_ddp(kwargs)),
         "optimizers": _get_state_dict(getattr(backward, "optimizers", {})),
         "grad_scalers": _get_state_dict(getattr(backward, "grad_scalers", {})),
         "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
     }
-    if wrapper is not None:
-        states["ema"] = _get_state_dict(cast("torch_trainer.TimmEmaWrapper", wrapper).models)
     mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
 
 
@@ -345,16 +342,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
-    ema: dict[str, Any] | None = Option(
-        None,
-        parser=bool_or_path_or_dict_parser,
-        help="Whether to use EMA (Exponential Moving Average) for the model during training. "
-        "Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments "
-        "for the EMA wrapper (e.g., decay rate).",
-    ),
-    ema_device: str | None = Option(
-        None, help="Device for the EMA model. If not specified, it will use the same device as the main model."
-    ),
     loss_pattern: Any = Option(
         ...,
         "--loss",
@@ -538,20 +525,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         backward = instantiate_object(backward_pattern)(**models)
     mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
     autocast = torch_trainer.get_autocast(mixed_precision_type, device)
-    inference_wrapper = None
-    if ema is not None:
-        inference_wrapper = torch_trainer.TimmEmaWrapper.from_models(
-            models,
-            device=None if ema_device is None else torch.device(ema_device),
-            compile_fn=compile_fn,
-            distributed=distributed,
-            **instantiator.instantiate(ema),
-        )
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
     step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
     trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern))(
         device=device,
-        inference_wrapper=inference_wrapper,
         training_step=(
             torch_trainer.TrainingStep if training_step_pattern is None else instantiate_object(training_step_pattern)
         )(**step_kw),
@@ -612,8 +589,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "device": device,
                 "distributed": distributed,
                 "world_size": world_size,
-                "ema": ema,
-                "ema_device": ema_device,
                 "loss": loss_pattern,
                 "loss_outputs": loss_outputs,
                 "metric": metric_pattern,
