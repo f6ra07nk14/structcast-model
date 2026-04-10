@@ -20,7 +20,6 @@ from timm.data import (
     create_dataset,
     create_loader,
 )
-from timm.utils import ModelEmaV3
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 from torch.utils.data import DataLoader
 
@@ -295,79 +294,6 @@ class TorchTracker:
         if distributed is None:
             distributed = torch.distributed.is_initialized()
         return cls(tracker=tracker, distributed=distributed)
-
-
-@dataclass(kw_only=True, slots=True)
-class TimmEmaWrapper:
-    """An inference wrapper that returns the EMA model from the timm library."""
-
-    is_cross_device: dict[str, bool]
-    """A dictionary mapping model names to a boolean indicating whether
-    the EMA model is on a different device than the original model."""
-
-    ema: dict[str, ModelEmaV3]
-    """The EMA model."""
-
-    distributed: bool = field(default_factory=torch.distributed.is_initialized)
-    """Whether the wrapper is being used in a distributed training environment."""
-
-    def __post_init__(self) -> None:
-        """Post-initialization."""
-        GLOBAL_CALLBACKS.on_update.register("ema_update", self.update)
-
-    def update(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Update the EMA model."""
-        if self.distributed:
-            models = {n: getattr(m, "module", m) for n, m in models.items()}  # unwrap DDP for EMA update
-        for name, ema in self.ema.items():
-            ema.update(models[name], step=info.update)
-
-    def __call__(self, info: BaseInfo, **models: torch.nn.Module) -> dict[str, Any]:
-        """Return the EMA model."""
-        return {n: m if n in self.ema and self.is_cross_device[n] else self.ema[n] for n, m in models.items()}
-
-    @property
-    def models(self) -> dict[str, torch.nn.Module]:
-        """Return the EMA models."""
-        return {n: ema.module for n, ema in self.ema.items()}
-
-    @classmethod
-    def from_models(
-        cls,
-        models: dict[str, torch.nn.Module],
-        device: torch.device | None = None,
-        compile_fn: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
-        distributed: bool | None = None,
-        **kwargs: Any,
-    ) -> "TimmEmaWrapper":
-        """Create a TimmEmaWrapper from the given models.
-
-        Args:
-            models (dict[str, torch.nn.Module]): The models to create the EMA wrapper for.
-            device (torch.device | None): The device to move the EMA models to.
-                If None, the EMA models will not be moved.
-            compile_fn (Callable[[torch.nn.Module], torch.nn.Module] | None):
-                An optional function to compile the EMA models.
-            distributed (bool | None): Whether the wrapper will be used in a distributed training environment.
-            **kwargs: Additional keyword arguments to pass to the ModelEmaV3 constructor.
-
-        Returns:
-            A TimmEmaWrapper instance with the specified EMA models and callbacks.
-        """
-
-        def _get_device(model: torch.nn.Module) -> str:
-            return next(model.parameters()).device.type
-
-        ema, is_cross_device = {}, {}
-        for name, model in models.items():
-            ema_model = ModelEmaV3(model, device=device, **kwargs)
-            if compile_fn is not None:
-                ema_model = compile_fn(ema_model)
-            ema[name] = ema_model
-            is_cross_device[name] = _get_device(model) != _get_device(ema_model.module)
-        if distributed is None:
-            distributed = torch.distributed.is_initialized()
-        return cls(ema=ema, is_cross_device=is_cross_device, distributed=distributed)
 
 
 def _model_train(info: BaseInfo, **models: torch.nn.Module) -> None:
@@ -845,7 +771,6 @@ __all__ = [
     "CriteriaTracker",
     "TimmDataLoaderWrapper",
     "TimmDatasetWrapper",
-    "TimmEmaWrapper",
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
