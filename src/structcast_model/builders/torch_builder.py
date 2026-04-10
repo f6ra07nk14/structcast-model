@@ -66,73 +66,73 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
 class TorchBackwardIntermediate(BackwardIntermediate):
     """Intermediate representation of a PyTorch backward layer."""
 
-    def _get_layer(self, layername: str) -> str:
-        """Get the sub-layer with the given name."""
-        return f"self.{layername}"
+    default_imports: ClassVar[dict[str, set[str | None]]] = {"torch": {None}}
+    """Default imports for PyTorch layers."""
 
     def _with_autocast(self, flow: list[str]) -> list[str]:
-        if not self.mixed_precision_type:
+        if not (self.mixed_precision_type and flow):
             return flow
-        autocast = f"with torch.autocast(self.device_type, torch.{self.mixed_precision_type}):"
+        autocast = f"with torch.autocast(device_type, torch.{self.mixed_precision_type}):"
         return [autocast] + [f"{' ' * 4}{L}" for L in flow]
 
     def _get_forward_inference_flow(self) -> list[str]:
         """Get the code for the inference flow in the forward method."""
-        return self._with_autocast(super()._get_forward_inference_flow())
+        inputs = self._forward_inputs
+        inputs += ", " if inputs else ""
+        flow = [f"{' ' * 4}{L}" for L in self._with_autocast(super()._get_forward_inference_flow())]
+        return [f"def _inference_step({inputs}**kwargs):"] + flow + [f"{' ' * 4}return {self._forward_outputs}"]
 
     def _get_forward_training_flow(self) -> list[str]:
-        scripts, start = [], 0
+        flow, start = [], 0
 
         def _param(layers: list[str]) -> str:
             if len(layers) == 1:
-                return f"{self._get_layer(layers[0])}.parameters()"
-            return f"(p for m in ({', '.join(self._get_layer(L) for L in layers)}) for p in m.parameters())"
+                return f"{layers[0]}.parameters()"
+            return f"(p for m in ({', '.join(f'{L}' for L in layers)}) for p in m.parameters())"
 
         for unit in self.flow:
             if len(unit) == 3:
-                scripts.append(self._get_regular_step(*unit))
+                flow.append(self._get_regular_step(*unit))
                 continue
             loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = unit
-            optimizer_name = self._get_layer(optimizer_name)
-            if mixed_precision_name is not None:
-                mixed_precision_name = self._get_layer(mixed_precision_name)
-            if clip_name is not None:
-                clip_name = self._get_layer(clip_name)
-            preset = [f"{self._get_layer(m)}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
-            scripts = scripts[:start] + preset + self._with_autocast(scripts[start:])
+            preset = [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
+            flow = flow[:start] + preset + self._with_autocast(flow[start:])
             if self.accumulate_gradients:
-                scripts.append(f"{loss} = {loss} / {self.accumulate_gradients}")
+                flow.append(f"{loss} = {loss} / {self.accumulate_gradients}")
             if mixed_precision_name is None:
-                scripts.append(f"{loss}.backward({backward_kwargs})")
+                flow.append(f"{loss}.backward({backward_kwargs})")
             else:
-                scripts.append(f"{mixed_precision_name}.scale({loss}).backward({backward_kwargs})")
+                flow.append(f"{mixed_precision_name}.scale({loss}).backward({backward_kwargs})")
             if self.accumulate_gradients:
-                scripts.append("if self.need_update:")
+                flow.append("if __need_update__:")
                 indent = " " * 4
             else:
                 indent = ""
             if mixed_precision_name is None:
                 if clip_name is not None:
-                    scripts.append(f"{indent}{mixed_precision_name}.unscale_({optimizer_name})")
-                    scripts.append(f"{indent}{clip_name}({_param(trainable_layers)})")
-                scripts.append(f"{indent}{mixed_precision_name}.step({optimizer_name})")
-                scripts.append(f"{indent}{mixed_precision_name}.update()")
+                    flow.append(f"{indent}{clip_name}({_param(trainable_layers)})")
+                flow.append(f"{indent}{optimizer_name}.step()")
             else:
                 if clip_name is not None:
-                    scripts.append(f"{indent}{clip_name}({_param(trainable_layers)})")
-                scripts.append(f"{indent}{optimizer_name}.step()")
-            scripts.append(f"{indent}{optimizer_name}.zero_grad()")
-            start = len(scripts)
-        return scripts
+                    flow.append(f"{indent}{mixed_precision_name}.unscale_({optimizer_name})")
+                    flow.append(f"{indent}{clip_name}({_param(trainable_layers)})")
+                flow.append(f"{indent}{mixed_precision_name}.step({optimizer_name})")
+                flow.append(f"{indent}{mixed_precision_name}.update()")
+            flow.append(f"{indent}{optimizer_name}.zero_grad()")
+            start = len(flow)
+        inputs = self._forward_inputs
+        inputs += ", " if inputs else ""
+        prefix = [f"def _training_step(__need_update__, {inputs}**kwargs):"]
+        suffix = [f"{' ' * 4}return {self._forward_outputs}"]
+        return prefix + [f"{' ' * 4}{L}" for L in flow] + suffix
 
-    def _get_backward_script(self, initialized_layers: list[str]) -> str:
+    def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the backward layer."""
         indent = " " * 4
         sep = "\n" + indent * 2
-        models_zero_grad = [f"{m}.zero_grad()" for m in self.models]
-        models_repr = ", ".join([f'"{m}": {self._get_layer(m)}' for m in self.models])
-        opts_repr = ", ".join([f'"{n}": {self._get_layer(n)}' for n in self.optimizers])
-        grad_scalers_repr = ", ".join([f'"{n}": {self._get_layer(n)}' for n in self.mixed_precision_scales])
+        models_repr = ", ".join([f'"{m}": self.{m}' for m in self.models])
+        opts_repr = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
+        grad_scalers_repr = ", ".join([f'"{n}": self.{n}' for n in self.mixed_precision_scales])
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
@@ -142,25 +142,30 @@ class TorchBackwardIntermediate(BackwardIntermediate):
 class {self.classname}:
 
     def __init__(self, {self._backward_models}, **kwargs):
+        device_type = next({self.models[0]}.parameters()).device.type
         def _get_param(models):
             return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
 
-        {sep.join(models_zero_grad)}
-        {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
-        self.mixed_precision_type = "{self.mixed_precision_type}"
+        {sep.join([f"{m}.zero_grad()" for m in self.models])}
+        {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
+        {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
+        {sep.join(self._forward_training_flow)}
+        {sep.join(self._forward_inference_flow)}
+        self.forward_training_step = _training_step
+        self.forward_inference_step = _inference_step
+        {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
+        {sep.join([f"self.{k} = {k}" for k in self.others])}
         self.need_update = True
-        self.device_type = next({self._get_layer(self.models[0])}.parameters()).device.type
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
 
     def training_step(self, {inputs}**kwargs):
-        {sep.join(self._forward_training_flow)}
-        return {self._forward_outputs}
+        return self.forward_training_step(self.need_update, {inputs}**kwargs)
 
+    @torch.no_grad()
     def inference_step(self, {inputs}**kwargs):
-        {sep.join(self._forward_inference_flow)}
-        return {self._forward_outputs}
+        return self.forward_inference_step({inputs}**kwargs)
 
     @property
     def models(self):

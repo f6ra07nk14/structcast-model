@@ -514,6 +514,10 @@ class BackwardIntermediate(_Intermediate):
     """The layers used in the backward layer, where the keys are the layer names and the values are either the layer
     as a `LayerIntermediate` instance or a string representation of the layer to be used directly in the script."""
 
+    others: dict[str, str]
+    """Other configurations for the backward layer, where the keys are the configuration names and the values are
+    the string representations of the configurations to be used directly in the script."""
+
     flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]]
     """The flow of the backward layer during training,
     where each element is either a tuple of the form (input, output, layer) for regular steps in the flow,
@@ -560,12 +564,8 @@ class BackwardIntermediate(_Intermediate):
         """Get the output arguments for calling the layer in the forward method."""
         return f"{{{','.join(f'{repr(k)}: {k}' for k in self.outputs)}}}"
 
-    def _get_layer(self, layername: str) -> str:
-        """Get the sub-layer with the given name."""
-        return layername
-
     def _get_regular_step(self, inputs: str, output: str, layer: str | None) -> str:
-        return f"{output} = {self._get_layer(layer)}({inputs})" if layer else f"{output} = {inputs}"
+        return f"{output} = {layer}({inputs})" if layer else f"{output} = {inputs}"
 
     def _get_forward_training_flow(self) -> list[str]:
         """Get the code for the training flow in the forward method."""
@@ -585,7 +585,7 @@ class BackwardIntermediate(_Intermediate):
         """Get the code for the inference flow in the forward method."""
         return self._get_forward_inference_flow()
 
-    def _get_backward_script(self, initialized_layers: list[str]) -> str:
+    def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the backward layer."""
         raise NotImplementedError("The _get_backward_script method must be implemented in the subclass.")
 
@@ -606,7 +606,7 @@ class BackwardIntermediate(_Intermediate):
             scripts.append(sub._get_layer_script(classname, layers))
             return sub._get_class_instance(classname)
 
-        init_layers: list[str] = [f"{k} = {v if isinstance(v, str) else _scripts(v)}" for k, v in self.layers.items()]
+        init_layers = {k: v if isinstance(v, str) else _scripts(v) for k, v in self.layers.items()}
         scripts.append(self._get_backward_script(init_layers))
         return scripts
 
@@ -679,9 +679,11 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(module.IMPORTS)
         layers: dict[str, LayerIntermediate | str] = {}
+        others: dict[str, str] = {}
         naming = AutoName("_")
         for layer in module.TRAINABLE_LAYERS:
-            layers[layer] = naming(layer)
+            layer = naming(layer)
+            others[layer] = layer
 
         def _inputs(raw: Any) -> str:
             if isinstance(raw, dict):
@@ -697,7 +699,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME in layers:
+                    if unit.NAME in layers or unit.NAME in others:
                         name = unit.NAME
                     else:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
@@ -706,7 +708,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
                         subclassname, subinst = self.layer_builder._get_layer(parameters, unit.LAYER)
-                    if (name := unit.NAME or naming(to_snake(subclassname))) in layers:
+                    if (name := unit.NAME or naming(to_snake(subclassname))) in layers or name in others:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
                     layers[name] = subinst
                 if unit.INPUTS is not None and unit.OUTPUTS is not None:
@@ -729,22 +731,24 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
         for backward in module.BACKWARDS:
             opt_inst, opt_cls = self._get_optimizer(imports, backward.OPTIMIZER, backward.TRAINABLE_LAYERS)
-            if (opt_name := backward.NAME or naming(to_snake(opt_cls))) in layers:
+            if (opt_name := backward.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
                 raise SpecError(f'Duplicate variable name "{opt_name}" for optimizer found in the backward flow.')
-            layers[opt_name] = opt_inst
+            others[opt_name] = opt_inst
             if backward.CLIP:
                 clip_inst, clip_cls = resolve_object(imports, backward.CLIP)
-                if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers:
+                if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers or clip_name in others:
                     raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the backward flow.')
-                layers[clip_name] = clip_inst
+                others[clip_name] = clip_inst
             else:
                 clip_inst, clip_name = None, None
-            if amp_cls is not None:
-                if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers:
+            if amp_cls is None:
+                amp_name = None
+            else:
+                if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers or amp_name in others:
                     raise SpecError(
                         f'Duplicate variable name "{amp_name}" for mixed precision instance found in the backward flow.'
                     )
-                layers[amp_name] = amp_inst
+                others[amp_name] = amp_inst
             backward_flow += _create_flow(backward.FLOW)
             inference_flow += _create_flow(backward.INFERENCE_FLOW or backward.FLOW)
             backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in backward.EXTRA.items())
@@ -757,6 +761,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             inputs=module.INPUTS,
             outputs=module.OUTPUTS,
             layers=layers,
+            others=others,
             flow=backward_flow,
             inference_flow=inference_flow,
         )
