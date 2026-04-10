@@ -1101,7 +1101,6 @@ Called once per training step. Receives the step index and criterion keyword arg
 
 Lifecycle hooks called with `(info: BaseInfo, **models)`. `BestCallback` additionally receives `target: str` and `best: float` arguments.
 
-
 ### State and callbacks
 
 #### `BaseInfo`
