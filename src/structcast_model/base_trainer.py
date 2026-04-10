@@ -32,22 +32,21 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
 
 
 @runtime_checkable
-class Forward(Protocol[ModelT_contra]):
-    """Protocol for forward pass configuration."""
-
-    def __call__(self, inputs: Any, **models: ModelT_contra) -> dict[str, Any]:
-        """Perform the forward pass for the given inputs and return the outputs and any additional information."""
-
-
-@runtime_checkable
 class Backward(Protocol):
     """Protocol for backward pass configuration."""
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """The models to train."""
 
     def update(self, step: int) -> bool:
         """Determine whether to update the model based on the current step and any internal state."""
 
-    def __call__(self, *args: Any, **kwargs: Any) -> None:
-        """Perform the backward pass for the given losses."""
+    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Perform the training step for the given criteria."""
+
+    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Perform the inference step for the given criteria."""
 
 
 @dataclass(kw_only=True)
@@ -285,17 +284,11 @@ class InferenceWrapper(Protocol[ModelT_contra]):
 class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     """Base trainer for training a model."""
 
-    training_step: Forward[ModelT_contra]
-    """The forward pass configuration for training."""
-
     backward: Backward
     """The backward pass configuration."""
 
     tracker: Callable[..., dict[str, float]]
     """The tracker to log training and validation information."""
-
-    validation_step: Forward[ModelT_contra] | None = None
-    """The forward pass configuration for validation."""
 
     training_prefix: str = ""
     """ Prefix for training logs. """
@@ -309,40 +302,36 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
 
-    def update_models(self, __inputs__: Any, **models: ModelT_contra) -> tuple[bool, dict[str, Any]]:
+    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
         """Perform a training step and update the models.
 
         Args:
             __inputs__ (Any): The inputs for the training step.
-            **models (ModelT): The models to update.
 
         Returns:
             tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
                 a dictionary of criteria for tracking.
         """
-        criteria = self.training_step(__inputs__, **models)
-        updated = self.backward.update(self.step)
-        self.backward(**criteria)
-        return updated, criteria
+        return self.backward.update(self.step), self.backward.training_step(**__inputs__)
 
-    def train(self, dataset: DatasetLike | Callable[[], DatasetLike], **models: ModelT_contra) -> Mapping[str, Any]:
+    def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
         """Train the model on the given dataset.
 
         Args:
             dataset (DatasetLike | Callable[[], DatasetLike]): The dataset to train on,
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
-            **models (ModelT): The models to train.
 
         Returns:
             Mapping[str, Any]: The logs from training, which may include metrics and other information.
         """
+        models = self.backward.models
         invoke_callback(self.on_training_begin, self, **models)
         elapsed_time = 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
             self.step += 1
             invoke_callback(self.on_training_step_begin, self, **models)
             elapsed_time -= time()
-            updated, criteria = self.update_models(inputs, **models)
+            updated, criteria = self.update_models(inputs)
             logs = self.tracker(**criteria)
             self.sync()
             elapsed_time += time()
@@ -357,27 +346,23 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         invoke_callback(self.on_training_end, self, **models)
         return logs
 
-    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike], **models: ModelT_contra) -> Mapping[str, Any]:
+    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
         """Evaluate the model on the given dataset.
 
         Args:
             dataset (DatasetLike | Callable[[], DatasetLike]): The dataset to evaluate on,
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
-            **models (ModelT): The models to evaluate.
 
         Returns:
             Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
         """
-        if self.validation_step is None:
-            logger.warning("Validation step is not defined. Skipping evaluation.")
-            return {}
+        models = self.backward.models
         invoke_callback(self.on_validation_begin, self, **models)
         elapsed_time = 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):
             invoke_callback(self.on_validation_step_begin, self, **models)
             elapsed_time -= time()
-            criteria = self.validation_step(data, **models)
-            logs = self.tracker(**criteria)
+            logs = self.tracker(**self.backward.inference_step(**data))
             self.sync()
             elapsed_time += time()
             logs["elapsed_time"] = elapsed_time / index
@@ -395,7 +380,6 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
         validation_dataset: DatasetLike | Callable[[], DatasetLike] | None = None,
         start_epoch: int = 1,
         validation_frequency: int = 1,
-        **models: ModelT_contra,
     ) -> dict[int, dict[str, Any]]:
         """Fit the model.
 
@@ -406,7 +390,6 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
                 Defaults to None.
             start_epoch (int, optional): Epoch to start training from. Defaults to 1.
             validation_frequency (int, optional): Frequency of validation. Defaults to 1.
-            **models (ModelT): The models to train and validate.
 
         Returns:
             History of training and validation logs.
@@ -417,12 +400,13 @@ class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
             raise ValueError(f"Start epoch must be at least 1: {start_epoch}")
         if start_epoch > epochs:
             raise ValueError(f"Start epoch must be less than or equal to epochs: {start_epoch} > {epochs}")
+        models = self.backward.models
         for epoch in range(start_epoch, epochs + 1):
             self.epoch = epoch
             invoke_callback(self.on_epoch_begin, self, **models)
-            self.train(training_dataset, **models)
+            self.train(training_dataset)
             if validation_dataset is not None and epoch % validation_frequency == 0:
-                self.evaluate(validation_dataset, **models)
+                self.evaluate(validation_dataset)
             invoke_callback(self.on_epoch_end, self, **models)
         return self.history
 
@@ -485,7 +469,6 @@ __all__ = [
     "Callback",
     "Callbacks",
     "DatasetLike",
-    "Forward",
     "InferenceWrapper",
     "NamedCallbackList",
     "callbacks_session",

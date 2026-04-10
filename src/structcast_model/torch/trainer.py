@@ -1,9 +1,9 @@
 """Trainer for PyTorch models."""
 
 from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import cached_property, partial
+from functools import cached_property
 from logging import getLogger
 import os
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
@@ -172,75 +172,6 @@ def initial_model(model: Any, shapes: dict[str, Any] | None = None) -> tuple[Any
     return inputs, _init(model)
 
 
-def get_autocast(mixed_precision_type: str | None, device: str | None) -> Callable[[], AbstractContextManager[None]]:
-    """Get the appropriate autocast context manager based on the device and mixed precision type."""
-    if mixed_precision_type is None:
-        return suppress
-    return partial(torch.autocast, device_type=get_torch_device_type(device), dtype=DTYPES[mixed_precision_type])
-
-
-@dataclass(kw_only=True, slots=True)
-class TrainingStep:
-    """A training step for a PyTorch model."""
-
-    models: list[str]
-    """The names of the models to use for the training step."""
-
-    losses: torch.nn.Module
-    """A module that computes the losses for the model."""
-
-    metrics: torch.nn.Module | None = None
-    """A module that computes the metrics for the model."""
-
-    autocast: Callable[[], AbstractContextManager[None]] = suppress
-    """A context manager for automatic mixed precision (AMP). By default, it does nothing."""
-
-    def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
-        """Perform the forward pass for the given inputs and return the outputs and any additional information.
-
-        Model objects are forwarded to the losses module via keyword arguments so that complex multi-model
-        training flows (e.g. GAN) can perform additional forward passes inside the loss computation.
-        Model names that collide with tensor output keys will be overridden by the tensor values.
-        """
-        with self.autocast():
-            outputs = inputs.copy()
-            for name in self.models:
-                outputs.update(models[name](**outputs))
-            # Merge models first, then tensor outputs: if a model and a tensor output share the same name
-            # (e.g. a model named "image" and an output key "image"), the tensor value wins.
-            criteria = self.losses(**{**models, **outputs})
-            if self.metrics is None:
-                return criteria
-            with torch.no_grad():
-                criteria.update(self.metrics(**outputs))
-            return criteria
-
-
-@dataclass(kw_only=True, slots=True)
-class ValidationStep(TrainingStep):
-    """A validation step for a PyTorch model."""
-
-    def __call__(self, inputs: dict[str, Any], **models: torch.nn.Module) -> dict[str, Tensor]:
-        """Perform the forward pass for the given inputs and return the outputs and any additional information.
-
-        Model objects are forwarded to the losses module via keyword arguments so that complex multi-model
-        training flows (e.g. GAN) can perform additional forward passes inside the loss computation.
-        Model names that collide with tensor output keys will be overridden by the tensor values.
-        """
-        with torch.no_grad():
-            with self.autocast():
-                outputs = inputs.copy()
-                for name in self.models:
-                    outputs.update(models[name](**outputs))
-                # Merge models first, then tensor outputs: if a model and a tensor output share the same name
-                # (e.g. a model named "image" and an output key "image"), the tensor value wins.
-                criteria = self.losses(**{**models, **outputs})
-                if self.metrics is None:
-                    return criteria
-                criteria.update(self.metrics(**outputs))
-                return criteria
-
-
 @dataclass(kw_only=True, slots=True)
 class TorchTracker:
     """A tracker for PyTorch models."""
@@ -296,18 +227,6 @@ class TorchTracker:
         return cls(tracker=tracker, distributed=distributed)
 
 
-def _model_train(info: BaseInfo, **models: torch.nn.Module) -> None:
-    """A callback to synchronize the device at the beginning of training."""
-    for model in models.values():
-        model.train()
-
-
-def _model_eval(info: BaseInfo, **models: torch.nn.Module) -> None:
-    """A callback to set the model to evaluation mode at the beginning of validation."""
-    for model in models.values():
-        model.eval()
-
-
 @dataclass(kw_only=True)
 class TorchTrainer(BaseTrainer[torch.nn.Module]):
     """Trainer for PyTorch models."""
@@ -315,29 +234,22 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
     device: str
     """Device to run the model on, e.g., 'cuda' or 'cpu'."""
 
-    def __post_init__(self) -> None:
-        """Post-initialization."""
-        super().__post_init__()
-        self.on_training_begin.register("model_train", _model_train)
-        self.on_validation_begin.register("model_eval", _model_eval)
-
     def sync(self) -> None:
         """Synchronize the device if it is a CUDA device."""
         if "cuda" in self.device:
             torch.cuda.synchronize()
 
     @contextmanager
-    def no_sync(self, __updated__: bool, **models: torch.nn.Module) -> Generator[None, None, None]:
+    def no_sync(self, __updated__: bool) -> Generator[None, None, None]:
         """Context manager to disable gradient synchronizations for DistributedDataParallel models when not updating.
 
         Args:
             __updated__ (bool): Whether the model is being updated.
-            **models (torch.nn.Module): The models to potentially disable gradient synchronization for.
         """
         if __updated__:
             yield
         else:
-            old_values = {}
+            models, old_values = self.backward.models, {}
             try:
                 for name, model in models.items():
                     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -348,22 +260,18 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
                 for name, value in old_values.items():
                     models[name].require_backward_grad_sync = value
 
-    def update_models(self, __inputs__: Any, **models: torch.nn.Module) -> tuple[bool, dict[str, Any]]:
+    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
         """Perform a training step and update the models.
 
         Args:
             __inputs__ (Any): The inputs for the training step.
-            **models (torch.nn.Module): The models to update.
 
         Returns:
             tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
                 a dictionary of criteria for tracking.
         """
-        updated = self.backward.update(self.step)
-        with self.no_sync(__updated__=updated, **models):
-            criteria = self.training_step(__inputs__, **models)
-            self.backward(**criteria)
-            return updated, criteria
+        with self.no_sync(updated := self.backward.update(self.step)):
+            return updated, self.backward.training_step(**__inputs__)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -774,10 +682,7 @@ __all__ = [
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
-    "TrainingStep",
-    "ValidationStep",
     "create_torch_inputs",
-    "get_autocast",
     "get_torch_device",
     "initial_distributed_env",
     "initial_model",

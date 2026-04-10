@@ -42,6 +42,7 @@ _jinja_yaml_: |-
   {% endif %}
 # "BACKWARDS" can be set to a backwards configuration or a list of backwards configurations
 # to specify the backward pass(es) to perform during training.
+OUTPUTS: [ce_loss, acc1, acc5]
 BACKWARDS:
   - LOSS: ce_loss
     TRAINABLE_LAYERS: [model]

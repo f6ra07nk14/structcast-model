@@ -342,38 +342,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
-    loss_pattern: Any = Option(
-        ...,
-        "--loss",
-        "-L",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the loss module. "
-        "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyLoss, my_package.py], {_call_: {...}}]".',
-    ),
-    loss_outputs: list[str] | None = Option(
-        None,
-        "--loss-outputs",
-        "-LO",
-        help="Default outputs for the loss module if it doesn't have an 'outputs' attribute.",
-    ),
-    metric_pattern: Any | None = Option(
-        None,
-        "--metric",
-        "-M",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the metric module. "
-        "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyMetric, my_package.py], {_call_: {...}}]".',
-    ),
-    metric_outputs: list[str] | None = Option(
-        None,
-        "--metric-outputs",
-        "-MO",
-        help="Default outputs for the metric module if it doesn't have an 'outputs' attribute.",
-    ),
     backward_pattern: Any = Option(
         ...,
         "--backward",
@@ -384,10 +352,11 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyBackward, my_package.py], {_call_: {...}}]".',
     ),
-    mixed_precision_type: Literal["bfloat16", "float16"] | None = Option(
+    backward_outputs: list[str] | None = Option(
         None,
-        help="Default mixed precision type to use during training when mixed precision is enabled. "
-        "This can be overridden by the backward class if it has its own mixed precision type specified.",
+        "--backward-outputs",
+        "-BO",
+        help="Default outputs for the backward module if it doesn't have an 'outputs' attribute.",
     ),
     compile_pattern: dict[str, Any] | None = compile_pattern,
     trainer_pattern: Any | None = Option(
@@ -398,24 +367,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         "For example, if the trainer is defined as `my_package.MyTrainer`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyTrainer, _file_: my_package.py}]" or '
         '"[_obj_, [_addr_, my_package.MyTrainer, my_package.py]]".',
-    ),
-    training_step_pattern: Any | None = Option(
-        None,
-        "--training-step",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the training step. "
-        "For example, if the training step is defined as `my_package.MyTrainingStep`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyTrainingStep, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyTrainingStep, my_package.py]]".',
-    ),
-    validation_step_pattern: Any | None = Option(
-        None,
-        "--validation-step",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the validation step. "
-        "For example, if the validation step is defined as `my_package.MyValidationStep`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyValidationStep, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyValidationStep, my_package.py]]".',
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
@@ -517,29 +468,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             for model_name, model in models.items():
                 if model_name in initializers:
                     model.apply(initializers[model_name])
-        loss = compile_fn(instantiate_object(loss_pattern))
-        metric = compile_fn(instantiate_object(metric_pattern)) if metric_pattern else None
-        loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
-        metric_outputs = [] if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
-        tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs + metric_outputs, compile_fn, distributed)
         backward = instantiate_object(backward_pattern)(**models)
-    mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
-    autocast = torch_trainer.get_autocast(mixed_precision_type, device)
+        backward_outputs = _get_module_outputs(backward, backward_outputs, "backward")
+        tracker = torch_trainer.TorchTracker.from_criteria(backward_outputs, compile_fn, distributed)
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
-    step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
-    trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern))(
-        device=device,
-        training_step=(
-            torch_trainer.TrainingStep if training_step_pattern is None else instantiate_object(training_step_pattern)
-        )(**step_kw),
-        validation_step=(
-            torch_trainer.ValidationStep
-            if validation_step_pattern is None
-            else instantiate_object(validation_step_pattern)
-        )(**step_kw),
-        backward=backward,
-        tracker=tracker,
-    )
+    trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer = trainer_type(device=device, backward=backward, tracker=tracker)
     if is_main:
         if ci:
             trainer.on_epoch_end.register("log_criteria", lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
@@ -552,12 +486,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 pbar.set_postfix([(n, logs[n]) for n in criteria])
 
             trainer.on_training_begin.register("pbar_reset_training", lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
-            train_losses = [f"{trainer.training_prefix}{n}" for n in loss_outputs]
+            train_losses = [f"{trainer.training_prefix}{n}" for n in backward_outputs]
             pbar_update_training = partial(_update_criteria, criteria=train_losses)
             trainer.on_training_step_end.register("pbar_update_training", pbar_update_training)
             trainer.on_training_end.register("pbar_refresh_training", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
             trainer.on_validation_begin.register("pbar_reset_validation", lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
-            valid_losses = [f"{trainer.validation_prefix}{n}" for n in loss_outputs]
+            valid_losses = [f"{trainer.validation_prefix}{n}" for n in backward_outputs]
             pbar_update_validation = partial(_update_criteria, criteria=valid_losses)
             trainer.on_validation_step_end.register("pbar_update_validation", pbar_update_validation)
             trainer.on_validation_end.register("pbar_refresh_validation", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
@@ -589,16 +523,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "device": device,
                 "distributed": distributed,
                 "world_size": world_size,
-                "loss": loss_pattern,
-                "loss_outputs": loss_outputs,
-                "metric": metric_pattern,
-                "metric_outputs": metric_outputs,
                 "backward": backward_pattern,
-                "mixed_precision_type": mixed_precision_type,
+                "backward_outputs": backward_outputs,
                 "compile": compile_pattern,
                 "trainer": trainer_pattern,
-                "training_step": training_step_pattern,
-                "validation_step": validation_step_pattern,
                 "epochs": epochs,
                 "start_epoch": start_epoch,
                 "training_dataset": training_dataset_pattern,

@@ -156,6 +156,8 @@ class {self.classname}:
         {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
         self.need_update = True
+        self.inputs = {self.inputs}
+        self.outputs = {self.outputs}
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
