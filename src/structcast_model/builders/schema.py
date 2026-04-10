@@ -398,8 +398,11 @@ class UserDefinedBackward(Serializable):
         """Validate the user-defined backward configuration."""
         self._validate_mixed_precision()
         self._validate_trainable_layers()
-        train_inputs, train_outputs, losses = [], [], []
-        infer_inputs, infer_outputs = [], []
+        train_inputs: list[str] = []
+        train_outputs: list[str] = []
+        losses: list[str] = []
+        infer_inputs: list[str] = []
+        infer_outputs: list[str] = []
         for backward in self.BACKWARDS:
             backward_inputs, backward_outputs = resolve_flow(backward.FLOW, existing_values=train_outputs)
             train_inputs += backward_inputs

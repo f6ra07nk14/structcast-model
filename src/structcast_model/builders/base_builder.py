@@ -643,11 +643,11 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
-    ) -> tuple[str, str] | tuple[None, None]:
+    ) -> tuple[str, str | None]:
         logger.warning(
             "Mixed precision is not implemented in the base backward builder. Returning None for mixed precision."
         )
-        return None, None
+        return "", None
 
     def _get_optimizer(
         self,
@@ -674,7 +674,8 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         Returns:
             BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
         """
-        module = self.template(parameters)
+        parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
+        module = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(module.IMPORTS)
         layers: dict[str, LayerIntermediate | str] = {}

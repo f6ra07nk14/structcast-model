@@ -201,10 +201,10 @@ class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
-    ) -> tuple[str, str] | tuple[None, None]:
+    ) -> tuple[str, str | None]:
         if isinstance(mixed_precision, bool):
             if not mixed_precision:
-                return None, None
+                return "", None
             mixed_precision = {}
         imports["torch.amp"].add(None)
         repr_mp_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
