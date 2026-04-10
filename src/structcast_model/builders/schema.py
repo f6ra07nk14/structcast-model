@@ -389,13 +389,21 @@ class UserDefinedBackward(Serializable):
     def _validate_user_defined_backward(self) -> Self:
         """Validate the user-defined backward configuration."""
         self._validate_trainable_layers()
-        train_inputs, train_outputs = [], []
+        train_inputs, train_outputs, losses = [], [], []
+        infer_inputs, infer_outputs = [], []
         for backward in self.BACKWARDS:
             backward_inputs, backward_outputs = resolve_flow(backward.FLOW, existing_values=train_outputs)
             train_inputs += backward_inputs
             train_outputs += backward_outputs
-        train_inputs, train_outputs = unique(train_inputs), unique(train_outputs)
-        losses = unique([b.LOSS for b in self.BACKWARDS])
+            if backward.LOSS not in train_outputs:
+                msg = f'Loss "{backward.LOSS}" must be in the outputs of the backward flow but got: {train_outputs}.'
+                raise SpecError(msg)
+            losses.append(backward.LOSS)
+            flow = backward.INFERENCE_FLOW if backward.INFERENCE_FLOW else backward.FLOW
+            backward_inputs, backward_outputs = resolve_flow(flow, existing_values=infer_outputs)
+            infer_inputs += backward_inputs
+            infer_outputs += backward_outputs
+        train_inputs, train_outputs, losses = unique(train_inputs), unique(train_outputs), unique(losses)
         if not self.INPUTS:
             self.INPUTS.extend(train_inputs)
         if not self.OUTPUTS:
@@ -412,16 +420,6 @@ class UserDefinedBackward(Serializable):
             raise SpecError(f"Unknown losses found: {unknown}.")
         if missing := set(losses) - set(self.LOSSES):
             raise SpecError(f"Missing losses found: {missing}.")
-        if missing := (set(self.LOSSES) - set(self.OUTPUTS)):
-            raise SpecError(f"Missing losses found: {missing}.")
-        infer_inputs, infer_outputs = [], []
-        for backward in self.BACKWARDS:
-            backward_inputs, backward_outputs = resolve_flow(
-                backward.INFERENCE_FLOW if backward.INFERENCE_FLOW else backward.FLOW,
-                existing_values=infer_outputs,
-            )
-            infer_inputs += backward_inputs
-            infer_outputs += backward_outputs
         if unknown := set(self.INPUTS) - set(infer_inputs):
             raise SpecError(f"Unknown inputs found in inference flow: {unknown}.")
         if missing := set(infer_inputs) - set(self.INPUTS):
