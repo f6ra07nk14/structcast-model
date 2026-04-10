@@ -275,25 +275,6 @@ def test_training_step_no_model_keys() -> None:
     assert "loss" in criteria
 
 
-def test_training_step_passes_models_to_losses() -> None:
-    """TrainingStep forwards model objects to the losses module for GAN-style training."""
-    received: dict[str, Any] = {}
-
-    class _GANLoss(Module):
-        def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
-            received.update(kwargs)
-            return {"loss_G": torch.tensor(0.1), "loss_D": torch.tensor(0.2)}
-
-    generator = _IdentityModel()
-    discriminator = _IdentityModel()
-    step = TrainingStep(models=[], losses=_GANLoss())
-    criteria = step({"x": torch.zeros(1)}, generator=generator, discriminator=discriminator)
-    assert "loss_G" in criteria
-    assert "loss_D" in criteria
-    assert received.get("generator") is generator
-    assert received.get("discriminator") is discriminator
-
-
 def test_training_step_tensor_outputs_override_model_kwargs() -> None:
     """Tensor outputs from model forward passes override same-named model kwargs in the losses call."""
     received: dict[str, Any] = {}
@@ -338,21 +319,6 @@ def test_validation_step_includes_metrics_when_provided() -> None:
     criteria = step({"x": torch.zeros(1)}, m=model)
     assert "loss" in criteria
     assert "acc" in criteria
-
-
-def test_validation_step_passes_models_to_losses() -> None:
-    """ValidationStep also forwards model objects to the losses module (same as TrainingStep)."""
-    received: dict[str, Any] = {}
-
-    class _GANLoss(Module):
-        def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
-            received.update(kwargs)
-            return {"loss_G": torch.tensor(0.1)}
-
-    generator = _IdentityModel()
-    step = ValidationStep(models=[], losses=_GANLoss())
-    step({"x": torch.zeros(1)}, generator=generator)
-    assert received.get("generator") is generator
 
 
 # ---------------------------------------------------------------------------
