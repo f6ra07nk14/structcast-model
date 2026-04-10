@@ -472,6 +472,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         backward_outputs = _get_module_outputs(backward, backward_outputs, "backward")
         tracker = torch_trainer.TorchTracker.from_criteria(backward_outputs, compile_fn, distributed)
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
+    if hasattr(backward, "forward_training_step"):
+        backward.forward_training_step = compile_fn(backward.forward_training_step)
+    if hasattr(backward, "forward_inference_step"):
+        backward.forward_inference_step = compile_fn(backward.forward_inference_step)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, backward=backward, tracker=tracker)
     if is_main:
