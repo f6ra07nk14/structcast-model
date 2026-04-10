@@ -559,12 +559,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                     mlflow.log_artifact(str(artifact))
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
                 try:
-                    trainer.fit(**fit_kwargs, **models)
+                    trainer.fit(**fit_kwargs)
                 except KeyboardInterrupt:
                     print("Training interrupted by user. Saving current state to MLflow.")
                     _save_training_state(trainer, **models)
         else:
-            trainer.fit(**fit_kwargs, **models)
+            trainer.fit(**fit_kwargs)
     finally:
         if distributed:
             torch.distributed.destroy_process_group()
