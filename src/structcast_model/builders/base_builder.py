@@ -447,10 +447,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME in layers:
-                        name = unit.NAME
-                    else:
+                    if unit.NAME and unit.NAME not in layers:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
+                    name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
@@ -697,10 +696,9 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME in layers or unit.NAME in others:
-                        name = unit.NAME
-                    else:
+                    if unit.NAME and unit.NAME not in layers:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
+                    name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
