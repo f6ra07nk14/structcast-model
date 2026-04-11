@@ -515,18 +515,16 @@ class BackwardIntermediate(_Intermediate):
     as a `LayerIntermediate` instance or a string representation of the layer to be used directly in the script."""
 
     others: dict[str, str]
-    """Other configurations for the backward layer, where the keys are the configuration names and the values are
-    the string representations of the configurations to be used directly in the script."""
+    """Other instances used in the backward layer that are not layers, where the keys are the instance names and
+    the values are the string representations of the instances to be used directly in the script."""
 
     flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]]
-    """The flow of the backward layer during training,
-    where each element is either a tuple of the form (input, output, layer) for regular steps in the flow,
-    or a tuple of the form (loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers)
-    for optimizer steps in the flow."""
+    """The forward flow during training, where each element is either a tuple of the form (input, output, layer)
+    for regular steps, or a tuple of the form (loss, output, optimizer, clip, mixed_precision_scale, trainable_models)
+    for optimizer steps."""
 
     inference_flow: list[tuple[str, str, str | None]]
-    """The flow of the backward layer during inference,
-    where each element is a tuple of the form (input, output, layer)."""
+    """The forward flow during inference, where each element is a tuple of the form (input, output, layer)."""
 
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
