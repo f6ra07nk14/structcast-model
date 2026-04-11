@@ -76,6 +76,6 @@ class GlobalResponseNormalization(keras.layers.Layer):
 
     def call(self, inputs: keras.KerasTensor) -> keras.KerasTensor:
         """Applies Global Response Normalization to the input."""
-        x_g = ops.norm(inputs, ord=2, axis=self.reduction_axes, keepdims=True)
+        x_g = ops.sqrt(ops.sum(ops.square(inputs), axis=self.reduction_axes, keepdims=True))
         x_n = x_g / (ops.mean(x_g, axis=self.feature_axes, keepdims=True) + self.epsilon)
         return inputs + (inputs * x_n) * self.scale + self.bias
