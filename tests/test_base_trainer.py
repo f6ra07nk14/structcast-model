@@ -14,6 +14,7 @@ from structcast_model.base_trainer import (
     BaseTrainer,
     BestCriterion,
     Callbacks,
+    NamedCallbackList,
     callbacks_session,
     get_dataset,
     get_dataset_size,
@@ -598,3 +599,70 @@ def test_best_criterion_on_best_called_even_without_improvement() -> None:
     info.history[2] = {"loss": 0.9}  # worse, but on_best still fires
     criterion(info)
     assert called_count == 2
+
+
+# ---------------------------------------------------------------------------
+# NamedCallbackList
+# ---------------------------------------------------------------------------
+
+
+def test_named_callback_list_class_getitem_returns_cls() -> None:
+    """NamedCallbackList[X] generic alias returns the class itself."""
+    alias = NamedCallbackList[int]
+    assert alias is NamedCallbackList
+
+
+def test_named_callback_list_register_uses_explicit_name() -> None:
+    """register() stores the given display name, not an inferred one."""
+    ncl: NamedCallbackList[Any] = NamedCallbackList()
+    ncl.register("my_custom_name", lambda i, **kw: None)
+    assert ncl.names() == ["my_custom_name"]
+    assert len(ncl) == 1
+
+
+def test_named_callback_list_append_infers_name_from_function() -> None:
+    """append() auto-derives the display name from the callable."""
+
+    def my_func(i: Any, **kw: Any) -> None:
+        pass
+
+    ncl: NamedCallbackList[Any] = NamedCallbackList()
+    ncl.append(my_func)
+    assert ncl.names() == ["my_func"]
+
+
+def test_named_callback_list_append_infers_name_from_bound_method() -> None:
+    """append() falls back to __func__.__name__ for bound methods."""
+
+    class _Dummy:
+        def step(self, i: Any, **kw: Any) -> None:
+            pass
+
+    ncl: NamedCallbackList[Any] = NamedCallbackList()
+    ncl.append(_Dummy().step)
+    assert ncl.names() == ["step"]
+
+
+def test_named_callback_list_extend_adds_multiple_callbacks() -> None:
+    """extend() adds multiple callbacks with auto-inferred names."""
+
+    def cb_a(i: Any, **kw: Any) -> None:
+        pass
+
+    def cb_b(i: Any, **kw: Any) -> None:
+        pass
+
+    ncl: NamedCallbackList[Any] = NamedCallbackList()
+    ncl.extend([cb_a, cb_b])
+    assert ncl.names() == ["cb_a", "cb_b"]
+    assert len(ncl) == 2
+
+
+def test_named_callback_list_clear_empties_names_too() -> None:
+    """clear() removes both callbacks and their names."""
+    ncl: NamedCallbackList[Any] = NamedCallbackList()
+    ncl.register("a", lambda i, **kw: None)
+    ncl.register("b", lambda i, **kw: None)
+    ncl.clear()
+    assert ncl.names() == []
+    assert len(ncl) == 0

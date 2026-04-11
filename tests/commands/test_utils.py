@@ -1,7 +1,10 @@
 """Unit tests for structcast_model.commands.utils."""
 
+from pathlib import Path
+
 import pydantic
 import pytest
+from structcast.utils.security import register_dir, unregister_dir
 
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
@@ -166,3 +169,33 @@ def test_bool_or_path_or_dict_parser_multiline_dict_yaml() -> None:
     """A multiline YAML mapping string is parsed into a dict."""
     result = bool_or_path_or_dict_parser("lr: 0.01\nmomentum: 0.9")
     assert result == {"lr": 0.01, "momentum": 0.9}
+
+
+def test_bool_or_path_or_dict_parser_empty_string_value_returns_none() -> None:
+    """An empty-string YAML value (string branch) returns None."""
+    # A bare empty string parsed as YAML yields empty, which is falsy
+    assert bool_or_path_or_dict_parser("") is None
+
+
+def test_bool_or_path_or_dict_parser_file_path_loads_content(tmp_path: Path) -> None:
+    """A path to a YAML file loads and returns its contents."""
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("alpha: 0.5\nbeta: 0.9\n")
+    register_dir(tmp_path)
+    try:
+        result = bool_or_path_or_dict_parser(str(cfg))
+        assert result == {"alpha": 0.5, "beta": 0.9}
+    finally:
+        unregister_dir(tmp_path)
+
+
+def test_path_or_any_parser_file_path_loads_content(tmp_path: Path) -> None:
+    """A path string pointing to a YAML file loads its content."""
+    cfg = tmp_path / "data.yaml"
+    cfg.write_text("key1: hello\nkey2: 42\n")
+    register_dir(tmp_path)
+    try:
+        result = path_or_any_parser(str(cfg))
+        assert result == {"key1": "hello", "key2": 42}
+    finally:
+        unregister_dir(tmp_path)

@@ -25,6 +25,7 @@ from structcast_model.commands.utils import instantiate_object
 from tests import ASSETS_DIR
 import torch
 
+LINEAR_CFG = str(ASSETS_DIR / "cfg" / "torch" / "Linear.yaml")
 MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
 BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")
 
@@ -279,6 +280,43 @@ def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> 
     assert result.exit_code == 0, result.output
     assert out_file.exists()
     assert "class Model" in out_file.read_text()
+
+
+def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model' generates a script from a simple Linear config."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "model.py").read_text()
+    assert "class Model" in text
+    assert "LazyLinear" in text
+
+
+def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model --classname' generates a script with the given class name for Linear."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "net.py")
+    result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--classname", "SimpleNet", "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class SimpleNet" in (tmp_path / "net.py").read_text()
+
+
+# ---------------------------------------------------------------------------
+# 'time' command — simple Linear layer
+# ---------------------------------------------------------------------------
+
+
+def test_time_linear(cli_runner: CliRunner) -> None:
+    """'time' measures inference on a simple torch Linear layer."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    pattern = "[_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: 4, out_features: 2}}]"
+    result = cli_runner.invoke(
+        app,
+        ["time", pattern, "--shape", "input: [4]", "--warmup-runs", "1", "--times", "1", "--batch-size", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Average inference time" in result.output
 
 
 # ---------------------------------------------------------------------------

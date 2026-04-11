@@ -1,0 +1,4 @@
+INPUTS: [x]
+OUTPUTS: [y]
+FLOW:
+  - [x, y, fc, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 2}}]]

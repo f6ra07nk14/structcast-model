@@ -64,13 +64,15 @@ def test_validate_imports_returns_raw_for_invalid_non_iterable() -> None:
 
 def test_backward_behavior_extra_kwargs() -> None:
     """BackwardBehavior EXTRA dict stores additional backward configuration."""
-    backward = BackwardBehavior.model_validate({
-        "NAME": "main",
-        "LOSS": "ce_loss",
-        "TRAINABLE_LAYERS": ["model"],
-        "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
-        "EXTRA": {"retain_graph": True},
-    })
+    backward = BackwardBehavior.model_validate(
+        {
+            "NAME": "main",
+            "LOSS": "ce_loss",
+            "TRAINABLE_LAYERS": ["model"],
+            "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
+            "EXTRA": {"retain_graph": True},
+        }
+    )
     assert backward.NAME == "main"
     assert backward.LOSS == "ce_loss"
     assert backward.EXTRA["retain_graph"] is True
@@ -89,11 +91,13 @@ def test_backward_behavior_instance_passthrough_and_clip() -> None:
     assert BackwardBehavior.model_validate(named) is named
     assert named.CLIP is not None
     with pytest.raises(ValidationError):
-        BackwardBehavior.model_validate({
-            "LOSS": 123,
-            "TRAINABLE_LAYERS": ["model"],
-            "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
-        })
+        BackwardBehavior.model_validate(
+            {
+                "LOSS": 123,
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
+            }
+        )
 
 
 def test_user_defined_backward_infers_losses_and_trainable_layers() -> None:
@@ -302,3 +306,197 @@ def test_template_raw_and_others_for_with_extra_target(tmp_path: Any) -> None:
         assert tmpl.others == {}
     finally:
         unregister_dir(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# LayerBehavior._validate_raw — tuple/list branches
+# ---------------------------------------------------------------------------
+
+
+def test_layer_behavior_from_tuple_with_layer_dict() -> None:
+    """3-element tuple with dict third element treats it as LAYER."""
+    layer_obj = {"_obj_": [["_addr_", "torch.nn.Identity"]]}
+    behavior = LayerBehavior.model_validate(["x", "y", layer_obj])
+    assert behavior.INPUTS is not None
+    assert behavior.OUTPUTS is not None
+    assert behavior.NAME is None
+    assert behavior.LAYER is not None
+
+
+def test_layer_behavior_from_tuple_with_4_elements() -> None:
+    """4-element tuple sets INPUTS, OUTPUTS, NAME, and LAYER."""
+    layer_obj = {"_obj_": [["_addr_", "torch.nn.Identity"]]}
+    behavior = LayerBehavior.model_validate(["x", "y", "my_layer", layer_obj])
+    assert behavior.NAME == "my_layer"
+    assert behavior.LAYER is not None
+
+
+def test_layer_behavior_from_tuple_with_wrong_length_raises() -> None:
+    """Tuple with 1 or 5+ elements raises SpecError."""
+    with pytest.raises((SpecError, ValidationError)):
+        LayerBehavior.model_validate(["x"])
+    with pytest.raises((SpecError, ValidationError)):
+        LayerBehavior.model_validate(["a", "b", "c", "d", "e"])
+
+
+# ---------------------------------------------------------------------------
+# UserDefinedBackward — mixed precision None branch
+# ---------------------------------------------------------------------------
+
+
+def test_user_defined_backward_mixed_precision_none_raises() -> None:
+    """MIXED_PRECISION=None with MIXED_PRECISION_TYPE set raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "ce_loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "ce_loss"]],
+            }
+        ],
+        "MIXED_PRECISION": None,
+        "MIXED_PRECISION_TYPE": "float16",
+    }
+    with pytest.raises((SpecError, ValidationError)):
+        UserDefinedBackward.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# UserDefinedBackward — loss not in outputs branch
+# ---------------------------------------------------------------------------
+
+
+def test_user_defined_backward_loss_not_in_flow_outputs_raises() -> None:
+    """LOSS that does not appear as a flow output raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "missing_loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "y"]],
+            }
+        ],
+    }
+    with pytest.raises(SpecError, match='Loss "missing_loss" must be in the outputs'):
+        UserDefinedBackward.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# UserDefinedBackward — unknown/missing inputs and outputs
+# ---------------------------------------------------------------------------
+
+
+def test_user_defined_backward_unknown_inputs_raises() -> None:
+    """INPUTS containing names not in the flow raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+            }
+        ],
+        "INPUTS": ["x", "extra_input"],
+    }
+    with pytest.raises(SpecError, match="Unknown inputs found"):
+        UserDefinedBackward.model_validate(raw)
+
+
+def test_user_defined_backward_missing_inputs_raises() -> None:
+    """Omitting an input that the flow needs raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss1",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss1"]],
+            },
+            {
+                "LOSS": "loss2",
+                "TRAINABLE_LAYERS": ["aux"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["y", "loss2"]],
+            },
+        ],
+        "INPUTS": ["x"],
+    }
+    with pytest.raises(SpecError, match="Missing inputs found"):
+        UserDefinedBackward.model_validate(raw)
+
+
+def test_user_defined_backward_unknown_outputs_raises() -> None:
+    """OUTPUTS with extra names not generated by flow raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+            }
+        ],
+        "OUTPUTS": ["loss", "ghost"],
+    }
+    with pytest.raises(SpecError, match="Unknown outputs found"):
+        UserDefinedBackward.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# UserDefinedBackward — inference flow mismatches
+# ---------------------------------------------------------------------------
+
+
+def test_user_defined_backward_unknown_inputs_in_inference_flow_raises() -> None:
+    """Unknown inputs in inference flow raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+                "INFERENCE_FLOW": [["z", "loss"]],
+            }
+        ],
+    }
+    with pytest.raises(SpecError, match="Unknown inputs found in inference flow"):
+        UserDefinedBackward.model_validate(raw)
+
+
+def test_user_defined_backward_missing_inputs_in_inference_flow_raises() -> None:
+    """Missing inputs in inference flow raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+                "INFERENCE_FLOW": [["x", "loss"], ["extra", "out2"]],
+            }
+        ],
+    }
+    with pytest.raises(SpecError, match="Missing inputs found in inference flow"):
+        UserDefinedBackward.model_validate(raw)
+
+
+def test_user_defined_backward_unknown_outputs_in_inference_flow_raises() -> None:
+    """Unknown outputs in inference flow raises SpecError."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+                "INFERENCE_FLOW": [["x", "other_output"]],
+            }
+        ],
+        "OUTPUTS": ["loss"],
+    }
+    with pytest.raises(SpecError, match="Unknown outputs found in inference flow"):
+        UserDefinedBackward.model_validate(raw)

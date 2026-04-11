@@ -1,0 +1,4 @@
+INPUTS: [x]
+OUTPUTS: [y]
+FLOW:
+  - [x, y, fc, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: 2}}]]
