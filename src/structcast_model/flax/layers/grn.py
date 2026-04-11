@@ -44,6 +44,6 @@ class GlobalResponseNorm(Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """Applies Global Response Normalization to the input."""
         x, scale, bias = self.promote_dtype((x, self.scale, self.bias), dtype=self.dtype)
-        x_g = jax.lax.rsqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
+        x_g = jnp.sqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
         x_n = x_g / (x_g.mean(axis=self.feature_axes, keepdims=True) + self.epsilon)
         return x + (x * x_n) * scale + bias
