@@ -75,12 +75,18 @@ class TorchBackwardIntermediate(BackwardIntermediate):
         autocast = f"with torch.autocast(device_type, torch.{self.mixed_precision_type}):"
         return [autocast] + [f"{' ' * 4}{L}" for L in flow]
 
-    def _get_forward_inference_flow(self) -> list[str]:
-        """Get the code for the inference flow in the forward method."""
+    def _wrap_step_function(self, name: str, flow: list[str], extra_params: str = "") -> list[str]:
+        """Wrap the given flow in a step function definition."""
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
-        flow = [f"{' ' * 4}{L}" for L in self._with_autocast(super()._get_forward_inference_flow())]
-        return [f"def _inference_step({inputs}**kwargs):"] + flow + [f"{' ' * 4}return {self._forward_outputs}"]
+        prefix = [f"def {name}({extra_params}{inputs}**kwargs):"]
+        body = [f"{' ' * 4}{L}" for L in flow]
+        suffix = [f"{' ' * 4}return {self._forward_outputs}"]
+        return prefix + body + suffix
+
+    def _get_forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return self._wrap_step_function("_inference_step", self._with_autocast(super()._get_forward_inference_flow()))
 
     def _get_forward_training_flow(self) -> list[str]:
         flow, start = [], 0
@@ -120,11 +126,7 @@ class TorchBackwardIntermediate(BackwardIntermediate):
                 flow.append(f"{indent}{mixed_precision_name}.update()")
             flow.append(f"{indent}{optimizer_name}.zero_grad()")
             start = len(flow)
-        inputs = self._forward_inputs
-        inputs += ", " if inputs else ""
-        prefix = [f"def _training_step(__need_update__, {inputs}**kwargs):"]
-        suffix = [f"{' ' * 4}return {self._forward_outputs}"]
-        return prefix + [f"{' ' * 4}{L}" for L in flow] + suffix
+        return self._wrap_step_function("_training_step", flow, extra_params="__need_update__, ")
 
     def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the backward layer."""
