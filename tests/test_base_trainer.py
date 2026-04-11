@@ -268,14 +268,32 @@ def test_callbacks_session_isolates_multiple_runs() -> None:
 class _FakeBackward:
     """Minimal Backward protocol implementation for tests."""
 
-    def __init__(self, should_update: bool = True) -> None:
+    def __init__(
+        self,
+        should_update: bool = True,
+        inference_fn: Any = None,
+    ) -> None:
         self._should_update = should_update
+        self._inference_fn = inference_fn
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return empty models dict."""
+        return {}
 
     def update(self, step: int) -> bool:
+        """Return whether to update."""
         return self._should_update
 
-    def __call__(self, **criteria: Any) -> None:
-        pass
+    def training_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Return fixed training criteria."""
+        return {"loss": 0.5}
+
+    def inference_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Return inference criteria or empty dict."""
+        if self._inference_fn is not None:
+            return self._inference_fn(kwargs)
+        return {}
 
 
 def _make_trainer(
@@ -283,23 +301,16 @@ def _make_trainer(
     prefix: str = "",
     validation_prefix: str = "val_",
     should_update: bool = True,
-    validation_step: Any = None,
-    inference_wrapper: Any = None,
+    inference_fn: Any = None,
 ) -> BaseTrainer:
-    def _forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.5}
-
     def _tracker(**criteria: Any) -> dict[str, float]:
         return {"loss": float(criteria.get("loss", 0.0))}
 
     return BaseTrainer(
-        training_step=_forward,
-        backward=_FakeBackward(should_update),
+        backward=_FakeBackward(should_update, inference_fn=inference_fn),
         tracker=_tracker,
         training_prefix=prefix,
         validation_prefix=validation_prefix,
-        validation_step=validation_step,
-        inference_wrapper=inference_wrapper,
         add_global_callbacks=False,
     )
 
@@ -373,48 +384,23 @@ def test_base_trainer_train_stores_logs_in_history() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_base_trainer_evaluate_returns_empty_without_validation_step() -> None:
-    """evaluate() returns {} when no validation_step is configured."""
+def test_base_trainer_evaluate_returns_default_when_no_inference_fn() -> None:
+    """evaluate() returns tracker defaults when inference_step returns empty dict."""
     trainer = _make_trainer()
     result = trainer.evaluate([{"x": 1}])
-    assert result == {}
+    assert "val_loss" in result
 
 
 def test_base_trainer_evaluate_returns_prefixed_val_logs() -> None:
     """evaluate() prepends validation_prefix to log keys."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    trainer = _make_trainer(validation_step=_val_forward)
+    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
     logs = trainer.evaluate([{"x": 1}])
     assert "val_loss" in logs
 
 
-def test_base_trainer_evaluate_calls_inference_wrapper_before_loop() -> None:
-    """inference_wrapper is called once before the validation loop."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    wrapper_called: list[bool] = []
-
-    def _wrapper(info: Any, **models: Any) -> dict:
-        wrapper_called.append(True)
-        return models
-
-    trainer = _make_trainer(validation_step=_val_forward, inference_wrapper=_wrapper)
-    trainer.evaluate([{"x": 1}])
-    assert wrapper_called
-
-
 def test_base_trainer_evaluate_invokes_callbacks() -> None:
     """Validation lifecycle callbacks are fired in the correct order."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    trainer = _make_trainer(validation_step=_val_forward)
+    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
     events: list[str] = []
     trainer.on_validation_begin.append(lambda i, **kw: events.append("begin"))
     trainer.on_validation_end.append(lambda i, **kw: events.append("end"))
@@ -426,11 +412,7 @@ def test_base_trainer_evaluate_invokes_callbacks() -> None:
 
 def test_base_trainer_evaluate_with_callable_dataset() -> None:
     """Callable dataset factories are supported in evaluate()."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    trainer = _make_trainer(validation_step=_val_forward)
+    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
     data = [{"x": 1}]
     logs = trainer.evaluate(lambda: data)
     assert "val_loss" in logs
@@ -450,22 +432,14 @@ def test_base_trainer_fit_runs_correct_number_of_epochs() -> None:
 
 def test_base_trainer_fit_with_validation_dataset() -> None:
     """fit() calls evaluate each epoch when validation_dataset is given."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    trainer = _make_trainer(validation_step=_val_forward)
+    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
     trainer.fit(epochs=2, training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}])
     assert "val_loss" in trainer.history[2]
 
 
 def test_base_trainer_fit_respects_validation_frequency() -> None:
     """Validation only runs at multiples of validation_frequency."""
-
-    def _val_forward(inputs: dict, **models: Any) -> dict:
-        return {"loss": 0.3}
-
-    trainer = _make_trainer(validation_step=_val_forward)
+    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
     evaluated_epochs: list[int] = []
     trainer.on_validation_end.append(lambda i, **kw: evaluated_epochs.append(i.epoch))
     trainer.fit(

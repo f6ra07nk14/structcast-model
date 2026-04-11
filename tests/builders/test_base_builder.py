@@ -211,30 +211,46 @@ def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
 def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
     """Reject duplicate backward names and optimizer names."""
     opt = {"_obj_": [["_addr_", "torch.optim.SGD"]]}
-    duplicate_backward = {"BACKWARDS": [["main", "loss_a", [[opt, ["model"]]]], ["main", "loss_b", [[opt, ["model"]]]]]}
-    with pytest.raises(SpecError, match='Duplicate backward name "main"'):
-        TorchBackwardBuilder(raw=duplicate_backward)()
-    duplicate_optimizer = {
+    duplicate_backward = {
         "BACKWARDS": [
-            [
-                "loss",
-                [["same_opt", opt, ["model"]], ["same_opt", {"_obj_": [["_addr_", "torch.optim.AdamW"]]}, ["model"]]],
-            ]
-        ]
+            {
+                "NAME": "main",
+                "LOSS": "loss_a",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": opt,
+                "FLOW": [["x", "loss_a"]],
+            },
+            {
+                "NAME": "main",
+                "LOSS": "loss_b",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": opt,
+                "FLOW": [["x", "loss_b"]],
+            },
+        ],
     }
-    with pytest.raises(SpecError, match='Duplicate optimizer name "same_opt"'):
-        TorchBackwardBuilder(raw=duplicate_optimizer)()
+    with pytest.raises(SpecError, match='Duplicate variable name "main" for optimizer'):
+        TorchBackwardBuilder(raw=duplicate_backward)()
 
 
-def test_base_backward_builder_mixed_precision_default_raises() -> None:
-    """Base backward builder requires subclass mixed precision implementation."""
+def test_base_backward_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Base backward builder logs a warning for mixed precision and returns None."""
 
     class _NoMixedPrecisionBuilder(BaseBackwardBuilder):
         pass
 
-    raw = {"BACKWARDS": [["loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]]}
-    with pytest.raises(NotImplementedError, match="_get_mixed_precision"):
-        _NoMixedPrecisionBuilder(raw=raw)()
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+            },
+        ],
+    }
+    _NoMixedPrecisionBuilder(raw=raw)()
+    assert "Mixed precision is not implemented" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -22,13 +22,6 @@ from typer.testing import CliRunner
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BestCriterion, callbacks_session
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import (
-    TimmEmaWrapper,
-    TorchTracker,
-    TorchTrainer,
-    TrainingStep,
-    ValidationStep,
-)
 from tests import ASSETS_DIR
 import torch
 
@@ -113,38 +106,32 @@ class _SimpleLoss(torch.nn.Module):
         return {"loss": torch.nn.functional.cross_entropy(logits, target)}
 
 
-class _SimpleMetric(torch.nn.Module):
-    """Metric module that computes top-1 accuracy."""
-
-    outputs: list[str] = ["acc"]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.register_buffer("_dummy", torch.tensor(0.0))
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
-        """Compute accuracy."""
-        preds = logits.argmax(dim=-1)
-        return {"acc": (preds == target).float().mean()}
-
-
 class _SimpleBackward:
     """Minimal backward implementing the Backward protocol with a real optimizer."""
 
-    mixed_precision_type: str | None = None
+    outputs: list[str] = ["loss", "acc"]
 
-    def __init__(self, model: torch.nn.Module, **kwargs: Any) -> None:
+    def __init__(self, **models: torch.nn.Module) -> None:
+        self._models = models
+        model = next(iter(models.values()))
         self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return models."""
+        return self._models
 
     def update(self, step: int) -> bool:
         """Always signal update."""
         return True
 
-    def __call__(self, loss: torch.Tensor, **kwargs: Any) -> None:
-        """Backward pass + optimizer step."""
-        loss.backward()
-        self._optimizer.step()
-        self._optimizer.zero_grad()
+    def training_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Return fixed training criteria."""
+        return {"loss": torch.tensor(0.5), "acc": torch.tensor(0.9)}
+
+    def inference_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Return fixed inference criteria."""
+        return {"loss": torch.tensor(0.3), "acc": torch.tensor(0.85)}
 
     @property
     def optimizers(self) -> dict[str, torch.optim.Optimizer]:
@@ -191,20 +178,12 @@ def _make_instantiate_fn(
     training_data: list[dict[str, torch.Tensor]],
     validation_data: list[dict[str, torch.Tensor]] | None = None,
     backward_cls: type = _SimpleBackward,
-    loss: torch.nn.Module | None = None,
-    metric: torch.nn.Module | None = None,
 ) -> Any:
     """Build a replacement for ``instantiate`` that returns real objects."""
-    _loss = loss if loss is not None else _SimpleLoss()
-    _metric = metric if metric is not None else _SimpleMetric()
 
     def _side_effect(raw: Any) -> Any:
         if raw == "MODEL":
             return _SimpleModel()
-        if raw == "LOSS":
-            return _loss
-        if raw == "METRIC":
-            return _metric
         if raw == "BACKWARD":
             return backward_cls
         if raw == "TRAIN_DS":
@@ -514,84 +493,6 @@ def test_on_best_does_not_save_when_save_false(tmp_path: pathlib.Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _save_training_state
-# ---------------------------------------------------------------------------
-
-
-def test_save_training_state_logs_to_mlflow(tmp_path: pathlib.Path) -> None:
-    """_save_training_state saves models, optimizers, grad_scalers, meta to MLflow."""
-    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    mlflow.set_experiment("test_save_state")
-    model = _SimpleModel()
-    backward = _SimpleBackward(model)
-    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
-    trainer = TorchTrainer(
-        device="cpu",
-        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
-        validation_step=ValidationStep(models=["model"], losses=_SimpleLoss()),
-        backward=backward,
-        tracker=tracker,
-        add_global_callbacks=False,
-    )
-    trainer.epoch = 1
-    trainer.step = 10
-    trainer.update = 10
-    with mlflow.start_run():
-        _save_training_state(trainer, model=model)
-
-
-def test_save_training_state_includes_ema(tmp_path: pathlib.Path) -> None:
-    """_save_training_state includes EMA state when inference_wrapper is set."""
-    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    mlflow.set_experiment("test_save_state_ema")
-    model = _SimpleModel()
-    backward = _SimpleBackward(model)
-    ema_wrapper = TimmEmaWrapper.from_models({"model": model}, distributed=False)
-    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
-    trainer = TorchTrainer(
-        device="cpu",
-        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
-        backward=backward,
-        tracker=tracker,
-        inference_wrapper=ema_wrapper,
-        add_global_callbacks=False,
-    )
-    trainer.epoch = 1
-    trainer.step = 10
-    trainer.update = 10
-    with mlflow.start_run():
-        _save_training_state(trainer, model=model)
-
-
-# ---------------------------------------------------------------------------
-# _log_criteria
-# ---------------------------------------------------------------------------
-
-
-def test_log_criteria_returns_yaml_string(tmp_path: pathlib.Path) -> None:
-    """_log_criteria formats criteria as YAML and logs them to MLflow."""
-    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    mlflow.set_experiment("test_log_criteria")
-    model = _SimpleModel()
-    backward = _SimpleBackward(model)
-    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
-    trainer = TorchTrainer(
-        device="cpu",
-        training_step=TrainingStep(models=["model"], losses=_SimpleLoss()),
-        backward=backward,
-        tracker=tracker,
-        add_global_callbacks=False,
-    )
-    trainer.epoch = 1
-    trainer.step = 5
-    trainer.update = 5
-    trainer.history[1] = {"loss": 0.5, "acc": 0.8}
-    with mlflow.start_run():
-        result = _log_criteria(trainer)
-    assert "epoch: 1" in result
-
-
-# ---------------------------------------------------------------------------
 # `train` command — validation errors
 # ---------------------------------------------------------------------------
 
@@ -605,18 +506,10 @@ def test_train_raises_for_empty_model_patterns() -> None:
             initializer_patterns=None,
             shapes=None,
             device="cpu",
-            ema=None,
-            ema_device=None,
-            loss_pattern="IGNORED",
-            loss_outputs=None,
-            metric_pattern=None,
-            metric_outputs=None,
             backward_pattern="IGNORED",
-            mixed_precision_type=None,
+            backward_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
-            training_step_pattern=None,
-            validation_step_pattern=None,
             epochs=1,
             start_epoch=1,
             training_dataset_pattern="IGNORED",
@@ -649,18 +542,10 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            ema=None,
-            ema_device=None,
-            loss_pattern="LOSS",
-            loss_outputs=None,
-            metric_pattern=None,
-            metric_outputs=None,
             backward_pattern="BACKWARD",
-            mixed_precision_type=None,
+            backward_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
-            training_step_pattern=None,
-            validation_step_pattern=None,
             epochs=1,
             start_epoch=1,
             training_dataset_pattern="TRAIN_DS",
@@ -681,33 +566,31 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
 
 
 def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
-    """`train` should fail when a loss module lacks ``outputs`` and no fallback is given."""
+    """`train` should fail when backward module lacks ``outputs`` and no fallback is given."""
     configure_security(allowed_modules_check=False)
     train_fn = _train_callback()
+
+    class _BackwardNoOutputs(_SimpleBackward):
+        """Backward without outputs attribute."""
+
+        outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
+
     deps = {
         "instantiate_object": _make_instantiate_fn(
             training_data=_make_training_dataset(),
-            loss=torch.nn.Identity(),
+            backward_cls=_BackwardNoOutputs,
         ),
     }
-    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
+    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "backward" does not have an "outputs"'):
         train_fn(
             model_patterns=[{"model": "MODEL"}],
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            ema=None,
-            ema_device=None,
-            loss_pattern="LOSS",
-            loss_outputs=None,
-            metric_pattern=None,
-            metric_outputs=None,
             backward_pattern="BACKWARD",
-            mixed_precision_type=None,
+            backward_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
-            training_step_pattern=None,
-            validation_step_pattern=None,
             epochs=1,
             start_epoch=1,
             training_dataset_pattern="TRAIN_DS",
@@ -736,16 +619,11 @@ def _invoke_train(
     tmp_path: pathlib.Path,
     *,
     ci: bool = True,
-    ema: dict[str, Any] | None = None,
     validation_data: list[dict[str, torch.Tensor]] | None = None,
-    loss_outputs: list[str] | None = None,
-    metric_outputs: list[str] | None = None,
-    mixed_precision_type: str | None = None,
+    backward_outputs: list[str] | None = None,
     lower_criteria: list[str] | None = None,
     higher_criteria: list[str] | None = None,
     save_criteria: list[str] | None = None,
-    loss: torch.nn.Module | None = None,
-    metric: torch.nn.Module | None = None,
     backward_cls: type = _SimpleBackward,
     log_arguments: list[dict[str, Any]] | None = None,
     log_artifacts: list[pathlib.Path] | None = None,
@@ -761,8 +639,6 @@ def _invoke_train(
             training_data=training_data,
             validation_data=validation_data,
             backward_cls=backward_cls,
-            loss=loss,
-            metric=metric,
         ),
     }
     mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
@@ -773,18 +649,10 @@ def _invoke_train(
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            ema=ema,
-            ema_device=None,
-            loss_pattern="LOSS",
-            loss_outputs=loss_outputs,
-            metric_pattern="METRIC",
-            metric_outputs=metric_outputs,
             backward_pattern="BACKWARD",
-            mixed_precision_type=mixed_precision_type,
+            backward_outputs=backward_outputs,
             compile_pattern=None,
             trainer_pattern=None,
-            training_step_pattern=None,
-            validation_step_pattern=None,
             epochs=epochs,
             start_epoch=1,
             training_dataset_pattern="TRAIN_DS",
@@ -816,59 +684,28 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     )
 
 
-def test_train_ci_mode_with_ema(tmp_path: pathlib.Path) -> None:
-    """CI mode with EMA enabled should save EMA state in training_state."""
-    _invoke_train(tmp_path, ci=True, ema={}, save_criteria=[])
+def test_train_ci_mode_with_backward_outputs_fallback(tmp_path: pathlib.Path) -> None:
+    """Train should accept explicit --backward-outputs when backward has no ``outputs`` attr."""
+
+    class _BackwardNoOutputs(_SimpleBackward):
+        """Backward without outputs attribute."""
+
+        outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
+
+    _invoke_train(
+        tmp_path,
+        ci=True,
+        backward_cls=_BackwardNoOutputs,
+        backward_outputs=["loss", "acc"],
+        save_criteria=[],
+        lower_criteria=[],
+        higher_criteria=[],
+    )
 
 
 def test_train_non_ci_mode_uses_pbar(tmp_path: pathlib.Path) -> None:
     """Non-CI mode should use tqdm progress bar callbacks."""
     _invoke_train(tmp_path, ci=False)
-
-
-def test_train_with_loss_outputs_fallback(tmp_path: pathlib.Path) -> None:
-    """Train should accept explicit --loss-outputs when module has no ``outputs`` attr."""
-
-    class _KwargsLoss(torch.nn.Module):
-        """Loss that accepts **kwargs (no ``outputs`` attribute)."""
-
-        def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
-            return {"loss": torch.nn.functional.cross_entropy(logits, target)}
-
-    class _KwargsMetric(torch.nn.Module):
-        """Metric that accepts **kwargs (no ``outputs`` attribute)."""
-
-        def forward(self, logits: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
-            return {"acc": (logits.argmax(dim=-1) == target).float().mean()}
-
-    _invoke_train(
-        tmp_path,
-        ci=True,
-        loss=_KwargsLoss(),
-        metric=_KwargsMetric(),
-        loss_outputs=["loss"],
-        metric_outputs=["acc"],
-        save_criteria=[],
-        lower_criteria=[],
-        higher_criteria=[],
-    )
-
-
-def test_train_backward_mixed_precision_type_override(tmp_path: pathlib.Path) -> None:
-    """Backward's mixed_precision_type should override the command's default."""
-
-    class _BackwardWithMixedPrecision(_SimpleBackward):
-        mixed_precision_type = "bfloat16"
-
-    _invoke_train(
-        tmp_path,
-        ci=True,
-        mixed_precision_type="float16",
-        backward_cls=_BackwardWithMixedPrecision,
-        save_criteria=[],
-        lower_criteria=[],
-        higher_criteria=[],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -924,18 +761,10 @@ def _ddp_train_worker(
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],
                     device="cpu",
-                    ema=None,
-                    ema_device=None,
-                    loss_pattern="LOSS",
-                    loss_outputs=None,
-                    metric_pattern="METRIC",
-                    metric_outputs=None,
                     backward_pattern="BACKWARD",
-                    mixed_precision_type=None,
+                    backward_outputs=None,
                     compile_pattern=None,
                     trainer_pattern=None,
-                    training_step_pattern=None,
-                    validation_step_pattern=None,
                     epochs=2,
                     start_epoch=1,
                     training_dataset_pattern="TRAIN_DS",
@@ -1002,18 +831,10 @@ def _ddp_rank_gating_worker(
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],
                     device="cpu",
-                    ema=None,
-                    ema_device=None,
-                    loss_pattern="LOSS",
-                    loss_outputs=None,
-                    metric_pattern=None,
-                    metric_outputs=None,
                     backward_pattern="BACKWARD",
-                    mixed_precision_type=None,
+                    backward_outputs=None,
                     compile_pattern=None,
                     trainer_pattern=None,
-                    training_step_pattern=None,
-                    validation_step_pattern=None,
                     epochs=1,
                     start_epoch=1,
                     training_dataset_pattern="TRAIN_DS",
@@ -1079,18 +900,10 @@ def _ddp_seed_offset_worker(
                     initializer_patterns=None,
                     shapes=[{"x": (4,)}],
                     device="cpu",
-                    ema=None,
-                    ema_device=None,
-                    loss_pattern="LOSS",
-                    loss_outputs=None,
-                    metric_pattern=None,
-                    metric_outputs=None,
                     backward_pattern="BACKWARD",
-                    mixed_precision_type=None,
+                    backward_outputs=None,
                     compile_pattern=None,
                     trainer_pattern=None,
-                    training_step_pattern=None,
-                    validation_step_pattern=None,
                     epochs=1,
                     start_epoch=1,
                     training_dataset_pattern="TRAIN_DS",
