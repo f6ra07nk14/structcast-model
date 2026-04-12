@@ -110,6 +110,7 @@ Model code generation is available for all three frameworks. Training workflow g
       - [`TimmDataLoaderWrapper`](#timmdataloaderwrapper)
   - [Minimal End-to-End Example](#minimal-end-to-end-example)
   - [Development](#development)
+  - [Migration Notes](#migration-notes)
   - [Roadmap](#roadmap)
 
 ## What This Project Does
@@ -1419,6 +1420,16 @@ The repository includes tests for:
 - Trainer utilities
 - timm dataset and dataloader wrappers
 - Custom torch layers
+
+## Migration Notes
+
+### Upgrading from v1.x
+
+The following breaking changes were introduced by the backward-template restructure for multi-optimizer GAN training support:
+
+- **EMA support removed** — `TimmEmaWrapper`, the `cfg/torch/others/ema.yaml` configuration, and all `InferenceWrapper`-based EMA integration in `cmd_torch.py` and `torch/trainer.py` have been removed. If your training workflow relied on built-in EMA, you will need to manage EMA externally.
+- **Backward template schema restructured** — The `BACKWARDS` key now expects a list of `BackwardBehavior` entries (each with its own `NAME`, `LOSS`, `TRAINABLE_LAYERS`, `OPTIMIZER`, `FLOW`, and optional `INFERENCE_FLOW`). Previous single-optimizer backward configurations must be wrapped in a single-entry list.
+- **`trainer.fit()` signature simplified** — Unused model arguments were removed from the `fit()` method. Update any custom callers accordingly.
 
 ## Roadmap
 
