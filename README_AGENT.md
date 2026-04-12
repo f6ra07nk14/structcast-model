@@ -7,7 +7,7 @@
 
 StructCast-Model turns YAML templates into executable models and training systems across multiple frameworks. It has four responsibilities:
 
-1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports backward/optimizer orchestration class generation.
+1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports backward/optimizer orchestration class generation, including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
 2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
 3. **Inference benchmarking**: Measure model inference time via `scm [torch/flax/keras] time`.
 4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` (PyTorch only; Flax and Keras training is planned).
@@ -156,6 +156,13 @@ Purpose:
 - Build a `TorchBackwardIntermediate`.
 - Optionally write generated Python to disk.
 
+The generated backward class supports:
+
+- Per-entry execution graphs (`FLOW` / `INFERENCE_FLOW`) with inline layer instantiation
+- Multiple backward entries, each with its own optimizer and trainable layers (multi-optimizer training, e.g., GAN)
+- Automatic train/eval mode switching per backward entry
+- Gradient accumulation, AMP scaler logic, and gradient clipping
+
 ### `scm torch ptflops` and `scm torch calflops`
 
 Purpose:
@@ -262,6 +269,8 @@ Important generation details:
 
 - Model code uses `self.<layer_name>` submodules.
 - Inference flow is rendered separately when `INFERENCE_FLOW` is present.
+- Backward code supports multiple backward entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`.
+- Each backward entry's trainable layers are set to training mode before its flow executes and set back to eval mode after the optimizer step.
 - Backward code can include gradient accumulation, AMP scaler logic, clipping, optimizer stepping, and optimizer metadata properties.
 
 ### Flax builder layer

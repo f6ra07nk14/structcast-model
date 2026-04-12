@@ -66,6 +66,12 @@ scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
 scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 ```
 
+The backward template supports multiple `BACKWARDS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`. This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
+
+```bash
+scm torch create backward cfg/torch/backwards/CycleGAN.yaml -o backward.py
+```
+
 Use this when the training workflow should remain fully declarative.
 
 ### Workflow 3: Format a Reusable Dataset Template
@@ -334,7 +340,9 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 - `cfg/torch/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks (PyTorch channel-first).
 - `cfg/flax/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Flax `nnx.Module` (channel-last, `rngs` constructor arg).
 - `cfg/keras/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Keras `Layer` (channel-last, multi-backend).
-- `cfg/torch/backwards/ConvNeXtV2.yaml` uses optimizer factories, scheduler settings, optional clipping, and gradient accumulation.
+- `cfg/torch/backwards/ConvNeXtV2.yaml` uses a single backward entry with optimizer factory, scheduler settings, optional clipping, gradient accumulation, and inline loss/metric layers in the `FLOW`.
+- `cfg/torch/backwards/CycleGAN.yaml` demonstrates multi-optimizer backward logic with three backward entries (generator pair + two discriminators), each with its own `FLOW`, `OPTIMIZER`, and `TRAINABLE_LAYERS`.
+- `cfg/torch/models/CycleGAN_generator.yaml` and `cfg/torch/models/CycleGAN_discriminator.yaml` define CycleGAN model architectures with Jinja-driven sublayer expansion.
 - `cfg/torch/datasets/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
 
 ## Base Trainer and Callback System
