@@ -1,3 +1,10 @@
+## [2.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.5.0...v2.0.0) (2026-04-12)
+
+
+### 💥 Breaking Changes
+
+* restructure backward template schema for multi-optimizer GAN training support ([26f0dd2](https://github.com/f6ra07nk14/structcast-model/commit/26f0dd2c63b5543b0c56fbed7a4d884bc0b7f977))
+
 ## [1.5.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.4.0...v1.5.0) (2026-04-09)
 
 
