@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
-import functools
 from pathlib import Path
 from typing import Any
 
@@ -11,20 +9,15 @@ import numpy as np
 from PIL import Image
 import pytest
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
-from timm.utils import ModelEmaV3
 from torch.nn import Module
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo
 from structcast_model.torch.trainer import (
     TimmDataLoaderWrapper,
     TimmDatasetWrapper,
-    TimmEmaWrapper,
     TorchTracker,
     TorchTrainer,
-    TrainingStep,
-    ValidationStep,
     create_torch_inputs,
-    get_autocast,
     get_torch_device,
     initial_distributed_env,
     initial_model,
@@ -78,12 +71,26 @@ class _LossModule(Module):
 class _StubBackward:
     """A minimal stub implementing the Backward protocol for tests that don't exercise the backward pass."""
 
+    def __init__(self, models: dict[str, Any] | None = None) -> None:
+        """Initialize with optional models dict."""
+        self._models = models or {}
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return the models dict."""
+        return self._models
+
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""
         return True
 
-    def __call__(self, *args: Any, **kwargs: Any) -> None:
-        """No-op backward pass."""
+    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """No-op training step."""
+        return {}
+
+    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """No-op inference step."""
+        return {}
 
 
 class _MetricModule(Module):
@@ -225,82 +232,6 @@ def test_initial_model_handles_list_of_modules() -> None:
 
 
 # ---------------------------------------------------------------------------
-# get_autocast
-# ---------------------------------------------------------------------------
-
-
-def test_get_autocast_returns_suppress_when_no_precision() -> None:
-    """Returns contextlib.suppress when mixed_precision_type is None."""
-    fn = get_autocast(None, "cpu")
-    assert fn is suppress
-
-
-def test_get_autocast_returns_partial_autocast_when_precision_set() -> None:
-    """Returns a partial wrapping torch.autocast when mixed precision is set."""
-    fn = get_autocast("bfloat16", "cpu")
-    assert isinstance(fn, functools.partial)
-
-
-# ---------------------------------------------------------------------------
-# TrainingStep
-# ---------------------------------------------------------------------------
-
-
-def test_training_step_returns_loss_criteria() -> None:
-    """TrainingStep runs models and loss module, returning criteria dict."""
-    model = _IdentityModel()
-    loss = _LossModule()
-    step = TrainingStep(models=["m"], losses=loss)
-    criteria = step({"x": torch.zeros(1)}, m=model)
-    assert "loss" in criteria
-    assert isinstance(criteria["loss"], torch.Tensor)
-
-
-def test_training_step_includes_metrics_when_provided() -> None:
-    """TrainingStep also computes metrics when metrics module is given."""
-    model = _IdentityModel()
-    loss = _LossModule()
-    metric = _MetricModule()
-    step = TrainingStep(models=["m"], losses=loss, metrics=metric)
-    criteria = step({"x": torch.zeros(1)}, m=model)
-    assert "loss" in criteria
-    assert "acc" in criteria
-
-
-def test_training_step_no_model_keys() -> None:
-    """TrainingStep with empty models list still runs the loss."""
-    loss = _LossModule()
-    step = TrainingStep(models=[], losses=loss)
-    criteria = step({"x": torch.zeros(1)})
-    assert "loss" in criteria
-
-
-# ---------------------------------------------------------------------------
-# ValidationStep
-# ---------------------------------------------------------------------------
-
-
-def test_validation_step_returns_loss_criteria() -> None:
-    """ValidationStep runs under no_grad and returns criteria."""
-    model = _IdentityModel()
-    loss = _LossModule()
-    step = ValidationStep(models=["m"], losses=loss)
-    criteria = step({"x": torch.zeros(1)}, m=model)
-    assert "loss" in criteria
-
-
-def test_validation_step_includes_metrics_when_provided() -> None:
-    """ValidationStep also computes metrics when provided."""
-    model = _IdentityModel()
-    loss = _LossModule()
-    metric = _MetricModule()
-    step = ValidationStep(models=["m"], losses=loss, metrics=metric)
-    criteria = step({"x": torch.zeros(1)}, m=model)
-    assert "loss" in criteria
-    assert "acc" in criteria
-
-
-# ---------------------------------------------------------------------------
 # TorchTracker
 # ---------------------------------------------------------------------------
 
@@ -348,11 +279,9 @@ def test_torch_tracker_post_init_registers_reset_callback() -> None:
 
 def test_torch_trainer_sync_cpu_is_noop() -> None:
     """sync() on a CPU trainer should not raise."""
-    loss = _LossModule()
     trainer = TorchTrainer(
         device="cpu",
-        training_step=TrainingStep(models=[], losses=loss),
-        backward=lambda step, **kw: True,
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"]),
         add_global_callbacks=False,
     )
@@ -411,94 +340,14 @@ def test_torch_trainer_sync_cuda_calls_synchronize(monkeypatch: pytest.MonkeyPat
     """sync() calls torch.cuda.synchronize() when device contains 'cuda' (line 287)."""
     synced: list[bool] = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: synced.append(True))
-    loss = _LossModule()
     trainer = TorchTrainer(
         device="cuda",
-        training_step=TrainingStep(models=[], losses=loss),
-        backward=lambda step, **kw: True,
+        backward=_StubBackward(),
         tracker=TorchTracker.from_criteria(["loss"]),
         add_global_callbacks=False,
     )
     trainer.sync()
     assert synced == [True]
-
-
-# ---------------------------------------------------------------------------
-# TimmEmaWrapper (lines 230, 234–235, 239, 244, 267–274)
-# ---------------------------------------------------------------------------
-
-
-class _ParamModel(Module):
-    """A tiny model with trainable parameters for EMA tests."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.fc = torch.nn.Linear(2, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
-
-
-def test_timm_ema_wrapper_from_models_registers_update_callback() -> None:
-    """from_models triggers __post_init__ which appends self.update to GLOBAL_CALLBACKS.on_update (line 230)."""
-    before = len(GLOBAL_CALLBACKS.on_update)
-    TimmEmaWrapper.from_models({"m": _ParamModel()})
-    assert len(GLOBAL_CALLBACKS.on_update) == before + 1
-
-
-def test_timm_ema_wrapper_from_models_creates_ema_entry() -> None:
-    """from_models produces a ModelEmaV3 for every provided model (lines 267–274)."""
-    wrapper = TimmEmaWrapper.from_models({"m": _ParamModel()})
-    assert "m" in wrapper.ema
-    assert isinstance(wrapper.ema["m"], ModelEmaV3)
-
-
-def test_timm_ema_wrapper_from_models_with_compile_fn() -> None:
-    """from_models applies compile_fn to each EMA model (lines 270–271)."""
-    compiled: list[Any] = []
-
-    def fake_compile(m: Module) -> Module:
-        compiled.append(m)
-        return m
-
-    TimmEmaWrapper.from_models({"m": _ParamModel()}, compile_fn=fake_compile)
-    assert len(compiled) == 1
-
-
-def test_timm_ema_wrapper_update_advances_ema() -> None:
-    """update() calls ema.update for each model (lines 234–235)."""
-    model = _ParamModel()
-    wrapper = TimmEmaWrapper.from_models({"m": model})
-    info = BaseInfo(update=3)
-    wrapper.update(info, m=model)  # must not raise
-
-
-def test_timm_ema_wrapper_call_returns_original_when_not_cross_device() -> None:
-    """__call__ returns EMA model when is_cross_device is False (same device)."""
-    model = _ParamModel()
-    wrapper = TimmEmaWrapper.from_models({"m": model})  # device=None → is_cross_device=False
-    info = BaseInfo()
-    result = wrapper(info, m=model)
-    assert result["m"] is wrapper.ema["m"]
-
-
-def test_timm_ema_wrapper_call_returns_ema_when_cross_device() -> None:
-    """__call__ returns the original model when is_cross_device is True."""
-    model = _ParamModel()
-    ema_model = ModelEmaV3(model)
-    wrapper = TimmEmaWrapper(ema={"m": ema_model}, is_cross_device={"m": True})
-    info = BaseInfo()
-    result = wrapper(info, m=model)
-    assert result["m"] is model
-
-
-def test_timm_ema_wrapper_models_property_returns_ema_modules() -> None:
-    """Models property returns the underlying nn.Module for each EMA entry (line 244)."""
-    model = _ParamModel()
-    wrapper = TimmEmaWrapper.from_models({"m": model})
-    ema_models = wrapper.models
-    assert "m" in ema_models
-    assert isinstance(ema_models["m"], Module)
 
 
 # ---------------------------------------------------------------------------
@@ -932,25 +781,6 @@ def test_torch_tracker_from_criteria_auto_detects_non_distributed() -> None:
     assert tracker.distributed is False
 
 
-# --- TimmEmaWrapper distributed DDP unwrap ---
-
-
-def test_timm_ema_wrapper_update_distributed_unwraps_ddp(single_process_gloo: None) -> None:
-    """update() with distributed=True unwraps DDP .module before EMA update."""
-    model = _ParamModel()
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    wrapper = TimmEmaWrapper.from_models({"m": model}, distributed=True)
-    info = BaseInfo(update=1)
-    # Should unwrap ddp_model.module (the original model) and pass to ema.update
-    wrapper.update(info, m=ddp_model)  # must not raise
-
-
-def test_timm_ema_wrapper_from_models_auto_detects_distributed(single_process_gloo: None) -> None:
-    """from_models with distributed=None auto-detects is_initialized() → True."""
-    wrapper = TimmEmaWrapper.from_models({"m": _ParamModel()}, distributed=None)
-    assert wrapper.distributed is True
-
-
 # --- TorchTrainer.no_sync ---
 
 
@@ -960,13 +790,12 @@ def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: N
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=_StubBackward(),
+        backward=_StubBackward(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
     assert ddp_model.require_backward_grad_sync is True
-    with trainer.no_sync(__updated__=False, m=ddp_model):
+    with trainer.no_sync(False):
         assert ddp_model.require_backward_grad_sync is False
     # restored after exiting
     assert ddp_model.require_backward_grad_sync is True
@@ -978,12 +807,11 @@ def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo:
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=_StubBackward(),
+        backward=_StubBackward(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
-    with trainer.no_sync(__updated__=True, m=ddp_model):
+    with trainer.no_sync(True):
         assert ddp_model.require_backward_grad_sync is True
 
 
@@ -993,13 +821,12 @@ def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) 
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=_StubBackward(),
+        backward=_StubBackward(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         add_global_callbacks=False,
     )
     with pytest.raises(RuntimeError, match="boom"):
-        with trainer.no_sync(__updated__=False, m=ddp_model):
+        with trainer.no_sync(False):
             raise RuntimeError("boom")
     assert ddp_model.require_backward_grad_sync is True
 
@@ -1009,10 +836,9 @@ def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
     model = torch.nn.Linear(2, 2)
     trainer = TorchTrainer(
         device="cpu",
-        training_step=TrainingStep(models=[], losses=_LossModule()),
-        backward=_StubBackward(),
+        backward=_StubBackward(models={"m": model}),
         tracker=TorchTracker.from_criteria(["loss"]),
         add_global_callbacks=False,
     )
-    with trainer.no_sync(__updated__=False, m=model):
+    with trainer.no_sync(False):
         assert not hasattr(model, "require_backward_grad_sync")

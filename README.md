@@ -43,6 +43,8 @@ Model code generation is available for all three frameworks. Training workflow g
     - [PyTorch](#pytorch-3)
       - [`cfg/torch/models/ConvNeXtV2.yaml`](#cfgtorchmodelsconvnextv2yaml)
       - [`cfg/torch/backwards/ConvNeXtV2.yaml`](#cfgtorchbackwardsconvnextv2yaml)
+      - [`cfg/torch/backwards/CycleGAN.yaml`](#cfgtorchbackwardscycleganyaml)
+      - [`cfg/torch/models/CycleGAN_generator.yaml` and `CycleGAN_discriminator.yaml`](#cfgtorchmodelscyclegan_generatoryaml-and-cyclegan_discriminatoryaml)
       - [`cfg/torch/datasets/default_timm.yaml`](#cfgtorchdatasetsdefault_timmyaml)
     - [Flax](#flax-2)
       - [`cfg/flax/models/ConvNeXtV2.yaml`](#cfgflaxmodelsconvnextv2yaml)
@@ -68,13 +70,13 @@ Model code generation is available for all three frameworks. Training workflow g
       - [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)
     - [Backward Template Schema](#backward-template-schema)
       - [`IMPORTS`](#imports-1)
+      - [`INPUTS` and `OUTPUTS`](#inputs-and-outputs)
       - [`MIXED_PRECISION`](#mixed_precision)
       - [`MIXED_PRECISION_TYPE`](#mixed_precision_type)
       - [`ACCUMULATE_GRADIENTS`](#accumulate_gradients)
       - [`BACKWARDS`](#backwards)
-      - [`LOSSES` and `MODELS`](#losses-and-models)
+      - [`LOSSES` and `TRAINABLE_LAYERS`](#losses-and-trainable_layers)
       - [`BACKWARDS` entry keys](#backwards-entry-keys)
-      - [`OPTIMIZERS` entry keys](#optimizers-entry-keys)
   - [API Reference: `base_trainer.py`](#api-reference-base_trainerpy)
     - [Utility functions](#utility-functions)
       - [`get_dataset(dataset)`](#get_datasetdataset)
@@ -84,7 +86,6 @@ Model code generation is available for all three frameworks. Training workflow g
       - [`Forward`](#forward)
       - [`Backward`](#backward)
       - [`Callback` and `BestCallback`](#callback-and-bestcallback)
-      - [`InferenceWrapper`](#inferencewrapper)
     - [State and callbacks](#state-and-callbacks)
       - [`BaseInfo`](#baseinfo)
       - [`Callbacks`](#callbacks)
@@ -107,7 +108,6 @@ Model code generation is available for all three frameworks. Training workflow g
     - [timm integrations](#timm-integrations)
       - [`TimmDatasetWrapper`](#timmdatasetwrapper)
       - [`TimmDataLoaderWrapper`](#timmdataloaderwrapper)
-      - [`TimmEmaWrapper`](#timmemawrapper)
   - [Minimal End-to-End Example](#minimal-end-to-end-example)
   - [Development](#development)
   - [Roadmap](#roadmap)
@@ -119,7 +119,7 @@ Model code generation is available for all three frameworks. Training workflow g
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
-- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, Exponential Moving Average (EMA), optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
 
 ## Installation
 
@@ -206,7 +206,7 @@ structcast-model/
 │   │   ├── losses/        # loss module templates
 │   │   ├── metrics/       # metric module templates
 │   │   ├── models/        # model architecture templates
-│   │   └── others/        # compile and EMA presets
+│   │   └── others/        # misc templates (e.g. for `torch.compile` options)
 │   ├── flax/
 │   │   └── models/        # Flax model architecture templates
 │   └── keras/
@@ -245,7 +245,7 @@ The repository follows a repeatable workflow:
 3. **Generate** Python source files for the model (and, for PyTorch, loss, metric, and backward logic) using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
 5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
-6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, EMA, and MLflow.
+6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, and MLflow.
 
 ```text
 YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
@@ -364,12 +364,21 @@ scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epoc
 
 The `scm torch create backward` command turns a backward template into a class that manages:
 
-- optimizer construction
-- optional gradient scaler creation
-- optional gradient clipping
-- optional gradient accumulation
-- optimizer stepping and zeroing
+- a training-time execution graph (`FLOW`) and an inference-time execution graph (`INFERENCE_FLOW`) per backward entry
+- inline layer instantiation (loss layers, metric layers, and arbitrary modules can be defined directly in the flow)
+- one or more backward entries, each with its own optimizer and trainable layers — enabling multi-optimizer training (e.g., GAN generator + discriminator)
+- optimizer construction via StructCast patterns
+- optional gradient scaler creation (`MIXED_PRECISION`)
+- optional gradient clipping (`CLIP`)
+- optional gradient accumulation (`ACCUMULATE_GRADIENTS`)
+- optimizer stepping, zeroing, and automatic train/eval mode switching
 - learning-rate and parameter-group inspection helpers
+
+For example, a CycleGAN backward template defines three backward entries — one for the generator pair and one for each discriminator — each with its own flow, optimizer, and trainable layers:
+
+```bash
+scm torch create backward cfg/torch/backwards/CycleGAN.yaml -o backward.py
+```
 
 ### 4. Inspect FLOPs and Parameters
 
@@ -467,7 +476,6 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -486,7 +494,6 @@ scm torch train \
     --matmul-precision high \
     -E Test \
     -A model.py \
-    -A cfg/torch/others/ema.yaml \
     -A loss.py \
     -A metric.py \
     -A backward.py \
@@ -500,7 +507,6 @@ Key arguments:
 - positional model patterns: one or more named model definitions
 - `-s/--shape`: dummy input shapes used for model initialization
 - `-d/--device`: `cpu` or `cuda`
-- `--ema`: boolean, YAML file, or inline dict for `timm.utils.ModelEmaV3`
 - `-L/--loss`: StructCast pattern for the loss module
 - `-M/--metric`: StructCast pattern for the metric module
 - `-B/--backward`: StructCast pattern for the backward class
@@ -517,7 +523,7 @@ What the train command does internally:
 
 1. Instantiates datasets and determines their lengths.
 2. Initializes models with optional dummy-input forward passes.
-3. Instantiates loss, metric, backward, compile, and EMA objects.
+3. Instantiates loss, metric, backward, and compile objects.
 4. Builds a `TorchTracker` from the declared output names.
 5. Creates a `TorchTrainer` with training and validation step objects.
 6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
@@ -541,8 +547,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — MLflow logging, progress bars, and checkpoint saving are performed only on rank 0.
 7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
-8. **EMA handling** — `TimmEmaWrapper` automatically unwraps the DDP module before updating EMA weights.
-9. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
+8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
 
 ### Single-Node Multi-GPU
 
@@ -556,7 +561,6 @@ torchrun --nproc_per_node=gpu \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -668,13 +672,34 @@ Demonstrates the model-building style used throughout the project:
 
 #### `cfg/torch/backwards/ConvNeXtV2.yaml`
 
-Demonstrates how backward logic is configured declaratively:
+Demonstrates how backward logic is configured declaratively for a single-optimizer workflow:
 
 - `MIXED_PRECISION` for `torch.amp.GradScaler`
 - `MIXED_PRECISION_TYPE` for autocast dtype
 - `ACCUMULATE_GRADIENTS` for delayed optimizer updates
+- single `BACKWARDS` entry with `FLOW` containing model forward pass, loss, and metric computation inline
+- separate `INFERENCE_FLOW` for evaluation without gradient tracking
 - optimizer creation through `structcast_model.torch.optimizers.create_with_scheduler`
 - optional gradient clipping via `timm.utils.clip_grad.dispatch_clip_grad`
+
+#### `cfg/torch/backwards/CycleGAN.yaml`
+
+Demonstrates multi-optimizer backward logic for GAN-style training:
+
+- three `BACKWARDS` entries: one for the generator pair (`G_AB`, `G_BA`) and one for each discriminator (`D_A`, `D_B`)
+- each entry defines its own `FLOW` with inline loss layers (`L1Loss`, `MSELoss`) and computed expressions
+- each entry has a dedicated `OPTIMIZER` with independent learning-rate scheduler
+- `TRAINABLE_LAYERS` specifies which models each optimizer manages
+- the generated backward class automatically handles train/eval mode switching per backward entry
+- `OUTPUTS` aggregates all tracked values (generator loss, GAN loss, cycle loss, identity loss, discriminator losses)
+
+#### `cfg/torch/models/CycleGAN_generator.yaml` and `CycleGAN_discriminator.yaml`
+
+Pair of model templates for the CycleGAN architecture:
+
+- **Generator** — uses `ResidualBlock`, `DownBlock`, and `UpBlock` sublayers with reflection padding, instance normalization, and Jinja-driven residual block expansion (`n_residual_blocks` parameter)
+- **Discriminator** — uses a `DiscriminatorBlock` sublayer with conditional instance normalization controlled by a `normalize` parameter
+- both templates use `LazyConv2d` for automatic input channel inference
 
 #### `cfg/torch/datasets/default_timm.yaml`
 
@@ -892,7 +917,7 @@ FLOW:
 `NAME` appears in two contexts:
 
 1. **As the third element of a `FLOW` entry** — sets the Python attribute name of the generated submodule (e.g., `"block0"`, `"head"`). Must be a valid Python identifier.
-2. **As a key in a `BACKWARDS` or `OPTIMIZERS` entry** — sets the generated method name for that backward or optimizer step.
+2. **As a key in a `BACKWARDS` entry** — sets the generated attribute name for that backward pass and its optimizer.
 
 ```yaml
 # In FLOW:
@@ -900,11 +925,10 @@ FLOW:
 
 # In BACKWARDS:
 BACKWARDS:
-  - NAME: backward
+  - NAME: optimizer
     LOSS: ce_loss
-    OPTIMIZERS:
-      - NAME: optimizer
-        ...
+    TRAINABLE_LAYERS: [model]
+    OPTIMIZER: [_obj_, ...]
 ```
 
 #### `LAYER`
@@ -947,7 +971,7 @@ These three keys form the `UserLayer` dict that activates a named sublayer:
 
 ### Backward Template Schema
 
-The following keys appear in backward configuration files such as [`cfg/torch/backwards/ConvNeXtV2.yaml`](cfg/torch/backwards/ConvNeXtV2.yaml).
+The following keys appear in backward configuration files such as [`cfg/torch/backwards/ConvNeXtV2.yaml`](cfg/torch/backwards/ConvNeXtV2.yaml) and [`cfg/torch/backwards/CycleGAN.yaml`](cfg/torch/backwards/CycleGAN.yaml).
 
 #### `IMPORTS`
 
@@ -955,6 +979,15 @@ Same format as in the model schema. Injects additional Python imports into the g
 
 ```yaml
 IMPORTS: {}
+```
+
+#### `INPUTS` and `OUTPUTS`
+
+`INPUTS` lists the tensor names the generated backward class expects as keyword arguments during training and inference. `OUTPUTS` lists the tensor names produced by the backward flow. Both default to `[]`, which instructs the code generator to infer them automatically from the `BACKWARDS` entries' `FLOW` definitions.
+
+```yaml
+INPUTS: []                # auto-inferred from BACKWARDS[*].FLOW
+OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
 #### `MIXED_PRECISION`
@@ -995,67 +1028,80 @@ ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
 
 #### `BACKWARDS`
 
-An ordered list of `BackwardBehavior` entries. Each entry defines one backward pass — i.e., one loss to differentiate and one set of optimizers to update. Multiple entries are used for multi-loss or GAN-style training where different optimizers are stepped independently.
+An ordered list of `BackwardBehavior` entries. Each entry defines one backward pass — i.e., one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
+
+During code generation, each entry's trainable layers are automatically set to training mode before its flow executes, and set back to eval mode after the optimizer step.
 
 ```yaml
+# Single-optimizer example (classification)
 BACKWARDS:
-  - NAME: backward
+  - NAME: optimizer
     LOSS: ce_loss
-    OPTIMIZERS:
-      - NAME: optimizer
-        OPTIMIZER: [_obj_, ...]
-        LAYERS: model
-        CLIP: null
+    TRAINABLE_LAYERS: [model]
+    OPTIMIZER: [_obj_, ...]
+    CLIP: null
+    EXTRA: {}
+    FLOW:
+      - [image, cls, model]
+      - [{target: label, input: cls}, ce_loss, cross_entropy_loss, [_obj_, ...]]
+    INFERENCE_FLOW:
+      - [image, cls, model]
+      - [{target: label, input: cls}, ce_loss, cross_entropy_loss]
+
+# Multi-optimizer example (GAN)
+BACKWARDS:
+  - NAME: optimizer_G
+    LOSS: loss_G
+    TRAINABLE_LAYERS: [G_AB, G_BA]
+    OPTIMIZER: [_obj_, ...]
+    FLOW: [...]          # generator forward + loss computation
+    INFERENCE_FLOW: [...] # inference-only flow
+  - NAME: optimizer_D_A
+    LOSS: loss_D_A
+    TRAINABLE_LAYERS: [D_A]
+    OPTIMIZER: [_obj_, ...]
+    FLOW: [...]          # discriminator A forward + loss computation
+  - NAME: optimizer_D_B
+    LOSS: loss_D_B
+    TRAINABLE_LAYERS: [D_B]
+    OPTIMIZER: [_obj_, ...]
+    FLOW: [...]          # discriminator B forward + loss computation
 ```
 
-#### `LOSSES` and `MODELS`
+#### `LOSSES` and `TRAINABLE_LAYERS`
 
 Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `BACKWARDS` entries.
 
-| Key      | Type        | Description                                                                                                                                                           |
-| -------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOSSES` | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`.                                   |
-| `MODELS` | `list[str]` | Explicit list of model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].OPTIMIZERS[*].LAYERS` when left as `[]`. |
+| Key                | Type        | Description                                                                                                                                                                 |
+| ------------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOSSES`           | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`.                                         |
+| `TRAINABLE_LAYERS` | `list[str]` | Explicit list of trainable model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].TRAINABLE_LAYERS` when left as `[]`. |
 
 ```yaml
-LOSSES: []   # auto-inferred
-MODELS: []   # auto-inferred
+LOSSES: []           # auto-inferred
+TRAINABLE_LAYERS: [] # auto-inferred
 ```
 
 #### `BACKWARDS` entry keys
 
 Each entry in `BACKWARDS` is a `BackwardBehavior` with the following fields:
 
-| Key          | Type   | Description                                                                                                                                           |
-| ------------ | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NAME`       | `str`  | Optional identifier for this backward pass. Used as the generated class or method name. Must be a valid Python identifier.                            |
-| `LOSS`       | `str`  | The loss key (matching a key returned by the loss module) that this backward pass differentiates.                                                     |
-| `OPTIMIZERS` | `list` | One or more `OptimizerBehavior` entries that are executed in order during each training step (see [`OPTIMIZERS` entry keys](#optimizers-entry-keys)). |
+| Key                | Type                         | Description                                                                                                                                                                                                                                           |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NAME`             | `str`                        | Optional identifier for this backward pass. Used as the generated attribute name for the optimizer. Must be a valid Python identifier.                                                                                                                |
+| `LOSS`             | `str`                        | The loss key (produced by the `FLOW`) that this backward pass differentiates.                                                                                                                                                                         |
+| `TRAINABLE_LAYERS` | `list[str]`                  | Model names whose parameters this optimizer manages. Each value must match a model passed to the backward class constructor.                                                                                                                          |
+| `FLOW`             | `list`                       | Training-time execution graph for this backward entry. Uses the same entry format as model `FLOW` (see [`FLOW` entry format](#flow-entry-format)), plus support for `"eval: ..."` expressions and inline layer instantiation via StructCast patterns. |
+| `INFERENCE_FLOW`   | `list`                       | Optional inference-time execution graph. When absent, `FLOW` is used for inference as well.                                                                                                                                                           |
+| `OPTIMIZER`        | StructCast pattern           | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`.     |
+| `CLIP`             | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `TRAINABLE_LAYERS`. Set to `null` to disable gradient clipping.                                 |
+| `EXTRA`            | `dict`                       | Extra keyword arguments forwarded to the backward/optimizer logic. Default is `{}`.                                                                                                                                                                   |
 
 ```yaml
 BACKWARDS:
-  - NAME: backward
-    LOSS: ce_loss
-    OPTIMIZERS:
-      - NAME: optimizer
-        OPTIMIZER: [_obj_, ...]
-        LAYERS: model
-```
-
-#### `OPTIMIZERS` entry keys
-
-Each entry in `OPTIMIZERS` is an `OptimizerBehavior` with the following fields:
-
-| Key         | Type                         | Description                                                                                                                                                                                                                                       |
-| ----------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NAME`      | `str`                        | Optional identifier for this optimizer entry. Used as the generated attribute name. Must be a valid Python identifier.                                                                                                                            |
-| `OPTIMIZER` | StructCast pattern           | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`. |
-| `LAYERS`    | `str` or `list[str]`         | Model parameter paths that this optimizer manages. Each value must be a valid Python attribute expression (e.g., `model` or `model.backbone`). The generated backward class calls `optimizer.param_groups` over these paths.                      |
-| `CLIP`      | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `LAYERS`. Set to `null` to disable gradient clipping.                                       |
-
-```yaml
-OPTIMIZERS:
   - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
     OPTIMIZER:
       - _obj_
       - _addr_: structcast_model.torch.optimizers.create_with_scheduler
@@ -1067,11 +1113,17 @@ OPTIMIZERS:
           scheduler_kwargs:
             name: cosine
             num_epochs: 300
-    LAYERS: model
     CLIP:
       - _obj_
       - _addr_: timm.utils.clip_grad.dispatch_clip_grad
       - _bind_: {value: 1.0, mode: norm, norm_type: 2.0}
+    EXTRA: {}
+    FLOW:
+      - [image, cls, model]
+      - [{target: label, input: cls}, ce_loss, cross_entropy_loss, [_obj_, _addr_: torch.nn.CrossEntropyLoss, _call_]]
+    INFERENCE_FLOW:
+      - [image, cls, model]
+      - [{target: label, input: cls}, ce_loss, cross_entropy_loss]
 ```
 
 ---
@@ -1107,10 +1159,6 @@ Called once per training step. Receives the step index and criterion keyword arg
 #### `Callback` and `BestCallback`
 
 Lifecycle hooks called with `(info: BaseInfo, **models)`. `BestCallback` additionally receives `target: str` and `best: float` arguments.
-
-#### `InferenceWrapper`
-
-Applied to models before each validation epoch. Returns a remapped model dictionary, e.g., swapping a trained model for its EMA copy.
 
 ### State and callbacks
 
@@ -1149,7 +1197,7 @@ The main training loop driver. Inherits both `BaseInfo` and `Callbacks`.
 
 Required fields: `training_step` (`Forward`), `backward` (`Backward`), `tracker` (callable returning `dict[str, float]`).
 
-Optional fields: `validation_step`, `inference_wrapper`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
+Optional fields: `validation_step`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
 
 Key methods:
 
@@ -1288,10 +1336,6 @@ Builds a timm dataloader with support for:
 
 The dataset template at `cfg/torch/datasets/default_timm.yaml` formats into this wrapper.
 
-#### `TimmEmaWrapper`
-
-Creates and updates `timm.utils.ModelEmaV3` instances and swaps them into inference-time evaluation when appropriate.
-
 ## Minimal End-to-End Example
 
 ```bash
@@ -1314,7 +1358,6 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    --ema cfg/torch/others/ema.yaml \
     -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
     -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
     -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \

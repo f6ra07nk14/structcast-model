@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
+from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, Union, cast
 
@@ -27,7 +28,9 @@ from structcast_model.builders.schema import (
     TemplateLayer,
     UserLayer,
 )
-from structcast_model.utils.base import load_any, to_pascal, to_snake
+from structcast_model.utils.base import load_any, to_pascal, to_snake, unique
+
+logger = getLogger(__name__)
 
 
 def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
@@ -210,6 +213,10 @@ class _Intermediate(Serializable):
         module_path.write_text(code, encoding="utf-8")
 
 
+def _hash(raw: Any) -> str:
+    return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
+
+
 class LayerIntermediate(_Intermediate):
     """Intermediate representation of a layer during the building process."""
 
@@ -220,8 +227,8 @@ class LayerIntermediate(_Intermediate):
     """The names of the output layers."""
 
     layers: dict[str, Union["LayerIntermediate", str]]
-    """The sub-layers used in the layer, where the keys are the layer names and the values are either the sub-layer
-    as a `LayerIntermediate` instance or a string representation of the sub-layer to be used directly in the script."""
+    """The layers used in the layer, where the keys are the layer names and the values are either the layer
+    as a `LayerIntermediate` instance or a string representation of the layer to be used directly in the script."""
 
     flow: list[tuple[str, str, str | None]]
     """The flow of the layer during training, where each element is a tuple of the form (input, output, layer),
@@ -291,9 +298,6 @@ class LayerIntermediate(_Intermediate):
         scripts: list[str] = []
         for name in [n for v in cfg.collected_imports.values() for n in v if n]:
             naming(name)
-
-        def _hash(raw: Any) -> str:
-            return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
 
         def _scripts(sub: LayerIntermediate) -> str:
             if (hash_id := _hash(sub)) in classnames:
@@ -374,7 +378,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             from_references={**self.from_references, self.current_path: current_parts},
         ).get_user_defined_layer(parts, parameters, classname)
 
-    def _get_sublayer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
+    def _get_layer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
         if unit.CFG is not None:
             current_path = str(unit.CFG)
             current_parts = self.from_references.get(current_path, None) or []
@@ -423,10 +427,10 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
         if user_defined_layer:
             return self.get_user_defined_layer(split_attribute(user_defined_layer), parameters, classname)
-        layer = self.template(parameters, merged=False)
+        module = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
-        imports.update(layer.IMPORTS)
-        sublayers: dict[str, LayerIntermediate | str] = {}
+        imports.update(module.IMPORTS)
+        layers: dict[str, LayerIntermediate | str] = {}
         naming = AutoName("_")
 
         def _inputs(raw: Any) -> str:
@@ -443,17 +447,17 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow: list[tuple[str, str, str | None]] = []
             for unit in units:
                 if unit.LAYER is None:
-                    if unit.NAME and unit.NAME not in sublayers:
+                    if unit.NAME and unit.NAME not in layers:
                         raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
                     name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
                         subinst, subclassname = resolve_object(imports, unit.LAYER)
                     else:
-                        subclassname, subinst = self._get_sublayer(parameters, unit.LAYER)
-                    if (name := unit.NAME or naming(to_snake(subclassname))) in sublayers:
+                        subclassname, subinst = self._get_layer(parameters, unit.LAYER)
+                    if (name := unit.NAME or naming(to_snake(subclassname))) in layers:
                         raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
-                    sublayers[name] = subinst
+                    layers[name] = subinst
                 if unit.INPUTS is not None and unit.OUTPUTS is not None:
                     inp = _inputs(unit.INPUTS.model_dump())
                     if isinstance(unit.OUTPUTS.spec, dict):
@@ -469,15 +473,16 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     )
             return flow
 
+        structured_output = module.STRUCTURED_OUTPUT if forced_structured_output is None else forced_structured_output
         return self.user_defined_layer_type(
             imports=imports,
             classname=classname,
-            inputs=layer.INPUTS,
-            outputs=layer.OUTPUTS,
-            layers=sublayers,
-            flow=_create_flow(layer.FLOW),
-            inference_flow=_create_flow(layer.INFERENCE_FLOW),
-            structured_output=layer.STRUCTURED_OUTPUT if forced_structured_output is None else forced_structured_output,
+            inputs=module.INPUTS,
+            outputs=module.OUTPUTS,
+            layers=layers,
+            flow=_create_flow(module.FLOW),
+            inference_flow=_create_flow(module.INFERENCE_FLOW),
+            structured_output=structured_output,
         )
 
 
@@ -491,9 +496,6 @@ class BackwardIntermediate(_Intermediate):
     classname: str
     """The name of the backward layer class."""
 
-    mixed_precision: str | None
-    """The mixed precision configuration for the backward layer, or `None` if mixed precision is not used."""
-
     mixed_precision_type: str | None
     """The mixed precision type for the backward layer, or `None` if mixed precision is not used."""
 
@@ -501,29 +503,109 @@ class BackwardIntermediate(_Intermediate):
     """The number of steps to accumulate gradients for before performing an optimizer step,
     or `None` if not applicable."""
 
-    losses: list[str]
-    """The loss expressions for the backward layer."""
+    inputs: list[str]
+    """The names of the input layers."""
 
-    models: list[str]
-    """The models used in the backward layer."""
+    outputs: list[str]
+    """The names of the output layers."""
 
-    optimizers: dict[str, tuple[str, list[str], str | None]]
-    """The optimizers defined in the backward layer, where the keys are the optimizer names and the values are
-    tuples of the form (optimizer, trainable_layers, clip_grad)."""
+    layers: dict[str, Union["LayerIntermediate", str]]
+    """The layers used in the backward layer, where the keys are the layer names and the values are either the layer
+    as a `LayerIntermediate` instance or a string representation of the layer to be used directly in the script."""
 
-    backwards: list[tuple[str, str, list[str]]]
-    """The backward steps in the backward layer,
-    where each element is a tuple of the form (loss, backward_kwargs, optimizers)."""
+    others: dict[str, str]
+    """Other instances used in the backward layer that are not layers, where the keys are the instance names and
+    the values are the string representations of the instances to be used directly in the script."""
+
+    flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]]
+    """The forward flow during training, where each element is either a tuple of the form (input, output, layer)
+    for regular steps, or a tuple of the form (loss, output, optimizer, clip, mixed_precision_scale, trainable_models)
+    for optimizer steps."""
+
+    inference_flow: list[tuple[str, str, str | None]]
+    """The forward flow during inference, where each element is a tuple of the form (input, output, layer)."""
 
     @cached_property
-    def _backward_losses(self) -> str:
-        """Get the loss expressions for the backward method."""
-        return ", ".join(self.losses)
+    def collected_imports(self) -> dict[str, set[str | None]]:
+        """Collect the required imports from the layer and its sub-layers."""
+        sub_imports = (s.collected_imports for s in self.layers.values() if isinstance(s, LayerIntermediate))
+        return _merge_imports(super().collected_imports, *sub_imports)
+
+    @cached_property
+    def models(self) -> list[str]:
+        """Get the models used in the layer."""
+        return unique([m for u in self.flow if len(u) == 6 for m in u[-1]])
+
+    @cached_property
+    def optimizers(self) -> list[str]:
+        """Get the optimizers used in the layer."""
+        return unique([u[2] for u in self.flow if len(u) == 6])
+
+    @cached_property
+    def mixed_precision_scales(self) -> list[str]:
+        """Get the mixed precision scales used in the layer."""
+        return unique([u[4] for u in self.flow if len(u) == 6 and u[4]])
 
     @cached_property
     def _backward_models(self) -> str:
         """Get the models used in the backward method."""
         return ", ".join(self.models)
+
+    @cached_property
+    def _forward_inputs(self) -> str:
+        """Get the input arguments for calling the layer in the forward method."""
+        return ", ".join(self.inputs)
+
+    @cached_property
+    def _forward_outputs(self) -> str:
+        """Get the output arguments for calling the layer in the forward method."""
+        return f"{{{','.join(f'{repr(k)}: {k}' for k in self.outputs)}}}"
+
+    def _get_regular_step(self, inputs: str, output: str, layer: str | None) -> str:
+        return f"{output} = {layer}({inputs})" if layer else f"{output} = {inputs}"
+
+    def _get_forward_training_flow(self) -> list[str]:
+        """Get the code for the training flow in the forward method."""
+        raise NotImplementedError("The _forward_training_flow method must be implemented in the subclass.")
+
+    @cached_property
+    def _forward_training_flow(self) -> list[str]:
+        """Get the code for the training flow in the forward method."""
+        return self._get_forward_training_flow()
+
+    def _get_forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
+
+    @cached_property
+    def _forward_inference_flow(self) -> list[str]:
+        """Get the code for the inference flow in the forward method."""
+        return self._get_forward_inference_flow()
+
+    def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
+        """Get the script for the backward layer."""
+        raise NotImplementedError("The _get_backward_script method must be implemented in the subclass.")
+
+    def _get_scripts(self) -> list[str]:
+        """Get the scripts for the layer and its sub-layers."""
+        naming = AutoName("")
+        classnames: dict[str, str] = {}
+        scripts: list[str] = []
+        naming(self.classname)
+        for name in [n for v in self.collected_imports.values() for n in v if n]:
+            naming(name)
+
+        def _scripts(sub: LayerIntermediate) -> str:
+            if (hash_id := _hash(sub)) in classnames:
+                return sub._get_class_instance(classnames[hash_id])
+            classnames[hash_id] = (classname := naming(sub.classname))
+            layers: list[str] = [f"{k} = {v if isinstance(v, str) else _scripts(v)}" for k, v in sub.layers.items()]
+            scripts.append(sub._get_layer_script(classname, layers))
+            return sub._get_class_instance(classname)
+
+        init_layers = {k: v if isinstance(v, str) else _scripts(v) for k, v in self.layers.items()}
+        scripts.append(self._get_backward_script(init_layers))
+        return scripts
 
 
 BackwardIntermediateT = TypeVar("BackwardIntermediateT", bound=BackwardIntermediate)
@@ -534,27 +616,45 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     """Base backward builder for building backward layers from templates."""
 
     user_defined_backward_layer_type: ClassVar[type[BackwardIntermediateT]] = BackwardIntermediate
+    layer_builder_type: ClassVar[type[BaseModelBuilder]] = BaseModelBuilder
 
     raw: Any
+    current_path: str = ""
     template: TemplateBackward = field(init=False)
+    layer_builder: BaseModelBuilder = field(init=False)
 
     @classmethod
     def from_path(cls, path: PathLike) -> "BaseBackwardBuilder[BackwardIntermediateT]":
         """Create a backward builder from the given configuration file path."""
-        return cls(raw=load_any(path))
+        return cls(raw=load_any(path), current_path=str(path))
 
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
         self.template = TemplateBackward.model_validate(self.raw)
+        from_references = {self.current_path: ["__root__"]} if self.current_path else {}
+        self.layer_builder = self.layer_builder_type(
+            raw=self.template.others, current_path=self.current_path, from_references=from_references
+        )
 
     def _get_mixed_precision(
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
-    ) -> str | None:
-        raise NotImplementedError("The _get_mixed_precision method must be implemented in the subclass.")
+    ) -> tuple[str, str | None]:
+        logger.warning(
+            "Mixed precision is not implemented in the base backward builder. Returning None for mixed precision."
+        )
+        return "", None
 
-    def __call__(
+    def _get_optimizer(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        optimizer: ObjectPattern,
+        trainable_layers: list[str],
+    ) -> tuple[str, str]:
+        return resolve_object(imports, optimizer)
+
+    def __call__(  # noqa: PLR0915
         self,
         parameters: dict[str, dict[str, Any]] | Parameters | None = None,
         classname: str = "Backward",
@@ -571,37 +671,95 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         Returns:
             BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
         """
-        backward = self.template(parameters)
+        parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
+        module = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
-        imports.update(backward.IMPORTS)
+        imports.update(module.IMPORTS)
+        layers: dict[str, LayerIntermediate | str] = {}
+        others: dict[str, str] = {}
         naming = AutoName("_")
-        opts: dict[str, tuple[str, list[str], str | None]] = {}
-        backward_names = set()
-        backwards: list[tuple[str, str, list[str]]] = []
-        for unit in backward.BACKWARDS:
-            if (backward_name := unit.NAME or naming("backward")) in backward_names:
-                raise SpecError(f'Duplicate backward name "{backward_name}" found in the backwards.')
-            backward_names.add(backward_name)
-            repr_backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in unit.model_extra.items())
-            backwards.append((unit.LOSS, repr_backward_kw, []))
-            for opt in unit.OPTIMIZERS:
-                optinst, optclassname = resolve_object(imports, opt.OPTIMIZER)
-                optname = opt.NAME or naming(optclassname)
-                if optname in opts:
-                    raise SpecError(f'Duplicate optimizer name "{optname}" found in the backwards.')
-                opt_clip = resolve_object(imports, opt.OPTIMIZER)[0] if opt.CLIP else None
-                opts[optname] = (optinst, opt.LAYERS, opt_clip)
-                backwards[-1][-1].append(optname)
+        for layer in module.TRAINABLE_LAYERS:
+            layer = naming(layer)
+            others[layer] = layer
+
+        def _inputs(raw: Any) -> str:
+            if isinstance(raw, dict):
+                return ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in raw.items())
+            if isinstance(raw, (list, tuple)):
+                return ", ".join(resolve_getter(imports, v) for v in raw)
+            return resolve_getter(imports, raw)
+
+        def _outputs(raw: SpecIntermediate | list[SpecIntermediate]) -> str:
+            return raw.value[0] if isinstance(raw, SpecIntermediate) else f"({', '.join(_outputs(r) for r in raw)})"
+
+        def _create_flow(units: list[LayerBehavior]) -> list[tuple[str, str, str | None]]:
+            flow: list[tuple[str, str, str | None]] = []
+            for unit in units:
+                if unit.LAYER is None:
+                    if unit.NAME and not (unit.NAME in layers or unit.NAME in others):
+                        raise SpecError(f'Layer with name "{unit.NAME}" not defined in the flow.')
+                    name = unit.NAME
+                else:
+                    if isinstance(unit.LAYER, ObjectPattern):
+                        subinst, subclassname = resolve_object(imports, unit.LAYER)
+                    else:
+                        subclassname, subinst = self.layer_builder._get_layer(parameters, unit.LAYER)
+                    if (name := unit.NAME or naming(to_snake(subclassname))) in layers or name in others:
+                        raise SpecError(f'Duplicate layer name "{name}" found in the flow.')
+                    layers[name] = subinst
+                if unit.INPUTS is not None and unit.OUTPUTS is not None:
+                    inp = _inputs(unit.INPUTS.model_dump())
+                    if isinstance(unit.OUTPUTS.spec, dict):
+                        flow.append((inp, (tmpname := f"{name or naming('tmp')}_output"), name))
+                        for key, value in unit.OUTPUTS.model_dump().items():
+                            flow.append((resolve_getter(imports, value, tmpname), key, None))
+                    else:
+                        flow.append((inp, _outputs(unit.OUTPUTS.spec), name))
+                elif unit.INPUTS is not None or unit.OUTPUTS is not None:
+                    raise SpecError(
+                        f"Both INPUTS and OUTPUTS must be specified together in the training/inference flow "
+                        f"but got: {unit.model_dump()}"
+                    )
+            return flow
+
+        backward_flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]] = []
+        inference_flow: list[tuple[str, str, str | None]] = []
+        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
+        for backward in module.BACKWARDS:
+            opt_inst, opt_cls = self._get_optimizer(imports, backward.OPTIMIZER, backward.TRAINABLE_LAYERS)
+            if (opt_name := backward.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
+                raise SpecError(f'Duplicate variable name "{opt_name}" for optimizer found in the backward flow.')
+            others[opt_name] = opt_inst
+            if backward.CLIP:
+                clip_inst, clip_cls = resolve_object(imports, backward.CLIP)
+                if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers or clip_name in others:
+                    raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the backward flow.')
+                others[clip_name] = clip_inst
+            else:
+                clip_inst, clip_name = None, None
+            if amp_cls is None:
+                amp_name = None
+            else:
+                if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers or amp_name in others:
+                    raise SpecError(
+                        f'Duplicate variable name "{amp_name}" for mixed precision instance found in the backward flow.'
+                    )
+                others[amp_name] = amp_inst
+            backward_flow += _create_flow(backward.FLOW)
+            inference_flow += _create_flow(backward.INFERENCE_FLOW or backward.FLOW)
+            backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in backward.EXTRA.items())
+            backward_flow.append((backward.LOSS, backward_kw, opt_name, clip_name, amp_name, backward.TRAINABLE_LAYERS))
         return self.user_defined_backward_layer_type(
             imports=imports,
             classname=classname,
-            mixed_precision=self._get_mixed_precision(imports, backward.MIXED_PRECISION),
-            mixed_precision_type=backward.MIXED_PRECISION_TYPE,
-            accumulate_gradients=backward.ACCUMULATE_GRADIENTS,
-            losses=backward.LOSSES,
-            models=backward.MODELS,
-            optimizers=opts,
-            backwards=backwards,
+            mixed_precision_type=module.MIXED_PRECISION_TYPE,
+            accumulate_gradients=module.ACCUMULATE_GRADIENTS,
+            inputs=module.INPUTS,
+            outputs=module.OUTPUTS,
+            layers=layers,
+            others=others,
+            flow=backward_flow,
+            inference_flow=inference_flow,
         )
 
 

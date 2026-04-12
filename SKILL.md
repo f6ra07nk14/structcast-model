@@ -66,6 +66,12 @@ scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
 scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
 ```
 
+The backward template supports multiple `BACKWARDS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`. This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
+
+```bash
+scm torch create backward cfg/torch/backwards/CycleGAN.yaml -o backward.py
+```
+
 Use this when the training workflow should remain fully declarative.
 
 ### Workflow 3: Format a Reusable Dataset Template
@@ -104,7 +110,6 @@ scm torch train \
   'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
   -s 'image: [3, 224, 224]' \
   -d cuda \
-  --ema cfg/torch/others/ema.yaml \
   -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
   -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
   -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -119,7 +124,7 @@ What happens:
 
 1. Datasets are instantiated and counted.
 2. Models are initialized and optionally compiled.
-3. Loss, metric, backward, and EMA objects are instantiated.
+3. Loss, metric, and backward objects are instantiated.
 4. `TorchTracker` is built from output names.
 5. `TorchTrainer` runs the loop and MLflow logging is attached.
 
@@ -163,7 +168,6 @@ torchrun --nproc_per_node=gpu \
   'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
   -s 'image: [3, 224, 224]' \
   -d cuda \
-  --ema cfg/torch/others/ema.yaml \
   -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
   -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
   -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
@@ -296,7 +300,6 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | -- | -- | -- |
 | Dataset wrapper | `TimmDatasetWrapper` | Lazily call `timm.data.create_dataset(...)` |
 | Dataloader wrapper | `TimmDataLoaderWrapper` | Lazily call `timm.data.create_loader(...)` |
-| EMA wrapper | `TimmEmaWrapper.from_models(...)` | Manage `ModelEmaV3` instances and update callbacks |
 
 ### Distributed training layer
 
@@ -306,7 +309,6 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | DDP model wrapping | `DistributedDataParallel` (via `cmd_torch.py`) | Wrap models for multi-GPU gradient synchronization |
 | Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
 | Gradient sync optimization | `TorchTrainer.no_sync()` | Skip DDP gradient sync during accumulation steps |
-| EMA DDP unwrapping | `TimmEmaWrapper.update()` | Unwrap DDP module before EMA weight update |
 
 ## Config and Pattern Vocabulary
 
@@ -338,7 +340,9 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 - `cfg/torch/models/ConvNeXtV2.yaml` uses nested user-defined layers and Jinja-expanded blocks (PyTorch channel-first).
 - `cfg/flax/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Flax `nnx.Module` (channel-last, `rngs` constructor arg).
 - `cfg/keras/models/ConvNeXtV2.yaml` mirrors the PyTorch model for Keras `Layer` (channel-last, multi-backend).
-- `cfg/torch/backwards/ConvNeXtV2.yaml` uses optimizer factories, scheduler settings, optional clipping, and gradient accumulation.
+- `cfg/torch/backwards/ConvNeXtV2.yaml` uses a single backward entry with optimizer factory, scheduler settings, optional clipping, gradient accumulation, and inline loss/metric layers in the `FLOW`.
+- `cfg/torch/backwards/CycleGAN.yaml` demonstrates multi-optimizer backward logic with three backward entries (generator pair + two discriminators), each with its own `FLOW`, `OPTIMIZER`, and `TRAINABLE_LAYERS`.
+- `cfg/torch/models/CycleGAN_generator.yaml` and `cfg/torch/models/CycleGAN_discriminator.yaml` define CycleGAN model architectures with Jinja-driven sublayer expansion.
 - `cfg/torch/datasets/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
 
 ## Base Trainer and Callback System

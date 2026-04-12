@@ -1,0 +1,4 @@
+INPUTS: [x]
+OUTPUTS: [y]
+FLOW:
+  - [x, y, fc, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: 4, out_features: 2, rngs: "eval: rngs"}}]]

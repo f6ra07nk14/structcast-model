@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from structcast.utils.security import configure_security
 from typer import Typer
 from typer.testing import CliRunner
 
 from structcast_model.commands.cmd_keras import app
+from tests import ASSETS_DIR
+
+LINEAR_CFG = str(ASSETS_DIR / "cfg" / "keras" / "Linear.yaml")
+MODEL_CFG = str(ASSETS_DIR / "cfg" / "keras" / "ConvNeXtV2.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_keras's real globals (bypasses LazySelectedImporter proxy)
@@ -42,3 +47,64 @@ def test_time_help_exits_zero(cli_runner: CliRunner) -> None:
     """Time subcommand --help should exit with code 0."""
     result = cli_runner.invoke(app, ["time", "--help"])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# 'create model' command — simple Linear layer
+# ---------------------------------------------------------------------------
+
+
+def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model' generates a script from a simple Dense config."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "model.py").read_text()
+    assert "class Model" in text
+    assert "Dense" in text
+
+
+def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model --classname' honours the custom class name."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "net.py")
+    result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--classname", "MyDense", "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class MyDense" in (tmp_path / "net.py").read_text()
+
+
+def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model --no-structured-output' does not return a dict."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--no-structured-output", "--output", out])
+    assert result.exit_code == 0, result.output
+    body = (tmp_path / "model.py").read_text().rsplit("class Model", 1)[-1]
+    assert "return {'" not in body
+
+
+def test_create_model_convnextv2(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model' generates a script from the ConvNeXtV2 config."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    assert "class Model" in (tmp_path / "model.py").read_text()
+
+
+# ---------------------------------------------------------------------------
+# 'time' command — simple Dense layer
+# ---------------------------------------------------------------------------
+
+
+def test_time_dense(cli_runner: CliRunner) -> None:
+    """'time' measures inference on a simple keras Dense layer."""
+    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    pattern = "[_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: 2}}]"
+    result = cli_runner.invoke(
+        app,
+        ["time", pattern, "--shape", "inputs: [4]", "--warmup-runs", "1", "--times", "1", "--batch-size", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Average inference time" in result.output

@@ -54,7 +54,6 @@ class KerasLayerIntermediate(LayerIntermediate):
             codes = self._forward_training_flow
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
-        init_body = sep.join([f"self.{v}" for v in initialized_layers]) if initialized_layers else "pass"
         return f"""\
 class {class_name}(keras.layers.Layer):
 
@@ -62,7 +61,7 @@ class {class_name}(keras.layers.Layer):
         super().__init__(**kwargs)
         self.input_names = {self.inputs}
         self.output_names = {self.outputs}
-        {init_body}
+        {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
     def call(self, {inputs}*, training = None, **kwargs):
         {sep.join(codes)}
