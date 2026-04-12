@@ -188,7 +188,7 @@ def test_base_model_builder_get_sublayer_cfg_with_type(tmp_path: Path) -> None:
     cfg_unit = UserLayer.model_validate({"CFG": cfg_path, "TYPE": "Backbone"})
     try:
         configure_security(working_dir_check=False)
-        subclassname, _sub = builder._get_sublayer(Parameters(), cfg_unit)
+        subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
         assert subclassname.endswith("Backbone")
     finally:
         configure_security()
@@ -211,30 +211,202 @@ def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
 def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
     """Reject duplicate backward names and optimizer names."""
     opt = {"_obj_": [["_addr_", "torch.optim.SGD"]]}
-    duplicate_backward = {"BACKWARDS": [["main", "loss_a", [[opt, ["model"]]]], ["main", "loss_b", [[opt, ["model"]]]]]}
-    with pytest.raises(SpecError, match='Duplicate backward name "main"'):
-        TorchBackwardBuilder(raw=duplicate_backward)()
-    duplicate_optimizer = {
+    duplicate_backward = {
         "BACKWARDS": [
-            [
-                "loss",
-                [["same_opt", opt, ["model"]], ["same_opt", {"_obj_": [["_addr_", "torch.optim.AdamW"]]}, ["model"]]],
-            ]
-        ]
+            {
+                "NAME": "main",
+                "LOSS": "loss_a",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": opt,
+                "FLOW": [["x", "loss_a"]],
+            },
+            {
+                "NAME": "main",
+                "LOSS": "loss_b",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": opt,
+                "FLOW": [["x", "loss_b"]],
+            },
+        ],
     }
-    with pytest.raises(SpecError, match='Duplicate optimizer name "same_opt"'):
-        TorchBackwardBuilder(raw=duplicate_optimizer)()
+    with pytest.raises(SpecError, match='Duplicate variable name "main" for optimizer'):
+        TorchBackwardBuilder(raw=duplicate_backward)()
 
 
-def test_base_backward_builder_mixed_precision_default_raises() -> None:
-    """Base backward builder requires subclass mixed precision implementation."""
+def test_base_backward_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Base backward builder logs a warning for mixed precision and returns None."""
 
     class _NoMixedPrecisionBuilder(BaseBackwardBuilder):
         pass
 
-    raw = {"BACKWARDS": [["loss", [[{"_obj_": [["_addr_", "torch.optim.SGD"]]}, ["model"]]]]]}
-    with pytest.raises(NotImplementedError, match="_get_mixed_precision"):
-        _NoMixedPrecisionBuilder(raw=raw)()
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "FLOW": [["x", "loss"]],
+            },
+        ],
+    }
+    _NoMixedPrecisionBuilder(raw=raw)()
+    assert "Mixed precision is not implemented" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# resolve_object — bind with list args (non-dict bind)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_object_with_list_bind_pattern() -> None:
+    """Resolve an object pattern where bind arguments are a list (not a dict)."""
+    imports: defaultdict[str, set[str | None]] = defaultdict(set)
+    raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_bind_", [1, 2, 3]]]}
+    resolved, class_name = resolve_object(imports, ObjectPattern.model_validate(raw))
+    assert "lambda" in resolved
+    assert class_name == "Identity"
+    # list bind places positional args before *args
+    assert "1, 2, 3" in resolved
+
+
+# ---------------------------------------------------------------------------
+# resolve_object — _repr with dict and list values
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_object_with_dict_literal_in_call() -> None:
+    """Dict literal in call arguments is formatted correctly."""
+    imports: defaultdict[str, set[str | None]] = defaultdict(set)
+    raw = {
+        "_obj_": [
+            ["_addr_", "torch.nn.Identity"],
+            ["_call_", {"config": {"nested_key": 42}}],
+        ]
+    }
+    resolved, _ = resolve_object(imports, ObjectPattern.model_validate(raw))
+    assert "'nested_key': 42" in resolved
+
+
+def test_resolve_object_with_list_literal_in_call() -> None:
+    """List literal in call arguments is formatted correctly."""
+    imports: defaultdict[str, set[str | None]] = defaultdict(set)
+    raw = {
+        "_obj_": [
+            ["_addr_", "torch.nn.Identity"],
+            ["_call_", {"sizes": [1, 2, 3]}],
+        ]
+    }
+    resolved, _ = resolve_object(imports, ObjectPattern.model_validate(raw))
+    assert "[1, 2, 3]" in resolved
+
+
+# ---------------------------------------------------------------------------
+# TorchBackwardBuilder — full backward build with flow
+# ---------------------------------------------------------------------------
+
+
+def test_torch_backward_builder_simple_backward_generates_scripts() -> None:
+    """Building a simple backward configuration produces scripts with training/inference steps."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"], ["_call_", {"lr": 0.01}]]},
+                "FLOW": [["x", "loss", {"_obj_": [["_addr_", "torch.nn.Identity"]]}]],
+            },
+        ],
+    }
+    intermediate = TorchBackwardBuilder(raw=raw)()
+    scripts = intermediate._get_scripts()
+    combined = "\n".join(scripts)
+    assert "class Backward" in combined
+    assert "_training_step" in combined
+    assert "_inference_step" in combined
+    assert "optimizer" in combined.lower() or "sgd" in combined.lower()
+
+
+def test_torch_backward_builder_with_mixed_precision() -> None:
+    """Building with mixed precision generates GradScaler code."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"], ["_call_", {"lr": 0.01}]]},
+                "FLOW": [["x", "loss", {"_obj_": [["_addr_", "torch.nn.Identity"]]}]],
+            },
+        ],
+        "MIXED_PRECISION": True,
+        "MIXED_PRECISION_TYPE": "float16",
+    }
+    intermediate = TorchBackwardBuilder(raw=raw)()
+    scripts = intermediate._get_scripts()
+    combined = "\n".join(scripts)
+    assert "GradScaler" in combined
+    assert "autocast" in combined
+
+
+def test_torch_backward_builder_with_clip_gradient() -> None:
+    """Building with CLIP generates a gradient clipping call."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"], ["_call_", {"lr": 0.01}]]},
+                "CLIP": {
+                    "_obj_": [
+                        ["_addr_", "timm.utils.clip_grad.dispatch_clip_grad"],
+                        ["_bind_", {"value": 1.0, "mode": "'norm'"}],
+                    ]
+                },
+                "FLOW": [["x", "loss", {"_obj_": [["_addr_", "torch.nn.Identity"]]}]],
+            },
+        ],
+    }
+    intermediate = TorchBackwardBuilder(raw=raw)()
+    scripts = intermediate._get_scripts()
+    combined = "\n".join(scripts)
+    assert "dispatch_clip_grad" in combined
+
+
+def test_torch_backward_builder_with_accumulate_gradients() -> None:
+    """Building with ACCUMULATE_GRADIENTS generates conditional update logic."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"], ["_call_", {"lr": 0.01}]]},
+                "FLOW": [["x", "loss", {"_obj_": [["_addr_", "torch.nn.Identity"]]}]],
+            },
+        ],
+        "ACCUMULATE_GRADIENTS": 4,
+    }
+    intermediate = TorchBackwardBuilder(raw=raw)()
+    scripts = intermediate._get_scripts()
+    combined = "\n".join(scripts)
+    assert "need_update" in combined.lower() or "__need_update__" in combined
+
+
+def test_torch_backward_builder_with_extra_kwargs() -> None:
+    """EXTRA dict in backward generates kwargs in the backward call."""
+    raw = {
+        "BACKWARDS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"], ["_call_", {"lr": 0.01}]]},
+                "EXTRA": {"retain_graph": True},
+                "FLOW": [["x", "loss", {"_obj_": [["_addr_", "torch.nn.Identity"]]}]],
+            },
+        ],
+    }
+    intermediate = TorchBackwardBuilder(raw=raw)()
+    scripts = intermediate._get_scripts()
+    combined = "\n".join(scripts)
+    assert "retain_graph" in combined
 
 
 # ---------------------------------------------------------------------------

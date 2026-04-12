@@ -55,7 +55,6 @@ class FlaxLayerIntermediate(LayerIntermediate):
             codes = self._forward_training_flow
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
-        init_body = sep.join([f"self.{v}" for v in initialized_layers]) if initialized_layers else "pass"
         return f"""\
 class {class_name}(flax.nnx.Module):
 
@@ -63,7 +62,7 @@ class {class_name}(flax.nnx.Module):
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
         self.training = training
-        {init_body}
+        {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
     def __call__(self, {inputs}*, training = None, **kwargs):
         training = self.training if training is None else training

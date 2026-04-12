@@ -14,7 +14,7 @@ Key modules:
 - `builders/base_builder.py` → `builders/torch_builder.py` — Template-to-code pipeline
 - `commands/main.py` + `commands/cmd_torch.py` — Typer CLI (`scm` entry point)
 - `base_trainer.py` — Generic trainer, callbacks, best-criterion tracking
-- `torch/trainer.py` — PyTorch training steps, tracker, EMA, timm wrappers, distributed training via `torchrun` + DDP
+- `torch/trainer.py` — PyTorch training steps, tracker, timm wrappers, distributed training via `torchrun` + DDP
 
 ## Build & Test
 

@@ -176,17 +176,14 @@ def _on_best(info: BaseInfo, best: BestCriterion, save: bool, **kwargs: Any) -> 
 
 
 def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
-    """Save full training state (models, optimizers, grad scalers, EMA, meta) to MLflow."""
+    """Save full training state (models, optimizers, grad scalers, meta) to MLflow."""
     backward = cast("torch_trainer.TorchTrainer", info).backward
-    wrapper = cast("torch_trainer.TorchTrainer", info).inference_wrapper
     states: dict[str, Any] = {
         "models": _get_state_dict(_unwrap_ddp(kwargs)),
         "optimizers": _get_state_dict(getattr(backward, "optimizers", {})),
         "grad_scalers": _get_state_dict(getattr(backward, "grad_scalers", {})),
         "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
     }
-    if wrapper is not None:
-        states["ema"] = _get_state_dict(cast("torch_trainer.TimmEmaWrapper", wrapper).models)
     mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
 
 
@@ -345,48 +342,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
-    ema: dict[str, Any] | None = Option(
-        None,
-        parser=bool_or_path_or_dict_parser,
-        help="Whether to use EMA (Exponential Moving Average) for the model during training. "
-        "Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments "
-        "for the EMA wrapper (e.g., decay rate).",
-    ),
-    ema_device: str | None = Option(
-        None, help="Device for the EMA model. If not specified, it will use the same device as the main model."
-    ),
-    loss_pattern: Any = Option(
-        ...,
-        "--loss",
-        "-L",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the loss module. "
-        "For example, if the loss module is defined as `my_package.MyLoss(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyLoss, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyLoss, my_package.py], {_call_: {...}}]".',
-    ),
-    loss_outputs: list[str] | None = Option(
-        None,
-        "--loss-outputs",
-        "-LO",
-        help="Default outputs for the loss module if it doesn't have an 'outputs' attribute.",
-    ),
-    metric_pattern: Any | None = Option(
-        None,
-        "--metric",
-        "-M",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the metric module. "
-        "For example, if the metric module is defined as `my_package.MyMetric(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyMetric, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyMetric, my_package.py], {_call_: {...}}]".',
-    ),
-    metric_outputs: list[str] | None = Option(
-        None,
-        "--metric-outputs",
-        "-MO",
-        help="Default outputs for the metric module if it doesn't have an 'outputs' attribute.",
-    ),
     backward_pattern: Any = Option(
         ...,
         "--backward",
@@ -397,10 +352,11 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
         '"[_obj_, [_addr_, my_package.MyBackward, my_package.py], {_call_: {...}}]".',
     ),
-    mixed_precision_type: Literal["bfloat16", "float16"] | None = Option(
+    backward_outputs: list[str] | None = Option(
         None,
-        help="Default mixed precision type to use during training when mixed precision is enabled. "
-        "This can be overridden by the backward class if it has its own mixed precision type specified.",
+        "--backward-outputs",
+        "-BO",
+        help="Default outputs for the backward module if it doesn't have an 'outputs' attribute.",
     ),
     compile_pattern: dict[str, Any] | None = compile_pattern,
     trainer_pattern: Any | None = Option(
@@ -411,24 +367,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         "For example, if the trainer is defined as `my_package.MyTrainer`, then the pattern should be "
         '"[_obj_, {_addr_: my_package.MyTrainer, _file_: my_package.py}]" or '
         '"[_obj_, [_addr_, my_package.MyTrainer, my_package.py]]".',
-    ),
-    training_step_pattern: Any | None = Option(
-        None,
-        "--training-step",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the training step. "
-        "For example, if the training step is defined as `my_package.MyTrainingStep`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyTrainingStep, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyTrainingStep, my_package.py]]".',
-    ),
-    validation_step_pattern: Any | None = Option(
-        None,
-        "--validation-step",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the validation step. "
-        "For example, if the validation step is defined as `my_package.MyValidationStep`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyValidationStep, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyValidationStep, my_package.py]]".',
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
@@ -530,39 +468,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             for model_name, model in models.items():
                 if model_name in initializers:
                     model.apply(initializers[model_name])
-        loss = compile_fn(instantiate_object(loss_pattern))
-        metric = compile_fn(instantiate_object(metric_pattern)) if metric_pattern else None
-        loss_outputs = _get_module_outputs(loss, loss_outputs, "loss")
-        metric_outputs = [] if metric is None else _get_module_outputs(metric, metric_outputs, "metric")
-        tracker = torch_trainer.TorchTracker.from_criteria(loss_outputs + metric_outputs, compile_fn, distributed)
         backward = instantiate_object(backward_pattern)(**models)
-    mixed_precision_type = getattr(backward, "mixed_precision_type", mixed_precision_type)
-    autocast = torch_trainer.get_autocast(mixed_precision_type, device)
-    inference_wrapper = None
-    if ema is not None:
-        inference_wrapper = torch_trainer.TimmEmaWrapper.from_models(
-            models,
-            device=None if ema_device is None else torch.device(ema_device),
-            compile_fn=compile_fn,
-            distributed=distributed,
-            **instantiator.instantiate(ema),
-        )
+        backward_outputs = _get_module_outputs(backward, backward_outputs, "backward")
+        tracker = torch_trainer.TorchTracker.from_criteria(backward_outputs, compile_fn, distributed)
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
-    step_kw = {"models": list(models), "losses": loss, "metrics": metric, "autocast": autocast}
-    trainer = (torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern))(
-        device=device,
-        inference_wrapper=inference_wrapper,
-        training_step=(
-            torch_trainer.TrainingStep if training_step_pattern is None else instantiate_object(training_step_pattern)
-        )(**step_kw),
-        validation_step=(
-            torch_trainer.ValidationStep
-            if validation_step_pattern is None
-            else instantiate_object(validation_step_pattern)
-        )(**step_kw),
-        backward=backward,
-        tracker=tracker,
-    )
+    if hasattr(backward, "forward_training_step"):
+        backward.forward_training_step = compile_fn(backward.forward_training_step)
+    if hasattr(backward, "forward_inference_step"):
+        backward.forward_inference_step = compile_fn(backward.forward_inference_step)
+    trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer = trainer_type(device=device, backward=backward, tracker=tracker)
     if is_main:
         if ci:
             trainer.on_epoch_end.register("log_criteria", lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
@@ -575,12 +490,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 pbar.set_postfix([(n, logs[n]) for n in criteria])
 
             trainer.on_training_begin.register("pbar_reset_training", lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
-            train_losses = [f"{trainer.training_prefix}{n}" for n in loss_outputs]
+            train_losses = [f"{trainer.training_prefix}{n}" for n in backward_outputs]
             pbar_update_training = partial(_update_criteria, criteria=train_losses)
             trainer.on_training_step_end.register("pbar_update_training", pbar_update_training)
             trainer.on_training_end.register("pbar_refresh_training", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
             trainer.on_validation_begin.register("pbar_reset_validation", lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
-            valid_losses = [f"{trainer.validation_prefix}{n}" for n in loss_outputs]
+            valid_losses = [f"{trainer.validation_prefix}{n}" for n in backward_outputs]
             pbar_update_validation = partial(_update_criteria, criteria=valid_losses)
             trainer.on_validation_step_end.register("pbar_update_validation", pbar_update_validation)
             trainer.on_validation_end.register("pbar_refresh_validation", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
@@ -612,18 +527,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "device": device,
                 "distributed": distributed,
                 "world_size": world_size,
-                "ema": ema,
-                "ema_device": ema_device,
-                "loss": loss_pattern,
-                "loss_outputs": loss_outputs,
-                "metric": metric_pattern,
-                "metric_outputs": metric_outputs,
                 "backward": backward_pattern,
-                "mixed_precision_type": mixed_precision_type,
+                "backward_outputs": backward_outputs,
                 "compile": compile_pattern,
                 "trainer": trainer_pattern,
-                "training_step": training_step_pattern,
-                "validation_step": validation_step_pattern,
                 "epochs": epochs,
                 "start_epoch": start_epoch,
                 "training_dataset": training_dataset_pattern,
@@ -652,12 +559,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                     mlflow.log_artifact(str(artifact))
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
                 try:
-                    trainer.fit(**fit_kwargs, **models)
+                    trainer.fit(**fit_kwargs)
                 except KeyboardInterrupt:
                     print("Training interrupted by user. Saving current state to MLflow.")
                     _save_training_state(trainer, **models)
         else:
-            trainer.fit(**fit_kwargs, **models)
+            trainer.fit(**fit_kwargs)
     finally:
         if distributed:
             torch.distributed.destroy_process_group()

@@ -1,0 +1,57 @@
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+    n_residual_blocks: 9
+    init_features: 64
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: false
+_jinja_yaml_: |-
+  FLOW:
+    # Initial convolution block
+    - [image, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: {{channels}}}}]]
+    - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{init_features}}, kernel_size: 7}}]]
+    - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{init_features}}}}]]
+    - [_, _, [_obj_, {_addr_: torch.nn.ReLU}, {_call_: {inplace: true}}]]
+    # Downsampling
+    - [_, _, down0, {TYPE: DownBlock, PARAM: {DEFAULT: {fout: {{init_features * 2}}}}}]
+    - [_, _, down1, {TYPE: DownBlock, PARAM: {DEFAULT: {fout: {{init_features * 4}}}}}]
+    # Residual blocks
+    {% for i in range(n_residual_blocks) %}
+    - [_, _, "res_block{{i}}", {TYPE: ResidualBlock, PARAM: {DEFAULT: {features: {{init_features * 4}}}}}]
+    {% endfor %}
+    # Upsampling
+    - [_, _, up0, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features * 2}}}}}]
+    - [_, _, up1, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features}}}}}]
+    # Output layer
+    - [_, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: {{channels}}}}]]
+    - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{channels}}, kernel_size: 7}}]]
+    - [_, out, [_obj_, {_addr_: torch.nn.Tanh}, _call_]]
+ResidualBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: 1}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{features}}, kernel_size: 3}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{features}}}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.ReLU}, {_call_: {inplace: true}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: 1}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{features}}, kernel_size: 3}}]]
+      - [_, feat, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{features}}}}]]
+      - ["eval: inp + feat", out, null]
+DownBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{fout}}, kernel_size: 3, stride: 2, padding: 1}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{fout}}}}]]
+      - [_, out, [_obj_, {_addr_: torch.nn.ReLU}, {_call_: {inplace: true}}]]
+UpBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.Upsample}, {_call_: {scale_factor: 2}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{fout}}, kernel_size: 3, stride: 1, padding: 1}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{fout}}}}]]
+      - [_, out, [_obj_, {_addr_: torch.nn.ReLU}, {_call_: {inplace: true}}]]

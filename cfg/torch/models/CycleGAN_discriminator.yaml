@@ -1,0 +1,28 @@
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: false
+FLOW:
+  # Block 1 (no normalization)
+  - [image, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 64, normalize: false}}}]
+  # Block 2
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 128, normalize: true}}}]
+  # Block 3
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 256, normalize: true}}}]
+  # Block 4
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 512, normalize: true}}}]
+  # Output
+  - [_, _, [_obj_, {_addr_: torch.nn.ZeroPad2d}, {_call_: {padding: [1, 0, 1, 0]}}]]
+  - [_, out, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: 1, kernel_size: 4, padding: 1}}]]
+DiscriminatorBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{fout}}, kernel_size: 4, stride: 2, padding: 1}}]]
+      {% if normalize %}
+      - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{fout}}}}]]
+      {% endif %}
+      - [_, out, [_obj_, {_addr_: torch.nn.LeakyReLU}, {_call_: {negative_slope: 0.2, inplace: true}}]]

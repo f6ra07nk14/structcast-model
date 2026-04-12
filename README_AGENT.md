@@ -7,7 +7,7 @@
 
 StructCast-Model turns YAML templates into executable models and training systems across multiple frameworks. It has four responsibilities:
 
-1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports backward/optimizer orchestration class generation.
+1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports backward/optimizer orchestration class generation, including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
 2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
 3. **Inference benchmarking**: Measure model inference time via `scm [torch/flax/keras] time`.
 4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` (PyTorch only; Flax and Keras training is planned).
@@ -21,7 +21,7 @@ cfg/torch/
 ├── losses/                    # Loss layer templates
 ├── metrics/                   # Metric layer templates
 ├── models/                    # Model architecture templates
-└── others/                    # Runtime presets such as compile and EMA
+└── others/                    # Other templates (e.g. compile settings)
 cfg/flax/
 └── models/                    # Flax model architecture templates
 cfg/keras/
@@ -42,7 +42,7 @@ src/structcast_model/
 │   ├── cmd_keras.py           # Keras CLI commands
 │   └── utils.py               # CLI argument parsers and reducers
 ├── torch/
-│   ├── trainer.py             # Training steps, tracker, EMA, timm wrappers, trainer
+│   ├── trainer.py             # Training steps, tracker, timm wrappers, trainer
 │   ├── optimizers.py          # Optimizer/scheduler helpers used by backward templates
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
@@ -156,6 +156,13 @@ Purpose:
 - Build a `TorchBackwardIntermediate`.
 - Optionally write generated Python to disk.
 
+The generated backward class supports:
+
+- Per-entry execution graphs (`FLOW` / `INFERENCE_FLOW`) with inline layer instantiation
+- Multiple backward entries, each with its own optimizer and trainable layers (multi-optimizer training, e.g., GAN)
+- Automatic train/eval mode switching per backward entry
+- Gradient accumulation, AMP scaler logic, and gradient clipping
+
 ### `scm torch ptflops` and `scm torch calflops`
 
 Purpose:
@@ -196,7 +203,7 @@ Key options are the same as `scm torch create model`: `-p`, `-c`, `--structured-
 
 Purpose:
 
-- Instantiate models, losses, metrics, backward logic, datasets, compile settings, and EMA.
+- Instantiate models, losses, metrics, backward logic, datasets, and compile settings.
 - Run a training loop via `TorchTrainer`.
 - Log metrics and states to MLflow.
 
@@ -216,7 +223,6 @@ Distributed training behavior (when launched through `torchrun`):
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - MLflow logging, checkpoints, and progress bars are gated to rank 0 only.
 - DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
-- `TimmEmaWrapper` unwraps the DDP module before updating EMA weights.
 - CLI options `--dist-backend` and `--dist-url` (also settable via `DIST_BACKEND` / `DIST_URL` env vars) control the distributed backend.
 
 Launch command for distributed training:
@@ -263,6 +269,8 @@ Important generation details:
 
 - Model code uses `self.<layer_name>` submodules.
 - Inference flow is rendered separately when `INFERENCE_FLOW` is present.
+- Backward code supports multiple backward entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`.
+- Each backward entry's trainable layers are set to training mode before its flow executes and set back to eval mode after the optimizer step.
 - Backward code can include gradient accumulation, AMP scaler logic, clipping, optimizer stepping, and optimizer metadata properties.
 
 ### Flax builder layer
@@ -330,7 +338,6 @@ timm integrations:
 
 - `TimmDatasetWrapper`
 - `TimmDataLoaderWrapper`
-- `TimmEmaWrapper`
 
 ### Flax runtime layer
 

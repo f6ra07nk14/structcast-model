@@ -1,0 +1,126 @@
+PARAMETERS:
+  DEFAULT:
+    epochs: 200
+    decay_epoch: 100
+    offset: 0
+    lr: 0.0002
+    b1: 0.5
+    b2: 0.999
+    lambda_cyc: 10.0
+    lambda_id: 5.0
+IMPORTS: {}
+MIXED_PRECISION: false
+ACCUMULATE_GRADIENTS: null
+OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
+BACKWARDS:
+  # ==================== Generator backward ====================
+  - NAME: optimizer_G
+    LOSS: loss_G
+    TRAINABLE_LAYERS: [G_AB, G_BA]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _bind_:
+          optimizer_kwargs:
+            opt: adam
+            _jinja_yaml_: "{lr: {{lr}}, betas: [{{b1}}, {{b2}}]}"
+          scheduler_kwargs:
+            name: LambdaLR
+            _jinja_yaml_: |-
+              lr_lambda: "eval: lambda epoch: 1.0 - max(0, epoch + {{offset}} - {{decay_epoch}}) / ({{epochs - decay_epoch}})"
+    CLIP: null
+    EXTRA: {}
+    FLOW:
+      # Identity loss
+      - [real_A, id_A, G_BA]
+      - [real_B, id_B, G_AB]
+      - [{input: id_A, target: real_A}, loss_id_A, criterion_identity, [_obj_, _addr_: torch.nn.L1Loss, _call_]]
+      - [{input: id_B, target: real_B}, loss_id_B, criterion_identity]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity, null]
+      # GAN loss
+      - [real_A, fake_B, G_AB]
+      - [fake_B, pred_fake_B, D_B]
+      - ["eval: torch.ones_like(pred_fake_B)", valid_B, null]
+      - [{input: pred_fake_B, target: valid_B}, loss_GAN_AB, criterion_GAN, [_obj_, {_addr_: torch.nn.MSELoss}, _call_]]
+      - [real_B, fake_A, G_BA]
+      - [fake_A, pred_fake_A, D_A]
+      - ["eval: torch.ones_like(pred_fake_A)", valid_A, null]
+      - [{input: pred_fake_A, target: valid_A}, loss_GAN_BA, criterion_GAN]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN, null]
+      # Cycle loss
+      - [fake_B, recov_A, G_BA]
+      - [{input: recov_A, target: real_A}, loss_cycle_A, criterion_cycle, [_obj_, {_addr_: torch.nn.L1Loss}, _call_]]
+      - [fake_A, recov_B, G_AB]
+      - [{input: recov_B, target: real_B}, loss_cycle_B, criterion_cycle]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle, null]
+      # Total generator loss
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G, null]'
+    INFERENCE_FLOW:
+      - [real_A, id_A, G_BA]
+      - [real_B, id_B, G_AB]
+      - [{input: id_A, target: real_A}, loss_id_A, criterion_identity]
+      - [{input: id_B, target: real_B}, loss_id_B, criterion_identity]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity, null]
+      - [real_A, fake_B, G_AB]
+      - [fake_B, pred_fake_B, D_B]
+      - ["eval: torch.ones_like(pred_fake_B)", valid_B, null]
+      - [{input: pred_fake_B, target: valid_B}, loss_GAN_AB, criterion_GAN]
+      - [real_B, fake_A, G_BA]
+      - [fake_A, pred_fake_A, D_A]
+      - ["eval: torch.ones_like(pred_fake_A)", valid_A, null]
+      - [{input: pred_fake_A, target: valid_A}, loss_GAN_BA, criterion_GAN]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN, null]
+      - [fake_B, recov_A, G_BA]
+      - [{input: recov_A, target: real_A}, loss_cycle_A, criterion_cycle]
+      - [fake_A, recov_B, G_AB]
+      - [{input: recov_B, target: real_B}, loss_cycle_B, criterion_cycle]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle, null]
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G, null]'
+  # ==================== Discriminator A backward ====================
+  - NAME: optimizer_D_A
+    LOSS: loss_D_A
+    TRAINABLE_LAYERS: [D_A]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _bind_:
+          optimizer_kwargs:
+            opt: adam
+            _jinja_yaml_: "{lr: {{lr}}, betas: [{{b1}}, {{b2}}]}"
+          scheduler_kwargs:
+            name: LambdaLR
+            _jinja_yaml_: |-
+              lr_lambda: "eval: lambda epoch: 1.0 - max(0, epoch + {{offset}} - {{decay_epoch}}) / ({{epochs - decay_epoch}})"
+    CLIP: null
+    EXTRA: {}
+    FLOW:
+      - [real_A, pred_real_A, D_A]
+      - [{input: pred_real_A, target: valid_A}, loss_real_A, criterion_GAN]
+      - [fake_A_sample, pred_fake_A, D_A]
+      - [{input: pred_fake_A, target: "eval: torch.zeros_like(pred_fake_A)"}, loss_fake_A, criterion_GAN]
+      - ["eval: (loss_real_A + loss_fake_A) / 2", loss_D_A, null]
+  # ==================== Discriminator B backward ====================
+  - NAME: optimizer_D_B
+    LOSS: loss_D_B
+    TRAINABLE_LAYERS: [D_B]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _bind_:
+          optimizer_kwargs:
+            opt: adam
+            _jinja_yaml_: "{lr: {{lr}}, betas: [{{b1}}, {{b2}}]}"
+          scheduler_kwargs:
+            name: LambdaLR
+            _jinja_yaml_: |-
+              lr_lambda: "eval: lambda epoch: 1.0 - max(0, epoch + {{offset}} - {{decay_epoch}}) / ({{epochs - decay_epoch}})"
+    CLIP: null
+    EXTRA: {}
+    FLOW:
+      - [real_B, pred_real_B, D_B]
+      - [{input: pred_real_B, target: valid_B}, loss_real_B, criterion_GAN]
+      - [fake_B_sample, pred_fake_B, D_B]
+      - [{input: pred_fake_B, target: "eval: torch.zeros_like(pred_fake_B)"}, loss_fake_B, criterion_GAN]
+      - ["eval: (loss_real_B + loss_fake_B) / 2", loss_D_B, null]
+LOSSES: []
+MODELS: []

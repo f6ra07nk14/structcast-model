@@ -406,3 +406,121 @@ def test_create_with_scheduler_step_lr_with_layer_decay() -> None:
         scheduler_kwargs={"name": "StepLR", "step_size": 1},
     )
     assert isinstance(opt, torch.optim.Optimizer)
+
+
+# ---------------------------------------------------------------------------
+# _get_native_scheduler — nested schedulers (SequentialLR)
+# ---------------------------------------------------------------------------
+
+_get_native_scheduler = _g["_get_native_scheduler"]
+
+
+def test_get_native_scheduler_sequential_lr() -> None:
+    """SequentialLR with nested scheduler specs creates a composite scheduler."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = _get_native_scheduler(
+        optimizer,
+        "SequentialLR",
+        schedulers=[
+            {"name": "ConstantLR", "factor": 0.5, "total_iters": 2},
+            {"name": "StepLR", "step_size": 1},
+        ],
+        milestones=[2],
+    )
+    assert type(scheduler).__name__ == "SequentialLR"
+
+
+# ---------------------------------------------------------------------------
+# _set_lr_scale — tensor lr branch
+# ---------------------------------------------------------------------------
+
+
+def test_set_lr_scale_with_tensor_lr() -> None:
+    """lr_scale multiplies tensor-type LR via .mul_()."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+    optimizer.param_groups[0]["lr"] = torch.tensor(1.0)
+    optimizer.param_groups[0]["lr_scale"] = 0.5
+    _set_lr_scale(optimizer)
+    assert optimizer.param_groups[0]["lr"].item() == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# _create_native_scheduler — ReduceLROnPlateau + lr_scale, default + lr_scale
+# ---------------------------------------------------------------------------
+
+_create_native_scheduler = _g["_create_native_scheduler"]
+
+
+def test_create_native_scheduler_reduce_lr_on_plateau_with_lr_scale() -> None:
+    """ReduceLROnPlateau with lr_scale registers both scheduler and lr_scale callbacks."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer.param_groups[0]["lr_scale"] = 0.5
+    _create_native_scheduler(optimizer, "ReduceLROnPlateau", has_lr_scale=True, criterion="loss")
+    names = GLOBAL_CALLBACKS.on_epoch_end.names()
+    assert "lr_scheduler_step" in names
+    assert "lr_scale_set" in names
+
+
+def test_create_native_scheduler_default_with_lr_scale() -> None:
+    """Default scheduler type (StepLR) with lr_scale registers both callbacks on epoch_end."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer.param_groups[0]["lr_scale"] = 0.5
+    _create_native_scheduler(optimizer, "StepLR", has_lr_scale=True, step_size=1)
+    names = GLOBAL_CALLBACKS.on_epoch_end.names()
+    assert "lr_scheduler_step" in names
+    assert "lr_scale_set" in names
+
+
+def test_create_native_scheduler_cosine_warm_restarts_with_lr_scale() -> None:
+    """CosineAnnealingWarmRestarts with lr_scale registers both callbacks on update."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer.param_groups[0]["lr_scale"] = 0.5
+    _create_native_scheduler(
+        optimizer,
+        "CosineAnnealingWarmRestarts",
+        has_lr_scale=True,
+        T_0=10,
+        updates_per_epoch=100,
+    )
+    names = GLOBAL_CALLBACKS.on_update.names()
+    assert "lr_scheduler_step" in names
+    assert "lr_scale_set" in names
+
+
+# ---------------------------------------------------------------------------
+# _create_timm_scheduler
+# ---------------------------------------------------------------------------
+
+_create_timm_scheduler = _g["_create_timm_scheduler"]
+
+
+def test_create_timm_scheduler_registers_update_and_epoch_callbacks() -> None:
+    """Timm scheduler registers both on_update and on_epoch_end callbacks."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    before_update = len(GLOBAL_CALLBACKS.on_update)
+    before_epoch = len(GLOBAL_CALLBACKS.on_epoch_end)
+    _create_timm_scheduler(optimizer, criterion="loss", name="cosine", num_epochs=10)
+    assert len(GLOBAL_CALLBACKS.on_update) > before_update
+    assert len(GLOBAL_CALLBACKS.on_epoch_end) > before_epoch
+
+
+# ---------------------------------------------------------------------------
+# _create_scheduler - dispatch to timm
+# ---------------------------------------------------------------------------
+
+_create_scheduler = _g["_create_scheduler"]
+
+
+def test_create_scheduler_dispatches_to_timm_for_unknown_native() -> None:
+    """Scheduler names not in torch.optim.lr_scheduler dispatch to timm."""
+    model = Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    before_update = len(GLOBAL_CALLBACKS.on_update)
+    _create_scheduler(optimizer, name="cosine", has_lr_scale=False, criterion="loss", num_epochs=10)
+    assert len(GLOBAL_CALLBACKS.on_update) > before_update
