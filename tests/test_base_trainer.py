@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
+from functools import partial
 from math import inf
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
 from structcast_model.base_trainer import (
-    GLOBAL_CALLBACKS,
+    EVENTS,
     BaseInfo,
     BaseTrainer,
     BestCriterion,
-    Callbacks,
-    NamedCallbackList,
-    callbacks_session,
+    Printer,
+    ProgressBar,
+    SimpleDataProvider,
     get_dataset,
     get_dataset_size,
     invoke_callback,
@@ -134,245 +135,248 @@ def test_invoke_callback_empty_list_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Callbacks.__post_init__ with add_global_callbacks=True
+# Test collaborators
 # ---------------------------------------------------------------------------
 
 
-def test_callbacks_post_init_copies_from_global_callbacks() -> None:
-    """When add_global_callbacks=True, callbacks from GLOBAL_CALLBACKS are copied."""
-    marker: list[str] = []
-
-    def cb(i: Any, **kw: Any) -> None:
-        marker.append("called")
-
-    GLOBAL_CALLBACKS.on_epoch_end.append(cb)
-    try:
-        cbs = Callbacks(add_global_callbacks=True)
-        assert cb in cbs.on_epoch_end
-    finally:
-        GLOBAL_CALLBACKS.on_epoch_end.remove(cb)
-
-
-def test_callbacks_post_init_skips_global_when_disabled() -> None:
-    """When add_global_callbacks=False, global callbacks are not copied."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    GLOBAL_CALLBACKS.on_update.append(cb)
-    try:
-        cbs = Callbacks(add_global_callbacks=False)
-        assert cb not in cbs.on_update
-    finally:
-        GLOBAL_CALLBACKS.on_update.remove(cb)
-
-
-# ---------------------------------------------------------------------------
-# Callbacks.clear
-# ---------------------------------------------------------------------------
-
-
-def test_callbacks_clear_empties_all_lists() -> None:
-    """clear() resets every callback list to empty."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    cbs = Callbacks(add_global_callbacks=False)
-    cbs.on_update.append(cb)
-    cbs.on_epoch_end.append(cb)
-    cbs.on_training_begin.append(cb)
-    cbs.clear()
-    assert cbs.on_update == []
-    assert cbs.on_epoch_end == []
-    assert cbs.on_training_begin == []
-
-
-def test_callbacks_clear_on_global_callbacks() -> None:
-    """clear() on GLOBAL_CALLBACKS removes all previously registered callbacks."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    GLOBAL_CALLBACKS.on_epoch_end.append(cb)
-    GLOBAL_CALLBACKS.on_update.append(cb)
-    GLOBAL_CALLBACKS.clear()
-    assert cb not in GLOBAL_CALLBACKS.on_epoch_end
-    assert cb not in GLOBAL_CALLBACKS.on_update
-
-
-# ---------------------------------------------------------------------------
-# callbacks_session
-# ---------------------------------------------------------------------------
-
-
-def test_callbacks_session_clears_on_entry() -> None:
-    """callbacks_session() clears GLOBAL_CALLBACKS before yielding."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    GLOBAL_CALLBACKS.on_epoch_end.append(cb)
-    with callbacks_session():
-        assert cb not in GLOBAL_CALLBACKS.on_epoch_end
-
-
-def test_callbacks_session_clears_on_exit() -> None:
-    """callbacks_session() clears GLOBAL_CALLBACKS when the block exits normally."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    with callbacks_session():
-        GLOBAL_CALLBACKS.on_epoch_end.append(cb)
-    assert cb not in GLOBAL_CALLBACKS.on_epoch_end
-
-
-def test_callbacks_session_clears_on_exception() -> None:
-    """callbacks_session() clears GLOBAL_CALLBACKS even when an exception is raised."""
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    def _run_with_error() -> None:
-        with callbacks_session():
-            GLOBAL_CALLBACKS.on_update.append(cb)
-            raise RuntimeError("test")
-
-    with pytest.raises(RuntimeError):
-        _run_with_error()
-    assert cb not in GLOBAL_CALLBACKS.on_update
-
-
-def test_callbacks_session_isolates_multiple_runs() -> None:
-    """Callbacks registered in one session are not seen by the next session."""
-    registered: list[Any] = []
-
-    def cb(i: Any, **kw: Any) -> None:
-        pass
-
-    with callbacks_session():
-        GLOBAL_CALLBACKS.on_training_begin.append(cb)
-        registered.append(cb)
-
-    # Second session starts clean
-    with callbacks_session():
-        for item in registered:
-            assert item not in GLOBAL_CALLBACKS.on_training_begin
-
-
-# ---------------------------------------------------------------------------
-# BaseTrainer helpers
-# ---------------------------------------------------------------------------
-
-
-class _FakeBackward:
-    """Minimal Backward protocol implementation for tests."""
+class _FakeLearner:
+    """Minimal Learner implementation producing deterministic criteria."""
 
     def __init__(
         self,
+        *,
         should_update: bool = True,
-        inference_fn: Any = None,
+        inference_loss: float = 0.3,
+        optimizers: Mapping[str, Any] | None = None,
     ) -> None:
         self._should_update = should_update
-        self._inference_fn = inference_fn
+        self._inference_loss = inference_loss
+        self.optimizers = dict(optimizers) if optimizers is not None else {}
+        self.learning_rates = {"lr": 0.1}
 
     @property
     def models(self) -> dict[str, Any]:
-        """Return empty models dict."""
-        return {}
+        """Return the named models handed to every callback."""
+        return {"model": "the-model"}
 
     def update(self, step: int) -> bool:
-        """Return whether to update."""
+        """Report whether this step ends an update."""
         return self._should_update
 
-    def training_step(self, **kwargs: Any) -> dict[str, Any]:
+    def training_step(self, **inputs: Any) -> dict[str, Any]:
         """Return fixed training criteria."""
         return {"loss": 0.5}
 
-    def inference_step(self, **kwargs: Any) -> dict[str, Any]:
-        """Return inference criteria or empty dict."""
-        if self._inference_fn is not None:
-            return self._inference_fn(kwargs)
-        return {}
+    def inference_step(self, **inputs: Any) -> dict[str, Any]:
+        """Return fixed inference criteria."""
+        return {"loss": self._inference_loss}
+
+
+class _Tracker:
+    """Callable tracker object, so that event methods can be attached to it."""
+
+    def __call__(self, **criteria: Any) -> dict[str, float]:
+        """Average nothing: pass the loss criterion straight through."""
+        return {"loss": float(criteria.get("loss", 0.0))}
+
+
+def _tracker(**criteria: Any) -> dict[str, float]:
+    """Pass the loss criterion straight through, as a plain function."""
+    return {"loss": float(criteria.get("loss", 0.0))}
+
+
+class _Recorder:
+    """Records the events it receives, implementing exactly the protocols it is asked to.
+
+    The event methods are set as instance attributes so one class can stand in for any subset
+    of the eleven event protocols; ``runtime_checkable`` protocols only check attribute presence.
+    """
+
+    def __init__(self, log: list[str], label: str = "rec", events: Sequence[str] = EVENTS) -> None:
+        self.log = log
+        self.label = label
+        for event in events:
+            setattr(self, event, partial(self._record, event))
+
+    def _record(self, event: str, info: BaseInfo, **models: Any) -> None:
+        """Append ``label:event`` to the shared log."""
+        self.log.append(f"{self.label}:{event}")
+
+
+def _hook(obj: Any, log: list[str], label: str, *events: str) -> Any:
+    """Attach recording methods for *events* to *obj* so protocol routing picks it up."""
+    for event in events:
+        setattr(obj, event, partial(_Recorder(log, label, events=())._record, event))
+    return obj
+
+
+class _EpochEndOnly:
+    """Callback implementing only ``on_epoch_end``."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+        """Record the epoch that just finished."""
+        self.log.append(f"epoch_end:{info.epoch}")
 
 
 def _make_trainer(
     *,
-    prefix: str = "",
+    learner: Any = None,
+    tracker: Any = None,
+    data: Any = None,
+    callbacks: Sequence[Any] = (),
+    training_prefix: str = "",
     validation_prefix: str = "val_",
-    should_update: bool = True,
-    inference_fn: Any = None,
 ) -> BaseTrainer:
-    def _tracker(**criteria: Any) -> dict[str, float]:
-        return {"loss": float(criteria.get("loss", 0.0))}
-
+    """Build a trainer wired with fake but real (non-mock) collaborators."""
     return BaseTrainer(
-        backward=_FakeBackward(should_update, inference_fn=inference_fn),
-        tracker=_tracker,
-        training_prefix=prefix,
+        learner=learner if learner is not None else _FakeLearner(),
+        tracker=tracker if tracker is not None else _tracker,
+        data=data,
+        callbacks=callbacks,
+        training_prefix=training_prefix,
         validation_prefix=validation_prefix,
-        add_global_callbacks=False,
     )
 
 
 # ---------------------------------------------------------------------------
-# BaseTrainer.train
+# Event routing
 # ---------------------------------------------------------------------------
 
 
-def test_base_trainer_train_returns_logs_with_loss() -> None:
-    """train() returns a dict containing tracked criteria."""
+def test_all_eleven_events_route_at_the_right_moment() -> None:
+    """Every event protocol implemented by a callback is dispatched in lifecycle order.
+
+    This pins the contract the whole design rests on: implementing a protocol method is the
+    only thing an object needs to do to take part in the loop.
+    """
+    log: list[str] = []
+    trainer = _make_trainer(
+        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        callbacks=[_Recorder(log)],
+    )
+    trainer.fit(epochs=1)
+    assert log == [
+        "rec:on_epoch_begin",
+        "rec:on_training_begin",
+        "rec:on_training_step_begin",
+        "rec:on_update",
+        "rec:on_training_step_end",
+        "rec:on_training_end",
+        "rec:on_validation_begin",
+        "rec:on_validation_step_begin",
+        "rec:on_validation_step_end",
+        "rec:on_validation_end",
+        "rec:on_epoch_end",
+    ]
+    assert set(EVENTS) == {entry.split(":", 1)[1] for entry in log}
+
+
+def test_callbacks_receive_info_and_models() -> None:
+    """A routed callback is called with the trainer as info plus the learner's models."""
+    received: list[tuple[Any, dict[str, Any]]] = []
+
+    class _Capture:
+        def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+            """Capture the arguments passed by the trainer."""
+            received.append((info, models))
+
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[_Capture()])
+    trainer.fit(epochs=1)
+    assert received == [(trainer, {"model": "the-model"})]
+
+
+def test_object_without_event_methods_is_ignored() -> None:
+    """An object implementing no event protocol is never registered and never called."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[object()])
+    trainer.fit(epochs=1)
+    assert trainer.describe() == {}
+
+
+def test_scan_order_is_learner_then_tracker_then_data_then_callbacks() -> None:
+    """Registration order fixes call order, so scheduler-like participants run before reporters."""
+    log: list[str] = []
+    learner = _hook(_FakeLearner(), log, "learner", "on_epoch_end")
+    tracker = _hook(_Tracker(), log, "tracker", "on_epoch_end")
+    data = _hook(SimpleDataProvider([{"x": 1}]), log, "data", "on_epoch_end")
+    trainer = _make_trainer(
+        learner=learner,
+        tracker=tracker,
+        data=data,
+        callbacks=[_Recorder(log, "first", ("on_epoch_end",)), _Recorder(log, "second", ("on_epoch_end",))],
+    )
+    trainer.fit(epochs=1)
+    assert log == [
+        "learner:on_epoch_end",
+        "tracker:on_epoch_end",
+        "data:on_epoch_end",
+        "first:on_epoch_end",
+        "second:on_epoch_end",
+    ]
+
+
+def test_learner_optimizers_are_scanned_for_events() -> None:
+    """Optimizer objects owned by the learner are routed too: this is how schedulers step."""
+    log: list[str] = []
+    learner = _FakeLearner(
+        optimizers={
+            "opt_a": _Recorder(log, "opt_a", ("on_update", "on_epoch_end")),
+            "opt_b": _Recorder(log, "opt_b", ("on_update",)),
+        }
+    )
+    trainer = _make_trainer(learner=learner, data=SimpleDataProvider([{"x": 1}]))
+    trainer.fit(epochs=1)
+    assert log == ["opt_a:on_update", "opt_b:on_update", "opt_a:on_epoch_end"]
+
+
+def test_same_object_registered_once_per_event() -> None:
+    """An object appearing twice in the scan (tracker and callback) fires only once per event."""
+    log: list[str] = []
+    tracker = _hook(_Tracker(), log, "shared", "on_epoch_end")
+    trainer = _make_trainer(tracker=tracker, data=SimpleDataProvider([{"x": 1}]), callbacks=[tracker])
+    trainer.fit(epochs=1)
+    assert log == ["shared:on_epoch_end"]
+
+
+def test_describe_lists_type_names_and_omits_empty_events() -> None:
+    """describe() reports who listens to what, for run-time introspection of the wiring."""
+    log: list[str] = []
+    trainer = _make_trainer(callbacks=[_EpochEndOnly(log), _Recorder(log, "rec", ("on_update",))])
+    assert trainer.describe() == {"on_update": ["_Recorder"], "on_epoch_end": ["_EpochEndOnly"]}
+
+
+# ---------------------------------------------------------------------------
+# BaseTrainer.train / BaseTrainer.evaluate
+# ---------------------------------------------------------------------------
+
+
+def test_train_returns_logs_and_counts_steps_and_updates() -> None:
+    """train() accepts an explicit dataset and advances the step/update counters."""
     trainer = _make_trainer()
     logs = trainer.train([{"x": 1}, {"x": 2}])
     assert "loss" in logs
-
-
-def test_base_trainer_train_increments_step_and_update() -> None:
-    """Step and update counters are incremented correctly."""
-    trainer = _make_trainer()
-    trainer.train([{"x": 1}, {"x": 2}])
     assert trainer.step == 2
     assert trainer.update == 2
 
 
-def test_base_trainer_train_with_prefix_renames_log_keys() -> None:
-    """training_prefix is prepended to all log keys."""
-    trainer = _make_trainer(prefix="train_")
+def test_train_with_prefix_renames_log_keys() -> None:
+    """training_prefix is prepended to all log keys so training and validation never collide."""
+    trainer = _make_trainer(training_prefix="train_")
     logs = trainer.train([{"x": 1}])
     assert "train_loss" in logs
     assert "loss" not in logs
 
 
-def test_base_trainer_train_no_update_when_backward_returns_false() -> None:
-    """Update counter stays 0 when backward always returns False."""
-    trainer = _make_trainer(should_update=False)
-    trainer.train([{"x": 1}, {"x": 2}])
-    assert trainer.update == 0
-
-
-def test_base_trainer_train_invokes_all_callbacks() -> None:
-    """Training lifecycle callbacks are fired in the correct order."""
+def test_train_reports_average_elapsed_time_per_step() -> None:
+    """elapsed_time is averaged over the steps taken so far, not accumulated."""
     trainer = _make_trainer()
-    events: list[str] = []
-    trainer.on_training_begin.append(lambda i, **kw: events.append("begin"))
-    trainer.on_training_end.append(lambda i, **kw: events.append("end"))
-    trainer.on_training_step_begin.append(lambda i, **kw: events.append("step_begin"))
-    trainer.on_training_step_end.append(lambda i, **kw: events.append("step_end"))
-    trainer.on_update.append(lambda i, **kw: events.append("update"))
-    trainer.train([{"x": 1}])
-    assert events == ["begin", "step_begin", "update", "step_end", "end"]
+    logs = trainer.train([{"x": 1}, {"x": 2}, {"x": 3}])
+    assert 0.0 <= logs["elapsed_time"] < 1.0
 
 
-def test_base_trainer_train_with_callable_dataset() -> None:
-    """Callable dataset factories are supported in train()."""
-    trainer = _make_trainer()
-    data = [{"x": 1}]
-    logs = trainer.train(lambda: data)
-    assert "loss" in logs
-
-
-def test_base_trainer_train_stores_logs_in_history() -> None:
+def test_train_stores_logs_in_history() -> None:
     """Logs are stored in trainer.history under the current epoch."""
     trainer = _make_trainer()
     trainer.epoch = 1
@@ -380,40 +384,45 @@ def test_base_trainer_train_stores_logs_in_history() -> None:
     assert "loss" in trainer.history[1]
 
 
-# ---------------------------------------------------------------------------
-# BaseTrainer.evaluate
-# ---------------------------------------------------------------------------
-
-
-def test_base_trainer_evaluate_returns_default_when_no_inference_fn() -> None:
-    """evaluate() returns tracker defaults when inference_step returns empty dict."""
+def test_train_with_callable_dataset() -> None:
+    """Callable dataset factories are supported in train()."""
     trainer = _make_trainer()
-    result = trainer.evaluate([{"x": 1}])
-    assert "val_loss" in result
+    data = [{"x": 1}]
+    logs = trainer.train(lambda: data)
+    assert "loss" in logs
 
 
-def test_base_trainer_evaluate_returns_prefixed_val_logs() -> None:
-    """evaluate() prepends validation_prefix to log keys."""
-    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
+def test_on_update_fires_only_when_the_learner_updates() -> None:
+    """With gradient accumulation the learner decides when an update happened; the trainer follows."""
+    log: list[str] = []
+    trainer = _make_trainer(
+        learner=_FakeLearner(should_update=False),
+        callbacks=[_Recorder(log, "rec", ("on_update",))],
+    )
+    trainer.train([{"x": 1}, {"x": 2}])
+    assert log == []
+    assert trainer.update == 0
+    assert trainer.step == 2
+
+
+def test_evaluate_prefixes_logs_and_fires_validation_events() -> None:
+    """evaluate() accepts an explicit dataset and prefixes its logs with validation_prefix."""
+    log: list[str] = []
+    trainer = _make_trainer(callbacks=[_Recorder(log)])
     logs = trainer.evaluate([{"x": 1}])
     assert "val_loss" in logs
+    assert "val_elapsed_time" in logs
+    assert log == [
+        "rec:on_validation_begin",
+        "rec:on_validation_step_begin",
+        "rec:on_validation_step_end",
+        "rec:on_validation_end",
+    ]
 
 
-def test_base_trainer_evaluate_invokes_callbacks() -> None:
-    """Validation lifecycle callbacks are fired in the correct order."""
-    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
-    events: list[str] = []
-    trainer.on_validation_begin.append(lambda i, **kw: events.append("begin"))
-    trainer.on_validation_end.append(lambda i, **kw: events.append("end"))
-    trainer.on_validation_step_begin.append(lambda i, **kw: events.append("step_begin"))
-    trainer.on_validation_step_end.append(lambda i, **kw: events.append("step_end"))
-    trainer.evaluate([{"x": 1}])
-    assert events == ["begin", "step_begin", "step_end", "end"]
-
-
-def test_base_trainer_evaluate_with_callable_dataset() -> None:
+def test_evaluate_with_callable_dataset() -> None:
     """Callable dataset factories are supported in evaluate()."""
-    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
+    trainer = _make_trainer()
     data = [{"x": 1}]
     logs = trainer.evaluate(lambda: data)
     assert "val_loss" in logs
@@ -424,72 +433,67 @@ def test_base_trainer_evaluate_with_callable_dataset() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_base_trainer_fit_runs_correct_number_of_epochs() -> None:
-    """fit() runs exactly the requested number of epochs."""
-    trainer = _make_trainer()
-    history = trainer.fit(epochs=3, training_dataset=[{"x": 1}])
+def test_fit_pulls_datasets_from_the_data_provider() -> None:
+    """fit() takes no dataset arguments: a fully wired trainer already knows its data."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}], [{"x": 2}]))
+    history = trainer.fit(epochs=3)
     assert list(history.keys()) == [1, 2, 3]
+    assert "loss" in history[3]
+    assert "val_loss" in history[3]
 
 
-def test_base_trainer_fit_with_validation_dataset() -> None:
-    """fit() calls evaluate each epoch when validation_dataset is given."""
-    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
-    trainer.fit(epochs=2, training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}])
-    assert "val_loss" in trainer.history[2]
+def test_fit_without_validation_dataset_skips_evaluation() -> None:
+    """A provider with no validation dataset means training only."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    history = trainer.fit(epochs=2)
+    assert "val_loss" not in history[2]
 
 
-def test_base_trainer_fit_respects_validation_frequency() -> None:
+def test_fit_respects_validation_frequency() -> None:
     """Validation only runs at multiples of validation_frequency."""
-    trainer = _make_trainer(inference_fn=lambda inputs: {"loss": 0.3})
-    evaluated_epochs: list[int] = []
-    trainer.on_validation_end.append(lambda i, **kw: evaluated_epochs.append(i.epoch))
-    trainer.fit(
-        epochs=4,
-        training_dataset=[{"x": 1}],
-        validation_dataset=[{"x": 2}],
-        validation_frequency=2,
+    log: list[str] = []
+    trainer = _make_trainer(
+        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        callbacks=[_EpochEndOnly(log), _Recorder(log, "val", ("on_validation_end",))],
     )
-    assert evaluated_epochs == [2, 4]
+    trainer.fit(epochs=4, validation_frequency=2)
+    assert log == [
+        "epoch_end:1",
+        "val:on_validation_end",
+        "epoch_end:2",
+        "epoch_end:3",
+        "val:on_validation_end",
+        "epoch_end:4",
+    ]
 
 
-def test_base_trainer_fit_with_start_epoch() -> None:
-    """fit() starts from start_epoch, not from 1."""
-    trainer = _make_trainer()
-    history = trainer.fit(epochs=3, training_dataset=[{"x": 1}], start_epoch=2)
+def test_fit_starts_from_start_epoch() -> None:
+    """fit() starts from start_epoch, not from 1, so a run can be resumed."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    history = trainer.fit(epochs=3, start_epoch=2)
     assert list(history.keys()) == [2, 3]
 
 
-def test_base_trainer_fit_invokes_epoch_callbacks() -> None:
-    """on_epoch_begin and on_epoch_end are fired for every epoch."""
+def test_fit_raises_without_a_data_provider() -> None:
+    """fit() cannot invent datasets: a missing provider is a configuration error, not a silent no-op."""
     trainer = _make_trainer()
-    begins: list[int] = []
-    ends: list[int] = []
-    trainer.on_epoch_begin.append(lambda i, **kw: begins.append(i.epoch))
-    trainer.on_epoch_end.append(lambda i, **kw: ends.append(i.epoch))
-    trainer.fit(epochs=2, training_dataset=[{"x": 1}])
-    assert begins == [1, 2]
-    assert ends == [1, 2]
+    with pytest.raises(ValueError, match="data provider"):
+        trainer.fit(epochs=1)
 
 
-def test_base_trainer_fit_raises_for_zero_validation_frequency() -> None:
-    """fit() raises ValueError when validation_frequency < 1."""
-    trainer = _make_trainer()
-    with pytest.raises(ValueError, match="Validation frequency"):
-        trainer.fit(epochs=2, training_dataset=[], validation_frequency=0)
-
-
-def test_base_trainer_fit_raises_for_start_epoch_zero() -> None:
-    """fit() raises ValueError when start_epoch < 1."""
-    trainer = _make_trainer()
-    with pytest.raises(ValueError, match="Start epoch must be at least 1"):
-        trainer.fit(epochs=2, training_dataset=[], start_epoch=0)
-
-
-def test_base_trainer_fit_raises_when_start_epoch_exceeds_epochs() -> None:
-    """fit() raises ValueError when start_epoch > epochs."""
-    trainer = _make_trainer()
-    with pytest.raises(ValueError, match="Start epoch must be less than or equal"):
-        trainer.fit(epochs=2, training_dataset=[], start_epoch=3)
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"epochs": 2, "validation_frequency": 0}, "Validation frequency"),
+        ({"epochs": 2, "start_epoch": 0}, "Start epoch must be at least 1"),
+        ({"epochs": 2, "start_epoch": 3}, "Start epoch must be less than or equal"),
+    ],
+)
+def test_fit_rejects_invalid_loop_parameters(kwargs: dict[str, int], message: str) -> None:
+    """Loop parameters are validated before any epoch runs."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    with pytest.raises(ValueError, match=message):
+        trainer.fit(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -498,171 +502,115 @@ def test_base_trainer_fit_raises_when_start_epoch_exceeds_epochs() -> None:
 
 
 def test_best_criterion_min_mode_initial_best_is_inf() -> None:
-    """In 'min' mode the initial best value is +inf."""
+    """In 'min' mode the initial best value is +inf, so any first value improves on it."""
     criterion = BestCriterion(target="loss", mode="min")
-    assert criterion._best == inf
+    assert criterion.value == inf
 
 
 def test_best_criterion_max_mode_initial_best_is_neg_inf() -> None:
-    """In 'max' mode the initial best value is -inf."""
+    """In 'max' mode the initial best value is -inf, so any first value improves on it."""
     criterion = BestCriterion(target="acc", mode="max")
-    assert criterion._best == -inf
+    assert criterion.value == -inf
 
 
-def test_best_criterion_min_mode_updates_on_improvement() -> None:
-    """In 'min' mode _best decreases when a lower value is found."""
-    best_values: list[float] = []
+@pytest.mark.parametrize(
+    ("mode", "values", "expected"),
+    [
+        ("min", [0.5, 0.3], 0.3),
+        ("min", [0.3, 0.5], 0.3),
+        ("max", [0.5, 0.8], 0.8),
+        ("max", [0.8, 0.5], 0.8),
+    ],
+)
+def test_best_criterion_tracks_the_best_value(
+    mode: Literal["min", "max"], values: list[float], expected: float
+) -> None:
+    """The best value survives regressions: that is what makes 'best' meaningful."""
+    criterion = BestCriterion(target="loss", mode=mode)
+    info = BaseInfo()
+    for epoch, value in enumerate(values, start=1):
+        info.epoch = epoch
+        info.step = epoch
+        info.history[epoch] = {"loss": value}
+        criterion.on_epoch_end(info)
+    assert criterion.value == pytest.approx(expected)
+    assert criterion.step == 1 + values.index(expected)
 
-    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
-        best_values.append(best.value)
 
-    criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
+def test_best_criterion_on_best_receives_info_best_and_models() -> None:
+    """on_best callbacks get the criterion itself, so they can log or save by its value/step."""
+    seen: list[tuple[int, float, dict[str, Any]]] = []
 
+    def cb(info: BaseInfo, best: BestCriterion, **models: Any) -> None:
+        seen.append((info.epoch, best.value, models))
+
+    criterion = BestCriterion(target="loss", on_best=[cb])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
-    criterion(info)
-    assert best_values[-1] == pytest.approx(0.5)
-
-    info.epoch = 2
-    info.history[2] = {"loss": 0.3}
-    criterion(info)
-    assert best_values[-1] == pytest.approx(0.3)
-
-
-def test_best_criterion_min_mode_does_not_update_on_regression() -> None:
-    """In 'min' mode _best does not change when a higher value is seen."""
-    best_values: list[float] = []
-
-    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
-        best_values.append(best.value)
-
-    criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
-
-    info = BaseInfo()
-    info.epoch = 1
-    info.history[1] = {"loss": 0.3}
-    criterion(info)
-
-    info.epoch = 2
-    info.history[2] = {"loss": 0.5}
-    criterion(info)
-    assert best_values[-1] == pytest.approx(0.3)
-
-
-def test_best_criterion_max_mode_updates_on_improvement() -> None:
-    """In 'max' mode _best increases when a higher value is found."""
-    best_values: list[float] = []
-
-    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
-        best_values.append(best.value)
-
-    criterion = BestCriterion(target="acc", mode="max", on_best=[cb])
-
-    info = BaseInfo()
-    info.epoch = 1
-    info.history[1] = {"acc": 0.8}
-    criterion(info)
-    assert best_values[-1] == pytest.approx(0.8)
-
-
-def test_best_criterion_on_best_not_called_when_target_missing() -> None:
-    """on_best callbacks are skipped when the target key is absent from logs."""
-    called: list[bool] = []
-
-    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
-        called.append(True)
-
-    criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
-
-    info = BaseInfo()
-    info.epoch = 1
-    info.history[1] = {}  # no "loss" key
-    criterion(info)
-    assert not called
+    criterion.on_epoch_end(info, model="the-model")
+    assert seen == [(1, 0.5, {"model": "the-model"})]
 
 
 def test_best_criterion_on_best_called_even_without_improvement() -> None:
-    """on_best IS always called as long as the target is present in logs."""
-    called_count = 0
-
-    def cb(info: Any, best: BestCriterion, **kw: Any) -> None:
-        nonlocal called_count
-        called_count += 1
-
-    criterion = BestCriterion(target="loss", mode="min", on_best=[cb])
+    """on_best fires whenever the target is present, so consumers can log the best value each epoch."""
+    calls: list[float] = []
+    criterion = BestCriterion(target="loss", on_best=[lambda info, best, **kw: calls.append(best.value)])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
-    criterion(info)
+    criterion.on_epoch_end(info)
     info.epoch = 2
-    info.history[2] = {"loss": 0.9}  # worse, but on_best still fires
-    criterion(info)
-    assert called_count == 2
+    info.history[2] = {"loss": 0.9}
+    criterion.on_epoch_end(info)
+    assert calls == [0.5, 0.5]
+
+
+def test_best_criterion_on_best_skipped_when_target_missing() -> None:
+    """A criterion that was not produced this epoch must not trigger best-value side effects."""
+    called: list[bool] = []
+    criterion = BestCriterion(target="loss", on_best=[lambda info, best, **kw: called.append(True)])
+    info = BaseInfo()
+    info.epoch = 1
+    info.history[1] = {}
+    criterion.on_epoch_end(info)
+    assert not called
+
+
+def test_best_criterion_routes_through_the_trainer() -> None:
+    """Passed as a callback, BestCriterion is routed by its on_epoch_end method alone."""
+    criterion = BestCriterion(target="val_loss", mode="min")
+    trainer = _make_trainer(
+        learner=_FakeLearner(inference_loss=0.2),
+        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        callbacks=[criterion],
+    )
+    assert trainer.describe() == {"on_epoch_end": ["BestCriterion"]}
+    trainer.fit(epochs=1)
+    assert criterion.value == pytest.approx(0.2)
 
 
 # ---------------------------------------------------------------------------
-# NamedCallbackList
+# Printer / ProgressBar
 # ---------------------------------------------------------------------------
 
 
-def test_named_callback_list_class_getitem_returns_cls() -> None:
-    """NamedCallbackList[X] generic alias returns the class itself."""
-    alias = NamedCallbackList[int]
-    assert alias is NamedCallbackList
+def test_printer_prints_epoch_criteria(capsys: pytest.CaptureFixture[str]) -> None:
+    """Printer is the CI-mode reporter: one plain-text block per epoch, learning rates included."""
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[Printer()])
+    trainer.fit(epochs=1)
+    out = capsys.readouterr().out
+    assert "epoch: 1" in out
+    assert "  lr: 0.1" in out
+    assert "  loss: 0.5" in out
 
 
-def test_named_callback_list_register_uses_explicit_name() -> None:
-    """register() stores the given display name, not an inferred one."""
-    ncl: NamedCallbackList[Any] = NamedCallbackList()
-    ncl.register("my_custom_name", lambda i, **kw: None)
-    assert ncl.names() == ["my_custom_name"]
-    assert len(ncl) == 1
-
-
-def test_named_callback_list_append_infers_name_from_function() -> None:
-    """append() auto-derives the display name from the callable."""
-
-    def my_func(i: Any, **kw: Any) -> None:
-        pass
-
-    ncl: NamedCallbackList[Any] = NamedCallbackList()
-    ncl.append(my_func)
-    assert ncl.names() == ["my_func"]
-
-
-def test_named_callback_list_append_infers_name_from_bound_method() -> None:
-    """append() falls back to __func__.__name__ for bound methods."""
-
-    class _Dummy:
-        def step(self, i: Any, **kw: Any) -> None:
-            pass
-
-    ncl: NamedCallbackList[Any] = NamedCallbackList()
-    ncl.append(_Dummy().step)
-    assert ncl.names() == ["step"]
-
-
-def test_named_callback_list_extend_adds_multiple_callbacks() -> None:
-    """extend() adds multiple callbacks with auto-inferred names."""
-
-    def cb_a(i: Any, **kw: Any) -> None:
-        pass
-
-    def cb_b(i: Any, **kw: Any) -> None:
-        pass
-
-    ncl: NamedCallbackList[Any] = NamedCallbackList()
-    ncl.extend([cb_a, cb_b])
-    assert ncl.names() == ["cb_a", "cb_b"]
-    assert len(ncl) == 2
-
-
-def test_named_callback_list_clear_empties_names_too() -> None:
-    """clear() removes both callbacks and their names."""
-    ncl: NamedCallbackList[Any] = NamedCallbackList()
-    ncl.register("a", lambda i, **kw: None)
-    ncl.register("b", lambda i, **kw: None)
-    ncl.clear()
-    assert ncl.names() == []
-    assert len(ncl) == 0
+def test_progress_bar_runs_a_full_epoch(capsys: pytest.CaptureFixture[str]) -> None:
+    """ProgressBar drives a real tqdm bar through training, validation, and the epoch summary."""
+    bar = ProgressBar(
+        steps_per_epoch=2, validation_steps=1, training_criteria=["loss"], validation_criteria=["val_loss"]
+    )
+    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}, {"x": 2}], [{"x": 3}]), callbacks=[bar])
+    trainer.fit(epochs=1)
+    assert "epoch: 1" in capsys.readouterr().out
+    bar.bar.close()
