@@ -462,7 +462,6 @@ __all__ = [
     "Callback",
     "Callbacks",
     "DatasetLike",
-    "InferenceWrapper",
     "NamedCallbackList",
     "callbacks_session",
     "get_dataset",
