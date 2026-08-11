@@ -13,14 +13,14 @@ from structcast.core.specifier import SpecIntermediate
 from structcast.utils.base import configure_security
 
 from structcast_model.builders.base_builder import (
-    BaseBackwardBuilder,
+    BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
     resolve_getter,
     resolve_object,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
-from structcast_model.builders.torch_builder import TorchBackwardBuilder, TorchBuilder, TorchLayerIntermediate
+from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from tests import ASSETS_DIR
 
 
@@ -256,11 +256,11 @@ def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
         BaseModelBuilder(raw=raw_bad)()
 
 
-def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
-    """Reject duplicate backward names and optimizer names."""
+def test_base_learner_builder_duplicate_name_and_optimizer_raise() -> None:
+    """Reject duplicate learner names and optimizer names."""
     opt = {"_obj_": [["_addr_", "torch.optim.SGD"]]}
-    duplicate_backward = {
-        "BACKWARDS": [
+    duplicate_learner = {
+        "LEARNERS": [
             {
                 "NAME": "main",
                 "LOSS": "loss_a",
@@ -278,17 +278,17 @@ def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
         ],
     }
     with pytest.raises(SpecError, match='Duplicate variable name "main" for optimizer'):
-        TorchBackwardBuilder(raw=duplicate_backward)()
+        TorchLearnerBuilder(raw=duplicate_learner)()
 
 
-def test_base_backward_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
-    """Base backward builder logs a warning for mixed precision and returns None."""
+def test_base_learner_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Base learner builder logs a warning for mixed precision and returns None."""
 
-    class _NoMixedPrecisionBuilder(BaseBackwardBuilder):
+    class _NoMixedPrecisionBuilder(BaseLearnerBuilder):
         pass
 
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -349,14 +349,14 @@ def test_resolve_object_with_list_literal_in_call() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder — full backward build with flow
+# TorchLearnerBuilder — full learner build with flow
 # ---------------------------------------------------------------------------
 
 
-def test_torch_backward_builder_simple_backward_generates_scripts() -> None:
-    """Building a simple backward configuration produces scripts with training/inference steps."""
+def test_torch_learner_builder_simple_learner_generates_scripts() -> None:
+    """Building a simple learner configuration produces scripts with training/inference steps."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -365,19 +365,19 @@ def test_torch_backward_builder_simple_backward_generates_scripts() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
-    assert "class Backward" in combined
+    assert "class Learner" in combined
     assert "_training_step" in combined
     assert "_inference_step" in combined
     assert "optimizer" in combined.lower() or "sgd" in combined.lower()
 
 
-def test_torch_backward_builder_with_mixed_precision() -> None:
+def test_torch_learner_builder_with_mixed_precision() -> None:
     """Building with mixed precision generates GradScaler code."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -388,17 +388,17 @@ def test_torch_backward_builder_with_mixed_precision() -> None:
         "MIXED_PRECISION": True,
         "MIXED_PRECISION_TYPE": "float16",
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "GradScaler" in combined
     assert "autocast" in combined
 
 
-def test_torch_backward_builder_with_clip_gradient() -> None:
+def test_torch_learner_builder_with_clip_gradient() -> None:
     """Building with CLIP generates a gradient clipping call."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -413,16 +413,16 @@ def test_torch_backward_builder_with_clip_gradient() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "dispatch_clip_grad" in combined
 
 
-def test_torch_backward_builder_with_accumulate_gradients() -> None:
+def test_torch_learner_builder_with_accumulate_gradients() -> None:
     """Building with ACCUMULATE_GRADIENTS generates conditional update logic."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -432,16 +432,16 @@ def test_torch_backward_builder_with_accumulate_gradients() -> None:
         ],
         "ACCUMULATE_GRADIENTS": 4,
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "need_update" in combined.lower() or "__need_update__" in combined
 
 
-def test_torch_backward_builder_with_extra_kwargs() -> None:
-    """EXTRA dict in backward generates kwargs in the backward call."""
+def test_torch_learner_builder_with_extra_kwargs() -> None:
+    """EXTRA dict in a learner generates kwargs in the backward call."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -451,7 +451,7 @@ def test_torch_backward_builder_with_extra_kwargs() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "retain_graph" in combined

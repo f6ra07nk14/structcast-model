@@ -8,15 +8,15 @@ from structcast.core.exceptions import SpecError
 from structcast.utils.base import register_dir, unregister_dir
 
 from structcast_model.builders.schema import (
-    BackwardBehavior,
     LayerBehavior,
+    LearnerBehavior,
     Template,
-    TemplateBackward,
     TemplateLayer,
+    TemplateLearner,
     TensorSpec,
     TensorSpecTree,
-    UserDefinedBackward,
     UserDefinedLayer,
+    UserDefinedLearner,
     resolve_flow,
     resolve_inputs,
 )
@@ -67,9 +67,9 @@ def test_validate_imports_returns_raw_for_invalid_non_iterable() -> None:
         UserDefinedLayer.model_validate({"IMPORTS": 123, "FLOW": []})
 
 
-def test_backward_behavior_extra_kwargs() -> None:
-    """BackwardBehavior EXTRA dict stores additional backward configuration."""
-    backward = BackwardBehavior.model_validate(
+def test_learner_behavior_extra_kwargs() -> None:
+    """LearnerBehavior EXTRA dict stores additional learner configuration."""
+    learner = LearnerBehavior.model_validate(
         {
             "NAME": "main",
             "LOSS": "ce_loss",
@@ -78,13 +78,13 @@ def test_backward_behavior_extra_kwargs() -> None:
             "EXTRA": {"retain_graph": True},
         }
     )
-    assert backward.NAME == "main"
-    assert backward.LOSS == "ce_loss"
-    assert backward.EXTRA["retain_graph"] is True
+    assert learner.NAME == "main"
+    assert learner.LOSS == "ce_loss"
+    assert learner.EXTRA["retain_graph"] is True
 
 
-def test_backward_behavior_instance_passthrough_and_clip() -> None:
-    """Cover instance passthrough and CLIP field for BackwardBehavior."""
+def test_learner_behavior_instance_passthrough_and_clip() -> None:
+    """Cover instance passthrough and CLIP field for LearnerBehavior."""
     raw = {
         "NAME": "main",
         "LOSS": "ce_loss",
@@ -92,11 +92,11 @@ def test_backward_behavior_instance_passthrough_and_clip() -> None:
         "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
         "CLIP": {"_obj_": [["_addr_", "timm.utils.clip_grad.dispatch_clip_grad"]]},
     }
-    named = BackwardBehavior.model_validate(raw)
-    assert BackwardBehavior.model_validate(named) is named
+    named = LearnerBehavior.model_validate(raw)
+    assert LearnerBehavior.model_validate(named) is named
     assert named.CLIP is not None
     with pytest.raises(ValidationError):
-        BackwardBehavior.model_validate(
+        LearnerBehavior.model_validate(
             {
                 "LOSS": 123,
                 "TRAINABLE_LAYERS": ["model"],
@@ -105,10 +105,10 @@ def test_backward_behavior_instance_passthrough_and_clip() -> None:
         )
 
 
-def test_user_defined_backward_infers_losses_and_trainable_layers() -> None:
-    """Infer LOSSES and TRAINABLE_LAYERS from BACKWARDS when omitted."""
+def test_user_defined_learner_infers_losses_and_trainable_layers() -> None:
+    """Infer LOSSES and TRAINABLE_LAYERS from LEARNERS when omitted."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss_a",
                 "TRAINABLE_LAYERS": ["model", "aux_model"],
@@ -117,15 +117,15 @@ def test_user_defined_backward_infers_losses_and_trainable_layers() -> None:
             },
         ],
     }
-    cfg = UserDefinedBackward.model_validate(raw)
+    cfg = UserDefinedLearner.model_validate(raw)
     assert cfg.LOSSES == ["loss_a"]
     assert set(cfg.TRAINABLE_LAYERS) == {"model", "aux_model"}
 
 
-def test_user_defined_backward_validates_unknown_losses() -> None:
-    """Raise when LOSSES includes names not present in BACKWARDS."""
+def test_user_defined_learner_validates_unknown_losses() -> None:
+    """Raise when LOSSES includes names not present in LEARNERS."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss_a",
                 "TRAINABLE_LAYERS": ["model"],
@@ -136,7 +136,7 @@ def test_user_defined_backward_validates_unknown_losses() -> None:
         "LOSSES": ["loss_a", "loss_b"],
     }
     with pytest.raises(SpecError, match="Unknown losses found"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 def test_user_defined_layer_validates_inference_flow_mismatch_cases() -> None:
@@ -150,10 +150,10 @@ def test_user_defined_layer_validates_inference_flow_mismatch_cases() -> None:
         UserDefinedLayer.model_validate({**base, "INFERENCE_FLOW": [["x", "y2"]]})
 
 
-def test_user_defined_backward_validates_missing_and_trainable_layer_errors() -> None:
+def test_user_defined_learner_validates_missing_and_trainable_layer_errors() -> None:
     """Raise for missing losses and unknown/missing trainable layers."""
     base = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss_a",
                 "TRAINABLE_LAYERS": ["model"],
@@ -169,17 +169,17 @@ def test_user_defined_backward_validates_missing_and_trainable_layer_errors() ->
         ]
     }
     with pytest.raises(SpecError, match="Missing losses"):
-        UserDefinedBackward.model_validate({**base, "LOSSES": ["loss_a"]})
+        UserDefinedLearner.model_validate({**base, "LOSSES": ["loss_a"]})
     with pytest.raises(SpecError, match="Unknown trainable layers found"):
-        UserDefinedBackward.model_validate({**base, "TRAINABLE_LAYERS": ["model", "extra"]})
+        UserDefinedLearner.model_validate({**base, "TRAINABLE_LAYERS": ["model", "extra"]})
     with pytest.raises(SpecError, match="Missing trainable layers found"):
-        UserDefinedBackward.model_validate({**base, "TRAINABLE_LAYERS": ["model"]})
+        UserDefinedLearner.model_validate({**base, "TRAINABLE_LAYERS": ["model"]})
 
 
-def test_template_backward_separates_raw_and_others() -> None:
+def test_template_learner_separates_raw_and_others() -> None:
     """Expose target raw fields and non-target extras separately."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss_a",
                 "TRAINABLE_LAYERS": ["model"],
@@ -189,10 +189,10 @@ def test_template_backward_separates_raw_and_others() -> None:
         ],
         "custom_option": {"enabled": True},
     }
-    template = TemplateBackward.model_validate(raw)
-    assert "BACKWARDS" in template.raw
+    template = TemplateLearner.model_validate(raw)
+    assert "LEARNERS" in template.raw
     assert "custom_option" in template.others
-    assert isinstance(template(), UserDefinedBackward)
+    assert isinstance(template(), UserDefinedLearner)
 
 
 def test_template_layer_call_with_merged_false_and_none_parameters() -> None:
@@ -230,10 +230,10 @@ def test_validate_name_raises_for_invalid_identifier() -> None:
         LayerBehavior.model_validate({"INPUTS": "x", "OUTPUTS": "y", "NAME": "not valid!"})
 
 
-def test_validate_name_raises_via_backward_behavior() -> None:
-    """BackwardBehavior NAME with invalid identifier raises SpecError."""
+def test_validate_name_raises_via_learner_behavior() -> None:
+    """LearnerBehavior NAME with invalid identifier raises SpecError."""
     with pytest.raises((SpecError, ValidationError)):
-        BackwardBehavior.model_validate(
+        LearnerBehavior.model_validate(
             {
                 "NAME": "123invalid",
                 "LOSS": "ce_loss",
@@ -244,30 +244,30 @@ def test_validate_name_raises_via_backward_behavior() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Instance passthrough – BackwardBehavior
+# Instance passthrough – LearnerBehavior
 # ---------------------------------------------------------------------------
 
 
-def test_backward_behavior_instance_passthrough() -> None:
-    """Passing an existing BackwardBehavior to model_validate returns it unchanged."""
+def test_learner_behavior_instance_passthrough() -> None:
+    """Passing an existing LearnerBehavior to model_validate returns it unchanged."""
     raw = {
         "LOSS": "ce_loss",
         "TRAINABLE_LAYERS": ["model"],
         "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
     }
-    bb = BackwardBehavior.model_validate(raw)
-    assert BackwardBehavior.model_validate(bb) is bb
+    bb = LearnerBehavior.model_validate(raw)
+    assert LearnerBehavior.model_validate(bb) is bb
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedBackward – MIXED_PRECISION without type raises
+# UserDefinedLearner – MIXED_PRECISION without type raises
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_backward_mixed_precision_type_without_mixed_precision_raises() -> None:
+def test_user_defined_learner_mixed_precision_type_without_mixed_precision_raises() -> None:
     """MIXED_PRECISION_TYPE set when MIXED_PRECISION is False raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "ce_loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -279,7 +279,7 @@ def test_user_defined_backward_mixed_precision_type_without_mixed_precision_rais
         "MIXED_PRECISION_TYPE": "bfloat16",
     }
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +345,14 @@ def test_layer_behavior_from_tuple_with_wrong_length_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedBackward — mixed precision None branch
+# UserDefinedLearner — mixed precision None branch
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_backward_mixed_precision_none_raises() -> None:
+def test_user_defined_learner_mixed_precision_none_raises() -> None:
     """MIXED_PRECISION=None with MIXED_PRECISION_TYPE set raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "ce_loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -364,18 +364,18 @@ def test_user_defined_backward_mixed_precision_none_raises() -> None:
         "MIXED_PRECISION_TYPE": "float16",
     }
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedBackward — loss not in outputs branch
+# UserDefinedLearner — loss not in outputs branch
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_backward_loss_not_in_flow_outputs_raises() -> None:
+def test_user_defined_learner_loss_not_in_flow_outputs_raises() -> None:
     """LOSS that does not appear as a flow output raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "missing_loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -385,18 +385,18 @@ def test_user_defined_backward_loss_not_in_flow_outputs_raises() -> None:
         ],
     }
     with pytest.raises(SpecError, match='Loss "missing_loss" must be in the outputs'):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedBackward — unknown/missing inputs and outputs
+# UserDefinedLearner — unknown/missing inputs and outputs
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_backward_unknown_inputs_raises() -> None:
+def test_user_defined_learner_unknown_inputs_raises() -> None:
     """INPUTS containing names not in the flow raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -407,13 +407,13 @@ def test_user_defined_backward_unknown_inputs_raises() -> None:
         "INPUTS": ["x", "extra_input"],
     }
     with pytest.raises(SpecError, match="Unknown inputs found"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
-def test_user_defined_backward_missing_inputs_raises() -> None:
+def test_user_defined_learner_missing_inputs_raises() -> None:
     """Omitting an input that the flow needs raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss1",
                 "TRAINABLE_LAYERS": ["model"],
@@ -430,13 +430,13 @@ def test_user_defined_backward_missing_inputs_raises() -> None:
         "INPUTS": ["x"],
     }
     with pytest.raises(SpecError, match="Missing inputs found"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
-def test_user_defined_backward_unknown_outputs_raises() -> None:
+def test_user_defined_learner_unknown_outputs_raises() -> None:
     """OUTPUTS with extra names not generated by flow raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -447,18 +447,18 @@ def test_user_defined_backward_unknown_outputs_raises() -> None:
         "OUTPUTS": ["loss", "ghost"],
     }
     with pytest.raises(SpecError, match="Unknown outputs found"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedBackward — inference flow mismatches
+# UserDefinedLearner — inference flow mismatches
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_backward_unknown_inputs_in_inference_flow_raises() -> None:
+def test_user_defined_learner_unknown_inputs_in_inference_flow_raises() -> None:
     """Unknown inputs in inference flow raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -469,13 +469,13 @@ def test_user_defined_backward_unknown_inputs_in_inference_flow_raises() -> None
         ],
     }
     with pytest.raises(SpecError, match="Unknown inputs found in inference flow"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
-def test_user_defined_backward_missing_inputs_in_inference_flow_raises() -> None:
+def test_user_defined_learner_missing_inputs_in_inference_flow_raises() -> None:
     """Missing inputs in inference flow raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -486,13 +486,13 @@ def test_user_defined_backward_missing_inputs_in_inference_flow_raises() -> None
         ],
     }
     with pytest.raises(SpecError, match="Missing inputs found in inference flow"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
-def test_user_defined_backward_unknown_outputs_in_inference_flow_raises() -> None:
+def test_user_defined_learner_unknown_outputs_in_inference_flow_raises() -> None:
     """Unknown outputs in inference flow raises SpecError."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -504,7 +504,7 @@ def test_user_defined_backward_unknown_outputs_in_inference_flow_raises() -> Non
         "OUTPUTS": ["loss"],
     }
     with pytest.raises(SpecError, match="Unknown outputs found in inference flow"):
-        UserDefinedBackward.model_validate(raw)
+        UserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------

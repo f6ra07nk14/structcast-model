@@ -368,3 +368,34 @@ def test_example_adamw_with_cosine_state_dict_covers_both_halves() -> None:
     state = optimizer.state_dict()
     assert set(state) == {"optimizer", "scheduler"}
     optimizer.load_state_dict(state)
+
+
+# ---------------------------------------------------------------------------
+# examples/torch/optimizers.py - OptimizerWithNativeScheduler
+# ---------------------------------------------------------------------------
+
+
+def test_example_native_scheduler_steps_the_schedule_on_epoch_end() -> None:
+    """A native scheduler counts epochs on its own, so the wrapper only has to step it once per epoch."""
+    module = _load_example_module()
+    optimizer = module.OptimizerWithNativeScheduler(
+        _named_params(),
+        optimizer_kwargs={"opt": "adam", "lr": 0.1},
+        scheduler_kwargs={"name": "LambdaLR", "lr_lambda": lambda epoch: 1.0 - 0.5 * epoch},
+    )
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    optimizer.on_epoch_end(BaseInfo(epoch=1))
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+
+
+def test_example_native_scheduler_state_dict_covers_both_halves() -> None:
+    """Schedule state must survive a resume, exactly as for the timm-scheduled combination."""
+    module = _load_example_module()
+    optimizer = module.OptimizerWithNativeScheduler(
+        _named_params(),
+        optimizer_kwargs={"opt": "adam", "lr": 0.1},
+        scheduler_kwargs={"name": "LambdaLR", "lr_lambda": lambda epoch: 1.0},
+    )
+    state = optimizer.state_dict()
+    assert set(state) == {"optimizer", "scheduler"}
+    optimizer.load_state_dict(state)

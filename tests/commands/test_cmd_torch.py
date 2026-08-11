@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Generator
 from contextlib import contextmanager
 import os
 import pathlib
+import sys
 import traceback
+from types import SimpleNamespace
 from typing import Any
 
 import mlflow
+from mlflow.tracking import MlflowClient
 import pytest
 from structcast.utils.base import configure_security
 import torch.distributed as dist
@@ -19,15 +21,16 @@ from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatc
 from typer import Typer
 from typer.testing import CliRunner
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BestCriterion, callbacks_session
+from structcast_model.base_trainer import BaseInfo, BestCriterion
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
+from structcast_model.torch.trainer import MLflowLogger
 from tests import ASSETS_DIR
 import torch
 
 LINEAR_CFG = str(ASSETS_DIR / "cfg" / "torch" / "Linear.yaml")
 MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
-BACKWARD_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml")
+LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
@@ -39,11 +42,9 @@ _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _get_state_dict = _CMD_GLOBALS["_get_state_dict"]
-_instantiate_models = _CMD_GLOBALS["_instantiate_models"]
-_log_criteria = _CMD_GLOBALS["_log_criteria"]
 _on_best = _CMD_GLOBALS["_on_best"]
-_save_training_state = _CMD_GLOBALS["_save_training_state"]
 _unwrap_ddp = _CMD_GLOBALS["_unwrap_ddp"]
+TrainingStateSaver = _CMD_GLOBALS["TrainingStateSaver"]
 
 
 @contextmanager
@@ -58,8 +59,8 @@ def patch_cmd_globals(**kwargs: Any) -> Generator[None, Any, None]:
 
 
 @pytest.fixture(autouse=True)
-def _clean_global_callbacks() -> Generator[None, None, None]:
-    """Ensure GLOBAL_CALLBACKS and torch dispatch stack are clean around each test."""
+def _clean_torch_dispatch_stack() -> Generator[None, None, None]:
+    """Ensure the torch dispatch stack is clean around each test."""
 
     def _drain_dispatch_stack() -> None:
         for mode in reversed(_get_current_dispatch_mode_stack()):
@@ -67,10 +68,8 @@ def _clean_global_callbacks() -> Generator[None, None, None]:
             # FlopCounterMode.__exit__ calling print_fn on a closed StringIO.
             TorchDispatchMode.__exit__(mode, None, None, None)
 
-    GLOBAL_CALLBACKS.clear()
     _drain_dispatch_stack()
     yield
-    GLOBAL_CALLBACKS.clear()
     _drain_dispatch_stack()
 
 
@@ -79,12 +78,16 @@ def _clean_global_callbacks() -> Generator[None, None, None]:
 # ---------------------------------------------------------------------------
 
 
-class _SimpleModel(torch.nn.Module):
-    """A tiny model for testing: Linear(4 -> 2) returning a dict."""
+class SimpleModel(torch.nn.Module):
+    """A tiny model for testing: Linear(4 -> 2) returning a dict.
+
+    Public so that object patterns can address it: the learner factory imports what it builds.
+    """
 
     outputs: list[str] = ["logits"]
 
     def __init__(self) -> None:
+        """Create the linear layer."""
         super().__init__()
         self.fc = torch.nn.Linear(4, 2)
 
@@ -107,12 +110,13 @@ class _SimpleLoss(torch.nn.Module):
         return {"loss": torch.nn.functional.cross_entropy(logits, target)}
 
 
-class _SimpleBackward:
-    """Minimal backward implementing the Backward protocol with a real optimizer."""
+class SimpleLearner:
+    """Minimal learner implementing the Learner protocol with a real optimizer."""
 
     outputs: list[str] = ["loss", "acc"]
 
     def __init__(self, **models: torch.nn.Module) -> None:
+        """Keep the models and build one optimizer over the first of them."""
         self._models = models
         model = next(iter(models.values()))
         self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -155,6 +159,13 @@ class _SimpleBackward:
         return {"optimizer": [{k: v for k, v in pg.items() if k != "params"} for pg in self._optimizer.param_groups]}
 
 
+class LearnerWithoutOutputs(SimpleLearner):
+    """Learner whose ``outputs`` attribute is missing, as a learner built from a bare class can be."""
+
+    # Raising keeps `hasattr(learner, "outputs")` False; mypy only sees a property replacing a list attribute.
+    outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
+
+
 def _make_training_dataset() -> list[dict[str, torch.Tensor]]:
     """Create a minimal training dataset (list of batches)."""
     return [{"x": torch.randn(4, 4), "target": torch.randint(0, 2, (4,))} for _ in range(3)]
@@ -174,19 +185,28 @@ def _train_callback() -> Any:
     raise AssertionError("train command not found")
 
 
+def _address(name: str) -> str:
+    """Return the import address of a class of this test module, for use in object patterns."""
+    return f"{__name__}.{name}"
+
+
+MODEL_PATTERN: list[Any] = ["_obj_", {"_addr_": _address("SimpleModel")}, "_call_"]
+"""Object pattern building one `SimpleModel`."""
+
+
+def _learner_pattern(classname: str = "SimpleLearner") -> list[Any]:
+    """Return the object pattern resolving to a learner class, which the factory calls with the models."""
+    return ["_obj_", {"_addr_": _address(classname)}]
+
+
 def _make_instantiate_fn(
     *,
     training_data: list[dict[str, torch.Tensor]],
     validation_data: list[dict[str, torch.Tensor]] | None = None,
-    backward_cls: type = _SimpleBackward,
 ) -> Any:
-    """Build a replacement for ``instantiate`` that returns real objects."""
+    """Build a replacement for ``instantiate_object`` that returns the datasets of a run."""
 
     def _side_effect(raw: Any) -> Any:
-        if raw == "MODEL":
-            return _SimpleModel()
-        if raw == "BACKWARD":
-            return backward_cls
         if raw == "TRAIN_DS":
             return training_data
         if raw == "VALID_DS":
@@ -224,7 +244,7 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
     """'create --help' should exit with code 0."""
     assert cli_runner.invoke(app, ["create", "--help"]).exit_code == 0
     assert cli_runner.invoke(app, ["create", "model", "--help"]).exit_code == 0
-    assert cli_runner.invoke(app, ["create", "backward", "--help"]).exit_code == 0
+    assert cli_runner.invoke(app, ["create", "learner", "--help"]).exit_code == 0
     assert cli_runner.invoke(app, ["ptflops", "--help"]).exit_code == 0
     assert cli_runner.invoke(app, ["calflops", "--help"]).exit_code == 0
 
@@ -320,26 +340,30 @@ def test_time_linear(cli_runner: CliRunner) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 'create backward' command
+# 'create learner' command
 # ---------------------------------------------------------------------------
 
 
-def test_create_backward_calls_torch_backward_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create backward' should generate a backward script from a real configuration."""
+def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create learner' should generate a learner script from a real configuration."""
     configure_security()
-    out = str(tmp_path / "backward.py")
-    result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
+    out = str(tmp_path / "learner.py")
+    result = cli_runner.invoke(app, ["create", "learner", LEARNER_CFG, "--output", out])
     assert result.exit_code == 0, result.output
-    assert "class Backward" in (tmp_path / "backward.py").read_text()
+    script = (tmp_path / "learner.py").read_text()
+    assert "class Learner" in script
+    # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
+    for member in ("def update(self", "def training_step(self", "def inference_step(self", "def models(self"):
+        assert member in script
 
 
-def test_create_backward_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create backward' default classname should produce a class named 'Backward'."""
+def test_create_learner_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create learner' default classname should produce a class named 'Learner'."""
     configure_security()
-    out = str(tmp_path / "backward.py")
-    result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
+    out = str(tmp_path / "learner.py")
+    result = cli_runner.invoke(app, ["create", "learner", LEARNER_CFG, "--output", out])
     assert result.exit_code == 0, result.output
-    assert "class Backward" in (tmp_path / "backward.py").read_text()
+    assert "class Learner" in (tmp_path / "learner.py").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +376,7 @@ def test_calflops_runs_with_real_model(cli_runner: CliRunner) -> None:
     """'calflops' should run calflops on a real model and print FLOPs, MACs, parameters."""
     configure_security()
 
-    deps = {"instantiate_object": lambda raw: _SimpleModel()}
+    deps = {"instantiate_object": lambda raw: SimpleModel()}
     with patch_cmd_globals(**deps):
         result = cli_runner.invoke(
             app,
@@ -420,33 +444,6 @@ def test_compile_module_returns_module_when_no_kwargs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _instantiate_models
-# ---------------------------------------------------------------------------
-
-
-def test_instantiate_models_creates_ordered_dict() -> None:
-    """_instantiate_models creates an OrderedDict of models from patterns."""
-    configure_security()
-    patterns = [{"model": {"_obj_": [["_addr_", "torch.nn.Identity"], "_call_"]}}]
-    result = _instantiate_models(patterns)
-    assert isinstance(result, OrderedDict)
-    assert "model" in result
-    assert isinstance(result["model"], torch.nn.Identity)
-
-
-def test_instantiate_models_raises_for_multiple_keys() -> None:
-    """_instantiate_models raises ValueError when a pattern dict has multiple keys."""
-    with pytest.raises(ValueError, match="exactly one model definition"):
-        _instantiate_models([{"a": {}, "b": {}}])
-
-
-def test_instantiate_models_returns_empty_for_empty_list() -> None:
-    """_instantiate_models returns empty OrderedDict for empty patterns list."""
-    result = _instantiate_models([])
-    assert result == OrderedDict()
-
-
-# ---------------------------------------------------------------------------
 # _get_module_outputs
 # ---------------------------------------------------------------------------
 
@@ -501,33 +498,45 @@ def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_on_best_logs_metric_to_mlflow(tmp_path: pathlib.Path) -> None:
-    """_on_best logs the best metric value to MLflow."""
-    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    mlflow.set_experiment("test_on_best")
-    with mlflow.start_run():
-        info = BaseInfo()
-        info.epoch = 1
-        info.step = 5
-        best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
-        best._best = 0.3
-        best._step = 5
-        model = torch.nn.Linear(4, 2)
-        _on_best(info, best, save=True, model=model)
+def _best_at_step(step: int, value: float = 0.3) -> BestCriterion[torch.nn.Module]:
+    """Return a best criterion that reached *value* at *step*."""
+    best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
+    best._best = value
+    best._step = step
+    return best
 
 
-def test_on_best_does_not_save_when_save_false(tmp_path: pathlib.Path) -> None:
-    """_on_best with save=False only logs metric, not state dict."""
+def _run_on_best(tmp_path: pathlib.Path, experiment: str, *, save: bool, step: int = 5) -> str:
+    """Record one best value through a real MLflow logger and return the run id it wrote to."""
     mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    mlflow.set_experiment("test_on_best_no_save")
-    with mlflow.start_run():
-        info = BaseInfo()
-        info.epoch = 1
-        info.step = 5
-        best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
-        best._best = 0.3
-        best._step = 5
-        _on_best(info, best, save=False, model=torch.nn.Linear(4, 2))
+    info = BaseInfo()
+    info.epoch = 1
+    info.step = 5
+    with MLflowLogger(experiment) as logger:
+        run = mlflow.active_run()
+        assert run is not None
+        _on_best(info, _best_at_step(step), logger=logger, save=save, model=torch.nn.Linear(4, 2))
+        return str(run.info.run_id)
+
+
+def test_on_best_logs_the_best_value_through_the_logger(tmp_path: pathlib.Path) -> None:
+    """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
+    run_id = _run_on_best(tmp_path, "test_on_best", save=False)
+    assert mlflow.get_run(run_id).data.metrics["best_val_loss"] == 0.3
+
+
+@pytest.mark.parametrize(("save", "expected"), [(True, True), (False, False)])
+def test_on_best_saves_the_state_only_when_asked(tmp_path: pathlib.Path, save: bool, expected: bool) -> None:
+    """Weights are only written for criteria the user asked to save, since every save costs disk space."""
+    run_id = _run_on_best(tmp_path, f"test_on_best_save_{save}", save=save)
+    artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run_id)]
+    assert ("best_val_loss" in artifacts) is expected
+
+
+def test_on_best_does_not_save_a_stale_best(tmp_path: pathlib.Path) -> None:
+    """A best reached at an earlier step must not overwrite the saved weights of the current models."""
+    run_id = _run_on_best(tmp_path, "test_on_best_stale", save=True, step=1)
+    assert [artifact.path for artifact in MlflowClient().list_artifacts(run_id)] == []
 
 
 # ---------------------------------------------------------------------------
@@ -544,8 +553,8 @@ def test_train_raises_for_empty_model_patterns() -> None:
             initializer_patterns=None,
             shapes=None,
             device="cpu",
-            backward_pattern="IGNORED",
-            backward_outputs=None,
+            learner_pattern="IGNORED",
+            learner_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
             epochs=1,
@@ -576,12 +585,12 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
     }
     with patch_cmd_globals(**deps), pytest.raises(ValueError, match="exactly one model definition"):
         train_fn(
-            model_patterns=[{"a": "MODEL", "b": "MODEL"}],
+            model_patterns=[{"a": MODEL_PATTERN, "b": MODEL_PATTERN}],
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            backward_pattern="BACKWARD",
-            backward_outputs=None,
+            learner_pattern=_learner_pattern(),
+            learner_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
             epochs=1,
@@ -604,29 +613,18 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
 
 
 def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
-    """`train` should fail when backward module lacks ``outputs`` and no fallback is given."""
+    """`train` should fail when the learner lacks ``outputs`` and no fallback is given."""
     configure_security()
     train_fn = _train_callback()
-
-    class _BackwardNoOutputs(_SimpleBackward):
-        """Backward without outputs attribute."""
-
-        outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
-
-    deps = {
-        "instantiate_object": _make_instantiate_fn(
-            training_data=_make_training_dataset(),
-            backward_cls=_BackwardNoOutputs,
-        ),
-    }
-    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "backward" does not have an "outputs"'):
+    deps = {"instantiate_object": _make_instantiate_fn(training_data=_make_training_dataset())}
+    with patch_cmd_globals(**deps), pytest.raises(ValueError, match='Module "learner" does not have an "outputs"'):
         train_fn(
-            model_patterns=[{"model": "MODEL"}],
+            model_patterns=[{"model": MODEL_PATTERN}],
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            backward_pattern="BACKWARD",
-            backward_outputs=None,
+            learner_pattern=_learner_pattern("LearnerWithoutOutputs"),
+            learner_outputs=None,
             compile_pattern=None,
             trainer_pattern=None,
             epochs=1,
@@ -658,37 +656,34 @@ def _invoke_train(
     *,
     ci: bool = True,
     validation_data: list[dict[str, torch.Tensor]] | None = None,
-    backward_outputs: list[str] | None = None,
+    learner_outputs: list[str] | None = None,
     lower_criteria: list[str] | None = None,
     higher_criteria: list[str] | None = None,
     save_criteria: list[str] | None = None,
-    backward_cls: type = _SimpleBackward,
+    learner_classname: str = "SimpleLearner",
+    logger_name: str = "mlflow",
     log_arguments: list[dict[str, Any]] | None = None,
     log_artifacts: list[pathlib.Path] | None = None,
     epochs: int = 2,
 ) -> None:
-    """Invoke the ``train`` callback with real modules, patching only ``instantiate``."""
+    """Invoke the ``train`` callback with real modules, patching only the dataset instantiation."""
     configure_security()
     training_data = _make_training_dataset()
     if validation_data is None:
         validation_data = _make_validation_dataset()
     deps = {
-        "instantiate_object": _make_instantiate_fn(
-            training_data=training_data,
-            validation_data=validation_data,
-            backward_cls=backward_cls,
-        ),
+        "instantiate_object": _make_instantiate_fn(training_data=training_data, validation_data=validation_data),
     }
     mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
     train_fn = _train_callback()
     with patch_cmd_globals(**deps):
         train_fn(
-            model_patterns=[{"model": "MODEL"}],
+            model_patterns=[{"model": MODEL_PATTERN}],
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
-            backward_pattern="BACKWARD",
-            backward_outputs=backward_outputs,
+            learner_pattern=_learner_pattern(learner_classname),
+            learner_outputs=learner_outputs,
             compile_pattern=None,
             trainer_pattern=None,
             epochs=epochs,
@@ -702,6 +697,7 @@ def _invoke_train(
             seed=42,
             matmul_precision="high",
             experiment="test-e2e",
+            logger_name=logger_name,
             log_arguments=log_arguments,
             log_artifacts=log_artifacts,
             ci=ci,
@@ -711,7 +707,7 @@ def _invoke_train(
 
 
 def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
-    """Full end-to-end train in CI mode with real model, loss, metric, backward."""
+    """Full end-to-end train in CI mode with a real model, learner, tracker, and MLflow logger."""
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
     _invoke_train(
@@ -720,21 +716,20 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
         log_arguments=[{"run": "test"}],
         log_artifacts=[artifact],
     )
+    run = mlflow.search_runs(experiment_names=["test-e2e"], output_format="list")[0]
+    assert run.data.metrics["val_loss"] == pytest.approx(0.3)
+    assert run.data.metrics["best_acc"] == pytest.approx(0.9)
+    artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)]
+    assert {"training_state", "best_acc", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
 
 
-def test_train_ci_mode_with_backward_outputs_fallback(tmp_path: pathlib.Path) -> None:
-    """Train should accept explicit --backward-outputs when backward has no ``outputs`` attr."""
-
-    class _BackwardNoOutputs(_SimpleBackward):
-        """Backward without outputs attribute."""
-
-        outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
-
+def test_train_ci_mode_with_learner_outputs_fallback(tmp_path: pathlib.Path) -> None:
+    """Train should accept explicit --learner-outputs when the learner has no ``outputs`` attribute."""
     _invoke_train(
         tmp_path,
         ci=True,
-        backward_cls=_BackwardNoOutputs,
-        backward_outputs=["loss", "acc"],
+        learner_classname="LearnerWithoutOutputs",
+        learner_outputs=["loss", "acc"],
         save_criteria=[],
         lower_criteria=[],
         higher_criteria=[],
@@ -742,8 +737,58 @@ def test_train_ci_mode_with_backward_outputs_fallback(tmp_path: pathlib.Path) ->
 
 
 def test_train_non_ci_mode_uses_pbar(tmp_path: pathlib.Path) -> None:
-    """Non-CI mode should use tqdm progress bar callbacks."""
+    """Non-CI mode should use the tqdm progress bar callback."""
     _invoke_train(tmp_path, ci=False)
+
+
+class _FakeWandb:
+    """Stand-in for the wandb package, recording what `WandbLogger` sends it."""
+
+    def __init__(self, run_dir: pathlib.Path) -> None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.run = SimpleNamespace(dir=str(run_dir))
+        self.config = SimpleNamespace(update=self._update_config)
+        self.projects: list[str] = []
+        self.finished = 0
+        self.params: dict[str, Any] = {}
+        self.metrics: list[tuple[dict[str, Any], int]] = []
+        self.saved: list[str] = []
+
+    def _update_config(self, params: dict[str, Any]) -> None:
+        self.params.update(params)
+
+    def init(self, project: str) -> None:
+        """Start a run."""
+        self.projects.append(project)
+
+    def finish(self) -> None:
+        """End the run."""
+        self.finished += 1
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        """Record metric values."""
+        self.metrics.append((metrics, step))
+
+    def save(self, path: str) -> None:
+        """Record an artifact."""
+        self.saved.append(path)
+
+
+def test_train_logs_the_whole_run_through_the_selected_logger(tmp_path: pathlib.Path, monkeypatch: Any) -> None:
+    """--logger wandb must route the run lifecycle and the metrics to wandb, not to MLflow."""
+    fake = _FakeWandb(tmp_path / "wandb_run")
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_text("dummy")
+    _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
+    assert fake.projects == ["test-e2e"]
+    assert fake.finished == 1
+    assert fake.params["epochs"] == 2
+    assert fake.saved == [str(artifact)]
+    assert [step for _, step in fake.metrics] == [1, 1, 1, 2, 2, 2]
+    assert fake.metrics[0][0]["val_loss"] == pytest.approx(0.3)
+    assert (tmp_path / "wandb_run" / "arguments.yaml").exists()
+    assert (tmp_path / "wandb_run" / "training_state.pt").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -793,33 +838,33 @@ def _ddp_train_worker(
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
-            with callbacks_session():
-                train_fn.__wrapped__(
-                    model_patterns=[{"model": "MODEL"}],
-                    initializer_patterns=None,
-                    shapes=[{"x": (4,)}],
-                    device="cpu",
-                    backward_pattern="BACKWARD",
-                    backward_outputs=None,
-                    compile_pattern=None,
-                    trainer_pattern=None,
-                    epochs=2,
-                    start_epoch=1,
-                    training_dataset_pattern="TRAIN_DS",
-                    validation_dataset_pattern="VALID_DS",
-                    validation_frequency=1,
-                    lower_criteria=["loss"],
-                    higher_criteria=["acc"],
-                    save_criteria=["acc"],
-                    seed=42,
-                    matmul_precision="high",
-                    experiment="test-ddp",
-                    log_arguments=None,
-                    log_artifacts=None,
-                    ci=ci,
-                    dist_backend="gloo",
-                    dist_url=f"file://{init_file}",
-                )
+            train_fn(
+                model_patterns=[{"model": MODEL_PATTERN}],
+                initializer_patterns=None,
+                shapes=[{"x": (4,)}],
+                device="cpu",
+                learner_pattern=_learner_pattern(),
+                learner_outputs=None,
+                compile_pattern=None,
+                trainer_pattern=None,
+                epochs=2,
+                start_epoch=1,
+                training_dataset_pattern="TRAIN_DS",
+                validation_dataset_pattern="VALID_DS",
+                validation_frequency=1,
+                lower_criteria=["loss"],
+                higher_criteria=["acc"],
+                save_criteria=["acc"],
+                seed=42,
+                matmul_precision="high",
+                experiment="test-ddp",
+                logger_name="mlflow",
+                log_arguments=None,
+                log_artifacts=None,
+                ci=ci,
+                dist_backend="gloo",
+                dist_url=f"file://{init_file}",
+            )
         finally:
             _CMD_GLOBALS.update(originals)
     except Exception:
@@ -863,33 +908,33 @@ def _ddp_rank_gating_worker(
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
-            with callbacks_session():
-                train_fn.__wrapped__(
-                    model_patterns=[{"model": "MODEL"}],
-                    initializer_patterns=None,
-                    shapes=[{"x": (4,)}],
-                    device="cpu",
-                    backward_pattern="BACKWARD",
-                    backward_outputs=None,
-                    compile_pattern=None,
-                    trainer_pattern=None,
-                    epochs=1,
-                    start_epoch=1,
-                    training_dataset_pattern="TRAIN_DS",
-                    validation_dataset_pattern=None,
-                    validation_frequency=1,
-                    lower_criteria=[],
-                    higher_criteria=[],
-                    save_criteria=[],
-                    seed=42,
-                    matmul_precision="high",
-                    experiment="test-rank-gating",
-                    log_arguments=None,
-                    log_artifacts=None,
-                    ci=True,
-                    dist_backend="gloo",
-                    dist_url=f"file://{init_file}",
-                )
+            train_fn(
+                model_patterns=[{"model": MODEL_PATTERN}],
+                initializer_patterns=None,
+                shapes=[{"x": (4,)}],
+                device="cpu",
+                learner_pattern=_learner_pattern(),
+                learner_outputs=None,
+                compile_pattern=None,
+                trainer_pattern=None,
+                epochs=1,
+                start_epoch=1,
+                training_dataset_pattern="TRAIN_DS",
+                validation_dataset_pattern=None,
+                validation_frequency=1,
+                lower_criteria=[],
+                higher_criteria=[],
+                save_criteria=[],
+                seed=42,
+                matmul_precision="high",
+                experiment="test-rank-gating",
+                logger_name="mlflow",
+                log_arguments=None,
+                log_artifacts=None,
+                ci=True,
+                dist_backend="gloo",
+                dist_url=f"file://{init_file}",
+            )
         finally:
             _CMD_GLOBALS.update(originals)
         marker = pathlib.Path(result_dir) / f"rank_{rank}_done"
@@ -932,33 +977,33 @@ def _ddp_seed_offset_worker(
         originals = {k: _CMD_GLOBALS.get(k) for k in deps}
         _CMD_GLOBALS.update(deps)
         try:
-            with callbacks_session():
-                train_fn.__wrapped__(
-                    model_patterns=[{"model": "MODEL"}],
-                    initializer_patterns=None,
-                    shapes=[{"x": (4,)}],
-                    device="cpu",
-                    backward_pattern="BACKWARD",
-                    backward_outputs=None,
-                    compile_pattern=None,
-                    trainer_pattern=None,
-                    epochs=1,
-                    start_epoch=1,
-                    training_dataset_pattern="TRAIN_DS",
-                    validation_dataset_pattern=None,
-                    validation_frequency=1,
-                    lower_criteria=[],
-                    higher_criteria=[],
-                    save_criteria=[],
-                    seed=seed,
-                    matmul_precision="high",
-                    experiment="test-seed",
-                    log_arguments=None,
-                    log_artifacts=None,
-                    ci=True,
-                    dist_backend="gloo",
-                    dist_url=f"file://{init_file}",
-                )
+            train_fn(
+                model_patterns=[{"model": MODEL_PATTERN}],
+                initializer_patterns=None,
+                shapes=[{"x": (4,)}],
+                device="cpu",
+                learner_pattern=_learner_pattern(),
+                learner_outputs=None,
+                compile_pattern=None,
+                trainer_pattern=None,
+                epochs=1,
+                start_epoch=1,
+                training_dataset_pattern="TRAIN_DS",
+                validation_dataset_pattern=None,
+                validation_frequency=1,
+                lower_criteria=[],
+                higher_criteria=[],
+                save_criteria=[],
+                seed=seed,
+                matmul_precision="high",
+                experiment="test-seed",
+                logger_name="mlflow",
+                log_arguments=None,
+                log_artifacts=None,
+                ci=True,
+                dist_backend="gloo",
+                dist_url=f"file://{init_file}",
+            )
         finally:
             _CMD_GLOBALS.update(originals)
         # After train(), torch manual_seed was called with (seed + rank).

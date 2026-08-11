@@ -24,6 +24,7 @@ from typing import Any
 from timm.scheduler.scheduler_factory import create_scheduler_v2
 
 from structcast_model.torch.optimizers import create_opt
+import torch
 
 
 class AdamWWithCosine:
@@ -63,6 +64,45 @@ class AdamWWithCosine:
     def on_epoch_end(self, info: Any, **models: Any) -> None:
         """Advance a per-epoch schedule."""
         self.scheduler.step(info.epoch, info.logs().get(self.criterion))
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the optimizer and schedule state, so a resumed run keeps its schedule."""
+        return {"optimizer": self.optimizer.state_dict(), "scheduler": self.scheduler.state_dict()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore the optimizer and schedule state."""
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+
+
+class OptimizerWithNativeScheduler:
+    """An optimizer stepping a native `torch.optim.lr_scheduler` schedule, usable anywhere an optimizer is."""
+
+    def __init__(self, params: Any, optimizer_kwargs: dict[str, Any], scheduler_kwargs: dict[str, Any]) -> None:
+        """Create the optimizer and its schedule.
+
+        Args:
+            params (Any): The named model parameters to optimize.
+            optimizer_kwargs (dict[str, Any]): Keyword arguments for `create_opt`, e.g. `opt` and `lr`.
+            scheduler_kwargs (dict[str, Any]): Keyword arguments for the scheduler, plus the required
+                `name` of the `torch.optim.lr_scheduler` class to build.
+        """
+        scheduler_kwargs = dict(scheduler_kwargs)
+        scheduler_type = getattr(torch.optim.lr_scheduler, scheduler_kwargs.pop("name"))
+        self.optimizer = create_opt(params, **optimizer_kwargs)
+        self.scheduler = scheduler_type(optimizer=self.optimizer, **scheduler_kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate the `Optimizer` interface to the wrapped optimizer.
+
+        This keeps generated learner code (`step`, `zero_grad`, `param_groups`) and
+        `torch.amp.GradScaler` working on this object unchanged.
+        """
+        return getattr(self.optimizer, name)
+
+    def on_epoch_end(self, info: Any, **models: Any) -> None:
+        """Advance the schedule, which native schedulers count in epochs."""
+        self.scheduler.step()
 
     def state_dict(self) -> dict[str, Any]:
         """Return the optimizer and schedule state, so a resumed run keeps its schedule."""
