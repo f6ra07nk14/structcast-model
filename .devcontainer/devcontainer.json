@@ -1,0 +1,83 @@
+{
+    "name": "codex-cli-devcontainer",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".",
+        "args": {
+            "UV_VERSION": "latest",
+            "NVM_VERSION": "v0.40.5",
+            "NODE_VERSION": "20"
+        }
+    },
+    "remoteUser": "vscode",
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "initializeCommand": "bash -lc 'mkdir -p \"$HOME/.codex\" \"$HOME/.claude\" && if [ ! -e \"$HOME/.claude.json\" ]; then printf \"{}\\n\" > \"$HOME/.claude.json\" && chmod 600 \"$HOME/.claude.json\"; fi'",
+    "runArgs": [
+        "--gpus=all",
+        "--cap-add=SYS_ADMIN",
+        "--cap-add=SYS_CHROOT",
+        "--cap-add=SETUID",
+        "--cap-add=SETGID",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt=seccomp=unconfined"
+    ],
+    "containerEnv": {
+        "UV_CACHE_DIR": "/home/vscode/.cache/uv",
+        "UV_LINK_MODE": "copy",
+        "CODEX_HOME": "/home/vscode/.codex",
+        "CLAUDE_HOME": "/home/vscode/.claude",
+        "NVM_DIR": "/home/vscode/.nvm",
+        "NODE_VERSION": "20",
+        "TERM": "xterm-256color"
+    },
+    // "remoteEnv": {
+    //     "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}"
+    // },
+    "mounts": [
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+        "source=uv-cache,target=/home/vscode/.cache/uv,type=volume",
+        // Bind-mount Codex state so auth, config, and session history are
+        // shared between the host and this devcontainer. The Codex binary
+        // payload is installed outside this path in the image.
+        "source=${localEnv:HOME}/.codex,target=/home/vscode/.codex,type=bind",
+        // Bind-mount Claude Code state (~/.claude.json holds login/account
+        // state, ~/.claude holds sessions/plugins/settings) so it is shared
+        // with the host and survives container rebuilds and volume cleanup.
+        // Host ~/.claude must be writable by UID 1000 (matches remoteUser
+        // vscode). Note: plugin metadata stores absolute /home/vscode/...
+        // paths, so this directory is only fully usable from inside the
+        // container unless the host home layout matches.
+        "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind",
+        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
+        // Use a stable project volume so shell history survives container rebuilds.
+        "source=commandhistory,target=/commandhistory,type=volume"
+    ],
+    "postCreateCommand": "bash .devcontainer/post-create.sh",
+    "postStartCommand": "bash .devcontainer/post-start.sh",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+                "python.terminal.activateEnvironment": true,
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "claudeCode.initialPermissionMode": "bypassPermissions",
+                "claudeCode.allowDangerouslySkipPermissions": true,
+                "files.eol": "\n"
+            },
+            "extensions": [
+                "intellsmi.comment-translate",
+                "openai.chatgpt",
+                "anthropic.claude-code",
+                "github.copilot-chat",
+                "ms-python.python",
+                "charliermarsh.ruff",
+                "ms-azuretools.vscode-docker",
+                "github.vscode-github-actions",
+                "tamasfe.even-better-toml",
+                "davidanson.vscode-markdownlint",
+                "samuelcolvin.jinjahtml",
+                "yzhang.markdown-all-in-one"
+            ]
+        }
+    }
+}
