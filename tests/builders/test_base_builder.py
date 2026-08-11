@@ -10,7 +10,6 @@ import pytest
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SpecIntermediate
-from structcast.utils.base import configure_security
 
 from structcast_model.builders.base_builder import (
     BaseLearnerBuilder,
@@ -234,12 +233,8 @@ def test_base_model_builder_get_sublayer_cfg_with_type(tmp_path: Path) -> None:
     )
     builder = BaseModelBuilder(raw={"FLOW": []})
     cfg_unit = UserLayer.model_validate({"CFG": cfg_path, "TYPE": "Backbone"})
-    try:
-        configure_security()
-        subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
-        assert subclassname.endswith("Backbone")
-    finally:
-        configure_security()
+    subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
+    assert subclassname.endswith("Backbone")
 
 
 def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:

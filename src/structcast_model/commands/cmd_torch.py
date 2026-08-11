@@ -7,7 +7,7 @@ import random
 from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from structcast.utils.base import configure_security, dump_yaml_to_string
+from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.base_trainer import (
@@ -216,7 +216,6 @@ def measure_inference_time(
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
-    configure_security()
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
     device = torch_trainer.get_torch_device(device)
@@ -269,7 +268,6 @@ def call_ptflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    configure_security()
     device = torch_trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
@@ -304,7 +302,6 @@ def call_calflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    configure_security()
     device = torch_trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
@@ -450,7 +447,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     """Train a PyTorch model, recording the run to an experiment tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    configure_security()
     device, global_rank, _, world_size, distributed = torch_trainer.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )

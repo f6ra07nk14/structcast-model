@@ -4,22 +4,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import logging
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import pytest
-from structcast.utils.base import configure_security
 
 from structcast_model.flax.trainer import create_jax_inputs, get_jax_device, get_jax_devices
-
-
-@pytest.fixture
-def allow_module_imports() -> Any:
-    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security()
-    yield
-    configure_security()
 
 
 def test_create_jax_inputs_from_int_tuple_returns_array() -> None:
@@ -70,7 +60,7 @@ def test_create_jax_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: py
     assert "Falling back to zeros" in caplog.text
 
 
-def test_create_jax_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+def test_create_jax_inputs_honours_explicit_initializer() -> None:
     """An explicit `_INIT_` address replaces the dtype-based default initializer."""
     result = create_jax_inputs({"_SHAPE_": [4], "_INIT_": "jax.numpy.ones"})
     assert jnp.array_equal(result, jnp.ones((1, 4), dtype=jnp.bfloat16))

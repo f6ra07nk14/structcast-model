@@ -8,7 +8,6 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 import pytest
-from structcast.utils.base import configure_security
 
 import keras
 from structcast_model.keras.trainer import (
@@ -17,14 +16,6 @@ from structcast_model.keras.trainer import (
     get_keras_device,
     initial_model,
 )
-
-
-@pytest.fixture
-def allow_module_imports() -> Any:
-    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security()
-    yield
-    configure_security()
 
 
 def test_create_numpy_inputs_from_int_tuple_returns_array() -> None:
@@ -130,7 +121,7 @@ def test_create_numpy_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: 
     assert "Falling back to zeros" in caplog.text
 
 
-def test_create_numpy_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+def test_create_numpy_inputs_honours_explicit_initializer() -> None:
     """An explicit `_INIT_` address replaces the dtype-based default initializer."""
     result = create_numpy_inputs({"_SHAPE_": [4], "_INIT_": "numpy.ones"})
     assert np.array_equal(result, np.ones((1, 4), dtype=ml_dtypes.bfloat16))
