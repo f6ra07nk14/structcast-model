@@ -1,0 +1,198 @@
+# Examples
+
+Two ways to build the same training program:
+
+| File                                             | What it shows                                                             |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| [`torch/simple_training.py`](torch/simple_training.py) | A complete training program written by hand against the trainer API   |
+| [`torch/optimizers.py`](torch/optimizers.py)     | Optimizer + scheduler compositions referenced from YAML by file path      |
+
+Run the tutorial:
+
+```bash
+uv run python examples/torch/simple_training.py
+```
+
+It trains a two-layer MLP on a synthetic dataset for three epochs and finishes in a few seconds on
+the CPU.
+
+## Walkthrough: `torch/simple_training.py`
+
+### The dataset
+
+A dataset is any iterable of dictionaries. `make_dataset` builds a list of pre-made batches from a
+seeded `torch.Generator`, so no download and no `DataLoader` are involved:
+
+```python
+dataset.append({"x": x, "y": y})
+```
+
+The keys of each dictionary become the keyword arguments of the learner's steps: the trainer calls
+`training_step(**inputs)` for every item it pulls from the dataset.
+
+### The learner
+
+`SimpleLearner` is the object the redesign asks you to write per model. It implements the `Learner`
+protocol — nothing is subclassed, nothing is registered:
+
+- **`models`** — the models by name. The trainer passes them as keyword arguments to every callback.
+- **`update(step)`** — whether this step applied the optimizers. Returning `True` on every step means
+  "one step, one update"; a learner accumulating gradients over N batches returns `True` only every
+  N-th step, and the trainer fires `on_update` that often.
+- **`training_step(**inputs)`** — forward, backward, optimizer step. Returns the criteria of the step.
+- **`inference_step(**inputs)`** — the validation counterpart, returning the same criteria.
+
+The optimizer lives on the learner, together with its schedule. `SimpleLearner` also defines
+`on_epoch_end`, which advances the schedule after each epoch. The trainer finds that method by
+checking the learner against the `OnEpochEnd` protocol, so no registration call is needed.
+
+Two optional properties are read by the rest of the toolkit when present: `optimizers` (the CLI
+saves their state between epochs, and the trainer scans them for event protocols as well) and
+`learning_rates` (printed next to the criteria by `Printer` and logged by the loggers).
+
+### The tracker
+
+The trainer calls the tracker once per step with the dictionary the step returned, then writes the
+result into the logs of the current epoch:
+
+```python
+def track(**criteria: torch.Tensor) -> dict[str, float]:
+    return {name: value.item() for name, value in criteria.items()}
+```
+
+This one simply reports the last step's values. `structcast_model.torch.trainer.TorchTracker`
+averages criteria over the epoch instead, and reduces them across ranks when the run is distributed.
+
+### The data provider
+
+`SimpleDataProvider` carries the training dataset and the optional validation dataset for the whole
+run. It is given to the trainer at construction, which is why `fit()` takes no dataset argument.
+Passing `validation_dataset=None` skips validation entirely.
+
+### The trainer and its callbacks
+
+```python
+trainer = TorchTrainer(
+    device="cpu",
+    learner=SimpleLearner(model),
+    tracker=track,
+    data=data,
+    callbacks=[Printer(), best],
+)
+```
+
+Every participant is scanned once here, in a fixed order — learner, the learner's optimizers,
+tracker, data provider, then the `callbacks` sequence in the order given — and routed into each
+lifecycle event whose protocol it implements. `trainer.describe()` prints the result:
+
+```text
+Registered callbacks: {'on_epoch_end': ['SimpleLearner', 'Printer', 'BestCriterion']}
+```
+
+The order matters: the learner steps its schedule before `Printer` reads `learning_rates`, so the
+line printed after epoch 1 already shows the rate that epoch 2 will use.
+
+`BestCriterion(target="val_loss", mode="min")` monitors one criterion and keeps its best value and
+the step at which it appeared. Validation criteria carry the `val_` prefix (`validation_prefix` on
+the trainer), which is why the target is `val_loss` and not `loss`.
+
+### Fitting
+
+```python
+trainer.fit(epochs=3)
+print(f"\nBest {best.target}: {best.value:.4f} at step {best.step}")
+```
+
+`fit()` only takes loop parameters: `epochs`, `start_epoch`, and `validation_frequency`. It feeds the
+provider's datasets into `train(dataset)` and `evaluate(dataset)`, which remain usable on their own
+when you want a single pass over a dataset rather than a whole run.
+
+## The same program, configuration-driven
+
+The CLI builds the same objects from YAML templates. Instead of writing a learner class, generate one:
+
+```bash
+# 1. The model
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+
+# 2. The learner: losses, metrics, optimizer, mixed precision, and both flows
+scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
+```
+
+`learner.py` holds a `Learner` class with exactly the members the tutorial writes by hand — `models`,
+`update`, `training_step`, `inference_step`, plus `optimizers`, `grad_scalers`, `learning_rates`, and
+`param_group_names`.
+
+Then render the dataset configurations and train:
+
+```bash
+scm format cfg/torch/others/default_timm.yaml \
+    -o dataset_train.yaml \
+    -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
+
+scm format cfg/torch/others/default_timm.yaml \
+    -o dataset_valid.yaml \
+    -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
+
+scm torch train \
+    'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
+    -s 'image: [3, 224, 224]' \
+    -d cuda \
+    --learner '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
+    --training-dataset dataset_train.yaml \
+    --validation-dataset dataset_valid.yaml \
+    -e 5 \
+    -LC val_ce_loss \
+    -HC val_acc1 \
+    -SC val_acc1 \
+    --logger mlflow \
+    -E Test
+```
+
+How the CLI maps onto the objects of the tutorial:
+
+| Tutorial                       | CLI                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------- |
+| `SimpleLearner(model)`         | `--learner/-L` pattern, built with the models by `TorchLearnerFactory`     |
+| `track`                        | `TorchTracker`, built from the learner's `outputs` or `--learner-outputs`  |
+| `SimpleDataProvider(...)`      | `--training-dataset` and `--validation-dataset/-V`, composed into one      |
+| `Printer()`                    | `ProgressBar`, or `Printer` when `--ci` is given                           |
+| `BestCriterion(...)`           | `--lower-criterion/-LC`, `--higher-criterion/-HC`, `--save-criterion/-SC`  |
+| `print(...)` of the best value | `--logger mlflow` or `--logger wandb`, plus `--experiment/-E`              |
+| `trainer.fit(epochs=3)`        | `--epochs/-e`, `--start-epoch`, `--validation-frequency/-f`                |
+
+The logger is a context manager owning the run: it starts the run, logs the parameters and the
+artifacts given with `--log-artifacts/-A`, records the epoch metrics through its own `on_epoch_end`,
+and ends the run. `--logger wandb` needs the `wandb` extra, `--logger mlflow` the `mlflow` extra.
+
+## File-addressed optimizer compositions
+
+The package ships `structcast_model.torch.optimizers.create_opt`, which builds an optimizer and
+nothing else. Combining it with a learning-rate schedule is use-case specific, so those combinations
+are example code — [`torch/optimizers.py`](torch/optimizers.py) — and a learner template references
+them by file path with `_file_`:
+
+```yaml
+OPTIMIZER:
+  - _obj_
+  - _addr_: AdamWWithCosine
+    _file_: examples/torch/optimizers.py
+  - _bind_:
+      optimizer_kwargs: {opt: adamw, lr: 0.004, weight_decay: 0.001}
+      scheduler_kwargs: {sched: cosine, num_epochs: 300, criterion: ce_loss}
+```
+
+`_addr_` names the symbol and `_file_` the Python file to load it from, relative to the working
+directory — so the composition can live in your own repository without being packaged. The path is
+resolved when the learner is instantiated, which means `scm torch train` must run from a directory
+where it resolves; copy the file next to your generated code and adjust `_file_` if it does not.
+
+`AdamWWithCosine` delegates the `Optimizer` interface to the wrapped optimizer through
+`__getattr__`, so the generated learner keeps calling `step()`, `zero_grad()`, and `param_groups`
+unchanged. It implements `on_update` and `on_epoch_end` itself, and the trainer's scan of the
+learner's `optimizers` routes those events to it — the same mechanism the tutorial uses for the
+learner's own `on_epoch_end`. `state_dict` merges the optimizer and schedule state into one
+dictionary, so a resumed run keeps its schedule.
+
+`OptimizerWithNativeScheduler` in the same file does the same for `torch.optim.lr_scheduler`
+schedules, which count in epochs and therefore only need `on_epoch_end`.
