@@ -1,25 +1,70 @@
-# StructCast-Model
+# StructCast Model
 
-Constructs neural network models and training workflows from declarative configuration. This glossary defines the
-terms that are specific to this project; general Python and machine-learning vocabulary is not repeated here.
+Configuration-driven toolkit for generating models and training workflows from YAML templates, with a
+framework-agnostic training loop specialized for PyTorch, Keras, and Flax.
 
 ## Language
 
-**INPUT_SHAPES**:
-A user-defined layer's declaration of what its named inputs look like. It is carried into the generated model so the
-model can describe its own inputs, instead of the caller having to state them again on the command line.
-_Avoid_: input spec, shape config, dummy input config
+### Training loop
 
-**TensorSpec**:
-The description of a single tensor input — its shape, its element type, and optionally the initializer that fills it.
-It is always a description, never a tensor.
-_Avoid_: tensor config, shape entry, input descriptor
+**Learner**:
+The object that owns the models being trained and defines how they learn: when an update should happen, how a
+training step runs, and how an inference step runs.
+_Avoid_: Backward, backward class, backward pass configuration
 
-**TensorSpecTree**:
-A `TensorSpec`, or a nested dictionary or list of them, mirroring the structure in which a layer expects its inputs.
-_Avoid_: nested shapes, shape tree, input structure
+**Trainer**:
+Runs the training loop — epochs, steps, and validation — over a Learner, dispatching lifecycle events to callbacks.
 
-**TensorInitializer**:
-A callable that produces a concrete tensor of a requested size and element type. Either the one a `TensorSpec` names,
-or the framework's default when the spec names none.
-_Avoid_: filler, generator, factory
+**Step**:
+One iteration over a single batch of inputs during training or validation.
+
+**Update**:
+One application of the Learner's optimizers. With gradient accumulation, several steps may pass between updates.
+
+**Epoch**:
+One full pass over the training dataset, optionally followed by validation.
+
+**Event**:
+A named moment in the training lifecycle at which callbacks run: update, training begin/end, training step
+begin/end, validation begin/end, validation step begin/end, epoch begin/end.
+
+**Callback**:
+An object that reacts to one or more events. Which events it receives is determined by which event protocols it
+implements.
+_Avoid_: hook, listener
+
+**Criterion**:
+A named scalar produced by a training or inference step — a loss or a metric — tracked across steps.
+(Plural: criteria.)
+
+**Tracker**:
+Averages per-step criteria into per-epoch metric values.
+_Avoid_: logger
+
+**Logger**:
+Records a training run to an experiment-tracking service (MLflow, wandb): parameters, metrics, artifacts, and
+model state.
+_Avoid_: tracker
+
+**Best criterion**:
+Monitors one criterion for its best value seen so far and reacts when a new best appears.
+
+### Data
+
+**Dataset**:
+An iterable of input dictionaries consumed by training or validation steps, or a callable returning such an
+iterable.
+
+**DataProvider**:
+Supplies the training dataset and the optional validation dataset for a whole training run; given to a Trainer at
+construction.
+_Avoid_: DataModule, dataset wrapper
+
+### Configuration
+
+**Object pattern**:
+A YAML/CLI expression describing how to instantiate an object (`_obj_` / `_addr_` / `_call_`).
+
+**Learner factory**:
+Builds a ready-to-train Learner from object patterns: instantiates models, resolves input shapes, applies
+initializers, and constructs the Learner.
