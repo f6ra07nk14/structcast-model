@@ -45,7 +45,8 @@ to date before making changes:
 - Merge the latest `dev` into `research` or `experiments` before research or experimental work.
 
 Perform branch-based work in a Git worktree. Confirm whether to use an existing worktree or create a dedicated one.
-Keep the main working directory free from unrelated task states. Preserve existing user changes and do not revert,
+When creating a new worktree, place it under `.worktrees/<branch>` inside the project directory so it survives
+devcontainer rebuilds; `.worktrees/` is git-ignored. Keep the main working directory free from unrelated task states. Preserve existing user changes and do not revert,
 overwrite, or clean unrelated work.
 
 All commit messages must follow Conventional Commits using `<type>(<optional scope>): <imperative description>`. Use
