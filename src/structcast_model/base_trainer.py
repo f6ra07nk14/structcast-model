@@ -79,12 +79,12 @@ class DataProvider(Protocol):
         """The dataset used for validation, or None to skip validation."""
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class SimpleDataProvider:
     """Data provider holding an already-built training dataset and an optional validation dataset.
 
     Example:
-        >>> provider = SimpleDataProvider([{"x": 1}])
+        >>> provider = SimpleDataProvider(training_dataset=[{"x": 1}])
         >>> provider.validation_dataset is None
         True
     """
@@ -283,7 +283,7 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
     tracker: Callable[..., dict[str, float]]
     """The tracker to log training and validation information."""
 
-    data: DataProvider | None = None
+    data: DataProvider
     """The provider of the training and validation datasets."""
 
     callbacks: Sequence[Any] = ()
@@ -302,10 +302,13 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
 
     def __post_init__(self) -> None:
         """Route every participant into the events whose protocol it implements."""
-        candidates: list[Any] = [self.learner, *self.learner.optimizers.values(), self.tracker]
-        if self.data is not None:
-            candidates.append(self.data)
-        candidates.extend(self.callbacks)
+        candidates: list[Any] = [
+            self.learner,
+            *self.learner.optimizers.values(),
+            self.tracker,
+            self.data,
+            *self.callbacks,
+        ]
         self._events = {event: [] for event in EVENTS}
         registered: dict[str, set[int]] = {event: set() for event in EVENTS}
         for candidate in candidates:
@@ -432,8 +435,6 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
             raise ValueError(f"Start epoch must be at least 1: {start_epoch}")
         if start_epoch > epochs:
             raise ValueError(f"Start epoch must be less than or equal to epochs: {start_epoch} > {epochs}")
-        if self.data is None:
-            raise ValueError("No data provider was given to the trainer: fit() needs one, use train() instead.")
         training_dataset = self.data.training_dataset
         validation_dataset = self.data.validation_dataset
         models = self.learner.models

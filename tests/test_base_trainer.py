@@ -210,6 +210,19 @@ def _hook(obj: Any, log: list[str], label: str, *events: str) -> Any:
     return obj
 
 
+class _RecordingProvider:
+    """DataProvider that records ``on_epoch_end``; SimpleDataProvider is slotted, so hooks need a class."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+        self.training_dataset = [{"x": 1}]
+        self.validation_dataset = None
+
+    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+        """Record that the data provider received the event."""
+        self.log.append("data:on_epoch_end")
+
+
 class _EpochEndOnly:
     """Callback implementing only ``on_epoch_end``."""
 
@@ -234,7 +247,7 @@ def _make_trainer(
     return BaseTrainer(
         learner=learner if learner is not None else _FakeLearner(),
         tracker=tracker if tracker is not None else _tracker,
-        data=data,
+        data=data if data is not None else SimpleDataProvider(training_dataset=[]),
         callbacks=callbacks,
         training_prefix=training_prefix,
         validation_prefix=validation_prefix,
@@ -254,7 +267,7 @@ def test_all_eleven_events_route_at_the_right_moment() -> None:
     """
     log: list[str] = []
     trainer = _make_trainer(
-        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),
         callbacks=[_Recorder(log)],
     )
     trainer.fit(epochs=1)
@@ -283,14 +296,14 @@ def test_callbacks_receive_info_and_models() -> None:
             """Capture the arguments passed by the trainer."""
             received.append((info, models))
 
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[_Capture()])
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[_Capture()])
     trainer.fit(epochs=1)
     assert received == [(trainer, {"model": "the-model"})]
 
 
 def test_object_without_event_methods_is_ignored() -> None:
     """An object implementing no event protocol is never registered and never called."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[object()])
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[object()])
     trainer.fit(epochs=1)
     assert trainer.describe() == {}
 
@@ -310,7 +323,7 @@ def test_explicit_callback_matching_no_event_warns(caplog: pytest.LogCaptureFixt
 def test_scanned_participants_without_events_do_not_warn(caplog: pytest.LogCaptureFixture) -> None:
     """The learner/tracker/data legitimately may implement no event: only explicit callbacks warn."""
     with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
-        _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+        _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]))
     assert not caplog.records
 
 
@@ -319,7 +332,7 @@ def test_scan_order_is_learner_then_tracker_then_data_then_callbacks() -> None:
     log: list[str] = []
     learner = _hook(_FakeLearner(), log, "learner", "on_epoch_end")
     tracker = _hook(_Tracker(), log, "tracker", "on_epoch_end")
-    data = _hook(SimpleDataProvider([{"x": 1}]), log, "data", "on_epoch_end")
+    data = _RecordingProvider(log)
     trainer = _make_trainer(
         learner=learner,
         tracker=tracker,
@@ -345,7 +358,7 @@ def test_learner_optimizers_are_scanned_for_events() -> None:
             "opt_b": _Recorder(log, "opt_b", ("on_update",)),
         }
     )
-    trainer = _make_trainer(learner=learner, data=SimpleDataProvider([{"x": 1}]))
+    trainer = _make_trainer(learner=learner, data=SimpleDataProvider(training_dataset=[{"x": 1}]))
     trainer.fit(epochs=1)
     assert log == ["opt_a:on_update", "opt_b:on_update", "opt_a:on_epoch_end"]
 
@@ -354,7 +367,7 @@ def test_same_object_registered_once_per_event() -> None:
     """An object appearing twice in the scan (tracker and callback) fires only once per event."""
     log: list[str] = []
     tracker = _hook(_Tracker(), log, "shared", "on_epoch_end")
-    trainer = _make_trainer(tracker=tracker, data=SimpleDataProvider([{"x": 1}]), callbacks=[tracker])
+    trainer = _make_trainer(tracker=tracker, data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[tracker])
     trainer.fit(epochs=1)
     assert log == ["shared:on_epoch_end"]
 
@@ -454,7 +467,7 @@ def test_evaluate_with_callable_dataset() -> None:
 
 def test_fit_pulls_datasets_from_the_data_provider() -> None:
     """fit() takes no dataset arguments: a fully wired trainer already knows its data."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}], [{"x": 2}]))
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]))
     history = trainer.fit(epochs=3)
     assert list(history.keys()) == [1, 2, 3]
     assert "loss" in history[3]
@@ -463,7 +476,7 @@ def test_fit_pulls_datasets_from_the_data_provider() -> None:
 
 def test_fit_without_validation_dataset_skips_evaluation() -> None:
     """A provider with no validation dataset means training only."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]))
     history = trainer.fit(epochs=2)
     assert "val_loss" not in history[2]
 
@@ -472,7 +485,7 @@ def test_fit_respects_validation_frequency() -> None:
     """Validation only runs at multiples of validation_frequency."""
     log: list[str] = []
     trainer = _make_trainer(
-        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),
         callbacks=[_EpochEndOnly(log), _Recorder(log, "val", ("on_validation_end",))],
     )
     trainer.fit(epochs=4, validation_frequency=2)
@@ -488,16 +501,16 @@ def test_fit_respects_validation_frequency() -> None:
 
 def test_fit_starts_from_start_epoch() -> None:
     """fit() starts from start_epoch, not from 1, so a run can be resumed."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]))
     history = trainer.fit(epochs=3, start_epoch=2)
     assert list(history.keys()) == [2, 3]
 
 
-def test_fit_raises_without_a_data_provider() -> None:
-    """fit() cannot invent datasets: a missing provider is a configuration error, not a silent no-op."""
-    trainer = _make_trainer()
-    with pytest.raises(ValueError, match="data provider"):
-        trainer.fit(epochs=1)
+def test_trainer_requires_a_data_provider() -> None:
+    """The data provider is a required constructor argument: a trainer without data cannot exist."""
+    with pytest.raises(TypeError, match="data"):
+        BaseTrainer(learner=_FakeLearner(), tracker=_tracker)  # type: ignore[call-arg]  # the missing
+        # argument is the behavior under test; mypy correctly rejects the call at type-check time.
 
 
 @pytest.mark.parametrize(
@@ -510,7 +523,7 @@ def test_fit_raises_without_a_data_provider() -> None:
 )
 def test_fit_rejects_invalid_loop_parameters(kwargs: dict[str, int], message: str) -> None:
     """Loop parameters are validated before any epoch runs."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]))
     with pytest.raises(ValueError, match=message):
         trainer.fit(**kwargs)
 
@@ -601,7 +614,7 @@ def test_best_criterion_routes_through_the_trainer() -> None:
     criterion = BestCriterion(target="val_loss", mode="min")
     trainer = _make_trainer(
         learner=_FakeLearner(inference_loss=0.2),
-        data=SimpleDataProvider([{"x": 1}], [{"x": 2}]),
+        data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),
         callbacks=[criterion],
     )
     assert trainer.describe() == {"on_epoch_end": ["BestCriterion"]}
@@ -616,7 +629,7 @@ def test_best_criterion_routes_through_the_trainer() -> None:
 
 def test_printer_prints_epoch_criteria(capsys: pytest.CaptureFixture[str]) -> None:
     """Printer is the CI-mode reporter: one plain-text block per epoch, learning rates included."""
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}]), callbacks=[Printer()])
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[Printer()])
     trainer.fit(epochs=1)
     out = capsys.readouterr().out
     assert "epoch: 1" in out
@@ -629,7 +642,9 @@ def test_progress_bar_runs_a_full_epoch(capsys: pytest.CaptureFixture[str]) -> N
     bar = ProgressBar(
         steps_per_epoch=2, validation_steps=1, training_criteria=["loss"], validation_criteria=["val_loss"]
     )
-    trainer = _make_trainer(data=SimpleDataProvider([{"x": 1}, {"x": 2}], [{"x": 3}]), callbacks=[bar])
+    trainer = _make_trainer(
+        data=SimpleDataProvider(training_dataset=[{"x": 1}, {"x": 2}], validation_dataset=[{"x": 3}]), callbacks=[bar]
+    )
     trainer.fit(epochs=1)
     assert "epoch: 1" in capsys.readouterr().out
     bar.bar.close()
