@@ -154,7 +154,7 @@ How the CLI maps onto the objects of the tutorial:
 
 | Tutorial                       | CLI                                                                       |
 | ------------------------------ | ------------------------------------------------------------------------- |
-| `SimpleLearner(model)`         | `--learner/-L` pattern, built with the models by `TorchLearnerFactory`     |
+| `SimpleLearner(model)`         | `--learner/-L` pattern, called with the models the command instantiated    |
 | `track`                        | `TorchTracker`, built from the learner's `outputs` or `--learner-outputs`  |
 | `SimpleDataProvider(...)`      | `--training-dataset` and `--validation-dataset/-V`, composed into one      |
 | `Printer()`                    | `ProgressBar`, or `Printer` when `--ci` is given                           |

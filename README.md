@@ -427,7 +427,7 @@ Key arguments:
 What the train command does internally:
 
 1. Instantiates the datasets, determines their lengths, and composes them into a `SimpleDataProvider`. A dataset implementing one of the event protocols also becomes a callback, so it receives the lifecycle events it defines.
-2. Builds the models and the learner with `TorchLearnerFactory`, which initializes the models with optional dummy-input forward passes, applies the initializers, and compiles the step functions.
+2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers, builds the learner from the models, and compiles the step functions.
 3. Wraps the models in `DistributedDataParallel` when the run is distributed.
 4. Builds a `TorchTracker` from the learner's output names.
 5. Collects the callbacks: the datasets that implement an event protocol (on every rank), then — on rank 0 only — a `ProgressBar` (or a `Printer` under `--ci`), the logger, a training-state saver, and one `TorchBestCriterion` per monitored criterion.
@@ -564,7 +564,7 @@ Whether it is built by the CLI or by hand, a training run is the same five objec
 
 | Object           | Responsibility                                                                                     | Ready-made pieces                                            |
 | ---------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| **Learner**      | Owns the models; decides when to update and how a training and an inference step run                | `scm torch create learner`, `TorchLearnerFactory`             |
+| **Learner**      | Owns the models; decides when to update and how a training and an inference step run                | `scm torch create learner`                                    |
 | **Tracker**      | Turns the criteria of each step into the values recorded for the epoch                             | `TorchTracker` (averages, and reduces across ranks)           |
 | **DataProvider** | Supplies the training dataset and the optional validation dataset for the whole run                | `SimpleDataProvider`                                          |
 | **Callbacks**    | React to lifecycle events                                                                          | `ProgressBar`, `Printer`, `BestCriterion`                     |
@@ -575,7 +575,7 @@ trainer = TorchTrainer(
     device="cpu",
     learner=learner,
     tracker=tracker,
-    data=SimpleDataProvider(training_dataset, validation_dataset),
+    data=SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset),
     callbacks=[Printer(), BestCriterion(target="val_loss", mode="min")],
 )
 trainer.fit(epochs=3)
@@ -788,7 +788,7 @@ The training loop was redesigned around protocol-routed callbacks. The rationale
 - **Callbacks are routed by protocol** — The `GLOBAL_CALLBACKS` registry, the `callbacks_session` context manager, and `NamedCallbackList.register()` are gone. Pass participants to the trainer as `callbacks=[...]`; each one joins the events whose `on_*` method it defines. Ad-hoc lambdas become small callback classes — `ProgressBar` and `Printer` ship with the package.
 - **Datasets are given at construction** — `fit()` no longer takes datasets. Build a `DataProvider` (`SimpleDataProvider`, or your own object with `training_dataset` and `validation_dataset`) and pass it as `data=`. `fit()` keeps `epochs`, `start_epoch`, and `validation_frequency`; `train(dataset)` and `evaluate(dataset)` are unchanged.
 - **`create_with_scheduler` is removed** — The package keeps `create_opt` (regex weight-decay and layer-decay grouping over `torch.optim` and timm engines). Optimizer + scheduler combinations move to example code referenced by file path; `AdamWWithCosine` (timm schedules) and `OptimizerWithNativeScheduler` (per-epoch native schedules) in [`examples/torch/optimizers.py`](examples/torch/optimizers.py) cover the cosine and per-epoch native cases and also keep the schedule in their `state_dict`; metric-driven (`ReduceLROnPlateau`), per-update, and composite schedules need a wrapper of their own modeled on these.
-- **Loggers own the run** — `MLflowLogger` and `WandbLogger` are context managers that start and end the run and log epoch metrics. Select the backend with `--logger mlflow|wandb`.
+- **Loggers own the run** — `MLflowLogger` (`structcast_model.torch.mlflow_logger`) and `WandbLogger` (`structcast_model.torch.wandb_logger`) are context managers that start and end the run and log epoch metrics; both follow the `Logger` protocol in `structcast_model.torch.logger`. Select the backend with `--logger mlflow|wandb`.
 - **Trackers reset themselves** — `TorchTracker` clears its averages from `on_training_begin` and `on_validation_begin`; the explicit `reset()` call in the loop is gone.
 
 ### Upgrading from v1.x

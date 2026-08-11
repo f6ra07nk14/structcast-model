@@ -5,7 +5,7 @@ from functools import partial
 from pathlib import Path
 import random
 from time import time
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from structcast.core import instantiator
 
     from structcast_model.builders import torch_builder
-    from structcast_model.torch import trainer as torch_trainer
+    from structcast_model.torch import mlflow_logger, trainer as torch_trainer, wandb_logger
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -45,7 +45,9 @@ else:
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
+    mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
+    wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
     torch = LazyModuleImporter("torch")
 
 
@@ -135,6 +137,17 @@ def _compile_module(module: Any, compile_kw: dict[str, Any] | None) -> Any:
     return module if compile_kw is None else torch.compile(module, **compile_kw)
 
 
+def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
+    """Instantiate models from a list of name-pattern mappings."""
+    res: OrderedDict[str, Any] = OrderedDict()
+    for raw in patterns:
+        if len(raw) != 1:
+            raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+        model_name, ptn = next(iter(raw.items()))
+        res[model_name] = instantiate_object(ptn)
+    return res
+
+
 def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
     """Return output names from a module attribute or the provided default, raising if neither is available."""
     if default:
@@ -147,41 +160,12 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
     )
 
 
-def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to state dict for all given modules."""
-    return {n: m.state_dict() for n, m in kwargs.items()}
-
-
-def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
-    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
-
-
 def _on_best(info: BaseInfo, best: BestCriterion, logger: Any, save: bool, **kwargs: Any) -> None:
     """Log the best value of a criterion, and save the models that reached it when asked to."""
     name = f"best_{best.target}"
     logger.log_metric(name, best.value, step=info.epoch)
     if save and info.step == best.step:
-        logger.log_state_dict(_get_state_dict(_unwrap_ddp(kwargs)), name)
-
-
-class TrainingStateSaver:
-    """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
-
-    def __init__(self, logger: Any) -> None:
-        """Create the saver writing to the given logger."""
-        self.logger = logger
-
-    def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
-        """Save the full training state of the finished epoch, so a run can be resumed from it."""
-        learner = cast("torch_trainer.TorchTrainer", info).learner
-        states: dict[str, Any] = {
-            "models": _get_state_dict(_unwrap_ddp(kwargs)),
-            "optimizers": _get_state_dict(getattr(learner, "optimizers", {})),
-            "grad_scalers": _get_state_dict(getattr(learner, "grad_scalers", {})),
-            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
-        }
-        self.logger.log_state_dict(states, "training_state")
+        logger.log_state_dict(torch_trainer._get_state_dict(torch_trainer._unwrap_ddp(kwargs)), name)
 
 
 @app.command(name="time")
@@ -443,6 +427,9 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
     is_main = global_rank == 0
+    input_shapes = reduce_dict(shapes)
+    initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
+    compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
@@ -460,27 +447,31 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     if is_main:
         print(f"Training dataset size: {steps_per_epoch} steps.")
         print(f"Validation dataset size: {validation_steps} steps.")
-    factory = torch_trainer.TorchLearnerFactory(
-        model_patterns=model_patterns,
-        learner_pattern=learner_pattern,
-        compile_pattern=compile_pattern,
-        initializer_patterns=initializer_patterns,
-        shapes=reduce_dict(shapes),
-    )
-    models, learner = factory(device, apply_initializers=is_main)
-    input_shapes, compile_fn = factory.input_shapes, factory.compile_fn
-    models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
-    learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-    # The tracker buffers are allocated with torch.zeros and must live on the training device,
-    # or the first training step fails mixing CUDA criteria with CPU buffers.
+    # Everything below runs on the training device: the models, and the tracker buffers, which are
+    # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
+    # CPU buffers.
     with torch.device(device):
+        models = _instantiate_models(model_patterns)
+        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
+        torch_trainer.initial_model(models, input_shapes)
+        if is_main:
+            for model_name, model in models.items():
+                if model_name in initializers:
+                    model.apply(initializers[model_name])
+        learner = instantiate_object(learner_pattern)(**models)
+        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
         tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
-    provider = SimpleDataProvider(training_dataset, validation_dataset)
+    models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
+    if hasattr(learner, "forward_training_step"):
+        learner.forward_training_step = compile_fn(learner.forward_training_step)
+    if hasattr(learner, "forward_inference_step"):
+        learner.forward_inference_step = compile_fn(learner.forward_inference_step)
+    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     callbacks: list[Any] = []
     if is_main:
         logger = (
-            torch_trainer.MLflowLogger(experiment) if logger_name == "mlflow" else torch_trainer.WandbLogger(experiment)
+            mlflow_logger.MLflowLogger(experiment) if logger_name == "mlflow" else wandb_logger.WandbLogger(experiment)
         )
         if ci:
             callbacks.append(Printer())
@@ -493,7 +484,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                     validation_criteria=[f"{trainer_type.validation_prefix}{n}" for n in learner_outputs],
                 )
             )
-        saver = TrainingStateSaver(logger)
+        saver = torch_trainer.TrainingStateSaver(logger)
         callbacks += [logger, saver]
         for target in higher_criteria:
             best = torch_trainer.TorchBestCriterion(target=target, mode="max")

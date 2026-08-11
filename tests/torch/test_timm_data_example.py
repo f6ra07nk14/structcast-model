@@ -12,7 +12,7 @@ from PIL import Image
 import pytest
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 
-from structcast_model.base_trainer import BaseInfo, DataProvider
+from structcast_model.base_trainer import BaseInfo, DataProvider, SimpleDataProvider
 from structcast_model.torch.trainer import TorchTracker, TorchTrainer
 import torch
 
@@ -275,6 +275,7 @@ def test_timm_dataloader_is_routed_into_the_epoch_events_by_the_trainer() -> Non
         learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         callbacks=[_training_wrapper()],
+        data=SimpleDataProvider(training_dataset=[]),
     )
     described = trainer.describe()
     assert described["on_epoch_begin"] == ["TimmDataLoaderWrapper"]

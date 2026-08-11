@@ -1,23 +1,19 @@
 """Trainer for PyTorch models."""
 
-from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from functools import cached_property, partial
 from logging import getLogger
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 from pydantic import TypeAdapter, ValidationError
-from structcast.core.instantiator import ObjectPattern, instantiate
-from structcast.utils.base import dump_yaml
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
+from structcast_model.torch.logger import Logger
 from structcast_model.torch.types import Tensor, TensorInitializer
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
@@ -321,206 +317,45 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
     """A callback to track the best criterion during training or validation for PyTorch models."""
 
 
-@dataclass(kw_only=True)
-class TorchLearnerFactory:
-    """Build the models and the learner of a training run from object patterns.
-
-    The tracker and any `DistributedDataParallel` wrapping are deliberately left to the caller:
-    the tracker is a metrics concern with its own trainer field, and the wrapping depends on the
-    distributed environment the caller set up.
-    """
-
-    model_patterns: list[dict[str, Any]]
-    """Object patterns of the models, each entry mapping exactly one model name to its pattern."""
-
-    learner_pattern: Any
-    """Object pattern of the learner, called with the instantiated models as keyword arguments."""
-
-    compile_pattern: dict[str, Any] | None = None
-    """Keyword arguments for `torch.compile`, or None to leave the step functions uncompiled."""
-
-    initializer_patterns: list[dict[str, Any]] | None = None
-    """Object patterns of the initializers, each entry mapping model names to an initializer."""
-
-    shapes: dict[str, Any] | None = None
-    """Input shapes used to create the dummy inputs, overriding the shapes declared by the models."""
-
-    input_shapes: dict[str, Any] = field(default_factory=dict, init=False)
-    """The input shapes actually used, resolved during the last call."""
-
-    @cached_property
-    def compile_fn(self) -> Callable[[Any], Any]:
-        """Compile a module or a function, or return it unchanged when no compile pattern was given."""
-        if self.compile_pattern is None:
-            return lambda module: module
-        return partial(torch.compile, **instantiate(self.compile_pattern))
-
-    @staticmethod
-    def _instantiate_pattern(raw: Any) -> Any:
-        """Instantiate a validated object pattern, raising on malformed input instead of passing it through."""
-        return ObjectPattern.model_validate(raw).build().runs[0]
-
-    def _instantiate_models(self) -> "OrderedDict[str, Any]":
-        """Instantiate the models from the name-pattern mappings, in the order they were given."""
-        models: OrderedDict[str, Any] = OrderedDict()
-        for raw in self.model_patterns:
-            if len(raw) != 1:
-                raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
-            name, pattern = next(iter(raw.items()))
-            models[name] = self._instantiate_pattern(pattern)
-        return models
-
-    def __call__(self, device: str, *, apply_initializers: bool = True) -> tuple["OrderedDict[str, Any]", Any]:
-        """Build the models and the learner on the given device.
-
-        Args:
-            device (str): The device to create the models on, e.g. "cpu" or "cuda:0".
-            apply_initializers (bool): Whether to apply the initializers. Distributed runs apply them
-                on the main process only and broadcast the result.
-
-        Returns:
-            The models by name, and the learner built from them.
-        """
-        with torch.device(device):
-            models = self._instantiate_models()
-            self.input_shapes = resolve_input_shapes(models, self.shapes) or {}
-            initial_model(models, self.input_shapes)
-            if apply_initializers and self.initializer_patterns:
-                initializers = instantiate({k: v for raw in self.initializer_patterns for k, v in raw.items()})
-                for name, model in models.items():
-                    if name in initializers:
-                        model.apply(initializers[name])
-            learner = self._instantiate_pattern(self.learner_pattern)(**models)
-        if hasattr(learner, "forward_training_step"):
-            learner.forward_training_step = self.compile_fn(learner.forward_training_step)
-        if hasattr(learner, "forward_inference_step"):
-            learner.forward_inference_step = self.compile_fn(learner.forward_inference_step)
-        return models, learner
+def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a mapping of name to state dict for all given modules."""
+    return {n: m.state_dict() for n, m in kwargs.items()}
 
 
-def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
-    """Merge the learning rates reported by the learner into the criteria of the current epoch.
-
-    Schedules step in the learner's own on_epoch_end hooks, which the trainer dispatches before the
-    logger's, so the recorded learning rate is the one the NEXT epoch will use -- the same one-epoch
-    offset the pre-redesign global callbacks produced.
-    """
-    return {**cast("BaseTrainer[Any]", info).learner.learning_rates, **info.logs()}
+def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
+    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
 
 
-class MLflowLogger:
-    """Logger recording a run to MLflow.
+class TrainingStateSaver:
+    """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
 
-    The logger owns the run: entering it starts the run, leaving it ends the run. It also reacts to
-    the end of each epoch, so passing it to a trainer logs the epoch metrics.
-    """
+    def __init__(self, logger: Logger) -> None:
+        """Create the saver writing to the given logger."""
+        self.logger = logger
 
-    def __init__(self, experiment: str) -> None:
-        """Create the logger for the given experiment, without starting a run yet."""
-        # mlflow is an optional extra: importing it here keeps this module importable without it.
-        import mlflow  # noqa: PLC0415
-        import mlflow.pytorch  # noqa: PLC0415
-
-        self.experiment = experiment
-        self.mlflow = mlflow
-
-    def __enter__(self) -> "MLflowLogger":
-        """Start a run in the configured experiment."""
-        self.mlflow.set_experiment(self.experiment)
-        self.mlflow.start_run()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        """End the run, marking it failed when an exception is propagating."""
-        self.mlflow.end_run(status="FINISHED" if exc_type is None else "FAILED")
-
-    def log_params(self, params: Mapping[str, Any]) -> None:
-        """Log the run parameters."""
-        for key, value in params.items():
-            self.mlflow.log_param(key, value)
-
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
-        """Log a dictionary as an artifact under the given file name."""
-        self.mlflow.log_dict(dict(data), name)
-
-    def log_artifact(self, path: str) -> None:
-        """Log a local file as an artifact."""
-        self.mlflow.log_artifact(path)
-
-    def log_metric(self, name: str, value: float, step: int) -> None:
-        """Log one metric value at the given step."""
-        self.mlflow.log_metric(name, value, step=step)
-
-    def log_metrics(self, metrics: Mapping[str, float], step: int) -> None:
-        """Log several metric values at the given step."""
-        self.mlflow.log_metrics(dict(metrics), step=step)
-
-    def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
-        """Log a state dictionary under the given artifact name."""
-        self.mlflow.pytorch.log_state_dict(dict(states), name)
-
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
-        """Log the criteria and learning rates of the finished epoch."""
-        self.log_metrics(_epoch_metrics(info), step=info.epoch)
+    def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
+        """Save the full training state of the finished epoch, so a run can be resumed from it."""
+        learner = cast("TorchTrainer", info).learner
+        states: dict[str, Any] = {
+            "models": _get_state_dict(_unwrap_ddp(kwargs)),
+            "optimizers": _get_state_dict(getattr(learner, "optimizers", {})),
+            "grad_scalers": _get_state_dict(getattr(learner, "grad_scalers", {})),
+            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
+        }
+        self.logger.log_state_dict(states, "training_state")
 
 
-class WandbLogger:
-    """Logger recording a run to Weights & Biases, with the same interface as `MLflowLogger`."""
-
-    def __init__(self, experiment: str) -> None:
-        """Create the logger for the given experiment, without starting a run yet."""
-        # wandb is an optional extra: importing it here keeps this module importable without it.
-        import wandb  # noqa: PLC0415
-
-        self.experiment = experiment
-        self.wandb = wandb
-
-    def __enter__(self) -> "WandbLogger":
-        """Start a run in the project named after the experiment."""
-        self.wandb.init(project=self.experiment)
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        """Finish the run, marking it failed when an exception is propagating."""
-        self.wandb.finish(exit_code=0 if exc_type is None else 1)
-
-    def log_params(self, params: Mapping[str, Any]) -> None:
-        """Log the run parameters."""
-        self.wandb.config.update(dict(params))
-
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
-        """Write a dictionary into the run directory as YAML, matching what MLflow stores."""
-        dump_yaml(dict(data), Path(self.wandb.run.dir) / name)
-
-    def log_artifact(self, path: str) -> None:
-        """Log a local file as an artifact."""
-        self.wandb.save(path)
-
-    def log_metric(self, name: str, value: float, step: int) -> None:
-        """Log one metric value at the given step."""
-        self.wandb.log({name: value}, step=step)
-
-    def log_metrics(self, metrics: Mapping[str, float], step: int) -> None:
-        """Log several metric values at the given step."""
-        self.wandb.log(dict(metrics), step=step)
-
-    def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
-        """Save a state dictionary into the run directory."""
-        torch.save(dict(states), Path(self.wandb.run.dir) / f"{name}.pt")
-
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
-        """Log the criteria and learning rates of the finished epoch."""
-        self.log_metrics(_epoch_metrics(info), step=info.epoch)
-
-
+# `_get_state_dict` and `_unwrap_ddp` are listed because the LazySelectedImporter tail below only
+# exposes the names in `__all__`, and the CLI reuses them for the best-criterion callback.
 __all__ = [
     "CriteriaTracker",
-    "MLflowLogger",
     "TorchBestCriterion",
-    "TorchLearnerFactory",
     "TorchTracker",
     "TorchTrainer",
-    "WandbLogger",
+    "TrainingStateSaver",
+    "_get_state_dict",
+    "_unwrap_ddp",
     "autocast_inputs",
     "create_torch_inputs",
     "get_torch_device",

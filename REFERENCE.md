@@ -526,27 +526,31 @@ history = trainer.fit(epochs=5)
 
 **`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models.
 
-**`TorchLearnerFactory`** — Builds the models and the learner of a run from object patterns. Fields: `model_patterns` (one name-to-pattern mapping per entry), `learner_pattern` (called with the instantiated models as keyword arguments), `compile_pattern`, `initializer_patterns`, and `shapes`. Calling it with a device returns `(models, learner)`, and records the resolved shapes in `input_shapes`; `compile_fn` is applied to the learner's `forward_training_step` and `forward_inference_step` when they exist.
+**`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it: the model state dicts (unwrapping `DistributedDataParallel`), the learner's optimizer and gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact.
 
 ```python
-factory = TorchLearnerFactory(model_patterns=[{"model": pattern}], learner_pattern=learner_pattern)
-models, learner = factory("cuda", apply_initializers=True)
+saver = TrainingStateSaver(logger)
+trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
-The factory deliberately does not create the tracker and does not apply `DistributedDataParallel` wrapping; both stay with the caller.
+The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, and handed to the learner by name.
 
 ### Loggers
 
-**`MLflowLogger`** and **`WandbLogger`** — Record a run to MLflow or to Weights & Biases through the same interface. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates — so passing a logger in `callbacks` is enough to get per-epoch metrics.
+**`Logger`** (`structcast_model.torch.logger`) — The runtime-checkable protocol both backends implement: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, `log_state_dict`, `on_epoch_end`, and the `__enter__` / `__exit__` pair that owns the run.
+
+**`MLflowLogger`** (`structcast_model.torch.mlflow_logger`) and **`WandbLogger`** (`structcast_model.torch.wandb_logger`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates — so passing a logger in `callbacks` is enough to get per-epoch metrics.
 
 ```python
+from structcast_model.torch.mlflow_logger import MLflowLogger
+
 with MLflowLogger("my-experiment") as logger:
     trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger])
     logger.log_params({"epochs": 5})
     trainer.fit(epochs=5)
 ```
 
-Methods: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, and `log_state_dict`. `MLflowLogger` needs the `mlflow` extra, `WandbLogger` the `wandb` extra; both import their backend lazily.
+`MLflowLogger` needs the `mlflow` extra, `WandbLogger` the `wandb` extra; each module imports its backend at import time and raises a descriptive `ImportError` from the constructor when it is missing.
 
 ### timm integrations
 

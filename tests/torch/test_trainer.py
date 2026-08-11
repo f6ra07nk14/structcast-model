@@ -3,22 +3,16 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-import sys
-from types import SimpleNamespace
 from typing import Any
 
-import mlflow
 import pytest
 from torch.nn import Module
 
-from structcast_model.base_trainer import BaseInfo
+from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
 from structcast_model.torch.trainer import (
-    MLflowLogger,
-    TorchLearnerFactory,
     TorchTracker,
     TorchTrainer,
-    WandbLogger,
+    TrainingStateSaver,
     autocast_inputs,
     create_torch_inputs,
     get_torch_device,
@@ -49,9 +43,15 @@ class _LossModule(Module):
 class _StubLearner:
     """A minimal stub implementing the Learner protocol for tests that don't exercise a real step."""
 
-    def __init__(self, models: dict[str, Any] | None = None, learning_rates: dict[str, float] | None = None) -> None:
-        """Initialize with optional models and the learning rates a real learner would report."""
+    def __init__(
+        self,
+        models: dict[str, Any] | None = None,
+        learning_rates: dict[str, float] | None = None,
+        optimizers: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize with optional models, optimizers, and the learning rates a real learner would report."""
         self._models = models or {}
+        self._optimizers = optimizers or {}
         self.learning_rates = learning_rates or {}
 
     @property
@@ -61,8 +61,8 @@ class _StubLearner:
 
     @property
     def optimizers(self) -> dict[str, Any]:
-        """No optimizers: the trainer scan must handle an empty mapping."""
-        return {}
+        """Return the optimizers dict; the trainer scan must handle an empty mapping."""
+        return self._optimizers
 
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""
@@ -301,7 +301,9 @@ def test_torch_tracker_call_with_metrics() -> None:
 def test_torch_tracker_is_routed_into_the_reset_events_by_the_trainer() -> None:
     """The tracker is scanned like any participant: its reset methods alone put it on both events."""
     tracker = TorchTracker.from_criteria(["loss"], distributed=False)
-    trainer = TorchTrainer(device="cpu", learner=_StubLearner(), tracker=tracker)
+    trainer = TorchTrainer(
+        device="cpu", learner=_StubLearner(), tracker=tracker, data=SimpleDataProvider(training_dataset=[])
+    )
     assert trainer.describe() == {
         "on_training_begin": ["TorchTracker"],
         "on_validation_begin": ["TorchTracker"],
@@ -327,6 +329,7 @@ def test_torch_trainer_sync_cpu_is_noop() -> None:
         device="cpu",
         learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"]),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     trainer.sync()  # should not raise
 
@@ -387,6 +390,7 @@ def test_torch_trainer_sync_cuda_calls_synchronize(monkeypatch: pytest.MonkeyPat
         device="cuda",
         learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"]),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     trainer.sync()
     assert synced == [True]
@@ -521,6 +525,7 @@ def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: N
         device="cpu",
         learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     assert ddp_model.require_backward_grad_sync is True
     with trainer.no_sync(False):
@@ -537,6 +542,7 @@ def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo:
         device="cpu",
         learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with trainer.no_sync(True):
         assert ddp_model.require_backward_grad_sync is True
@@ -550,6 +556,7 @@ def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) 
         device="cpu",
         learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with pytest.raises(RuntimeError, match="boom"):
         with trainer.no_sync(False):
@@ -564,233 +571,44 @@ def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
         device="cpu",
         learner=_StubLearner(models={"m": model}),
         tracker=TorchTracker.from_criteria(["loss"]),
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with trainer.no_sync(False):
         assert not hasattr(model, "require_backward_grad_sync")
 
 
 # ---------------------------------------------------------------------------
-# TorchLearnerFactory
+# TrainingStateSaver
 # ---------------------------------------------------------------------------
 
 
-_LEARNER_SOURCE = '''"""Tiny learner module instantiated by object patterns in the factory tests."""
+class _RecordingLogger:
+    """Logger recording only the state dictionaries, which is all the saver produces."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.states: list[tuple[dict[str, Any], str]] = []
+
+    def log_state_dict(self, states: Any, name: str) -> None:
+        """Record the state dictionary the saver hands over."""
+        self.states.append((dict(states), name))
 
 
-class TinyLearner:
-    """Records the models it was built from, like a real learner keeps them for its steps."""
-
-    def __init__(self, **models):
-        self.models = models
-
-    def forward_training_step(self, **inputs):
-        return {}
-
-
-def zero_weights(module):
-    """Zero every weight, so an applied initializer is visible in the parameters."""
-    if hasattr(module, "weight"):
-        module.weight.data.zero_()
-'''
-
-
-@pytest.fixture
-def learner_module(tmp_path: Path) -> Path:
-    """Write the learner module the patterns refer to by file path, and return that path."""
-    path = tmp_path / "tiny_learner.py"
-    path.write_text(_LEARNER_SOURCE)
-    return path
-
-
-def _linear_pattern(**kwargs: Any) -> list[Any]:
-    """Return the object pattern of a `torch.nn.Linear`."""
-    return ["_obj_", {"_addr_": "torch.nn.Linear"}, {"_call_": kwargs}]
-
-
-def _factory(learner_module: Path, **kwargs: Any) -> TorchLearnerFactory:
-    """Return a factory building one linear model and the tiny learner from the temporary module."""
-    kwargs.setdefault("model_patterns", [{"encoder": _linear_pattern(in_features=4, out_features=2)}])
-    return TorchLearnerFactory(
-        learner_pattern=["_obj_", {"_addr_": "TinyLearner", "_file_": str(learner_module)}], **kwargs
-    )
-
-
-def test_torch_learner_factory_builds_the_models_and_hands_them_to_the_learner(learner_module: Path) -> None:
-    """The learner is constructed from the models by name: that binding is the factory's job."""
-    models, learner = _factory(learner_module)("cpu")
-    assert list(models) == ["encoder"]
-    assert learner.models["encoder"] is models["encoder"]
-
-
-def test_torch_learner_factory_resolves_shapes_and_initializes_lazy_models(learner_module: Path) -> None:
-    """A model with deferred parameters only gets them from a forward pass on the resolved shapes."""
-    factory = _factory(
-        learner_module,
-        model_patterns=[{"encoder": ["_obj_", {"_addr_": "torch.nn.LazyLinear"}, {"_call_": {"out_features": 2}}]}],
-        shapes={"input": [4]},
-    )
-    models, _ = factory("cpu")
-    assert factory.input_shapes == {"input": [4]}
-    assert tuple(models["encoder"].weight.shape) == (2, 4)
-
-
-def test_torch_learner_factory_applies_the_initializers(learner_module: Path) -> None:
-    """Initializers are matched to models by name, so only the named model is reinitialized."""
-    factory = _factory(
-        learner_module,
-        initializer_patterns=[{"encoder": ["_obj_", {"_addr_": "zero_weights", "_file_": str(learner_module)}]}],
-    )
-    models, _ = factory("cpu")
-    assert torch.count_nonzero(models["encoder"].weight) == 0
-
-
-def test_torch_learner_factory_can_skip_the_initializers(learner_module: Path) -> None:
-    """Distributed runs initialize on the main rank only, so skipping must leave the weights alone."""
-    factory = _factory(
-        learner_module,
-        initializer_patterns=[{"encoder": ["_obj_", {"_addr_": "zero_weights", "_file_": str(learner_module)}]}],
-    )
-    models, _ = factory("cpu", apply_initializers=False)
-    assert torch.count_nonzero(models["encoder"].weight) > 0
-
-
-def test_torch_learner_factory_compiles_the_step_functions(learner_module: Path) -> None:
-    """The step functions are the hot path, so a compile pattern has to reach them, not just the models."""
-    _, learner = _factory(learner_module, compile_pattern={"dynamic": False})("cpu")
-    assert hasattr(learner.forward_training_step, "_torchdynamo_orig_callable")
-
-
-def test_torch_learner_factory_leaves_the_learner_uncompiled_without_a_pattern(learner_module: Path) -> None:
-    """No compile pattern means no compilation: `torch.compile` must not be applied by default."""
-    _, learner = _factory(learner_module)("cpu")
-    assert not hasattr(learner.forward_training_step, "_torchdynamo_orig_callable")
-
-
-def test_torch_learner_factory_rejects_a_pattern_naming_several_models(learner_module: Path) -> None:
-    """A two-key entry hides which name belongs to which pattern, so it is a configuration error."""
-    factory = _factory(
-        learner_module, model_patterns=[{"a": _linear_pattern(in_features=1, out_features=1), "b": None}]
-    )
-    with pytest.raises(ValueError, match="exactly one model definition"):
-        factory("cpu")
-
-
-# ---------------------------------------------------------------------------
-# MLflowLogger / WandbLogger
-# ---------------------------------------------------------------------------
-
-
-def _info_with_metrics() -> TorchTrainer:
-    """Return a trainer carrying one epoch of criteria and a learner reporting learning rates."""
+def test_training_state_saver_records_everything_needed_to_resume() -> None:
+    """A run is resumed from the weights, the optimizer state, and the loop counters together."""
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(learning_rates={"lr": 0.1}),
+        learner=_StubLearner(models={"model": model}, optimizers={"opt": optimizer}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
     )
-    trainer.epoch = 1
-    trainer.logs()["loss"] = 0.5
-    return trainer
-
-
-@pytest.fixture
-def mlflow_store(tmp_path: Path) -> Any:
-    """Point MLflow at a temporary store, so the tests exercise the real client, and restore it after."""
-    previous = mlflow.get_tracking_uri()
-    mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
-    yield mlflow
-    mlflow.set_tracking_uri(previous)
-
-
-def test_mlflow_logger_owns_the_run_and_logs_the_epoch_metrics(mlflow_store: Any) -> None:
-    """No event fires once per fit, so the run lifecycle lives in the context manager, not a callback."""
-    with MLflowLogger("phase-two") as logger:
-        run_id = mlflow_store.active_run().info.run_id
-        logger.log_params({"epochs": 1})
-        logger.log_metric("best_loss", 0.25, step=1)
-        logger.on_epoch_end(_info_with_metrics())
-    assert mlflow_store.active_run() is None
-    run = mlflow_store.get_run(run_id)
-    assert run.data.params == {"epochs": "1"}
-    assert run.data.metrics == pytest.approx({"best_loss": 0.25, "loss": 0.5, "lr": 0.1})
-
-
-def test_mlflow_logger_stores_dicts_states_and_files_as_artifacts(mlflow_store: Any, tmp_path: Path) -> None:
-    """Arguments, model states and config files must survive the run for it to be reproducible."""
-    artifact = tmp_path / "config.yaml"
-    artifact.write_text("epochs: 1\n")
-    with MLflowLogger("phase-two") as logger:
-        run_id = mlflow_store.active_run().info.run_id
-        logger.log_dict({"epochs": 1}, "arguments.yaml")
-        logger.log_artifact(str(artifact))
-        logger.log_state_dict({"weight": torch.zeros(2)}, "training_state")
-    names = {item.path for item in mlflow_store.artifacts.list_artifacts(run_id=run_id)}
-    assert {"arguments.yaml", "config.yaml", "training_state"} <= names
-
-
-def test_wandb_logger_requires_the_optional_dependency() -> None:
-    """Wandb is an optional extra: the failure must be a plain import error, not a missing attribute."""
-    with pytest.raises(ImportError, match="wandb"):
-        WandbLogger("phase-two")
-
-
-class _FakeWandbRun:
-    """Stand-in for `wandb.run`, exposing only the run directory the logger writes into."""
-
-    def __init__(self, directory: Path) -> None:
-        """Remember the directory reported as the run directory."""
-        self.dir = str(directory)
-
-
-class _FakeWandb:
-    """Stand-in for the wandb module, recording what the logger asks it to do."""
-
-    def __init__(self, directory: Path) -> None:
-        """Create the fake module with a run directory and empty call records."""
-        self.run = _FakeWandbRun(directory)
-        self.projects: list[str] = []
-        self.finished = 0
-        self.params: dict[str, Any] = {}
-        self.logged: list[tuple[dict[str, Any], int]] = []
-        self.saved: list[str] = []
-        self.config = SimpleNamespace(update=self.params.update)
-
-    def init(self, project: str) -> None:
-        """Record the started project."""
-        self.projects.append(project)
-
-    def finish(self, exit_code: int = 0) -> None:
-        """Record that the run was finished."""
-        self.finished += 1
-
-    def log(self, values: dict[str, Any], step: int) -> None:
-        """Record logged metrics."""
-        self.logged.append((values, step))
-
-    def save(self, path: str) -> None:
-        """Record a saved file."""
-        self.saved.append(path)
-
-
-def test_wandb_logger_records_a_run_through_the_wandb_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The wandb backend must offer the same lifecycle and calls as MLflow, so phase 3 can swap them."""
-    fake = _FakeWandb(tmp_path)
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    with WandbLogger("phase-two") as logger:
-        logger.log_params({"epochs": 1})
-        logger.log_dict({"epochs": 1}, "arguments.yaml")
-        logger.log_artifact("config.yaml")
-        logger.log_state_dict({"weight": torch.zeros(2)}, "training_state")
-        logger.on_epoch_end(_info_with_metrics())
-    assert fake.projects == ["phase-two"]
-    assert fake.finished == 1
-    assert fake.params == {"epochs": 1}
-    assert fake.saved == ["config.yaml"]
-    assert fake.logged == [({"lr": 0.1, "loss": 0.5}, 1)]
-    assert "epochs: 1" in (tmp_path / "arguments.yaml").read_text()
-    assert torch.load(tmp_path / "training_state.pt")["weight"].tolist() == [0.0, 0.0]
-
-
-def test_the_two_loggers_expose_the_same_interface() -> None:
-    """The CLI picks a backend by name, so any member missing on one of them breaks that choice."""
-    members = {name for name in vars(MLflowLogger) if not name.startswith("_")}
-    assert members == {name for name in vars(WandbLogger) if not name.startswith("_")}
+    trainer.epoch, trainer.step, trainer.update = 3, 7, 2
+    recorder = _RecordingLogger()
+    TrainingStateSaver(recorder).on_epoch_end(trainer, model=model)
+    states, name = recorder.states[0]
+    assert name == "training_state"
+    assert "weight" in states["models"]["model"]
+    assert states["optimizers"]["opt"]["param_groups"][0]["lr"] == 0.1
+    assert states["meta"] == {"epoch": 3, "step": 7, "update": 2}

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections import OrderedDict
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 import os
 import pathlib
-import sys
 import traceback
 from types import SimpleNamespace
 from typing import Any
@@ -23,7 +23,8 @@ from typer.testing import CliRunner
 from structcast_model.base_trainer import BaseInfo, BestCriterion
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import MLflowLogger, TorchTrainer
+from structcast_model.torch.mlflow_logger import MLflowLogger
+from structcast_model.torch.trainer import TorchTrainer, _get_state_dict, _unwrap_ddp
 from tests import ASSETS_DIR
 import torch
 
@@ -40,10 +41,8 @@ _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 # Access private functions from cmd_torch via its module globals
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
-_get_state_dict = _CMD_GLOBALS["_get_state_dict"]
+_instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 _on_best = _CMD_GLOBALS["_on_best"]
-_unwrap_ddp = _CMD_GLOBALS["_unwrap_ddp"]
-TrainingStateSaver = _CMD_GLOBALS["TrainingStateSaver"]
 
 
 @contextmanager
@@ -210,7 +209,9 @@ def _make_instantiate_fn(
             return training_data
         if raw == "VALID_DS":
             return validation_data
-        return raw
+        # Models and learner are built for real, so the tests exercise the actual assembly; a
+        # trainer type handed over directly, rather than as a pattern, is passed through.
+        return instantiate_object(raw) if isinstance(raw, (list, dict)) else raw
 
     return _side_effect
 
@@ -424,6 +425,30 @@ def test_compile_module_returns_module_when_no_kwargs() -> None:
     """_compile_module returns the module unchanged when compile_kw is None."""
     module = torch.nn.Linear(4, 2)
     assert _compile_module(module, None) is module
+
+
+# ---------------------------------------------------------------------------
+# _instantiate_models
+# ---------------------------------------------------------------------------
+
+
+def test_instantiate_models_creates_ordered_dict() -> None:
+    """The learner is built with the models by keyword, so their names and order must be preserved."""
+    patterns = [{"model": {"_obj_": [["_addr_", "torch.nn.Identity"], "_call_"]}}]
+    result = _instantiate_models(patterns)
+    assert isinstance(result, OrderedDict)
+    assert isinstance(result["model"], torch.nn.Identity)
+
+
+def test_instantiate_models_raises_for_multiple_keys() -> None:
+    """A two-key entry hides which name belongs to which pattern, so it is a configuration error."""
+    with pytest.raises(ValueError, match="exactly one model definition"):
+        _instantiate_models([{"a": {}, "b": {}}])
+
+
+def test_instantiate_models_returns_empty_for_empty_list() -> None:
+    """_instantiate_models returns an empty OrderedDict for an empty pattern list."""
+    assert _instantiate_models([]) == OrderedDict()
 
 
 # ---------------------------------------------------------------------------
@@ -816,13 +841,16 @@ class _FakeWandb:
         self.saved.append(path)
 
 
-def test_train_logs_the_whole_run_through_the_selected_logger(tmp_path: pathlib.Path, monkeypatch: Any) -> None:
+def test_train_logs_the_whole_run_through_the_selected_logger(
+    tmp_path: pathlib.Path, wandb_logger_with: Callable[[Any], Any]
+) -> None:
     """--logger wandb must route the run lifecycle and the metrics to wandb, not to MLflow."""
     fake = _FakeWandb(tmp_path / "wandb_run")
-    monkeypatch.setitem(sys.modules, "wandb", fake)
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
-    _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
+    # The command's lazy handle caches the module it first loaded, so it needs the reloaded one.
+    with patch_cmd_globals(wandb_logger=wandb_logger_with(fake)):
+        _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
     assert fake.projects == ["test-e2e"]
     assert fake.finished == 1
     assert fake.params["epochs"] == 2

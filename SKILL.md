@@ -126,7 +126,7 @@ scm torch train \
 What happens:
 
 1. Datasets are instantiated, counted, and composed into a `SimpleDataProvider`; every dataset implementing an event protocol is also collected as a callback.
-2. `TorchLearnerFactory` builds the models and the learner, initializing and compiling them.
+2. The command builds the models and the learner on the training device, initializing and compiling them.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
 4. Callbacks are collected: the event-protocol datasets on every rank, then on rank 0 `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
 5. `TorchTrainer` routes every participant into its events, and `fit(epochs=...)` runs inside the logger's run context.
@@ -290,11 +290,11 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
-| Build models and learner | `TorchLearnerFactory(...)` | Instantiate models and learner from object patterns; excludes tracker and DDP |
+| Save the training state | `TrainingStateSaver(logger)` | Save models, optimizers, gradient scalers, and loop counters each epoch |
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Average criteria per pass, reset on training/validation begin, reduce across ranks |
 | Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization and DDP `no_sync` |
 | Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion |
-| Experiment logging | `MLflowLogger(experiment)` / `WandbLogger(experiment)` | Own the run as a context manager; log epoch metrics via `on_epoch_end` |
+| Experiment logging | `MLflowLogger(experiment)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
 ### timm integration layer (example code)

@@ -43,7 +43,10 @@ src/structcast_model/
 │   ├── cmd_keras.py           # Keras CLI commands
 │   └── utils.py               # CLI argument parsers and reducers
 ├── torch/
-│   ├── trainer.py             # Trainer, tracker, learner factory, loggers, timm wrappers
+│   ├── trainer.py             # Trainer, tracker, best criterion, training-state saver
+│   ├── logger.py              # Logger protocol shared by the experiment tracking backends
+│   ├── mlflow_logger.py       # MLflowLogger
+│   ├── wandb_logger.py        # WandbLogger
 │   ├── optimizers.py          # create_opt: regex parameter grouping over optimizer engines
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
@@ -208,7 +211,7 @@ Key options are the same as `scm torch create model`: `-p`, `-c`, `--structured-
 
 Purpose:
 
-- Instantiate the models and the learner (via `TorchLearnerFactory`), the datasets, and the compile settings.
+- Instantiate the models and the learner inline on the training device, the datasets, and the compile settings.
 - Run a training loop via `TorchTrainer`.
 - Log metrics and states through the selected logger.
 
@@ -342,15 +345,16 @@ Utility functions:
 
 Training/evaluation helpers:
 
-- `TorchLearnerFactory` — builds models and learner from object patterns; excludes the tracker and DDP wrapping
 - `TorchTracker` — averaging tracker that resets itself on training/validation begin
 - `TorchTrainer` — adds `device`, `sync()`, and `no_sync()` to `BaseTrainer`
 - `TorchBestCriterion`
+- `TrainingStateSaver` — saves models, optimizers, gradient scalers, and loop counters through a logger
 
 Loggers (run-owning context managers that also implement `on_epoch_end`):
 
-- `MLflowLogger`
-- `WandbLogger`
+- `Logger` — the shared protocol, in `structcast_model.torch.logger`
+- `MLflowLogger` — in `structcast_model.torch.mlflow_logger`
+- `WandbLogger` — in `structcast_model.torch.wandb_logger`
 
 timm data integrations — example code in `examples/torch/data.py`, not package API; a configuration loads them by file path (`_addr_` plus `_file_`):
 
@@ -381,7 +385,7 @@ Utility functions:
 ### Training flow in practice
 
 1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`; those implementing an event protocol are also collected as callbacks.
-2. `TorchLearnerFactory` instantiates the models, initializes them with dummy inputs, applies initializers, and builds the learner with those models.
+2. The `train` command instantiates the models on the training device, initializes them with dummy inputs, applies initializers on the main rank, and builds the learner with those models.
 3. Models are DDP-wrapped and compiled where requested.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).
 5. Callbacks are assembled: progress reporting, logger, state saver, best criteria.
