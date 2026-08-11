@@ -1,16 +1,20 @@
 """Trainer for PyTorch models."""
 
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 from logging import getLogger
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from structcast.core.base import WithExtra
+from structcast.core.instantiator import instantiate
 from structcast.core.specifier import FlexSpec
+from structcast.utils.base import dump_yaml
 from timm.data import (
     IMAGENET_DEFAULT_MEAN,
     IMAGENET_DEFAULT_STD,
@@ -23,7 +27,7 @@ from timm.data import (
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 from torch.utils.data import DataLoader
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.types import Tensor, TensorInitializer
@@ -233,13 +237,12 @@ class TorchTracker:
     distributed: bool = field(default_factory=torch.distributed.is_initialized)
     """Whether the tracker is being used in a distributed training environment."""
 
-    def __post_init__(self) -> None:
-        """Post-initialization."""
-        GLOBAL_CALLBACKS.on_training_begin.register("reset_tracker", self.reset)
-        GLOBAL_CALLBACKS.on_validation_begin.register("reset_tracker", self.reset)
+    def on_training_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Reset the tracker so an epoch's training averages start empty."""
+        self.tracker.reset()
 
-    def reset(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Reset the trackers at the beginning of training."""
+    def on_validation_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Reset the tracker so validation averages do not carry training values."""
         self.tracker.reset()
 
     def __call__(self, **criteria: Tensor) -> dict[str, float]:
@@ -300,7 +303,7 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
         if __updated__:
             yield
         else:
-            models, old_values = self.backward.models, {}
+            models, old_values = self.learner.models, {}
             try:
                 for name, model in models.items():
                     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -321,8 +324,8 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
             tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
                 a dictionary of criteria for tracking.
         """
-        with self.no_sync(updated := self.backward.update(self.step)):
-            return updated, self.backward.training_step(**__inputs__)
+        with self.no_sync(updated := self.learner.update(self.step)):
+            return updated, self.learner.training_step(**__inputs__)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -650,8 +653,17 @@ class TimmDataLoaderWrapper(WithExtra):
         raise ValueError("Mixup is not active, cannot create mixup function.")
 
     def disable_mixup(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Disable mixup after the specified epoch."""
-        if info.epoch >= self.mixup_off_epoch:
+        """Disable mixup once the configured epoch is reached.
+
+        Safe to call on every training begin: it is a no-op unless this is a training split whose
+        active mixup is configured to stop at `mixup_off_epoch`.
+        """
+        if (
+            self.dataset.is_training
+            and self.mixup_active
+            and self.mixup_off_epoch
+            and info.epoch >= self.mixup_off_epoch
+        ):
             self.mixup.mixup_enabled = False
 
     @cached_property
@@ -662,25 +674,26 @@ class TimmDataLoaderWrapper(WithExtra):
             dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
         return dataset
 
-    def set_dataset_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Set the epoch for the dataset if it has a set_epoch method."""
-        self.dataset_wrapper.set_epoch(info.epoch - 1)
+    def set_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Tell the dataset or the distributed sampler which epoch is starting, so shuffling varies.
 
-    def set_dataloader_epoch(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Set the epoch for the data loader if it has a set_epoch method."""
-        self.dataloader.sampler.set_epoch(info.epoch - 1)
+        Safe to call on every epoch begin: it is a no-op unless this is a training split whose
+        dataset or sampler supports `set_epoch`. Epochs are 1-based here and 0-based there.
+        """
+        if not self.dataset.is_training:
+            return
+        if hasattr(self.dataset_wrapper, "set_epoch"):
+            self.dataset_wrapper.set_epoch(info.epoch - 1)
+        elif self.distributed and hasattr(self.dataloader.sampler, "set_epoch"):
+            self.dataloader.sampler.set_epoch(info.epoch - 1)
 
     @cached_property
     def dataloader(self) -> DataLoader:
         """Create a data loader using the timm library."""
         collate_fn, dataset = None, self.dataset_wrapper
-        if self.dataset.is_training:
-            if self.mixup_active:
-                if self.use_prefetcher:
-                    collate_fn = self.mixup
-                if self.mixup_off_epoch:
-                    GLOBAL_CALLBACKS.on_training_begin.register("disable_mixup", self.disable_mixup)
-        loader = create_loader(
+        if self.dataset.is_training and self.mixup_active and self.use_prefetcher:
+            collate_fn = self.mixup
+        return create_loader(
             dataset=dataset,
             batch_size=self.dataset.batch_size,
             is_training=self.dataset.is_training,
@@ -688,12 +701,6 @@ class TimmDataLoaderWrapper(WithExtra):
             **self.default_kwargs,
             **self.model_extra,
         )
-        if self.dataset.is_training:
-            if hasattr(dataset, "set_epoch"):
-                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataset_epoch", self.set_dataset_epoch)
-            elif self.distributed and hasattr(loader.sampler, "set_epoch"):
-                GLOBAL_CALLBACKS.on_epoch_begin.register("set_dataloader_epoch", self.set_dataloader_epoch)
-        return loader
 
     def __len__(self) -> int:
         """Return the length of the data loader."""
@@ -726,13 +733,231 @@ class TimmDataLoaderWrapper(WithExtra):
             yield from map(self.spec, self._call())
 
 
+class TimmDataProvider(BaseModel):
+    """Data provider supplying timm data loaders and keeping the training split in sync with the loop.
+
+    The trainer scans the provider for event protocols, so the epoch synchronization and the mixup
+    cutoff of the training wrapper run without any registration.
+    """
+
+    training: TimmDataLoaderWrapper
+    """The wrapper producing the training dataset."""
+
+    validation: TimmDataLoaderWrapper | None = None
+    """The wrapper producing the validation dataset, or None to skip validation."""
+
+    @property
+    def training_dataset(self) -> TimmDataLoaderWrapper:
+        """The dataset used for training: the wrapper is callable and yields the loader outputs."""
+        return self.training
+
+    @property
+    def validation_dataset(self) -> TimmDataLoaderWrapper | None:
+        """The dataset used for validation, or None when no validation wrapper was given."""
+        return self.validation
+
+    def on_epoch_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Forward the new epoch to the training wrapper."""
+        self.training.set_epoch(info, **models)
+
+    def on_training_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+        """Let the training wrapper turn mixup off once its cutoff epoch is reached."""
+        self.training.disable_mixup(info, **models)
+
+
+@dataclass(kw_only=True)
+class TorchLearnerFactory:
+    """Build the models and the learner of a training run from object patterns.
+
+    The tracker and any `DistributedDataParallel` wrapping are deliberately left to the caller:
+    the tracker is a metrics concern with its own trainer field, and the wrapping depends on the
+    distributed environment the caller set up.
+    """
+
+    model_patterns: list[dict[str, Any]]
+    """Object patterns of the models, each entry mapping exactly one model name to its pattern."""
+
+    learner_pattern: Any
+    """Object pattern of the learner, called with the instantiated models as keyword arguments."""
+
+    compile_pattern: dict[str, Any] | None = None
+    """Keyword arguments for `torch.compile`, or None to leave the step functions uncompiled."""
+
+    initializer_patterns: list[dict[str, Any]] | None = None
+    """Object patterns of the initializers, each entry mapping model names to an initializer."""
+
+    shapes: dict[str, Any] | None = None
+    """Input shapes used to create the dummy inputs, overriding the shapes declared by the models."""
+
+    input_shapes: dict[str, Any] = field(default_factory=dict, init=False)
+    """The input shapes actually used, resolved during the last call."""
+
+    @cached_property
+    def compile_fn(self) -> Callable[[Any], Any]:
+        """Compile a module or a function, or return it unchanged when no compile pattern was given."""
+        if self.compile_pattern is None:
+            return lambda module: module
+        return partial(torch.compile, **instantiate(self.compile_pattern))
+
+    def _instantiate_models(self) -> "OrderedDict[str, Any]":
+        """Instantiate the models from the name-pattern mappings, in the order they were given."""
+        models: OrderedDict[str, Any] = OrderedDict()
+        for raw in self.model_patterns:
+            if len(raw) != 1:
+                raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+            name, pattern = next(iter(raw.items()))
+            models[name] = instantiate(pattern)
+        return models
+
+    def __call__(self, device: str, *, apply_initializers: bool = True) -> tuple["OrderedDict[str, Any]", Any]:
+        """Build the models and the learner on the given device.
+
+        Args:
+            device (str): The device to create the models on, e.g. "cpu" or "cuda:0".
+            apply_initializers (bool): Whether to apply the initializers. Distributed runs apply them
+                on the main process only and broadcast the result.
+
+        Returns:
+            The models by name, and the learner built from them.
+        """
+        with torch.device(device):
+            models = self._instantiate_models()
+            self.input_shapes = resolve_input_shapes(models, self.shapes) or {}
+            initial_model(models, self.input_shapes)
+            if apply_initializers and self.initializer_patterns:
+                initializers = instantiate({k: v for raw in self.initializer_patterns for k, v in raw.items()})
+                for name, model in models.items():
+                    if name in initializers:
+                        model.apply(initializers[name])
+            learner = instantiate(self.learner_pattern)(**models)
+        if hasattr(learner, "forward_training_step"):
+            learner.forward_training_step = self.compile_fn(learner.forward_training_step)
+        if hasattr(learner, "forward_inference_step"):
+            learner.forward_inference_step = self.compile_fn(learner.forward_inference_step)
+        return models, learner
+
+
+def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
+    """Merge the learning rates reported by the learner into the criteria of the current epoch."""
+    return {**getattr(getattr(info, "learner", None), "learning_rates", {}), **info.logs()}
+
+
+class MLflowLogger:
+    """Logger recording a run to MLflow.
+
+    The logger owns the run: entering it starts the run, leaving it ends the run. It also reacts to
+    the end of each epoch, so passing it to a trainer logs the epoch metrics.
+    """
+
+    def __init__(self, experiment: str) -> None:
+        """Create the logger for the given experiment, without starting a run yet."""
+        # mlflow is an optional extra: importing it here keeps this module importable without it.
+        import mlflow  # noqa: PLC0415
+        import mlflow.pytorch  # noqa: PLC0415
+
+        self.experiment = experiment
+        self.mlflow = mlflow
+
+    def __enter__(self) -> "MLflowLogger":
+        """Start a run in the configured experiment."""
+        self.mlflow.set_experiment(self.experiment)
+        self.mlflow.start_run()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """End the run."""
+        self.mlflow.end_run()
+
+    def log_params(self, params: Mapping[str, Any]) -> None:
+        """Log the run parameters."""
+        for key, value in params.items():
+            self.mlflow.log_param(key, value)
+
+    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+        """Log a dictionary as an artifact under the given file name."""
+        self.mlflow.log_dict(dict(data), name)
+
+    def log_artifact(self, path: str) -> None:
+        """Log a local file as an artifact."""
+        self.mlflow.log_artifact(path)
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        """Log one metric value at the given step."""
+        self.mlflow.log_metric(name, value, step=step)
+
+    def log_metrics(self, metrics: Mapping[str, float], step: int) -> None:
+        """Log several metric values at the given step."""
+        self.mlflow.log_metrics(dict(metrics), step=step)
+
+    def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
+        """Log a state dictionary under the given artifact name."""
+        self.mlflow.pytorch.log_state_dict(dict(states), name)
+
+    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+        """Log the criteria and learning rates of the finished epoch."""
+        self.log_metrics(_epoch_metrics(info), step=info.epoch)
+
+
+class WandbLogger:
+    """Logger recording a run to Weights & Biases, with the same interface as `MLflowLogger`."""
+
+    def __init__(self, experiment: str) -> None:
+        """Create the logger for the given experiment, without starting a run yet."""
+        # wandb is an optional extra: importing it here keeps this module importable without it.
+        import wandb  # noqa: PLC0415
+
+        self.experiment = experiment
+        self.wandb = wandb
+
+    def __enter__(self) -> "WandbLogger":
+        """Start a run in the project named after the experiment."""
+        self.wandb.init(project=self.experiment)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Finish the run."""
+        self.wandb.finish()
+
+    def log_params(self, params: Mapping[str, Any]) -> None:
+        """Log the run parameters."""
+        self.wandb.config.update(dict(params))
+
+    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+        """Write a dictionary into the run directory as YAML, matching what MLflow stores."""
+        dump_yaml(dict(data), Path(self.wandb.run.dir) / name)
+
+    def log_artifact(self, path: str) -> None:
+        """Log a local file as an artifact."""
+        self.wandb.save(path)
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        """Log one metric value at the given step."""
+        self.wandb.log({name: value}, step=step)
+
+    def log_metrics(self, metrics: Mapping[str, float], step: int) -> None:
+        """Log several metric values at the given step."""
+        self.wandb.log(dict(metrics), step=step)
+
+    def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
+        """Save a state dictionary into the run directory."""
+        torch.save(dict(states), Path(self.wandb.run.dir) / f"{name}.pt")
+
+    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+        """Log the criteria and learning rates of the finished epoch."""
+        self.log_metrics(_epoch_metrics(info), step=info.epoch)
+
+
 __all__ = [
     "CriteriaTracker",
+    "MLflowLogger",
     "TimmDataLoaderWrapper",
+    "TimmDataProvider",
     "TimmDatasetWrapper",
     "TorchBestCriterion",
+    "TorchLearnerFactory",
     "TorchTracker",
     "TorchTrainer",
+    "WandbLogger",
     "autocast_inputs",
     "create_torch_inputs",
     "get_torch_device",
