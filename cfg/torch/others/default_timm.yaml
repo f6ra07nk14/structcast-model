@@ -20,7 +20,8 @@ PARAMETERS:
     device: cuda # "cuda" or "cpu"
     workers: 16
 _obj_:
-  - _addr_: structcast_model.torch.trainer.TimmDataLoaderWrapper
+  - _addr_: TimmDataLoaderWrapper
+    _file_: examples/torch/data.py
   - _attr_: model_validate
   - - _call_
     - spec: {image: "0", label: "1"}

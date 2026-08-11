@@ -20,10 +20,10 @@ from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatc
 from typer import Typer
 from typer.testing import CliRunner
 
-from structcast_model.base_trainer import BaseInfo, BestCriterion, SimpleDataProvider
+from structcast_model.base_trainer import BaseInfo, BestCriterion
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import MLflowLogger, TimmDataLoaderWrapper, TimmDataProvider
+from structcast_model.torch.trainer import MLflowLogger, TorchTrainer
 from tests import ASSETS_DIR
 import torch
 
@@ -38,7 +38,6 @@ LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
 _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_build_data_provider = _CMD_GLOBALS["_build_data_provider"]
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _get_state_dict = _CMD_GLOBALS["_get_state_dict"]
@@ -449,40 +448,6 @@ def test_get_module_outputs_raises_when_no_outputs_and_no_default() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _build_data_provider
-# ---------------------------------------------------------------------------
-
-
-def test_build_data_provider_uses_timm_provider_for_timm_wrappers() -> None:
-    """A timm training wrapper must get TimmDataProvider, or its per-epoch hooks are never forwarded."""
-    training = TimmDataLoaderWrapper()
-    provider = _build_data_provider(training, None)
-    assert isinstance(provider, TimmDataProvider)
-    assert provider.training is training
-    assert provider.validation_dataset is None
-    both = _build_data_provider(training, TimmDataLoaderWrapper())
-    assert isinstance(both, TimmDataProvider)
-
-
-def test_build_data_provider_falls_back_to_simple_provider() -> None:
-    """A non-timm training dataset has no hooks to forward and gets the plain SimpleDataProvider."""
-    plain = _build_data_provider([{"x": 1}], None)
-    assert isinstance(plain, SimpleDataProvider)
-
-
-def test_build_data_provider_keeps_timm_hooks_with_a_foreign_validation_dataset() -> None:
-    """Only the training wrapper carries per-epoch hooks.
-
-    A non-timm validation dataset must not silently drop DistributedSampler reshuffling and the
-    mixup cutoff.
-    """
-    validation = [{"x": 1}]
-    provider = _build_data_provider(TimmDataLoaderWrapper(), validation)
-    assert isinstance(provider, TimmDataProvider)
-    assert provider.validation_dataset is validation
-
-
-# ---------------------------------------------------------------------------
 # _get_state_dict / _unwrap_ddp
 # ---------------------------------------------------------------------------
 
@@ -667,10 +632,36 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _EpochAwareDataset(list[dict[str, torch.Tensor]]):
+    """A dataset that also reacts to epochs, the way a wrapper driving a `DistributedSampler` does."""
+
+    def __init__(self, batches: list[dict[str, torch.Tensor]]) -> None:
+        """Keep the batches and start with no epoch seen."""
+        super().__init__(batches)
+        self.epochs: list[int] = []
+
+    def on_epoch_begin(self, info: BaseInfo, **models: Any) -> None:
+        """Record the epoch the trainer is starting."""
+        self.epochs.append(info.epoch)
+
+
+def _recording_trainer(captured: list[Any]) -> Any:
+    """Return a trainer type that records the callbacks the command hands it."""
+
+    class _RecordingTrainer(TorchTrainer):
+        def __post_init__(self) -> None:
+            captured.extend(self.callbacks)
+            super().__post_init__()
+
+    return _RecordingTrainer
+
+
 def _invoke_train(
     tmp_path: pathlib.Path,
     *,
     ci: bool = True,
+    training_data: list[dict[str, torch.Tensor]] | None = None,
+    trainer_pattern: Any = None,
     validation_data: list[dict[str, torch.Tensor]] | None = None,
     learner_outputs: list[str] | None = None,
     lower_criteria: list[str] | None = None,
@@ -683,7 +674,8 @@ def _invoke_train(
     epochs: int = 2,
 ) -> None:
     """Invoke the ``train`` callback with real modules, patching only the dataset instantiation."""
-    training_data = _make_training_dataset()
+    if training_data is None:
+        training_data = _make_training_dataset()
     if validation_data is None:
         validation_data = _make_validation_dataset()
     deps = {
@@ -700,7 +692,7 @@ def _invoke_train(
             learner_pattern=_learner_pattern(learner_classname),
             learner_outputs=learner_outputs,
             compile_pattern=None,
-            trainer_pattern=None,
+            trainer_pattern=trainer_pattern,
             epochs=epochs,
             start_epoch=1,
             training_dataset_pattern="TRAIN_DS",
@@ -754,6 +746,41 @@ def test_train_ci_mode_with_learner_outputs_fallback(tmp_path: pathlib.Path) -> 
 def test_train_non_ci_mode_uses_pbar(tmp_path: pathlib.Path) -> None:
     """Non-CI mode should use the tqdm progress bar callback."""
     _invoke_train(tmp_path, ci=False)
+
+
+def test_train_routes_a_dataset_implementing_an_event_protocol_into_the_callbacks(tmp_path: pathlib.Path) -> None:
+    """The CLI knows no dataset type: a dataset with a lifecycle hook becomes a callback and is called.
+
+    It is placed before the main-rank callbacks because it must run on every rank -- a
+    `DistributedSampler` reshuffles only if `set_epoch` reaches all of them.
+    """
+    captured: list[Any] = []
+    training = _EpochAwareDataset(_make_training_dataset())
+    validation = _make_validation_dataset()
+    _invoke_train(
+        tmp_path,
+        training_data=training,
+        validation_data=validation,
+        trainer_pattern=_recording_trainer(captured),
+        epochs=2,
+    )
+    assert captured[0] is training
+    assert all(cb is not validation for cb in captured)
+    assert training.epochs == [1, 2]
+
+
+def test_train_adds_no_callbacks_for_datasets_without_event_hooks(tmp_path: pathlib.Path) -> None:
+    """A plain dataset has nothing to react to, so it must stay out of the callbacks entirely."""
+    captured: list[Any] = []
+    training, validation = _make_training_dataset(), _make_validation_dataset()
+    _invoke_train(
+        tmp_path,
+        training_data=training,
+        validation_data=validation,
+        trainer_pattern=_recording_trainer(captured),
+        epochs=1,
+    )
+    assert all(cb is not training and cb is not validation for cb in captured)
 
 
 class _FakeWandb:

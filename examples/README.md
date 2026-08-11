@@ -1,11 +1,12 @@
 # Examples
 
-Two ways to build the same training program:
+Two ways to build the same training program, plus the integrations a configuration loads by file path:
 
 | File                                             | What it shows                                                             |
 | ------------------------------------------------ | ------------------------------------------------------------------------- |
 | [`torch/simple_training.py`](torch/simple_training.py) | A complete training program written by hand against the trainer API   |
 | [`torch/optimizers.py`](torch/optimizers.py)     | Optimizer + scheduler compositions referenced from YAML by file path      |
+| [`torch/data.py`](torch/data.py)                 | timm dataset and dataloader wrappers, referenced from YAML by file path   |
 
 Run the tutorial:
 
@@ -196,3 +197,14 @@ dictionary, so a resumed run keeps its schedule.
 
 `OptimizerWithNativeScheduler` in the same file does the same for `torch.optim.lr_scheduler`
 schedules, which count in epochs and therefore only need `on_epoch_end`.
+
+## File-addressed datasets
+
+[`torch/data.py`](torch/data.py) holds the timm dataset and dataloader wrappers for the same reason:
+the package's training loop takes any iterable of dictionaries, so a timm integration is use-case
+code. [`cfg/torch/others/default_timm.yaml`](../cfg/torch/others/default_timm.yaml) addresses
+`TimmDataLoaderWrapper` there with `_addr_` plus `_file_`, and `scm torch train` stays timm-agnostic:
+it adds every dataset implementing an event protocol to the trainer's callbacks — on every rank, so
+`TimmDataLoaderWrapper.on_epoch_begin` reaches the `DistributedSampler` of each process — and
+`on_training_begin` applies the mixup cutoff. `TimmDataProvider` in the same file does the forwarding
+when you wire a trainer by hand instead.

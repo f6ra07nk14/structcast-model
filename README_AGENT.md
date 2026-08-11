@@ -217,8 +217,8 @@ Key runtime behavior:
 - `configure_security()` is called because commands frequently import generated local files via `_file_` patterns.
 - `torch.compile` is optional and configured via `-c/--compile`; it is applied to the models and to the learner's step functions.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
-- The two dataset options are composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`) passed as `data=`; `fit()` receives only loop parameters.
-- Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion. They are created on rank 0 only.
+- The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
+- Callbacks passed to the trainer: first each dataset that implements at least one event protocol (on every rank), then — on rank 0 only — `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
 - `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`, and a `KeyboardInterrupt` saves the current training state before leaving it.
 - `trainer.describe()` is printed before fitting, showing which object handles which event.
 
@@ -227,7 +227,7 @@ Distributed training behavior (when launched through `torchrun`):
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
 - All models are wrapped with `DistributedDataParallel`.
-- `TimmDataLoaderWrapper` creates `DistributedSampler` automatically. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when the training dataset option is a timm wrapper, so the sampler epoch advances on the CLI path too.
+- The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the CLI adds event-protocol datasets to the callbacks of every rank, so the sampler epoch advances on all of them.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - Experiment logging, checkpoints, and progress bars are gated to rank 0 only.
 - DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
@@ -352,11 +352,11 @@ Loggers (run-owning context managers that also implement `on_epoch_end`):
 - `MLflowLogger`
 - `WandbLogger`
 
-timm integrations:
+timm data integrations — example code in `examples/torch/data.py`, not package API; a configuration loads them by file path (`_addr_` plus `_file_`):
 
 - `TimmDatasetWrapper`
-- `TimmDataLoaderWrapper`
-- `TimmDataProvider`
+- `TimmDataLoaderWrapper` — implements `on_epoch_begin` (sampler reshuffling) and `on_training_begin` (mixup cutoff), so the CLI routes it into those events like any other callback
+- `TimmDataProvider` — the programmatic `DataProvider` forwarding both events to the training wrapper
 
 ### Flax runtime layer
 
@@ -380,7 +380,7 @@ Utility functions:
 
 ### Training flow in practice
 
-1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`).
+1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`; those implementing an event protocol are also collected as callbacks.
 2. `TorchLearnerFactory` instantiates the models, initializes them with dummy inputs, applies initializers, and builds the learner with those models.
 3. Models are DDP-wrapped and compiled where requested.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).
@@ -475,7 +475,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 | `ValueError: Each model pattern should contain exactly one model definition` | A positional model argument included multiple names in one YAML dict. | Split into separate positional arguments, one model name per dict. |
 | `Module "learner" does not have an "outputs" attribute` | The generated or custom learner does not expose `outputs`, and no CLI default was provided. | Define `outputs` on the learner or pass `-LO/--learner-outputs`. |
 | `ValueError: Invalid tensor shape` | `-s/--shape` was not a tuple/list/dict of integers. | Use shapes like `'image: [3, 224, 224]'`. |
-| `ValueError: Mixup is not active` | Code accessed `TimmDataLoaderWrapper.mixup` while mixup/cutmix settings were disabled. | Enable `mixup_alpha`, `cutmix_alpha`, or `cutmix_minmax` first. |
+| `ValueError: Mixup is not active` | Code accessed `TimmDataLoaderWrapper.mixup` (`examples/torch/data.py`) while mixup/cutmix settings were disabled. | Enable `mixup_alpha`, `cutmix_alpha`, or `cutmix_minmax` first. |
 | CUDA requested but CPU used | `get_torch_device("cuda")` falls back when CUDA is unavailable. | Verify PyTorch CUDA installation. |
 | Flax/Keras GPU not detected | JAX cannot find NVIDIA libraries. | Set `LD_LIBRARY_PATH` to include CUDA/cuDNN paths. |
 | `RuntimeError: Address already in use` during distributed training | Another process is using the `MASTER_PORT`. | Change `--master_port` or kill the conflicting process. |

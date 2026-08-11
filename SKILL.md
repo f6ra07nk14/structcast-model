@@ -90,7 +90,7 @@ What happens:
 
 1. `commands/main.py` loads the template through `schema.Template.from_path(...)`.
 2. Parameter groups are merged.
-3. The rendered YAML becomes a StructCast object pattern that instantiates `TimmDataLoaderWrapper.model_validate(...)`.
+3. The rendered YAML becomes a StructCast object pattern that instantiates `TimmDataLoaderWrapper.model_validate(...)`, loading the wrapper from `examples/torch/data.py` by file path.
 
 ### Workflow 4: Run FLOPs Inspection on a Generated Model
 
@@ -125,10 +125,10 @@ scm torch train \
 
 What happens:
 
-1. Datasets are instantiated, counted, and composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`).
+1. Datasets are instantiated, counted, and composed into a `SimpleDataProvider`; every dataset implementing an event protocol is also collected as a callback.
 2. `TorchLearnerFactory` builds the models and the learner, initializing and compiling them.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
-4. Callbacks are collected: `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
+4. Callbacks are collected: the event-protocol datasets on every rank, then on rank 0 `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
 5. `TorchTrainer` routes every participant into its events, and `fit(epochs=...)` runs inside the logger's run context.
 
 ### Workflow 6: Measure Inference Time
@@ -190,7 +190,7 @@ What happens:
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
 3. Each model is wrapped with `DistributedDataParallel`.
-4. `TimmDataLoaderWrapper` creates a `DistributedSampler`. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when the training dataset option is a timm wrapper.
+4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the CLI routes event-protocol datasets into the callbacks of every rank.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
 6. Experiment logging and checkpoints are gated to rank 0 only.
 7. DDP gradient sync is skipped during gradient accumulation steps.
@@ -297,13 +297,15 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | Experiment logging | `MLflowLogger(experiment)` / `WandbLogger(experiment)` | Own the run as a context manager; log epoch metrics via `on_epoch_end` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
-### timm integration layer
+### timm integration layer (example code)
+
+These live in `examples/torch/data.py` and are referenced from a configuration by file path (`_addr_` plus `_file_`); the CLI itself is timm-agnostic.
 
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
 | Dataset wrapper | `TimmDatasetWrapper` | Lazily call `timm.data.create_dataset(...)` |
-| Dataloader wrapper | `TimmDataLoaderWrapper` | Lazily call `timm.data.create_loader(...)` |
-| Data provider | `TimmDataProvider` | Supply both splits and forward epoch changes and the mixup cutoff |
+| Dataloader wrapper | `TimmDataLoaderWrapper` | Lazily call `timm.data.create_loader(...)`; `on_epoch_begin` reshuffles, `on_training_begin` applies the mixup cutoff |
+| Data provider | `TimmDataProvider` | Supply both splits and forward those two events to the training wrapper |
 
 ### Distributed training layer
 
@@ -347,7 +349,7 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 - `cfg/torch/learners/ConvNeXtV2.yaml` uses a single `LEARNERS` entry with a file-addressed optimizer composition, scheduler settings, optional clipping, gradient accumulation, and inline loss/metric layers in the `FLOW`.
 - `cfg/torch/learners/CycleGAN.yaml` demonstrates a multi-optimizer learner with three `LEARNERS` entries (generator pair + two discriminators), each with its own `FLOW`, `OPTIMIZER`, and `TRAINABLE_LAYERS`.
 - `cfg/torch/models/CycleGAN_generator.yaml` and `cfg/torch/models/CycleGAN_discriminator.yaml` define CycleGAN model architectures with Jinja-driven sublayer expansion.
-- `cfg/torch/others/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern.
+- `cfg/torch/others/default_timm.yaml` formats into a `TimmDataLoaderWrapper.model_validate(...)` object pattern addressing `examples/torch/data.py` by file.
 
 ## Base Trainer and Callback System
 
@@ -405,7 +407,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Solution: pass shapes like `'image: [3, 224, 224]'`.
 
 **`ValueError: Mixup is not active`**
-- Cause: `TimmDataLoaderWrapper.mixup` was accessed with all mixup/cutmix settings disabled.
+- Cause: `TimmDataLoaderWrapper.mixup` (`examples/torch/data.py`) was accessed with all mixup/cutmix settings disabled.
 - Solution: enable `mixup_alpha`, `cutmix_alpha`, or `cutmix_minmax` before using `mixup`.
 
 **CUDA requested but training runs on CPU**

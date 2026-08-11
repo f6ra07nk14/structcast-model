@@ -11,6 +11,7 @@ from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.base_trainer import (
+    EVENT_PROTOCOLS,
     BaseInfo,
     BestCriterion,
     Printer,
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
     import numpy as np
     import ptflops
     from structcast.core import instantiator
-    import timm
 
     from structcast_model.builders import torch_builder
     from structcast_model.torch import trainer as torch_trainer
@@ -44,7 +44,6 @@ else:
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
-    timm = LazyModuleImporter("timm")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
     torch = LazyModuleImporter("torch")
@@ -146,18 +145,6 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
     )
-
-
-def _build_data_provider(training_dataset: Any, validation_dataset: Any) -> Any:
-    """Return the data provider for the instantiated datasets.
-
-    A timm training wrapper needs its per-epoch hooks (sampler reshuffling, mixup cutoff) forwarded
-    by TimmDataProvider, whatever the validation dataset is; any other training dataset has no hooks
-    and gets the plain provider.
-    """
-    if isinstance(training_dataset, torch_trainer.TimmDataLoaderWrapper):
-        return torch_trainer.TimmDataProvider(training=training_dataset, validation=validation_dataset)
-    return SimpleDataProvider(training_dataset, validation_dataset)
 
 
 def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -459,6 +446,13 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
+    # A dataset implementing an event protocol (e.g. a distributed sampler needing set_epoch) must be
+    # called on every rank, unlike the display and logging callbacks gated on the main rank below.
+    dataset_callbacks = [
+        dataset
+        for dataset in (training_dataset, validation_dataset)
+        if dataset is not None and isinstance(dataset, tuple(EVENT_PROTOCOLS.values()))
+    ]
     if is_main:
         print("Count the dataset sizes...")
     steps_per_epoch = get_dataset_size(training_dataset)
@@ -481,7 +475,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     # or the first training step fails mixing CUDA criteria with CPU buffers.
     with torch.device(device):
         tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
-    provider = _build_data_provider(training_dataset, validation_dataset)
+    provider = SimpleDataProvider(training_dataset, validation_dataset)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     callbacks: list[Any] = []
     if is_main:
@@ -509,7 +503,13 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             best = torch_trainer.TorchBestCriterion(target=target, mode="min")
             best.on_best.append(partial(_on_best, logger=logger, save=target in save_criteria))
             callbacks.append(best)
-    trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=callbacks)
+    trainer = trainer_type(
+        device=device,
+        learner=learner,
+        tracker=tracker,
+        data=provider,
+        callbacks=[*dataset_callbacks, *callbacks],
+    )
     try:
         if is_main:
             arguments = {
@@ -544,7 +544,6 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                     {
                         "cuda_version": torch.version.cuda,
                         "torch_version": torch.__version__,
-                        "timm_version": timm.__version__,
                         "epochs": epochs,
                         "steps_per_epoch": steps_per_epoch,
                         "validation_steps": validation_steps,

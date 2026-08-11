@@ -550,6 +550,8 @@ Methods: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, 
 
 ### timm integrations
 
+These are example code in [`examples/torch/data.py`](examples/torch/data.py), not package API: the CLI knows nothing about timm and loads them from a configuration by file path (`_addr_` plus `_file_`), the same way the optimizer compositions are loaded.
+
 **`TimmDatasetWrapper`** — Holds validated dataset configuration and lazily calls `timm.data.create_dataset(...)`.
 
 **`TimmDataLoaderWrapper`** — Builds a timm dataloader with support for:
@@ -561,9 +563,11 @@ Methods: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, 
 - Distributed device initialization
 - Optional `FlexSpec` output remapping
 
+It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to its dataset or `DistributedSampler` (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. `scm torch train` routes every dataset implementing an event protocol into the trainer's callbacks — on every rank — so these hooks run without any further wiring.
+
 The dataset template at [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml) formats into this wrapper.
 
-**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` wrapper. It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to the training wrapper's sampler (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. `scm torch train` builds a `TimmDataProvider` automatically when the training dataset option is a timm wrapper (falling back to `SimpleDataProvider` otherwise); use it directly when wiring a trainer programmatically.
+**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` wrapper, forwarding `on_epoch_begin` and `on_training_begin` to the training wrapper. The CLI always composes a `SimpleDataProvider`; use this one when wiring a trainer programmatically.
 
 ```python
 provider = TimmDataProvider(training=training_wrapper, validation=validation_wrapper)
