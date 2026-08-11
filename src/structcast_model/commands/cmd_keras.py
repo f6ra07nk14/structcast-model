@@ -3,7 +3,7 @@
 from time import time
 from typing import TYPE_CHECKING, Any
 
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import (
@@ -128,7 +128,7 @@ def measure_inference_time(
     ),
 ) -> None:
     """Measure the average inference time of a Keras model."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     device = keras_trainer.get_keras_device(device)
     print("Initializing the model...")
     model = instantiate_object(model_pattern)

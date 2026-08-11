@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from structcast.utils.security import register_dir, unregister_dir
+from structcast.utils.base import register_dir, unregister_dir
 from typer.testing import CliRunner
 
 from structcast_model.commands.main import app

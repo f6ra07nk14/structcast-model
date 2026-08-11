@@ -12,7 +12,7 @@ from typing import Any
 
 import mlflow
 import pytest
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode_stack
@@ -236,7 +236,7 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
 
 def test_create_model_calls_torch_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' should generate a model script from a real configuration."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -245,7 +245,7 @@ def test_create_model_calls_torch_builder(tmp_path: Any, cli_runner: CliRunner) 
 
 def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --classname' should generate a script with the given class name."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "my_net.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--classname", "MyNet", "--output", out])
     assert result.exit_code == 0, result.output
@@ -254,7 +254,7 @@ def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> 
 
 def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' should default structured_output to True (dict return in root class)."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -264,7 +264,7 @@ def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: 
 
 def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --no-structured-output' root class should not return a dict."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--no-structured-output", "--output", out])
     assert result.exit_code == 0, result.output
@@ -274,7 +274,7 @@ def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner)
 
 def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --output' should write the generated script to the specified path."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out_file = tmp_path / "nested" / "out.py"
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", str(out_file)])
     assert result.exit_code == 0, result.output
@@ -284,7 +284,7 @@ def test_create_model_with_output_path(tmp_path: Any, cli_runner: CliRunner) -> 
 
 def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' generates a script from a simple Linear config."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -295,7 +295,7 @@ def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
 
 def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --classname' generates a script with the given class name for Linear."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "net.py")
     result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--classname", "SimpleNet", "--output", out])
     assert result.exit_code == 0, result.output
@@ -309,7 +309,7 @@ def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> 
 
 def test_time_linear(cli_runner: CliRunner) -> None:
     """'time' measures inference on a simple torch Linear layer."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     pattern = "[_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: 4, out_features: 2}}]"
     result = cli_runner.invoke(
         app,
@@ -326,7 +326,7 @@ def test_time_linear(cli_runner: CliRunner) -> None:
 
 def test_create_backward_calls_torch_backward_builder(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create backward' should generate a backward script from a real configuration."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "backward.py")
     result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -335,7 +335,7 @@ def test_create_backward_calls_torch_backward_builder(tmp_path: Any, cli_runner:
 
 def test_create_backward_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create backward' default classname should produce a class named 'Backward'."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
+    configure_security()
     out = str(tmp_path / "backward.py")
     result = cli_runner.invoke(app, ["create", "backward", BACKWARD_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -350,7 +350,7 @@ def test_create_backward_passes_default_classname(tmp_path: Any, cli_runner: Cli
 
 def test_calflops_runs_with_real_model(cli_runner: CliRunner) -> None:
     """'calflops' should run calflops on a real model and print FLOPs, MACs, parameters."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
 
     deps = {"instantiate_object": lambda raw: _SimpleModel()}
     with patch_cmd_globals(**deps):
@@ -373,14 +373,14 @@ _IDENTITY_PATTERN = "{_obj_: [[_addr_, torch.nn.Identity], _call_]}"
 
 def test_ptflops_runs_with_real_model(cli_runner: CliRunner) -> None:
     """'ptflops' should run ptflops on a real model and print results."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     result = cli_runner.invoke(app, ["ptflops", _IDENTITY_PATTERN, "--device", "cpu"])
     assert result.exit_code == 0, result.output
 
 
 def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
     """'ptflops' should not error when flops/params are None (e.g. identity)."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     result = cli_runner.invoke(app, ["ptflops", _IDENTITY_PATTERN, "--device", "cpu"])
     assert result.exit_code == 0, result.output
 
@@ -392,7 +392,7 @@ def test_ptflops_none_results_print_nothing(cli_runner: CliRunner) -> None:
 
 def test_instantiate_builds_object_from_pattern() -> None:
     """instantiate() resolves an ObjectPattern and returns the built instance."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_call_", {}]]}
     result = instantiate_object(raw)
     assert isinstance(result, torch.nn.Identity)
@@ -400,7 +400,7 @@ def test_instantiate_builds_object_from_pattern() -> None:
 
 def test_instantiate_builds_linear_with_args() -> None:
     """instantiate() builds a torch.nn.Linear with keyword arguments."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     raw = {"_obj_": [["_addr_", "torch.nn.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
     result = instantiate_object(raw)
     assert isinstance(result, torch.nn.Linear)
@@ -426,7 +426,7 @@ def test_compile_module_returns_module_when_no_kwargs() -> None:
 
 def test_instantiate_models_creates_ordered_dict() -> None:
     """_instantiate_models creates an OrderedDict of models from patterns."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     patterns = [{"model": {"_obj_": [["_addr_", "torch.nn.Identity"], "_call_"]}}]
     result = _instantiate_models(patterns)
     assert isinstance(result, OrderedDict)
@@ -569,7 +569,7 @@ def test_train_raises_for_empty_model_patterns() -> None:
 
 def test_train_raises_for_invalid_model_pattern_shape() -> None:
     """`train` should reject model-pattern entries containing multiple models."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     train_fn = _train_callback()
     deps = {
         "instantiate_object": _make_instantiate_fn(training_data=_make_training_dataset()),
@@ -605,7 +605,7 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
 
 def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
     """`train` should fail when backward module lacks ``outputs`` and no fallback is given."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     train_fn = _train_callback()
 
     class _BackwardNoOutputs(_SimpleBackward):
@@ -668,7 +668,7 @@ def _invoke_train(
     epochs: int = 2,
 ) -> None:
     """Invoke the ``train`` callback with real modules, patching only ``instantiate``."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     training_data = _make_training_dataset()
     if validation_data is None:
         validation_data = _make_validation_dataset()
@@ -782,7 +782,7 @@ def _ddp_train_worker(
     _patch_ddp_for_cpu()
 
     try:
-        configure_security(allowed_modules_check=False)
+        configure_security()
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
         validation_data = _make_validation_dataset()
@@ -854,7 +854,7 @@ def _ddp_rank_gating_worker(
     _patch_ddp_for_cpu()
 
     try:
-        configure_security(allowed_modules_check=False)
+        configure_security()
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
@@ -923,7 +923,7 @@ def _ddp_seed_offset_worker(
     dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     _patch_ddp_for_cpu()
     try:
-        configure_security(allowed_modules_check=False)
+        configure_security()
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()

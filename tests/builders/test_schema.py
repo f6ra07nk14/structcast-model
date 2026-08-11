@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
-from structcast.utils.security import register_dir, unregister_dir
+from structcast.utils.base import register_dir, unregister_dir
 
 from structcast_model.builders.schema import (
     BackwardBehavior,

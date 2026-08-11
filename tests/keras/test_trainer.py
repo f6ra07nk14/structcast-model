@@ -8,7 +8,7 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 import pytest
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 
 import keras
 from structcast_model.keras.trainer import (
@@ -22,7 +22,7 @@ from structcast_model.keras.trainer import (
 @pytest.fixture
 def allow_module_imports() -> Any:
     """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     yield
     configure_security()
 

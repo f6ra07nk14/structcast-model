@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 import pytest
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 from torch.nn import Module
 
@@ -60,7 +60,7 @@ def _clean_global_callbacks() -> Any:
 @pytest.fixture
 def allow_module_imports() -> Any:
     """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     yield
     configure_security()
 

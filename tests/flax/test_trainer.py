@@ -9,7 +9,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import pytest
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 
 from structcast_model.flax.trainer import create_jax_inputs, get_jax_device, get_jax_devices
 
@@ -17,7 +17,7 @@ from structcast_model.flax.trainer import create_jax_inputs, get_jax_device, get
 @pytest.fixture
 def allow_module_imports() -> Any:
     """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     yield
     configure_security()
 

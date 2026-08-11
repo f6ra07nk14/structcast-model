@@ -3,7 +3,7 @@
 from time import time
 from typing import TYPE_CHECKING, Any
 
-from structcast.utils.security import configure_security
+from structcast.utils.base import configure_security
 from typer import Argument, Option, Typer
 
 from structcast_model.commands.utils import (
@@ -120,7 +120,7 @@ def measure_inference_time(
     ),
 ) -> None:
     """Measure the average inference time of a Flax model."""
-    configure_security(allowed_modules_check=False)
+    configure_security()
     jax_device = flax_trainer.get_jax_device(device)
     training_mode_kw = (
         {"training": training_mode, "deterministic": not training_mode, "use_running_average": not training_mode}
