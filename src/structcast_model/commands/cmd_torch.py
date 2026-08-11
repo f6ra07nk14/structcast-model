@@ -148,6 +148,19 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
     )
 
 
+def _build_data_provider(training_dataset: Any, validation_dataset: Any) -> Any:
+    """Return the data provider for the instantiated datasets.
+
+    A timm training wrapper needs its per-epoch hooks (sampler reshuffling, mixup cutoff) forwarded
+    by TimmDataProvider; any other dataset object has no hooks and gets the plain provider.
+    """
+    if isinstance(training_dataset, torch_trainer.TimmDataLoaderWrapper) and (
+        validation_dataset is None or isinstance(validation_dataset, torch_trainer.TimmDataLoaderWrapper)
+    ):
+        return torch_trainer.TimmDataProvider(training=training_dataset, validation=validation_dataset)
+    return SimpleDataProvider(training_dataset, validation_dataset)
+
+
 def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return a mapping of name to state dict for all given modules."""
     return {n: m.state_dict() for n, m in kwargs.items()}
@@ -470,7 +483,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
     learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
     tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
-    provider = SimpleDataProvider(training_dataset, validation_dataset)
+    provider = _build_data_provider(training_dataset, validation_dataset)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     callbacks: list[Any] = []
     if is_main:

@@ -21,10 +21,10 @@ from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatc
 from typer import Typer
 from typer.testing import CliRunner
 
-from structcast_model.base_trainer import BaseInfo, BestCriterion
+from structcast_model.base_trainer import BaseInfo, BestCriterion, SimpleDataProvider
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import MLflowLogger
+from structcast_model.torch.trainer import MLflowLogger, TimmDataLoaderWrapper, TimmDataProvider
 from tests import ASSETS_DIR
 import torch
 
@@ -39,6 +39,7 @@ LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
 _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 
 # Access private functions from cmd_torch via its module globals
+_build_data_provider = _CMD_GLOBALS["_build_data_provider"]
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _get_state_dict = _CMD_GLOBALS["_get_state_dict"]
@@ -462,6 +463,30 @@ def test_get_module_outputs_raises_when_no_outputs_and_no_default() -> None:
     """_get_module_outputs raises ValueError when neither source is available."""
     with pytest.raises(ValueError, match='Module "loss" does not have an "outputs"'):
         _get_module_outputs(torch.nn.Identity(), None, "loss")
+
+
+# ---------------------------------------------------------------------------
+# _build_data_provider
+# ---------------------------------------------------------------------------
+
+
+def test_build_data_provider_uses_timm_provider_for_timm_wrappers() -> None:
+    """A timm training wrapper must get TimmDataProvider, or its per-epoch hooks are never forwarded."""
+    training = TimmDataLoaderWrapper()
+    provider = _build_data_provider(training, None)
+    assert isinstance(provider, TimmDataProvider)
+    assert provider.training is training
+    assert provider.validation_dataset is None
+    both = _build_data_provider(training, TimmDataLoaderWrapper())
+    assert isinstance(both, TimmDataProvider)
+
+
+def test_build_data_provider_falls_back_to_simple_provider() -> None:
+    """Datasets without timm hooks (or mixed pairs) get the plain SimpleDataProvider."""
+    plain = _build_data_provider([{"x": 1}], None)
+    assert isinstance(plain, SimpleDataProvider)
+    mixed = _build_data_provider(TimmDataLoaderWrapper(), [{"x": 1}])
+    assert isinstance(mixed, SimpleDataProvider)
 
 
 # ---------------------------------------------------------------------------
