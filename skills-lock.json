@@ -1,12 +1,6 @@
 {
   "version": 1,
   "skills": {
-    "anysearch": {
-      "source": "anysearch-ai/anysearch-skill",
-      "sourceType": "github",
-      "skillPath": "SKILL.md",
-      "computedHash": "a0289ea550c3c55f3ed67673e428fcf4f9ff0820dc4cf00571cf7f77d5f03ff9"
-    },
     "ask-matt": {
       "source": "mattpocock/skills",
       "sourceType": "github",
