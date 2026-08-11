@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 import pytest
+from structcast.utils.security import configure_security
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 from torch.nn import Module
 
@@ -17,6 +19,7 @@ from structcast_model.torch.trainer import (
     TimmDatasetWrapper,
     TorchTracker,
     TorchTrainer,
+    autocast_inputs,
     create_torch_inputs,
     get_torch_device,
     initial_distributed_env,
@@ -52,6 +55,14 @@ def _clean_global_callbacks() -> Any:
         ncl.clear()
         for name, cb in zip(names, cbs, strict=True):
             ncl.register(name, cb)
+
+
+@pytest.fixture
+def allow_module_imports() -> Any:
+    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
+    configure_security(allowed_modules_check=False)
+    yield
+    configure_security()
 
 
 class _IdentityModel(Module):
@@ -121,11 +132,11 @@ def _populate_image_folder(root: Path, *, num_classes: int = 2, images_per_class
 
 
 def test_create_torch_inputs_from_int_tuple_returns_tensor() -> None:
-    """A tuple of ints produces a float32 tensor with batch dimension 1."""
+    """A tuple of ints produces a bfloat16 tensor with batch dimension 1, bfloat16 being the default dtype."""
     result = create_torch_inputs((3, 4))
     assert isinstance(result, torch.Tensor)
     assert result.shape == (1, 3, 4)
-    assert result.dtype == torch.float32
+    assert result.dtype == torch.bfloat16
 
 
 def test_create_torch_inputs_from_list_returns_list() -> None:
@@ -148,6 +159,30 @@ def test_create_torch_inputs_invalid_shape_raises() -> None:
     """A non-shape scalar raises ValueError."""
     with pytest.raises(ValueError, match="Invalid tensor shape"):
         create_torch_inputs("not_a_shape")
+
+
+def test_create_torch_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """An integer dtype without an initializer falls back to zeros, because rand cannot produce integers.
+
+    The fallback is a guess about the caller's intent, so it must be reported.
+    """
+    with caplog.at_level(logging.WARNING):
+        result = create_torch_inputs({"_SHAPE_": [5], "_DTYPE_": "int64"})
+    assert result.dtype == torch.int64
+    assert torch.equal(result, torch.zeros((1, 5), dtype=torch.int64))
+    assert "Falling back to zeros" in caplog.text
+
+
+def test_create_torch_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+    """An explicit `_INIT_` address replaces the dtype-based default initializer."""
+    result = create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.ones"})
+    assert torch.equal(result, torch.ones((1, 4), dtype=torch.bfloat16))
+
+
+def test_create_torch_inputs_rejects_non_callable_initializer(allow_module_imports: None) -> None:
+    """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
+    with pytest.raises(TypeError, match="not callable as a tensor initializer"):
+        create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.pi"})
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +264,35 @@ def test_initial_model_handles_list_of_modules() -> None:
     models = [_IdentityModel(), _IdentityModel()]
     inputs, outputs = initial_model(models, shapes=None)
     assert inputs is None
+
+
+def test_initial_model_falls_back_to_the_shapes_declared_by_the_model() -> None:
+    """Without requested shapes, the model is initialized from the `input_shapes` the builder emitted."""
+
+    class DeclaredModel(Module):
+        input_shapes = {"x": (3,)}
+
+        def forward(self, x: torch.Tensor) -> dict[str, Any]:
+            return {"x": x}
+
+    inputs, outputs = initial_model(DeclaredModel())
+    assert inputs["x"].shape == (1, 3)
+    assert outputs["x"].shape == (1, 3)
+
+
+def test_initial_model_runs_low_precision_inputs_through_float32_parameters() -> None:
+    """Dummy inputs default to `bfloat16` while parameters stay `float32`, so the forward pass needs autocast."""
+    model = torch.nn.Linear(4, 2)
+    inputs, outputs = initial_model(model, shapes={"input": [4]})
+    assert inputs["input"].dtype is torch.bfloat16
+    assert next(model.parameters()).dtype is torch.float32
+    assert outputs.dtype is torch.bfloat16
+
+
+def test_autocast_inputs_is_a_null_context_for_float32_inputs() -> None:
+    """Inputs that already match `float32` parameters must keep running without autocast."""
+    with autocast_inputs({"x": torch.rand((1, 4), dtype=torch.float32)}, "cpu"):
+        assert not torch.is_autocast_enabled("cpu")
 
 
 # ---------------------------------------------------------------------------

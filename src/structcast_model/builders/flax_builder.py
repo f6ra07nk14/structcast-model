@@ -60,6 +60,7 @@ class {class_name}(flax.nnx.Module):
 
     def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):
         self.inputs = {self.inputs}
+        self.input_shapes = {self.input_shapes}
         self.outputs = {self.outputs}
         self.training = training
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}

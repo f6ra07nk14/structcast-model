@@ -1,6 +1,6 @@
 """Types for torch module."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from typing import TypeAlias
@@ -27,7 +27,25 @@ else:
     Tensor = Any
     """Tensor type."""
 
-__all__ = ["DType", "DeviceLike", "Tensor"]
+
+@runtime_checkable
+class TensorInitializer(Protocol):
+    """Callable creating a dummy tensor of the given size and element type, e.g. `torch.rand`.
+
+    Note:
+        Being runtime-checkable, `isinstance` only verifies that `__call__` exists;
+        a mismatched signature is only detected when the initializer is called.
+    """
+
+    # The aliases above are assigned in both branches of the `TYPE_CHECKING` split, so within this module mypy
+    # sees them as variables rather than types. The annotations are quoted because the underlying torch names
+    # are only imported while type checking.
+    def __call__(self, size: tuple[int, ...], *, dtype: "_dtype") -> "_Tensor":
+        """Create a tensor of the given size and element type."""
+        ...
+
+
+__all__ = ["DType", "DeviceLike", "Tensor", "TensorInitializer"]
 
 
 if not TYPE_CHECKING:

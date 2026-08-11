@@ -129,6 +129,7 @@ def measure_inference_time(
     )
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
+    shapes = flax_trainer.resolve_input_shapes(model, shapes)
     model = nnx.view(model, raise_if_not_found=False, **training_mode_kw)
     if compile_pattern is None:
         print("Skipping compilation...")

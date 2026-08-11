@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
 from structcast.utils.security import register_dir, unregister_dir
@@ -13,11 +13,16 @@ from structcast_model.builders.schema import (
     Template,
     TemplateBackward,
     TemplateLayer,
+    TensorSpec,
+    TensorSpecTree,
     UserDefinedBackward,
     UserDefinedLayer,
     resolve_flow,
     resolve_inputs,
 )
+
+TREE = TypeAdapter(TensorSpecTree)
+"""Adapter validating a single INPUT_SHAPES entry, the way consumers of the tree do."""
 
 
 def test_resolve_flow_returns_unique_inputs_and_outputs() -> None:
@@ -500,3 +505,91 @@ def test_user_defined_backward_unknown_outputs_in_inference_flow_raises() -> Non
     }
     with pytest.raises(SpecError, match="Unknown outputs found in inference flow"):
         UserDefinedBackward.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# TensorSpec / TensorSpecTree
+# ---------------------------------------------------------------------------
+
+
+def test_tensor_spec_compact_form_fills_defaults() -> None:
+    """A bare shape is the compact form of a TensorSpec and gets the default dtype."""
+    spec = TREE.validate_python([3, 224, 224])
+    assert isinstance(spec, TensorSpec)
+    assert spec.SHAPE == (3, 224, 224)
+    assert spec.DTYPE == "bfloat16"
+    assert spec.INIT is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ([3, 224, 224], (3, 224, 224)),
+        ([], ()),
+        ({"_SHAPE_": [512], "_DTYPE_": "int64"}, {"_SHAPE_": (512,), "_DTYPE_": "int64"}),
+        ({"_SHAPE_": [8], "_INIT_": "torch.zeros"}, {"_SHAPE_": (8,), "_INIT_": "torch.zeros"}),
+        ({"_SHAPE_": [8], "_DTYPE_": "bfloat16"}, (8,)),
+        ({"a": [10], "b": [5]}, {"a": (10,), "b": (5,)}),
+        ([[3, 224], [5]], [(3, 224), (5,)]),
+    ],
+)
+def test_tensor_spec_tree_round_trips(raw: Any, expected: Any) -> None:
+    """Validation is reversible: dumping restores the compact form whenever nothing but the shape is set."""
+    assert TREE.dump_python(TREE.validate_python(raw)) == expected
+
+
+def test_tensor_spec_tree_keeps_nested_containers() -> None:
+    """Nesting is preserved, dictionaries and lists stay themselves and only the leaves become TensorSpec."""
+    nested = TREE.validate_python({"a": [10], "b": [[3, 224], [5]]})
+    assert isinstance(nested, dict)
+    assert isinstance(nested["a"], TensorSpec)
+    branch = nested["b"]
+    assert isinstance(branch, list)
+    assert [leaf.SHAPE for leaf in branch if isinstance(leaf, TensorSpec)] == [(3, 224), (5,)]
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (10, "Input should be a valid dictionary or instance of TensorSpec"),
+        ({"_SHAPE_": [1], "_DTYPE_": "float64"}, "Input should be 'bfloat16', 'float16', 'float32'"),
+    ],
+)
+def test_tensor_spec_tree_rejects_invalid_input(raw: Any, match: str) -> None:
+    """Scalars and unsupported dtypes fail as ValidationError, so the union can report every branch."""
+    with pytest.raises(ValidationError, match=match):
+        TREE.validate_python(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"_SHAPE_": [4], "extra": [2]},
+        {"_DTYPE_": [4]},
+        {"nested": {"_INIT_": [2]}},
+    ],
+)
+def test_tensor_spec_tree_rejects_marker_keys_in_nested_dict(raw: Any) -> None:
+    """A malformed explicit form must error instead of being reinterpreted as nested inputs named by markers."""
+    with pytest.raises(ValidationError, match="marker keys"):
+        TREE.validate_python(raw)
+
+
+def test_user_defined_layer_input_shapes_defaults_to_empty() -> None:
+    """INPUT_SHAPES is optional."""
+    assert UserDefinedLayer.model_validate({"FLOW": [["x", "y", "layer"]]}).INPUT_SHAPES == {}
+
+
+def test_user_defined_layer_input_shapes_round_trip() -> None:
+    """INPUT_SHAPES validates its entries and dumps them back to plain nested data."""
+    layer = UserDefinedLayer.model_validate(
+        {
+            "FLOW": [["x", "y", "layer"]],
+            "INPUT_SHAPES": {"x": [3, 224, 224], "aux": {"m": {"_SHAPE_": [4], "_DTYPE_": "int32"}}},
+        }
+    )
+    assert isinstance(layer.INPUT_SHAPES["x"], TensorSpec)
+    assert layer.model_dump()["INPUT_SHAPES"] == {
+        "x": (3, 224, 224),
+        "aux": {"m": {"_SHAPE_": (4,), "_DTYPE_": "int32"}},
+    }

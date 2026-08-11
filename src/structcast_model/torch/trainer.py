@@ -1,7 +1,7 @@
 """Trainer for PyTorch models."""
 
 from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import cached_property
 from logging import getLogger
@@ -24,8 +24,10 @@ from timm.utils.distributed import init_distributed_device_so, is_distributed_en
 from torch.utils.data import DataLoader
 
 from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
-from structcast_model.torch.types import Tensor
+from structcast_model.torch.types import Tensor, TensorInitializer
+from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
 
 logger = getLogger(__name__)
@@ -34,6 +36,8 @@ DTYPES = {
     "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
+    "int32": torch.int32,
+    "int64": torch.int64,
 }
 
 T = TypeVar("T")
@@ -43,23 +47,34 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     """Create dummy inputs based on the provided shape.
 
     Args:
-        shape (Any): The shape of the inputs to create. This can be a tuple of integers,
+        shape (Any): The shape of the inputs to create. This can be a tensor specification,
+            which is a tuple of integers or a mapping with the `_SHAPE_` key,
             a dictionary of shapes, or a list/tuple of shapes.
         batch_size (int): The batch size to use for the inputs.
-            This will be prepended to the shape if the shape is a tuple of integers.
+            This will be prepended to the shape of every tensor specification.
 
     Returns:
-        Any: The created inputs, which can be a tensor, a dictionary of tensors, or a list/tuple of tensors.
+        Any: The created inputs, which can be a tensor, a dictionary of tensors, or a list of tensors.
+
+    Raises:
+        ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        return torch.rand((batch_size, *TypeAdapter(tuple[int, ...]).validate_python(shape)), dtype=torch.float32)
+        node = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
-        pass
-    if isinstance(shape, Mapping):
-        return {k: create_torch_inputs(v, batch_size=batch_size) for k, v in shape.items()}
-    if isinstance(shape, (list, tuple)):
-        return [create_torch_inputs(v, batch_size=batch_size) for v in shape]
-    raise ValueError(f"Invalid tensor shape: {shape}")
+        raise ValueError(f"Invalid tensor shape: {shape}") from None
+    if isinstance(node, TensorSpec):
+        initializer = resolve_tensor_initializer(
+            node.INIT,
+            node.DTYPE,
+            float_default=torch.rand,
+            int_default=torch.zeros,
+            protocol=TensorInitializer,
+        )
+        return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
+    if isinstance(node, Mapping):
+        return {k: create_torch_inputs(v, batch_size=batch_size) for k, v in node.items()}
+    return [create_torch_inputs(v, batch_size=batch_size) for v in node]
 
 
 def get_torch_device(device: str | None = None) -> str:
@@ -79,6 +94,36 @@ def get_torch_device(device: str | None = None) -> str:
 def get_torch_device_type(device: str | None = None) -> str:
     """Get the device type (cpu or cuda) from the device string."""
     return get_torch_device(device).split(":")[0]
+
+
+def _low_precision_dtype(inputs: Any) -> Any:
+    """Return the first `float16` or `bfloat16` element type found in the inputs, or `None` if there is none."""
+    if isinstance(inputs, torch.Tensor):
+        return inputs.dtype if inputs.dtype in (torch.float16, torch.bfloat16) else None
+    if isinstance(inputs, Mapping):
+        inputs = inputs.values()
+    elif not isinstance(inputs, (list, tuple)):
+        return None
+    return next((dtype for value in inputs if (dtype := _low_precision_dtype(value)) is not None), None)
+
+
+def autocast_inputs(inputs: Any, device_type: str) -> AbstractContextManager[Any]:
+    """Get the autocast context to run a model on the given dummy inputs in.
+
+    Tensor specifications declare `bfloat16` by default while model parameters are created as `float32`,
+    so running a model on the dummy inputs directly would fail on mismatched element types.
+    Autocast resolves this the same way mixed precision training does.
+
+    Args:
+        inputs (Any): The dummy inputs, which can be a tensor, a dictionary of tensors, or a list of tensors.
+        device_type (str): The device type to autocast on, e.g. "cpu" or "cuda".
+
+    Returns:
+        AbstractContextManager[Any]: An autocast context for the element type of the inputs,
+            or a null context when the inputs contain no low precision floating point tensor.
+    """
+    dtype = _low_precision_dtype(inputs)
+    return nullcontext() if dtype is None else torch.autocast(device_type, dtype=dtype)
 
 
 @overload
@@ -151,17 +196,23 @@ def initial_model(model: Any, shapes: dict[str, Any] | None = None) -> tuple[Any
     Args:
         model (Any): The model to initialize. Can be any nested structure containing PyTorch modules.
         shapes (dict[str, Any] | None): A dictionary mapping module names to their input shapes.
-            If None, the model will not be initialized with dummy inputs.
+            If empty or None, the shapes declared by the model itself are used, and the model
+            will not be initialized with dummy inputs when it declares none either.
 
     Returns:
         A tuple containing the inputs created based on the shapes,
             and the outputs forwarded through the model using the dummy inputs.
     """
+    shapes = resolve_input_shapes(model, shapes)
     inputs = None if shapes is None else create_torch_inputs(shapes)
+    device_type = torch.get_default_device().type
 
     def _init(raw: Any) -> Any:
         if isinstance(raw, torch.nn.Module):
-            return None if inputs is None else raw(**inputs)
+            if inputs is None:
+                return None
+            with autocast_inputs(inputs, device_type):
+                return raw(**inputs)
         if isinstance(raw, Mapping):
             res = {k: _init(v) for k, v in raw.items()}
             return res if (cls := type(raw)) is dict else cls(**res)
@@ -682,10 +733,13 @@ __all__ = [
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
+    "autocast_inputs",
     "create_torch_inputs",
     "get_torch_device",
+    "get_torch_device_type",
     "initial_distributed_env",
     "initial_model",
+    "resolve_input_shapes",
 ]
 
 
