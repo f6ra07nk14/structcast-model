@@ -255,6 +255,42 @@ def test_create_opt_sends_bare_names_to_timm() -> None:
     assert optimizer.param_groups[0]["nesterov"] is True
 
 
+def test_create_opt_applies_regex_weight_decay_on_the_native_engine() -> None:
+    """Native torch.optim reads per-group weight_decay: the regex groups must override the engine default."""
+    optimizer = create_opt(
+        _named_params(), opt="torch.optim.AdamW", lr=0.01, weight_decay=0.05, no_weight_decay_regexes=["bias"]
+    )
+    decays = {tuple(group["param_names"]): group["weight_decay"] for group in optimizer.param_groups}
+    assert decays == {("bias",): 0.0, ("weight",): 0.05}
+
+
+def test_native_engine_weight_decay_shrinks_only_decayed_parameters() -> None:
+    """One SGD step with zero gradients proves decay is applied: the weight shrinks, the bias stays put."""
+    layer = Linear(4, 2)
+    params = list(layer.named_parameters())
+    optimizer = create_opt(params, opt="torch.optim.SGD", lr=0.1, weight_decay=0.5, no_weight_decay_regexes=["bias"])
+    weight_before, bias_before = layer.weight.detach().clone(), layer.bias.detach().clone()
+    for _, parameter in params:
+        parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    assert torch.allclose(layer.weight.detach(), weight_before * (1 - 0.1 * 0.5))
+    assert torch.equal(layer.bias.detach(), bias_before)
+
+
+def test_native_engine_layer_decay_scales_each_group_learning_rate() -> None:
+    """One SGD step with unit gradients proves layer decay reaches native optim: each group moves by its scaled lr."""
+    layer = Linear(4, 2)
+    params = list(layer.named_parameters())
+    optimizer = create_opt(params, opt="torch.optim.SGD", lr=0.1, layer_decay=0.5, layer_group_regexes=["weight"])
+    weight_before, bias_before = layer.weight.detach().clone(), layer.bias.detach().clone()
+    for _, parameter in params:
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    # "weight" matches group 0 (scale 0.5); "bias" matches none and lands in the unscaled group.
+    assert torch.allclose(layer.weight.detach(), weight_before - 0.5 * 0.1)
+    assert torch.allclose(layer.bias.detach(), bias_before - 1.0 * 0.1)
+
+
 def test_create_opt_rejects_a_bad_explicit_native_name() -> None:
     """An explicit torch.optim.X name that is not an optimizer must fail loudly, not fall back to timm."""
     with pytest.raises(ValueError, match="does not name a torch.optim optimizer class"):
