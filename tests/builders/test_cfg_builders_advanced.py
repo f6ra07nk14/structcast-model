@@ -219,9 +219,8 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
     script_path = tmp_path / "learner.py"
     built(script_path)
     code = script_path.read_text(encoding="utf-8")
-    assert (
-        'AdamWWithCosine = import_from_address("AdamWWithCosine", module_file="examples/torch/optimizers.py")' in code
-    )
+    resolved = str(Path("examples/torch/optimizers.py").resolve())
+    assert f"AdamWWithCosine = import_from_address('AdamWWithCosine', module_file={resolved!r})" in code
     assert "from structcast.utils.base import import_from_address" in code
 
 

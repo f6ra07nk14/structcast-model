@@ -563,7 +563,7 @@ Methods: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, 
 
 The dataset template at [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml) formats into this wrapper.
 
-**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` wrapper. It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to the training wrapper's sampler (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. `scm torch train` builds a `TimmDataProvider` automatically when both dataset options are timm wrappers (falling back to `SimpleDataProvider` otherwise); use it directly when wiring a trainer programmatically.
+**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` wrapper. It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to the training wrapper's sampler (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. `scm torch train` builds a `TimmDataProvider` automatically when the training dataset option is a timm wrapper (falling back to `SimpleDataProvider` otherwise); use it directly when wiring a trainer programmatically.
 
 ```python
 provider = TimmDataProvider(training=training_wrapper, validation=validation_wrapper)

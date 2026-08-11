@@ -242,11 +242,23 @@ def test_set_lr_scale_with_tensor_lr() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("opt", ["adamw", "AdamW", "sgd"])
-def test_create_opt_builds_a_native_optimizer_by_name(opt: str) -> None:
-    """A `torch.optim` name is resolved case-insensitively, so cfg files can keep lowercase names."""
+@pytest.mark.parametrize("opt", ["torch.optim.AdamW", "torch.AdamW", "torch.optim.SGD"])
+def test_create_opt_builds_a_native_optimizer_by_explicit_name(opt: str) -> None:
+    """Only an explicit torch.optim.X name selects the native engine: bare names keep timm's defaults."""
     optimizer = create_opt(_named_params(), opt=opt, lr=0.01)
-    assert type(optimizer) is getattr(torch.optim, "AdamW" if opt.lower() == "adamw" else "SGD")
+    assert type(optimizer) is getattr(torch.optim, opt.rsplit(".", 1)[-1])
+
+
+def test_create_opt_sends_bare_names_to_timm() -> None:
+    """Bare names like "sgd" must keep timm's defaults (nesterov momentum), or migrated cfgs change behavior."""
+    optimizer = create_opt(_named_params(), opt="sgd", lr=0.01, momentum=0.9)
+    assert optimizer.param_groups[0]["nesterov"] is True
+
+
+def test_create_opt_rejects_a_bad_explicit_native_name() -> None:
+    """An explicit torch.optim.X name that is not an optimizer must fail loudly, not fall back to timm."""
+    with pytest.raises(ValueError, match="does not name a torch.optim optimizer class"):
+        create_opt(_named_params(), opt="torch.optim.NoSuchOptimizer", lr=0.01)
 
 
 def test_create_opt_builds_the_given_optimizer_class() -> None:
@@ -288,7 +300,12 @@ def test_create_opt_passes_weight_decay_through_when_no_group_consumed_it() -> N
 def test_create_opt_bakes_layer_scales_into_lr_on_the_native_engine() -> None:
     """Native schedulers ignore lr_scale, so the scale has to be applied to lr before training."""
     optimizer = create_opt(
-        _named_params(), opt="sgd", lr=1.0, layer_decay=0.5, layer_group_regexes=["weight"], weight_decay=0.05
+        _named_params(),
+        opt="torch.optim.SGD",
+        lr=1.0,
+        layer_decay=0.5,
+        layer_group_regexes=["weight"],
+        weight_decay=0.05,
     )
     assert not any("lr_scale" in group for group in optimizer.param_groups)
     assert sorted(group["lr"] for group in optimizer.param_groups) == [pytest.approx(0.5), pytest.approx(1.0)]

@@ -302,6 +302,14 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
                 if isinstance(candidate, protocol) and id(candidate) not in registered[event]:
                     registered[event].add(id(candidate))
                     self._events[event].append((type(candidate).__name__, getattr(candidate, event)))
+        # The learner/tracker/data participants legitimately may implement no event, but an entry of
+        # the explicit callbacks sequence that matches nothing is almost certainly a typo'd hook name.
+        for callback in self.callbacks:
+            if not any(isinstance(callback, protocol) for protocol in EVENT_PROTOCOLS.values()):
+                logger.warning(
+                    f'Callback "{type(callback).__name__}" implements no event protocol '
+                    f"({', '.join(EVENTS)}) and will never be called."
+                )
 
     def describe(self) -> dict[str, list[str]]:
         """Return a mapping of event name to registered callback display names.

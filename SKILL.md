@@ -125,7 +125,7 @@ scm torch train \
 
 What happens:
 
-1. Datasets are instantiated, counted, and composed into a `SimpleDataProvider`.
+1. Datasets are instantiated, counted, and composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`).
 2. `TorchLearnerFactory` builds the models and the learner, initializing and compiling them.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
 4. Callbacks are collected: `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
@@ -190,7 +190,7 @@ What happens:
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
 3. Each model is wrapped with `DistributedDataParallel`.
-4. `TimmDataLoaderWrapper` creates a `DistributedSampler`. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when its dataset options are timm wrappers.
+4. `TimmDataLoaderWrapper` creates a `DistributedSampler`. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when the training dataset option is a timm wrapper.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
 6. Experiment logging and checkpoints are gated to rank 0 only.
 7. DDP gradient sync is skipped during gradient accumulation steps.

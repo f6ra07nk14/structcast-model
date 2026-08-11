@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from structcast.core.base import WithExtra
-from structcast.core.instantiator import instantiate
+from structcast.core.instantiator import ObjectPattern, instantiate
 from structcast.core.specifier import FlexSpec
 from structcast.utils.base import dump_yaml
 from timm.data import (
@@ -743,8 +743,10 @@ class TimmDataProvider(BaseModel):
     training: TimmDataLoaderWrapper
     """The wrapper producing the training dataset."""
 
-    validation: TimmDataLoaderWrapper | None = None
-    """The wrapper producing the validation dataset, or None to skip validation."""
+    validation: Any = None
+    """The validation dataset: a timm wrapper, any other dataset object, or None to skip validation.
+
+    Only the training wrapper needs per-epoch hooks, so the validation side accepts any dataset."""
 
     @property
     def training_dataset(self) -> TimmDataLoaderWrapper:
@@ -752,8 +754,8 @@ class TimmDataProvider(BaseModel):
         return self.training
 
     @property
-    def validation_dataset(self) -> TimmDataLoaderWrapper | None:
-        """The dataset used for validation, or None when no validation wrapper was given."""
+    def validation_dataset(self) -> Any:
+        """The dataset used for validation, or None when no validation dataset was given."""
         return self.validation
 
     def on_epoch_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
@@ -799,6 +801,11 @@ class TorchLearnerFactory:
             return lambda module: module
         return partial(torch.compile, **instantiate(self.compile_pattern))
 
+    @staticmethod
+    def _instantiate_pattern(raw: Any) -> Any:
+        """Instantiate a validated object pattern, raising on malformed input instead of passing it through."""
+        return ObjectPattern.model_validate(raw).build().runs[0]
+
     def _instantiate_models(self) -> "OrderedDict[str, Any]":
         """Instantiate the models from the name-pattern mappings, in the order they were given."""
         models: OrderedDict[str, Any] = OrderedDict()
@@ -806,7 +813,7 @@ class TorchLearnerFactory:
             if len(raw) != 1:
                 raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
             name, pattern = next(iter(raw.items()))
-            models[name] = instantiate(pattern)
+            models[name] = self._instantiate_pattern(pattern)
         return models
 
     def __call__(self, device: str, *, apply_initializers: bool = True) -> tuple["OrderedDict[str, Any]", Any]:
@@ -829,7 +836,7 @@ class TorchLearnerFactory:
                 for name, model in models.items():
                     if name in initializers:
                         model.apply(initializers[name])
-            learner = instantiate(self.learner_pattern)(**models)
+            learner = self._instantiate_pattern(self.learner_pattern)(**models)
         if hasattr(learner, "forward_training_step"):
             learner.forward_training_step = self.compile_fn(learner.forward_training_step)
         if hasattr(learner, "forward_inference_step"):
@@ -838,7 +845,12 @@ class TorchLearnerFactory:
 
 
 def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
-    """Merge the learning rates reported by the learner into the criteria of the current epoch."""
+    """Merge the learning rates reported by the learner into the criteria of the current epoch.
+
+    Schedules step in the learner's own on_epoch_end hooks, which the trainer dispatches before the
+    logger's, so the recorded learning rate is the one the NEXT epoch will use -- the same one-epoch
+    offset the pre-redesign global callbacks produced.
+    """
     return {**getattr(getattr(info, "learner", None), "learning_rates", {}), **info.logs()}
 
 
@@ -865,8 +877,8 @@ class MLflowLogger:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        """End the run."""
-        self.mlflow.end_run()
+        """End the run, marking it failed when an exception is propagating."""
+        self.mlflow.end_run(status="FINISHED" if exc_type is None else "FAILED")
 
     def log_params(self, params: Mapping[str, Any]) -> None:
         """Log the run parameters."""
@@ -915,8 +927,8 @@ class WandbLogger:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        """Finish the run."""
-        self.wandb.finish()
+        """Finish the run, marking it failed when an exception is propagating."""
+        self.wandb.finish(exit_code=0 if exc_type is None else 1)
 
     def log_params(self, params: Mapping[str, Any]) -> None:
         """Log the run parameters."""

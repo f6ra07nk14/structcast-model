@@ -295,6 +295,17 @@ def test_torch_tracker_from_criteria_with_metric_outputs() -> None:
     assert isinstance(tracker, TorchTracker)
 
 
+def test_torch_tracker_buffers_follow_the_ambient_device() -> None:
+    """The CLI builds the tracker inside `with torch.device(device)`.
+
+    The buffers must land on that device, or the first CUDA training step mixes CUDA criteria with
+    CPU buffers and crashes.
+    """
+    with torch.device("meta"):
+        tracker = TorchTracker.from_criteria(["loss"], None, False)
+    assert tracker.tracker.total.device.type == "meta"
+
+
 def test_torch_tracker_call_returns_float_values() -> None:
     """__call__ returns a dict of float values from Tensor criteria."""
     tracker = TorchTracker.from_criteria(["loss"])
@@ -1196,7 +1207,7 @@ class _FakeWandb:
         """Record the started project."""
         self.projects.append(project)
 
-    def finish(self) -> None:
+    def finish(self, exit_code: int = 0) -> None:
         """Record that the run was finished."""
         self.finished += 1
 

@@ -217,7 +217,7 @@ Key runtime behavior:
 - `configure_security()` is called because commands frequently import generated local files via `_file_` patterns.
 - `torch.compile` is optional and configured via `-c/--compile`; it is applied to the models and to the learner's step functions.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
-- The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
+- The two dataset options are composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`) passed as `data=`; `fit()` receives only loop parameters.
 - Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion. They are created on rank 0 only.
 - `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`, and a `KeyboardInterrupt` saves the current training state before leaving it.
 - `trainer.describe()` is printed before fitting, showing which object handles which event.
@@ -227,7 +227,7 @@ Distributed training behavior (when launched through `torchrun`):
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
 - All models are wrapped with `DistributedDataParallel`.
-- `TimmDataLoaderWrapper` creates `DistributedSampler` automatically. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when its dataset options are timm wrappers, so the sampler epoch advances on the CLI path too.
+- `TimmDataLoaderWrapper` creates `DistributedSampler` automatically. `set_epoch()` is forwarded by `TimmDataProvider.on_epoch_begin`; the CLI builds a `TimmDataProvider` when the training dataset option is a timm wrapper, so the sampler epoch advances on the CLI path too.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - Experiment logging, checkpoints, and progress bars are gated to rank 0 only.
 - DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
@@ -380,7 +380,7 @@ Utility functions:
 
 ### Training flow in practice
 
-1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`.
+1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a data provider (`TimmDataProvider` for a timm training wrapper, else `SimpleDataProvider`).
 2. `TorchLearnerFactory` instantiates the models, initializes them with dummy inputs, applies initializers, and builds the learner with those models.
 3. Models are DDP-wrapped and compiled where requested.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).

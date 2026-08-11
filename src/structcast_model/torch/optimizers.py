@@ -109,16 +109,19 @@ def _param_groups_weight_decay(
 
 
 def _native_optimizer(name: str) -> "type[Optimizer] | None":
-    """Return the `torch.optim` optimizer class named *name*, ignoring case, or None when there is none."""
-    for attribute in dir(torch.optim):
-        candidate = getattr(torch.optim, attribute)
-        if (
-            attribute.lower() == name.lower()
-            and isinstance(candidate, type)
-            and issubclass(candidate, torch.optim.Optimizer)
-        ):
-            return candidate
-    return None
+    """Return the `torch.optim` class for an explicit ``torch.optim.X`` (or ``torch.X``) name, else None.
+
+    Bare names ("sgd", "adamw") deliberately do NOT resolve here: timm's registry configures
+    different defaults for several shared names (e.g. sgd with nesterov momentum), so bare names keep
+    going to timm and the native engine must be requested explicitly.
+    """
+    attribute = name.removeprefix("torch.optim.") if name.startswith("torch.optim.") else name.removeprefix("torch.")
+    if attribute == name:
+        return None
+    candidate = getattr(torch.optim, attribute, None)
+    if isinstance(candidate, type) and issubclass(candidate, torch.optim.Optimizer):
+        return candidate
+    raise ValueError(f'"{name}" does not name a torch.optim optimizer class.')
 
 
 def set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
@@ -158,9 +161,10 @@ def create_opt(
     group carries the weight decay, `weight_decay` is passed on as 0.0 so the engine default cannot
     override it.
 
-    The engine is then chosen from *opt*: a callable is instantiated directly, a string naming a
-    `torch.optim` class (case-insensitive) instantiates that class, and anything else falls back to
-    `timm.optim.create_optimizer_v2`.
+    The engine is then chosen from *opt*: a callable is instantiated directly, an explicit
+    `torch.optim.X` (or `torch.X`) name instantiates that class natively, and every bare name goes to
+    `timm.optim.create_optimizer_v2` -- bare names keep timm's defaults (e.g. `sgd` with nesterov
+    momentum), so configurations migrated from `create_with_scheduler` behave identically.
 
     Layer decay emits an `lr_scale` per group, which only timm schedulers consume. For the callable
     and native engines the scale is therefore baked into the learning rate right away; on the timm

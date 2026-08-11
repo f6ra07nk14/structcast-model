@@ -23,12 +23,16 @@ from typing import Any
 
 from timm.scheduler.scheduler_factory import create_scheduler_v2
 
-from structcast_model.torch.optimizers import create_opt
+from structcast_model.torch.optimizers import create_opt, set_lr_scale
 import torch
 
 
 class AdamWWithCosine:
-    """An optimizer stepping a timm scheduler, usable anywhere a `torch.optim.Optimizer` is."""
+    """An optimizer stepping a timm scheduler, usable wherever an optimizer is duck-typed.
+
+    The proxy covers `step`, `zero_grad`, `param_groups`, `state_dict` and `torch.amp.GradScaler`;
+    it is not an `Optimizer` subclass, so isinstance checks (e.g. a native `LRScheduler`) reject it.
+    """
 
     def __init__(self, params: Any, optimizer_kwargs: dict[str, Any], scheduler_kwargs: dict[str, Any]) -> None:
         """Create the optimizer and its schedule.
@@ -53,8 +57,12 @@ class AdamWWithCosine:
         """Delegate the `Optimizer` interface to the wrapped optimizer.
 
         This keeps generated learner code (`step`, `zero_grad`, `param_groups`) and
-        `torch.amp.GradScaler` working on this object unchanged.
+        `torch.amp.GradScaler` working on this object unchanged. Dunder names and the wrapped
+        attributes themselves are not delegated: on a partially-initialized instance (pickling,
+        deepcopy, a failed __init__) that delegation would recurse forever.
         """
+        if name.startswith("__") or name in ("optimizer", "scheduler"):
+            raise AttributeError(name)
         return getattr(self.optimizer, name)
 
     def on_update(self, info: Any, **models: Any) -> None:
@@ -76,7 +84,13 @@ class AdamWWithCosine:
 
 
 class OptimizerWithNativeScheduler:
-    """An optimizer stepping a native `torch.optim.lr_scheduler` schedule, usable anywhere an optimizer is."""
+    """An optimizer stepping a per-epoch native `torch.optim.lr_scheduler` schedule.
+
+    Duck-typed like `AdamWWithCosine` (not an `Optimizer` subclass). Deliberately minimal: it steps
+    the schedule once per epoch with no metric, so metric-driven (`ReduceLROnPlateau`), per-update
+    (`CosineAnnealingWarmRestarts`) and composite (`SequentialLR`) schedules need their own wrapper
+    modeled on this one.
+    """
 
     def __init__(self, params: Any, optimizer_kwargs: dict[str, Any], scheduler_kwargs: dict[str, Any]) -> None:
         """Create the optimizer and its schedule.
@@ -90,14 +104,21 @@ class OptimizerWithNativeScheduler:
         scheduler_kwargs = dict(scheduler_kwargs)
         scheduler_type = getattr(torch.optim.lr_scheduler, scheduler_kwargs.pop("name"))
         self.optimizer = create_opt(params, **optimizer_kwargs)
+        # Native schedulers ignore the lr_scale keys a timm-engine layer decay leaves in the param
+        # groups: bake them into lr now, before the scheduler snapshots its base_lrs.
+        set_lr_scale(self.optimizer, True)
         self.scheduler = scheduler_type(optimizer=self.optimizer, **scheduler_kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Delegate the `Optimizer` interface to the wrapped optimizer.
 
         This keeps generated learner code (`step`, `zero_grad`, `param_groups`) and
-        `torch.amp.GradScaler` working on this object unchanged.
+        `torch.amp.GradScaler` working on this object unchanged. Dunder names and the wrapped
+        attributes themselves are not delegated: on a partially-initialized instance (pickling,
+        deepcopy, a failed __init__) that delegation would recurse forever.
         """
+        if name.startswith("__") or name in ("optimizer", "scheduler"):
+            raise AttributeError(name)
         return getattr(self.optimizer, name)
 
     def on_epoch_end(self, info: Any, **models: Any) -> None:

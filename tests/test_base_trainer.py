@@ -295,6 +295,25 @@ def test_object_without_event_methods_is_ignored() -> None:
     assert trainer.describe() == {}
 
 
+def test_explicit_callback_matching_no_event_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """A typo'd hook name (on_epoch_ended) would die silently, so dead explicit callbacks must warn."""
+
+    class Typoed:
+        def on_epoch_ended(self, info: Any, **models: Any) -> None:
+            raise AssertionError("never called")
+
+    with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
+        _make_trainer(callbacks=[Typoed()])
+    assert any("Typoed" in record.message and "no event protocol" in record.message for record in caplog.records)
+
+
+def test_scanned_participants_without_events_do_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    """The learner/tracker/data legitimately may implement no event: only explicit callbacks warn."""
+    with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
+        _make_trainer(data=SimpleDataProvider([{"x": 1}]))
+    assert not caplog.records
+
+
 def test_scan_order_is_learner_then_tracker_then_data_then_callbacks() -> None:
     """Registration order fixes call order, so scheduler-like participants run before reporters."""
     log: list[str] = []

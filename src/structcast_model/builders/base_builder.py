@@ -219,11 +219,28 @@ class _Intermediate(Serializable):
             + [f"import {p}" for p, i in module_imports.items() if None in i]
             + (["from structcast.utils.base import import_from_address"] if file_imports else [])
         ).strip()
-        file_bindings = "\n".join(
-            f'{resolve_address(address)[1]} = import_from_address("{address}", module_file="{file}")'
-            for file, addresses in sorted(file_imports.items())
-            for address in sorted(a for a in addresses if a)
-        )
+        module_names = {name for names in from_imports.values() for name in names}
+        bound: dict[str, str] = {}
+        binding_lines: list[str] = []
+        for file, addresses in sorted(file_imports.items()):
+            for address in sorted(a for a in addresses if a):
+                leaf = resolve_address(address)[1]
+                if bound.get(leaf, file) != file:
+                    raise SpecError(
+                        f'File-addressed name "{leaf}" is bound from both "{bound[leaf]}" and "{file}": '
+                        "the generated script would silently shadow one of them. Rename one symbol."
+                    )
+                if leaf in module_names:
+                    raise SpecError(
+                        f'File-addressed name "{leaf}" collides with an imported module member of the same name: '
+                        "the generated script would silently shadow the import. Rename one symbol."
+                    )
+                bound[leaf] = file
+                # Resolve the config-relative path while it is resolvable, so the generated script
+                # imports the same file regardless of the directory it is later run from.
+                rendered_file = str(Path(file).resolve()) if Path(file).exists() else file
+                binding_lines.append(f"{leaf} = import_from_address({address!r}, module_file={rendered_file!r})")
+        file_bindings = "\n".join(binding_lines)
         code = "\n\n".join([s for s in [(imported_code + "\n"), file_bindings, *self.scripts] if s])
         if module_path is None:
             module_path = Path(f"{to_snake(self.classname)}.py")

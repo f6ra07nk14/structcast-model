@@ -482,11 +482,21 @@ def test_build_data_provider_uses_timm_provider_for_timm_wrappers() -> None:
 
 
 def test_build_data_provider_falls_back_to_simple_provider() -> None:
-    """Datasets without timm hooks (or mixed pairs) get the plain SimpleDataProvider."""
+    """A non-timm training dataset has no hooks to forward and gets the plain SimpleDataProvider."""
     plain = _build_data_provider([{"x": 1}], None)
     assert isinstance(plain, SimpleDataProvider)
-    mixed = _build_data_provider(TimmDataLoaderWrapper(), [{"x": 1}])
-    assert isinstance(mixed, SimpleDataProvider)
+
+
+def test_build_data_provider_keeps_timm_hooks_with_a_foreign_validation_dataset() -> None:
+    """Only the training wrapper carries per-epoch hooks.
+
+    A non-timm validation dataset must not silently drop DistributedSampler reshuffling and the
+    mixup cutoff.
+    """
+    validation = [{"x": 1}]
+    provider = _build_data_provider(TimmDataLoaderWrapper(), validation)
+    assert isinstance(provider, TimmDataProvider)
+    assert provider.validation_dataset is validation
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +796,7 @@ class _FakeWandb:
         """Start a run."""
         self.projects.append(project)
 
-    def finish(self) -> None:
+    def finish(self, exit_code: int = 0) -> None:
         """End the run."""
         self.finished += 1
 
