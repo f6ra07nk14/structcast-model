@@ -6,7 +6,14 @@ from logging import getLogger
 from math import inf
 from operator import gt, lt
 from time import time
-from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
+
+if TYPE_CHECKING:
+    import tqdm
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    tqdm = LazyModuleImporter("tqdm")
 
 logger = getLogger(__name__)
 
@@ -40,6 +47,14 @@ class Learner(Protocol):
     @property
     def models(self) -> dict[str, Any]:
         """The models to train."""
+
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """The optimizers by name; members implementing event protocols are routed by the trainer."""
+
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        """The current learning rate of each optimizer, for display and logging."""
 
     def update(self, step: int) -> bool:
         """Determine whether to update the model based on the current step and any internal state."""
@@ -287,11 +302,7 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
 
     def __post_init__(self) -> None:
         """Route every participant into the events whose protocol it implements."""
-        candidates: list[Any] = [self.learner]
-        optimizers = getattr(self.learner, "optimizers", None)
-        if isinstance(optimizers, Mapping):
-            candidates.extend(optimizers.values())
-        candidates.append(self.tracker)
+        candidates: list[Any] = [self.learner, *self.learner.optimizers.values(), self.tracker]
         if self.data is not None:
             candidates.append(self.data)
         candidates.extend(self.callbacks)
@@ -481,11 +492,9 @@ class BestCriterion(Generic[ModelT_contra]):
 def _format_criteria(info: BaseInfo) -> str:
     """Format the criteria of the current epoch as indented ``key: value`` lines.
 
-    The learner's learning rates are prepended when *info* exposes a learner that reports them.
+    Trainers dispatch themselves as *info*, so the learner's learning rates are read directly.
     """
-    learner = getattr(info, "learner", None)
-    learning_rates = getattr(learner, "learning_rates", None)
-    values: dict[str, Any] = dict(learning_rates) if isinstance(learning_rates, Mapping) else {}
+    values: dict[str, Any] = dict(cast("BaseTrainer[Any]", info).learner.learning_rates)
     values.update(info.logs())
     return "\n".join([f"epoch: {info.epoch}", *(f"  {key}: {value}" for key, value in values.items())])
 
@@ -508,15 +517,11 @@ class ProgressBar:
             training_criteria: Log keys shown next to the bar during training.
             validation_criteria: Log keys shown next to the bar during validation.
         """
-        # tqdm is not a declared dependency of this package: importing it here keeps the module
-        # importable without it, so a top-level import is not an option.
-        from tqdm import tqdm  # noqa: PLC0415
-
         self.steps_per_epoch = steps_per_epoch
         self.validation_steps = validation_steps
         self.training_criteria = training_criteria
         self.validation_criteria = validation_criteria
-        self.bar = tqdm(total=steps_per_epoch, unit="batch")
+        self.bar = tqdm.tqdm(total=steps_per_epoch, unit="batch")
 
     def _set_postfix(self, info: BaseInfo, criteria: Sequence[str]) -> None:
         """Show the values of *criteria* that the current epoch has produced."""

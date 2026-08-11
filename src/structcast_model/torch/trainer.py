@@ -8,7 +8,7 @@ from functools import cached_property, partial
 from logging import getLogger
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from structcast.core.base import WithExtra
@@ -851,7 +851,7 @@ def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
     logger's, so the recorded learning rate is the one the NEXT epoch will use -- the same one-epoch
     offset the pre-redesign global callbacks produced.
     """
-    return {**getattr(getattr(info, "learner", None), "learning_rates", {}), **info.logs()}
+    return {**cast("BaseTrainer[Any]", info).learner.learning_rates, **info.logs()}
 
 
 class MLflowLogger:

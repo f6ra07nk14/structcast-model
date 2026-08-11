@@ -12,7 +12,6 @@ import mlflow
 import numpy as np
 from PIL import Image
 import pytest
-from structcast.utils.base import configure_security
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 from torch.nn import Module
 
@@ -37,14 +36,6 @@ import torch
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def allow_module_imports() -> Any:
-    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security()
-    yield
-    configure_security()
 
 
 class _IdentityModel(Module):
@@ -73,6 +64,11 @@ class _StubLearner:
     def models(self) -> dict[str, Any]:
         """Return the models dict."""
         return self._models
+
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """No optimizers: the trainer scan must handle an empty mapping."""
+        return {}
 
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""
@@ -156,13 +152,13 @@ def test_create_torch_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: 
     assert "Falling back to zeros" in caplog.text
 
 
-def test_create_torch_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+def test_create_torch_inputs_honours_explicit_initializer() -> None:
     """An explicit `_INIT_` address replaces the dtype-based default initializer."""
     result = create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.ones"})
     assert torch.equal(result, torch.ones((1, 4), dtype=torch.bfloat16))
 
 
-def test_create_torch_inputs_rejects_non_callable_initializer(allow_module_imports: None) -> None:
+def test_create_torch_inputs_rejects_non_callable_initializer() -> None:
     """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
     with pytest.raises(TypeError, match="not callable as a tensor initializer"):
         create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.pi"})
@@ -1056,18 +1052,14 @@ def _factory(learner_module: Path, **kwargs: Any) -> TorchLearnerFactory:
     )
 
 
-def test_torch_learner_factory_builds_the_models_and_hands_them_to_the_learner(
-    learner_module: Path, allow_module_imports: None
-) -> None:
+def test_torch_learner_factory_builds_the_models_and_hands_them_to_the_learner(learner_module: Path) -> None:
     """The learner is constructed from the models by name: that binding is the factory's job."""
     models, learner = _factory(learner_module)("cpu")
     assert list(models) == ["encoder"]
     assert learner.models["encoder"] is models["encoder"]
 
 
-def test_torch_learner_factory_resolves_shapes_and_initializes_lazy_models(
-    learner_module: Path, allow_module_imports: None
-) -> None:
+def test_torch_learner_factory_resolves_shapes_and_initializes_lazy_models(learner_module: Path) -> None:
     """A model with deferred parameters only gets them from a forward pass on the resolved shapes."""
     factory = _factory(
         learner_module,
@@ -1079,7 +1071,7 @@ def test_torch_learner_factory_resolves_shapes_and_initializes_lazy_models(
     assert tuple(models["encoder"].weight.shape) == (2, 4)
 
 
-def test_torch_learner_factory_applies_the_initializers(learner_module: Path, allow_module_imports: None) -> None:
+def test_torch_learner_factory_applies_the_initializers(learner_module: Path) -> None:
     """Initializers are matched to models by name, so only the named model is reinitialized."""
     factory = _factory(
         learner_module,
@@ -1089,7 +1081,7 @@ def test_torch_learner_factory_applies_the_initializers(learner_module: Path, al
     assert torch.count_nonzero(models["encoder"].weight) == 0
 
 
-def test_torch_learner_factory_can_skip_the_initializers(learner_module: Path, allow_module_imports: None) -> None:
+def test_torch_learner_factory_can_skip_the_initializers(learner_module: Path) -> None:
     """Distributed runs initialize on the main rank only, so skipping must leave the weights alone."""
     factory = _factory(
         learner_module,
@@ -1099,23 +1091,19 @@ def test_torch_learner_factory_can_skip_the_initializers(learner_module: Path, a
     assert torch.count_nonzero(models["encoder"].weight) > 0
 
 
-def test_torch_learner_factory_compiles_the_step_functions(learner_module: Path, allow_module_imports: None) -> None:
+def test_torch_learner_factory_compiles_the_step_functions(learner_module: Path) -> None:
     """The step functions are the hot path, so a compile pattern has to reach them, not just the models."""
     _, learner = _factory(learner_module, compile_pattern={"dynamic": False})("cpu")
     assert hasattr(learner.forward_training_step, "_torchdynamo_orig_callable")
 
 
-def test_torch_learner_factory_leaves_the_learner_uncompiled_without_a_pattern(
-    learner_module: Path, allow_module_imports: None
-) -> None:
+def test_torch_learner_factory_leaves_the_learner_uncompiled_without_a_pattern(learner_module: Path) -> None:
     """No compile pattern means no compilation: `torch.compile` must not be applied by default."""
     _, learner = _factory(learner_module)("cpu")
     assert not hasattr(learner.forward_training_step, "_torchdynamo_orig_callable")
 
 
-def test_torch_learner_factory_rejects_a_pattern_naming_several_models(
-    learner_module: Path, allow_module_imports: None
-) -> None:
+def test_torch_learner_factory_rejects_a_pattern_naming_several_models(learner_module: Path) -> None:
     """A two-key entry hides which name belongs to which pattern, so it is a configuration error."""
     factory = _factory(
         learner_module, model_patterns=[{"a": _linear_pattern(in_features=1, out_features=1), "b": None}]
