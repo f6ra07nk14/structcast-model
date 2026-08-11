@@ -220,6 +220,7 @@ def measure_inference_time(
     print("Initializing the model...")
     with torch.device(device):
         model = instantiate_object(model_pattern)
+        shapes = torch_trainer.resolve_input_shapes(model, shapes)
         torch_trainer.initial_model(model, shapes)
     print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
     model = _compile_module(model, instantiator.instantiate(compile_pattern))
@@ -228,12 +229,14 @@ def measure_inference_time(
     else:
         model.eval()
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
+    device_type = torch_trainer.get_torch_device_type(device)
 
     def _measure_single_run() -> float:
         with torch.device(device):
             inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        model(**inputs)
+        with torch_trainer.autocast_inputs(inputs, device_type):
+            model(**inputs)
         cuda_sync()
         return time() - start_time
 
@@ -264,22 +267,24 @@ def call_ptflops(
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
     configure_security(allowed_modules_check=False)
-    with torch.device(torch_trainer.get_torch_device(device)):
+    device = torch_trainer.get_torch_device(device)
+    with torch.device(device):
         model = instantiate_object(model_pattern)
         inputs, _ = torch_trainer.initial_model(model, shapes)
-        flops, params = ptflops.get_model_complexity_info(
-            model=model,
-            input_res=(1,),
-            print_per_layer_stat=True,
-            input_constructor=lambda _: inputs,
-            verbose=True,
-            ignore_modules=[],
-            custom_modules_hooks={},
-            backend=backend,
-            output_precision=output_precision,
-            flops_units=flops_units,
-            param_units=param_units,
-        )
+        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+            flops, params = ptflops.get_model_complexity_info(
+                model=model,
+                input_res=(1,),
+                print_per_layer_stat=True,
+                input_constructor=lambda _: inputs,
+                verbose=True,
+                ignore_modules=[],
+                custom_modules_hooks={},
+                backend=backend,
+                output_precision=output_precision,
+                flops_units=flops_units,
+                param_units=param_units,
+            )
     if flops:
         print(f"{'Computational complexity: ':<30}  {flops:<8}")
     if params:
@@ -297,24 +302,26 @@ def call_calflops(
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
     configure_security(allowed_modules_check=False)
-    with torch.device(torch_trainer.get_torch_device(device)):
+    device = torch_trainer.get_torch_device(device)
+    with torch.device(device):
         model = instantiate_object(model_pattern)
         inputs, _ = torch_trainer.initial_model(model, shapes)
-        flops, macs, params = calflops.calculate_flops(
-            model=model,
-            input_shape=None,
-            args=[],
-            kwargs=inputs,
-            forward_mode="forward",
-            include_backPropagation=include_bp,
-            compute_bp_factor=bp_factor,
-            print_results=True,
-            print_detailed=True,
-            output_as_string=True,
-            output_precision=output_precision,
-            output_unit=None,
-            ignore_modules=None,
-        )
+        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+            flops, macs, params = calflops.calculate_flops(
+                model=model,
+                input_shape=None,
+                args=[],
+                kwargs=inputs,
+                forward_mode="forward",
+                include_backPropagation=include_bp,
+                compute_bp_factor=bp_factor,
+                print_results=True,
+                print_detailed=True,
+                output_as_string=True,
+                output_precision=output_precision,
+                output_unit=None,
+                ignore_modules=None,
+            )
     print(f"FLOPs: {flops}")
     print(f"MACs: {macs}")
     print(f"Parameters: {params}")
@@ -463,6 +470,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         print(f"Validation dataset size: {validation_steps} steps.")
     with torch.device(device):
         models = _instantiate_models(model_patterns)
+        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
         torch_trainer.initial_model(models, input_shapes)
         if is_main:
             for model_name, model in models.items():

@@ -8,7 +8,15 @@ from typing import Any
 import pytest
 from structcast.utils.security import register_dir, unregister_dir
 
-from structcast_model.utils.base import load_any, load_json, to_camel, to_pascal, to_snake, unique
+from structcast_model.utils.base import (
+    load_any,
+    load_json,
+    resolve_input_shapes,
+    to_camel,
+    to_pascal,
+    to_snake,
+    unique,
+)
 
 
 @contextmanager
@@ -129,3 +137,33 @@ def test_to_pascal(value: str, expected: str) -> None:
 def test_to_camel(value: str, expected: str) -> None:
     """Test to_camel function."""
     assert to_camel(value) == expected
+
+
+class _StubModel:
+    """A stub of a built model, which declares the input shapes it was built from."""
+
+    def __init__(self, **input_shapes: Any) -> None:
+        """Declare the given input shapes on the model."""
+        self.input_shapes = input_shapes
+
+
+def test_resolve_input_shapes_prefers_the_requested_shapes() -> None:
+    """Shapes requested on the command line must win over the ones the model was built from."""
+    assert resolve_input_shapes(_StubModel(x=(4,)), {"x": (8,)}) == {"x": (8,)}
+
+
+@pytest.mark.parametrize("shapes", [None, {}])
+def test_resolve_input_shapes_falls_back_to_the_declared_shapes(shapes: dict[str, Any] | None) -> None:
+    """Without requested shapes, the model is run on the shapes it declares itself."""
+    assert resolve_input_shapes(_StubModel(x=(4,)), shapes) == {"x": (4,)}
+
+
+def test_resolve_input_shapes_merges_the_shapes_declared_by_a_collection_of_models() -> None:
+    """Training instantiates several models at once, which together declare the inputs of the step."""
+    models = {"encoder": _StubModel(image=(3, 8, 8)), "head": _StubModel(tokens=(4,))}
+    assert resolve_input_shapes(models) == {"image": (3, 8, 8), "tokens": (4,)}
+
+
+def test_resolve_input_shapes_returns_none_when_no_shapes_are_available() -> None:
+    """A model declaring no shapes and no request means there is nothing to build dummy inputs from."""
+    assert resolve_input_shapes(_StubModel()) is None

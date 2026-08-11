@@ -3,9 +3,10 @@
 from collections.abc import Sequence
 from functools import cached_property
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar
 
 from pydantic import (
+    AfterValidator,
     Field,
     FilePath,
     PositiveInt,
@@ -24,6 +25,7 @@ from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate,
 from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.types import PathLike
+from typing_extensions import TypeAliasType
 
 from structcast_model.builders import jinja_filters
 from structcast_model.utils.base import load_any, unique
@@ -219,6 +221,88 @@ def _validate_imports(data: Any) -> Any:
     return data
 
 
+DTypeName = Literal["bfloat16", "float16", "float32", "int32", "int64"]
+"""Supported element types of an input tensor."""
+
+
+class TensorSpec(Serializable):
+    """Tensor specification: shape, dtype and optional initializer address.
+
+    A tensor can be written in the compact form, which is a plain shape (`[3, 224, 224]`),
+    or in the explicit form, which is a mapping with the `_SHAPE_` key
+    (`{_SHAPE_: [512], _DTYPE_: int64, _INIT_: torch.zeros}`).
+    """
+
+    SHAPE: tuple[int, ...] = Field(alias="_SHAPE_")
+    """Shape of the tensor, excluding the batch dimension."""
+
+    DTYPE: DTypeName = Field("bfloat16", alias="_DTYPE_")
+    """Element type of the tensor."""
+
+    INIT: str | None = Field(None, alias="_INIT_")
+    """Address of the callable creating the dummy tensor, e.g. `torch.zeros`.
+
+    If not specified, the initializer is chosen from `DTYPE` by the framework creating the dummy inputs.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, raw: Any) -> Any:
+        """Expand the compact shape form into the explicit mapping form.
+
+        Anything else is returned unchanged, so that pydantic reports a `ValidationError`
+        instead of an exception escaping the surrounding `TensorSpecTree` union.
+        """
+        if isinstance(raw, (list, tuple)):
+            return {"_SHAPE_": raw}
+        return raw
+
+    @model_serializer(mode="wrap")
+    def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> tuple[int, ...] | dict[str, Any]:
+        """Serialize the model, collapsing to the compact shape form when only the shape is specified."""
+        default_dtype = self.DTYPE == TensorSpec.model_fields["DTYPE"].default
+        if default_dtype and self.INIT is None:
+            return self.SHAPE
+        res: dict[str, Any] = {"_SHAPE_": self.SHAPE}
+        if not default_dtype:
+            res["_DTYPE_"] = self.DTYPE
+        if self.INIT is not None:
+            res["_INIT_"] = self.INIT
+        return res
+
+
+def _validate_no_marker_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Reject nested dictionaries using the reserved tensor specification marker keys.
+
+    A mapping with the `_SHAPE_` key only reaches the nested dictionary branch of `TensorSpecTree`
+    when it failed to validate as an explicit `TensorSpec`, so accepting it would silently
+    reinterpret a malformed explicit form as a nested input named `_SHAPE_`.
+    """
+    if markers := {"_SHAPE_", "_DTYPE_", "_INIT_"} & data.keys():
+        raise ValueError(f"Invalid explicit tensor specification with marker keys: {sorted(markers)}")
+    return data
+
+
+if TYPE_CHECKING:
+    # mypy resolves the recursion only in this implicit alias form, while pydantic builds a recursive schema
+    # only from `TypeAliasType`, so the two forms of the same alias are kept side by side.
+    TensorSpecTree = Annotated[
+        TensorSpec | dict[str, "TensorSpecTree"] | list["TensorSpecTree"],
+        Field(union_mode="left_to_right"),
+    ]
+    """A `TensorSpec`, or a dictionary or list nesting more of them."""
+else:
+    TensorSpecTree = TypeAliasType(
+        "TensorSpecTree",
+        Annotated[
+            TensorSpec
+            | Annotated[dict[str, "TensorSpecTree"], AfterValidator(_validate_no_marker_keys)]
+            | list["TensorSpecTree"],
+            Field(union_mode="left_to_right"),
+        ],
+    )
+
+
 class UserDefinedLayer(Serializable):
     """User defined layer configuration."""
 
@@ -231,6 +315,13 @@ class UserDefinedLayer(Serializable):
 
     INPUTS: list[str] = Field(default_factory=list)
     """Inputs of the layer."""
+
+    INPUT_SHAPES: dict[str, TensorSpecTree] = Field(default_factory=dict)
+    """Shapes of the inputs of the layer, where the keys are input names.
+
+    Each value is a `TensorSpec` written in the compact or the explicit form,
+    or a dictionary or list nesting more of them.
+    """
 
     OUTPUTS: list[str] = Field(default_factory=list)
     """Outputs of the layer."""
@@ -520,11 +611,14 @@ class TemplateBackward(Template[UserDefinedBackward]):
 __all__ = [
     "SPEC_EVAL",
     "BackwardBehavior",
+    "DTypeName",
     "LayerBehavior",
     "Parameters",
     "Template",
     "TemplateBackward",
     "TemplateLayer",
+    "TensorSpec",
+    "TensorSpecTree",
     "UserDefinedBackward",
     "UserDefinedLayer",
     "UserLayer",

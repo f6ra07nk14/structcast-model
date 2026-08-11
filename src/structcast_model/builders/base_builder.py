@@ -9,7 +9,7 @@ from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, Union, cast
 
-from pydantic import ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 from pydantic_core import to_jsonable_python
 from structcast.core.base import Serializable
 from structcast.core.constants import SPEC_SOURCE
@@ -26,6 +26,7 @@ from structcast_model.builders.schema import (
     Parameters,
     TemplateBackward,
     TemplateLayer,
+    TensorSpecTree,
     UserLayer,
 )
 from structcast_model.utils.base import load_any, to_pascal, to_snake, unique
@@ -217,11 +218,21 @@ def _hash(raw: Any) -> str:
     return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
 
 
+_input_shapes_adapter = TypeAdapter(dict[str, TensorSpecTree])
+"""Adapter dumping `INPUT_SHAPES` back to the plain nested data emitted in the generated script."""
+
+
 class LayerIntermediate(_Intermediate):
     """Intermediate representation of a layer during the building process."""
 
     inputs: list[str]
     """The names of the input layers."""
+
+    input_shapes: dict[str, Any] = Field(default_factory=dict)
+    """The shapes of the input layers in their serialized compact form, where the keys are the input names.
+
+    Each value is a plain shape, a mapping with the `_SHAPE_` key, or a dictionary or list nesting more of them,
+    and is emitted as a literal in the generated script."""
 
     outputs: list[str]
     """The names of the output layers."""
@@ -478,6 +489,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             imports=imports,
             classname=classname,
             inputs=module.INPUTS,
+            input_shapes=_input_shapes_adapter.dump_python(module.INPUT_SHAPES),
             outputs=module.OUTPUTS,
             layers=layers,
             flow=_create_flow(module.FLOW),

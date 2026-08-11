@@ -1,7 +1,9 @@
 """API-level tests for base builder utilities."""
 
 from collections import defaultdict
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import ModuleType
 from typing import TypeAlias
 
 import pytest
@@ -18,7 +20,7 @@ from structcast_model.builders.base_builder import (
     resolve_object,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
-from structcast_model.builders.torch_builder import TorchBackwardBuilder, TorchLayerIntermediate
+from structcast_model.builders.torch_builder import TorchBackwardBuilder, TorchBuilder, TorchLayerIntermediate
 from tests import ASSETS_DIR
 
 
@@ -123,6 +125,52 @@ def test_base_model_builder_from_path_and_user_defined_entry() -> None:
     sublayer = builder(classname="BackboneOnly", user_defined_layer="Backbone")
     assert sublayer.classname == "BackboneOnly"
     assert sublayer.outputs == ["feat1", "feat2", "feat3", "feat4"]
+
+
+def _import_module(module_path: Path) -> ModuleType:
+    """Import the generated module from its file path."""
+    spec = spec_from_file_location(module_path.stem, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_builder_emits_input_shapes_onto_the_generated_model(tmp_path: Path) -> None:
+    """The declared INPUT_SHAPES survive as a literal, so a built model knows its own inputs without a --shape flag."""
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "INPUT_SHAPES": {"x": [3, 224, 224], "tokens": {"_SHAPE_": [512], "_DTYPE_": "int64"}},
+        "FLOW": [["x", "y", {"_obj_": [["_addr_", "torch.nn.LazyLinear"], ["_call_", {"out_features": 2}]]}]],
+    }
+    expected = {"x": (3, 224, 224), "tokens": {"_SHAPE_": (512,), "_DTYPE_": "int64"}}
+    built = TorchBuilder(raw=raw)(classname="TinyNet")
+    assert built.input_shapes == expected
+    module_path = tmp_path / "tiny_net.py"
+    built(module_path)
+    assert _import_module(module_path).TinyNet().input_shapes == expected
+
+
+def test_builder_deduplicates_sublayers_sharing_input_shapes(tmp_path: Path) -> None:
+    """Identical sub-layers still collapse into a single class now that input_shapes takes part in their hash."""
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["z"],
+        "FLOW": [["x", "y", "first", {"TYPE": "Unit"}], ["y", "z", "second", {"TYPE": "Unit"}]],
+        "Unit": {
+            "INPUTS": ["a"],
+            "OUTPUTS": ["b"],
+            "FLOW": [["a", "b", {"_obj_": [["_addr_", "torch.nn.LazyLinear"], ["_call_", {"out_features": 2}]]}]],
+        },
+    }
+    built = TorchBuilder(raw=raw)(classname="TinyNet")
+    module_path = tmp_path / "tiny_net.py"
+    built(module_path)
+    assert module_path.read_text(encoding="utf-8").count("class Unit(") == 1
+    model = _import_module(module_path).TinyNet()
+    assert model.first is not model.second
 
 
 def test_layer_intermediate_default_methods_raise_not_implemented() -> None:

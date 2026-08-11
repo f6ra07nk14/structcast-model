@@ -3,34 +3,84 @@
 from collections import OrderedDict
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import jax
 import numpy as np
 from pydantic import TypeAdapter, ValidationError
+
+from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
+
+DTYPES = {
+    "float32": jax.numpy.float32,
+    "float16": jax.numpy.float16,
+    "bfloat16": jax.numpy.bfloat16,
+    "int32": jax.numpy.int32,
+    "int64": jax.numpy.int64,
+}
+"""JAX element types of the supported tensor element types.
+
+`int64` is truncated to `int32` unless JAX is configured with `jax_enable_x64`.
+"""
+
+
+@runtime_checkable
+class TensorInitializer(Protocol):
+    """Callable creating a dummy JAX array, called as `initializer(size, dtype=...)`."""
+
+    def __call__(self, size: tuple[int, ...], *, dtype: Any) -> Any:
+        """Create an array of the given size and element type."""
+        ...
+
+
+def random_array(size: tuple[int, ...], *, dtype: Any) -> Any:
+    """Create a uniformly distributed random JAX array, the default initializer for floating point types.
+
+    `jax.random` cannot be used as an initializer directly, since it requires an explicit key.
+
+    Args:
+        size (tuple[int, ...]): The size of the array, including the batch dimension.
+        dtype (Any): The element type of the array.
+
+    Returns:
+        Any: The created array.
+    """
+    return jax.numpy.array(np.random.random(size), dtype=dtype)
 
 
 def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     """Create dummy JAX inputs based on the provided shape.
 
     Args:
-        shape (Any): The shape of the inputs to create. This can be a tuple of integers,
+        shape (Any): The shape of the inputs to create. This can be a tensor specification,
+            which is a tuple of integers or a mapping with the `_SHAPE_` key,
             a dictionary of shapes, or a list of shapes.
         batch_size (int): The batch size to use for the inputs.
+            This will be prepended to the shape of every tensor specification.
 
     Returns:
         Any: The created inputs, which can be a JAX array, a dictionary of arrays, or a list of arrays.
+
+    Raises:
+        ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        shape = TypeAdapter(tuple[int, ...]).validate_python(shape)
-        return jax.numpy.array(np.random.rand(batch_size, *shape).astype(np.float32))
+        node = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
-        pass
-    if isinstance(shape, Mapping):
-        return {key: create_jax_inputs(value, batch_size=batch_size) for key, value in shape.items()}
-    if isinstance(shape, (list, tuple)):
-        return [create_jax_inputs(value, batch_size=batch_size) for value in shape]
-    raise ValueError(f"Invalid tensor shape: {shape}")
+        raise ValueError(f"Invalid tensor shape: {shape}") from None
+    if isinstance(node, TensorSpec):
+        initializer = resolve_tensor_initializer(
+            node.INIT,
+            node.DTYPE,
+            float_default=random_array,
+            int_default=jax.numpy.zeros,
+            protocol=TensorInitializer,
+        )
+        return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
+    if isinstance(node, Mapping):
+        return {key: create_jax_inputs(value, batch_size=batch_size) for key, value in node.items()}
+    return [create_jax_inputs(value, batch_size=batch_size) for value in node]
 
 
 @lru_cache(maxsize=1)
@@ -65,7 +115,7 @@ def get_jax_device(device: str | None = None) -> jax.Device:
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
-__all__ = ["create_jax_inputs", "get_jax_device", "get_jax_devices"]
+__all__ = ["TensorInitializer", "create_jax_inputs", "get_jax_device", "get_jax_devices", "resolve_input_shapes"]
 
 
 if not TYPE_CHECKING:

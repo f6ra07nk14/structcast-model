@@ -78,6 +78,22 @@ def test_keras_layer_intermediate_uses_input_output_names_attributes() -> None:
     assert "self.output_names = ['cls']" in script
 
 
+def test_keras_layer_intermediate_emits_input_shapes_literal() -> None:
+    """Emit the declared input shapes as a literal so the built model can create its own dummy inputs."""
+    script = KerasLayerIntermediate(
+        classname="Unit",
+        imports={},
+        inputs=["image"],
+        input_shapes={"image": (3, 224, 224)},
+        outputs=["cls"],
+        layers={},
+        flow=[("image", "cls", None)],
+        inference_flow=[],
+        structured_output=False,
+    )._get_layer_script("Unit", [])
+    assert "self.input_shapes = {'image': (3, 224, 224)}" in script
+
+
 def test_keras_builder_builds_intermediate_and_scripts() -> None:
     """Build a minimal Keras model and render Python script content."""
     raw = {

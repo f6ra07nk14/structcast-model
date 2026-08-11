@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 import pytest
+from structcast.utils.security import configure_security
 
 import keras
 from structcast_model.keras.trainer import (
@@ -16,12 +19,20 @@ from structcast_model.keras.trainer import (
 )
 
 
+@pytest.fixture
+def allow_module_imports() -> Any:
+    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
+    configure_security(allowed_modules_check=False)
+    yield
+    configure_security()
+
+
 def test_create_numpy_inputs_from_int_tuple_returns_array() -> None:
-    """A tuple of ints produces a float32 NumPy array with batch dimension 1."""
+    """A tuple of ints produces a bfloat16 NumPy array with batch dimension 1, bfloat16 being the default dtype."""
     result = create_numpy_inputs((3, 4))
     assert isinstance(result, np.ndarray)
     assert result.shape == (1, 3, 4)
-    assert result.dtype == np.float32
+    assert result.dtype == ml_dtypes.bfloat16
 
 
 def test_create_numpy_inputs_from_dict_returns_dict() -> None:
@@ -107,6 +118,24 @@ def test_create_numpy_inputs_custom_batch_size() -> None:
     assert result.shape == (8, 2)
 
 
+def test_create_numpy_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """An integer dtype without an initializer falls back to zeros, because random floats cannot be integers.
+
+    The fallback is a guess about the caller's intent, so it must be reported.
+    """
+    with caplog.at_level(logging.WARNING):
+        result = create_numpy_inputs({"_SHAPE_": [5], "_DTYPE_": "int64"})
+    assert result.dtype == np.int64
+    assert np.array_equal(result, np.zeros((1, 5), dtype=np.int64))
+    assert "Falling back to zeros" in caplog.text
+
+
+def test_create_numpy_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+    """An explicit `_INIT_` address replaces the dtype-based default initializer."""
+    result = create_numpy_inputs({"_SHAPE_": [4], "_INIT_": "numpy.ones"})
+    assert np.array_equal(result, np.ones((1, 4), dtype=ml_dtypes.bfloat16))
+
+
 # ---------------------------------------------------------------------------
 # create_keras_inputs — additional branches
 # ---------------------------------------------------------------------------
@@ -131,6 +160,15 @@ def test_create_keras_inputs_with_batch_size() -> None:
     """Batch size is attached to symbolic input when specified."""
     result = create_keras_inputs((5,), batch_size=4)
     assert tuple(result.shape) == (4, 5)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [((5,), "bfloat16"), ({"_SHAPE_": [5], "_DTYPE_": "int32"}, "int32")],
+)
+def test_create_keras_inputs_uses_spec_dtype(shape: Any, expected: str) -> None:
+    """The symbolic input carries the element type of the specification, so the traced model is built for it."""
+    assert create_keras_inputs(shape).dtype == expected
 
 
 # ---------------------------------------------------------------------------

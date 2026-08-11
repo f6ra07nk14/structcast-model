@@ -1,14 +1,17 @@
 """Base utility functions for StructCast-Model."""
 
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from logging import getLogger
 import re
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic_core import from_json
 from structcast.utils.base import load_yaml
-from structcast.utils.security import check_path
+from structcast.utils.security import check_path, import_from_address
 from structcast.utils.types import PathLike
+
+logger = getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -116,7 +119,79 @@ def to_camel(value: str) -> str:
     return camel[0].lower() + camel[1:] if camel else ""
 
 
-__all__ = ["load_any", "load_json", "to_camel", "to_pascal", "to_snake", "unique"]
+def resolve_tensor_initializer(
+    init: str | None,
+    dtype: str,
+    *,
+    float_default: Any,
+    int_default: Any,
+    protocol: Any,
+) -> Any:
+    """Resolve the callable creating a dummy tensor for a tensor specification.
+
+    Args:
+        init (str | None): The address of the initializer to use,
+            or `None` to select a default based on `dtype`.
+        dtype (str): The name of the element type of the tensor, e.g. `"bfloat16"` or `"int64"`.
+        float_default (Any): The initializer to use for floating point element types.
+        int_default (Any): The initializer to use for integer element types,
+            since the floating point default cannot produce integer values.
+        protocol (Any): The runtime-checkable protocol the resolved initializer must satisfy.
+
+    Returns:
+        Any: The initializer, to be called as `initializer(size, dtype=...)`.
+
+    Raises:
+        TypeError: If the initializer resolved from `init` does not satisfy `protocol`.
+
+    Note:
+        A runtime-checkable protocol only verifies that `__call__` exists, which makes this check
+        equivalent to `callable(...)`. A mismatched signature is only detected when the initializer is called.
+    """
+    if init is not None:
+        initializer = import_from_address(init)
+        if not isinstance(initializer, protocol):
+            raise TypeError(f"Initializer is not callable as a tensor initializer: {init!r}")
+        return initializer
+    if dtype.startswith("int"):
+        logger.warning('No initializer specified for dtype "%s". Falling back to zeros.', dtype)
+        return int_default
+    return float_default
+
+
+def resolve_input_shapes(model: Any, shapes: Any = None) -> Any:
+    """Resolve the input shapes to create dummy inputs from, preferring the explicitly requested ones.
+
+    Args:
+        model (Any): The built model, or a mapping or sequence of models. The `input_shapes` attribute
+            emitted by the builders is used when no shapes are requested; for a collection of models,
+            the attributes of its members are merged.
+        shapes (Any): The explicitly requested shapes, which take precedence when they are not empty.
+
+    Returns:
+        Any: The requested shapes, the shapes declared by the model, or `None` when neither is available.
+    """
+    if shapes:
+        return shapes
+    if declared := getattr(model, "input_shapes", None):
+        return declared
+    values = model.values() if isinstance(model, Mapping) else model if isinstance(model, (list, tuple)) else ()
+    merged: dict[str, Any] = {}
+    for value in values:
+        merged.update(resolve_input_shapes(value) or {})
+    return merged or None
+
+
+__all__ = [
+    "load_any",
+    "load_json",
+    "resolve_input_shapes",
+    "resolve_tensor_initializer",
+    "to_camel",
+    "to_pascal",
+    "to_snake",
+    "unique",
+]
 
 
 if not TYPE_CHECKING:

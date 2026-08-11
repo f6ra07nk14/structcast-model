@@ -131,7 +131,9 @@ def measure_inference_time(
     configure_security(allowed_modules_check=False)
     device = keras_trainer.get_keras_device(device)
     print("Initializing the model...")
-    model = keras_trainer.initial_model(instantiate_object(model_pattern), shapes)
+    model = instantiate_object(model_pattern)
+    shapes = keras_trainer.resolve_input_shapes(model, shapes)
+    model = keras_trainer.initial_model(model, shapes)
     if compile_pattern is None:
         print("Skipping compilation...")
     else:

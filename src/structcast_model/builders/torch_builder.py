@@ -47,6 +47,7 @@ class {class_name}(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.inputs = {self.inputs}
+        self.input_shapes = {self.input_shapes}
         self.outputs = {self.outputs}
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
