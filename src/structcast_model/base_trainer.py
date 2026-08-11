@@ -273,13 +273,6 @@ def callbacks_session() -> Generator[None, None, None]:
         GLOBAL_CALLBACKS.clear()
 
 
-class InferenceWrapper(Protocol[ModelT_contra]):
-    """Protocol for inference wrapper."""
-
-    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> dict[str, Any]:
-        """Wrap the model for inference, e.g., for quantization or ONNX export."""
-
-
 @dataclass(kw_only=True)
 class BaseTrainer(BaseInfo, Callbacks[ModelT_contra]):
     """Base trainer for training a model."""
