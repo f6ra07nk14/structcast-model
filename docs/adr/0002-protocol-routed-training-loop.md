@@ -79,6 +79,10 @@ best-criterion recording go through the Logger interface so both backends receiv
 
 ## Learner assembly is inline in the CLI, excluding the tracker and DDP wrapping
 
+> **Superseded in part by ADR-0003.** Distributed wrapping is now a step of the inline assembly (before
+> learner construction), owned by a `DistributedStrategy`; the "known limitation" below is fixed. The
+> factory revert and the rest of this section stand.
+
 `scm torch train` assembles the learner inline — model instantiation, input-shape resolution, initializers,
 learner construction, and step-function compilation — rather than through a factory class; an intermediate
 `TorchLearnerFactory` was tried and reverted, because the CLI is its only consumer and the class added a second
