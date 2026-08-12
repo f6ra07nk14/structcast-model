@@ -13,7 +13,7 @@ Every ``state_dict``/``load_state_dict`` implementation routes through
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
@@ -25,10 +25,22 @@ import torch
 logger = getLogger(__name__)
 
 try:  # torch >= 2.6 ships the stable per-parameter sharding (FSDP2) API.
-    from torch.distributed.fsdp import FSDPModule as _FSDP_MODULE, fully_shard as _fully_shard
+    from torch.distributed.fsdp import (
+        FSDPModule as _FSDP_MODULE,
+        MixedPrecisionPolicy as _MIXED_PRECISION_POLICY,
+        fully_shard as _fully_shard,
+    )
 except ImportError:  # pragma: no cover - exercised only on old torch builds
     _FSDP_MODULE = None
+    _MIXED_PRECISION_POLICY = None
     _fully_shard = None
+
+try:  # torch >= 2.2; the older builds admitted by the torch-cpu extra floor lack both modules.
+    from torch.distributed.checkpoint import state_dict as _dcp_state_dict
+    from torch.distributed.device_mesh import init_device_mesh as _init_device_mesh
+except ImportError:  # pragma: no cover - exercised only on old torch builds
+    _dcp_state_dict = None
+    _init_device_mesh = None
 
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
@@ -37,11 +49,7 @@ _WRAPPER_PREFIXES = ("module.", "_orig_mod.")
 
 def _state_dict_api() -> Any:
     """Return the ``torch.distributed.checkpoint.state_dict`` module, or ``None`` on old torch."""
-    try:
-        from torch.distributed.checkpoint import state_dict as dcp_state_dict
-    except ImportError:  # pragma: no cover - exercised only on old torch builds
-        return None
-    return dcp_state_dict
+    return _dcp_state_dict
 
 
 def _strip_wrapper_prefixes(state: dict[str, Any]) -> dict[str, Any]:
@@ -172,7 +180,9 @@ class _StateDictMixin:
         if optimizers is not None:
             if optimizer_models:
                 states["optimizers"] = {
-                    n: api.get_optimizer_state_dict(_optimizer_container(models, optimizer_models[n]), o, options=options)
+                    n: api.get_optimizer_state_dict(
+                        _optimizer_container(models, optimizer_models[n]), o, options=options
+                    )
                     for n, o in optimizers.items()
                 }
             else:
@@ -226,7 +236,7 @@ class _StateDictMixin:
             options = api.StateDictOptions(full_state_dict=True)
             api.set_optimizer_state_dict(container, optimizer, optim_state_dict=osd, options=options)
             return
-        for group, saved in zip(optimizer.param_groups, osd.get("param_groups", [])):
+        for group, saved in zip(optimizer.param_groups, osd.get("param_groups", []), strict=False):
             group.update({k: v for k, v in saved.items() if k != "params"})
 
     def _share_state(self, state: dict[str, Any] | None) -> dict[str, Any]:
@@ -338,6 +348,7 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
     grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     _broadcast_on_load = True
+    _mesh: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Fail loud when the installed torch has no stable ``fully_shard``."""
@@ -349,11 +360,15 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Shard every model in place with ``fully_shard`` and return the same (now sharded) modules."""
-        kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward}
+        if self._mesh is None:
+            # Without an explicit mesh, fully_shard follows the accelerator, which reports CUDA on
+            # CUDA-enabled builds even when this strategy trains on CPU — the mesh must follow the
+            # strategy's device instead.
+            device_type = "cpu" if "cpu" in self.device else self.device.split(":")[0]
+            self._mesh = _init_device_mesh(device_type, (torch.distributed.get_world_size(),))
+        kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
-            from torch.distributed.fsdp import MixedPrecisionPolicy
-
-            kwargs["mp_policy"] = MixedPrecisionPolicy(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
+            kwargs["mp_policy"] = _MIXED_PRECISION_POLICY(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
         return OrderedDict((n, _fully_shard(m, **kwargs)) for n, m in models.items())
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
