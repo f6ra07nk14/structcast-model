@@ -1,7 +1,9 @@
 """Shared interface of the loggers recording a training run to an experiment tracking service."""
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, cast
+
+from typing_extensions import Protocol, runtime_checkable
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer
 

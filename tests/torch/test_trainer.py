@@ -672,7 +672,7 @@ def test_from_criteria_builds_one_wired_monitor_per_criterion() -> None:
     """The CLI hands its criteria lists straight to this factory, so the modes must map correctly."""
     monitors = TorchBestCriterion.from_criteria(["acc"], ["loss"], ["acc"], _BestRecordingLogger())
     assert [(monitor.target, monitor.mode) for monitor in monitors] == [("acc", "max"), ("loss", "min")]
-    assert all(len(monitor.on_best) == 1 for monitor in monitors)
+    assert all(len(monitor.callbacks) == 1 for monitor in monitors)
 
 
 def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:

@@ -331,11 +331,11 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
         monitors: list[Self] = []
         for target in higher_criteria:
             best = cls(target=target, mode="max")
-            best.on_best.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
             monitors.append(best)
         for target in lower_criteria:
             best = cls(target=target, mode="min")
-            best.on_best.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
             monitors.append(best)
         return monitors
 

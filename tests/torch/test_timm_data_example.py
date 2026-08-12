@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,7 +12,7 @@ from PIL import Image
 import pytest
 from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 
-from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
+from structcast_model.base_trainer import BaseInfo, DataProvider, SimpleDataProvider
 from structcast_model.torch.trainer import TorchTracker, TorchTrainer
 import torch
 
@@ -455,12 +454,11 @@ def test_timm_dataloader_dunder_call_with_spec(image_folder: Path) -> None:
 def test_timm_data_provider_satisfies_the_data_provider_protocol() -> None:
     """The trainer accepts any DataProvider; the provider must qualify without inheriting anything.
 
-    Checked with getattr_static: DataProvider is deliberately not runtime_checkable, because on
-    Python 3.11 an isinstance check would execute the property getters and build a real loader.
+    Safe on 3.11 too: the protocols come from typing_extensions, whose isinstance checks use
+    getattr_static and never execute a property getter (counting steps builds a real loader).
     """
     provider = TimmDataProvider(training=_training_wrapper())
-    for member in ("training_dataset", "validation_dataset", "steps_per_epoch", "validation_steps"):
-        assert inspect.getattr_static(provider, member, None) is not None
+    assert isinstance(provider, DataProvider)
     assert provider.training_dataset is provider.training
     assert provider.validation_dataset is None
 

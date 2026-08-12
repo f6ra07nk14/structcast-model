@@ -364,7 +364,7 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 | Dataset supply | `DataProvider` protocol, `SimpleDataProvider` |
 | Event names and their gates | `EVENTS`, `EVENT_PROTOCOLS` |
 | Generic train/eval loop | `BaseTrainer` (`train`, `evaluate`, `fit`, `describe`) |
-| Best-criterion monitor | `BestCriterion` (notifies its `on_best` participants, `OnBest` protocol) |
+| Best-criterion monitor | `BestCriterion` (notifies its `callbacks` participants via the `OnBest` protocol) |
 | Built-in reporting callbacks | `ProgressBar`, `Printer` |
 
 Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and, on first use (the first dispatched event; `describe()` only previews), routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, its `training_dataset` and `validation_dataset`, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.

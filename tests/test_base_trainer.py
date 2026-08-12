@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from functools import partial
-import inspect
 from math import inf
 from typing import Any, Literal
 
@@ -15,6 +14,8 @@ from structcast_model.base_trainer import (
     BaseInfo,
     BaseTrainer,
     BestCriterion,
+    DataProvider,
+    OnBest,
     Printer,
     ProgressBar,
     SimpleDataProvider,
@@ -112,12 +113,10 @@ def test_simple_data_provider_counts_steps_from_its_datasets() -> None:
 def test_simple_data_provider_satisfies_the_data_provider_protocol() -> None:
     """Widening the protocol must not orphan the package's own provider.
 
-    Checked with getattr_static: DataProvider is deliberately not runtime_checkable, because on
-    Python 3.11 an isinstance check would execute the property getters.
+    Safe on 3.11 too: the protocols come from typing_extensions, whose isinstance checks use
+    getattr_static and never execute a property getter.
     """
-    provider = SimpleDataProvider(training_dataset=[])
-    for member in ("training_dataset", "validation_dataset", "steps_per_epoch", "validation_steps"):
-        assert inspect.getattr_static(provider, member, None) is not None
+    assert isinstance(SimpleDataProvider(training_dataset=[]), DataProvider)
 
 
 def test_simple_data_provider_reports_zero_validation_steps_without_a_validation_dataset() -> None:
@@ -655,7 +654,7 @@ class _BestRecorder:
 def test_best_criterion_on_best_receives_info_best_and_models() -> None:
     """on_best participants get the criterion itself, so they can log or save by its value/step."""
     recorder = _BestRecorder()
-    criterion = BestCriterion(target="loss", on_best=[recorder])
+    criterion = BestCriterion(target="loss", callbacks=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
@@ -666,7 +665,7 @@ def test_best_criterion_on_best_receives_info_best_and_models() -> None:
 def test_best_criterion_on_best_called_even_without_improvement() -> None:
     """on_best fires whenever the target is present, so consumers can log the best value each epoch."""
     recorder = _BestRecorder()
-    criterion = BestCriterion(target="loss", on_best=[recorder])
+    criterion = BestCriterion(target="loss", callbacks=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
@@ -677,10 +676,16 @@ def test_best_criterion_on_best_called_even_without_improvement() -> None:
     assert [value for _, value, _ in recorder.seen] == [0.5, 0.5]
 
 
+def test_best_criterion_is_not_mistaken_for_an_on_best_participant() -> None:
+    """The callbacks field must not shadow the protocol method: a criterion is not a participant."""
+    assert isinstance(_BestRecorder(), OnBest)
+    assert not isinstance(BestCriterion(target="loss"), OnBest)
+
+
 def test_best_criterion_on_best_skipped_when_target_missing() -> None:
     """A criterion that was not produced this epoch must not trigger best-value side effects."""
     recorder = _BestRecorder()
-    criterion = BestCriterion(target="loss", on_best=[recorder])
+    criterion = BestCriterion(target="loss", callbacks=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {}

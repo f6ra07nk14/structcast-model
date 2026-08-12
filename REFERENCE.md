@@ -480,11 +480,11 @@ class SaveCheckpoint:
     def on_best(self, info: BaseInfo, best: BestCriterion, **models) -> None:
         ...  # log or save by best.value / best.step
 
-checkpoint = BestCriterion(target="val_acc1", mode="max", on_best=[SaveCheckpoint()])
+checkpoint = BestCriterion(target="val_acc1", mode="max", callbacks=[SaveCheckpoint()])
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[checkpoint])
 ```
 
-Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `OnBest` participants, notified after every epoch in which the target appeared, whether or not it improved). Properties: `value` (the best value so far) and `step` (the step at which it was reached).
+Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `callbacks` (list of `OnBest` participants, notified after every epoch in which the target appeared, whether or not it improved; named `callbacks` so the field cannot shadow the protocol method in an isinstance check). Properties: `value` (the best value so far) and `step` (the step at which it was reached).
 
 ---
 

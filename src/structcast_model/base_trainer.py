@@ -6,7 +6,12 @@ from logging import getLogger
 from math import inf
 from operator import gt, lt
 from time import time
-from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
+
+# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
+# inspect.getattr_static on Python 3.11 as well (backported from 3.12): probing a protocol member
+# must not execute a property getter, which for a data provider may build a real data loader.
+from typing_extensions import Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import tqdm
@@ -73,15 +78,13 @@ class Learner(Protocol):
         """Perform the inference step for the given criteria."""
 
 
+@runtime_checkable
 class DataProvider(Protocol):
     """Protocol supplying the datasets of a whole training run.
 
     Both dataset properties must return the same object on every read: the trainer reads them for
     the event-protocol scan and again in ``fit()``, so a getter that builds a fresh dataset per
     read would train a different object than the one receiving events.
-
-    Deliberately not ``runtime_checkable``: on Python 3.11 an attribute-presence isinstance check
-    executes the property getters, and counting steps may build a real data loader.
     """
 
     @property
@@ -483,12 +486,9 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
         return self.history
 
 
+@runtime_checkable
 class OnBest(Protocol, Generic[ModelT_contra]):
-    """Protocol for participants notified after a monitored criterion has been checked.
-
-    Deliberately not ``runtime_checkable``: ``BestCriterion`` itself carries an ``on_best`` list
-    field, so an attribute-presence isinstance check would wrongly match every criterion.
-    """
+    """Protocol for participants notified after a monitored criterion has been checked."""
 
     def on_best(self, info: BaseInfo, best: "BestCriterion[Any]", **models: ModelT_contra) -> None:
         """React to the check of *best* for the current epoch."""
@@ -504,9 +504,12 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    on_best: list[OnBest[ModelT_contra]] = field(default_factory=list)
+    callbacks: list[OnBest[ModelT_contra]] = field(default_factory=list)
     """Participants notified whenever the target was produced, the way a trainer routes events:
-    each implements the ``OnBest`` protocol and receives this criterion alongside the info."""
+    each implements the ``OnBest`` protocol and receives this criterion alongside the info.
+
+    Named ``callbacks`` (not ``on_best``) so the field cannot shadow the protocol method name in
+    an isinstance check."""
 
     _step: int = field(default=0, repr=False)
     _best: float = field(init=False, repr=False)
@@ -534,7 +537,7 @@ class BestCriterion(Generic[ModelT_contra]):
             if self._compare(current, self._best):
                 self._step = info.step
                 self._best = current
-            for callback in self.on_best:
+            for callback in self.callbacks:
                 callback.on_best(info, self, **models)
 
 
