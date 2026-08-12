@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from structcast.core.instantiator import ObjectPattern
 
 from structcast_model.builders.base_builder import (
-    BackwardIntermediate,
-    BaseBackwardBuilder,
+    BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
+    LearnerIntermediate,
     resolve_getter,
     resolve_object,
 )
@@ -64,8 +64,8 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
     user_defined_layer_type: ClassVar[type[TorchLayerIntermediate]] = TorchLayerIntermediate
 
 
-class TorchBackwardIntermediate(BackwardIntermediate):
-    """Intermediate representation of a PyTorch backward layer."""
+class TorchLearnerIntermediate(LearnerIntermediate):
+    """Intermediate representation of a PyTorch learner."""
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {"torch": {None}}
     """Default imports for PyTorch layers."""
@@ -129,8 +129,8 @@ class TorchBackwardIntermediate(BackwardIntermediate):
             start = len(flow)
         return self._wrap_step_function("_training_step", flow, extra_params="__need_update__, ")
 
-    def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
-        """Get the script for the backward layer."""
+    def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
+        """Get the script for the learner."""
         indent = " " * 4
         sep = "\n" + indent * 2
         models_repr = ", ".join([f'"{m}": self.{m}' for m in self.models])
@@ -144,7 +144,7 @@ class TorchBackwardIntermediate(BackwardIntermediate):
         return f"""\
 class {self.classname}:
 
-    def __init__(self, {self._backward_models}, **kwargs):
+    def __init__(self, {self._learner_models}, **kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
         def _get_param(models):
             return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
@@ -192,6 +192,12 @@ class {self.classname}:
         return {{k: _get_lr(v) for k, v in self.optimizers.items()}}
 
     @property
+    def weight_decays(self):
+        from structcast_model.torch.optimizers import get_decays
+
+        return get_decays(self.optimizers)
+
+    @property
     def param_group_names(self):
         def _get_param_groups(opt):
             return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
@@ -201,10 +207,10 @@ class {self.classname}:
 
 
 @dataclass(kw_only=True, slots=True)
-class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
-    """Builder for PyTorch backward layers."""
+class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
+    """Builder for PyTorch learners."""
 
-    user_defined_backward_layer_type: ClassVar[type[TorchBackwardIntermediate]] = TorchBackwardIntermediate
+    user_defined_learner_layer_type: ClassVar[type[TorchLearnerIntermediate]] = TorchLearnerIntermediate
     layer_builder_type: ClassVar[type[TorchBuilder]] = TorchBuilder
 
     def _get_mixed_precision(
@@ -230,7 +236,7 @@ class TorchBackwardBuilder(BaseBackwardBuilder[TorchBackwardIntermediate]):
         return f"{opt_inst}(_get_param([{', '.join(trainable_layers)}]))", opt_cls
 
 
-__all__ = ["TorchBackwardBuilder", "TorchBackwardIntermediate", "TorchBuilder", "TorchLayerIntermediate"]
+__all__ = ["TorchBuilder", "TorchLayerIntermediate", "TorchLearnerBuilder", "TorchLearnerIntermediate"]
 
 
 if not TYPE_CHECKING:

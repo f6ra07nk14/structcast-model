@@ -372,8 +372,8 @@ class UserDefinedLayer(Serializable):
         return self
 
 
-class BackwardBehavior(Serializable):
-    """Backward behavior configuration."""
+class LearnerBehavior(Serializable):
+    """Learner behavior configuration."""
 
     LOSS: str
     """The target loss to optimize."""
@@ -391,14 +391,14 @@ class BackwardBehavior(Serializable):
     """The name of the optimizer class or an instance of the optimizer."""
 
     NAME: str | None = None
-    """The name of the backward layer class or an instance of the backward layer."""
+    """The name of the learner class or an instance of the learner."""
 
     CLIP: ObjectPattern | None = None
     """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
     or a pattern to instantiate the gradient clipping configuration."""
 
     EXTRA: dict[str, Any] = Field(default_factory=dict)
-    """Extra fields for the backward behavior,
+    """Extra fields for the learner behavior,
     which will be passed to the optimizer or the backward process in general."""
 
     @field_validator("TRAINABLE_LAYERS", mode="before")
@@ -422,11 +422,11 @@ class BackwardBehavior(Serializable):
         return data
 
 
-class UserDefinedBackward(Serializable):
-    """User defined backward configuration."""
+class UserDefinedLearner(Serializable):
+    """User defined learner configuration."""
 
     IMPORTS: dict[str, set[str | None]] = Field(default_factory=dict)
-    """Imports required for the backward behavior,
+    """Imports required for the learner behavior,
     where the keys are module names and the values are sets of imported names from the corresponding modules.
 
     The imported names can be `None`, which indicates that the entire module is imported.
@@ -442,10 +442,10 @@ class UserDefinedBackward(Serializable):
     """Losses to optimize."""
 
     TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
-    """Trainable layer names required for the backward behavior."""
+    """Trainable layer names required for the learner behavior."""
 
-    BACKWARDS: list[BackwardBehavior] = Field(default_factory=list, min_length=1)
-    """Backward behavior configuration."""
+    LEARNERS: list[LearnerBehavior] = Field(default_factory=list, min_length=1)
+    """Learner behavior configuration."""
 
     MIXED_PRECISION: bool | dict[str, Any] = False
     """Whether to use mixed precision during backward pass.
@@ -467,8 +467,8 @@ class UserDefinedBackward(Serializable):
         return _validate_imports(data)
 
     def _validate_trainable_layers(self) -> None:
-        """Validate that the trainable layers exist in the backwards."""
-        layers = unique([L for b in self.BACKWARDS for L in b.TRAINABLE_LAYERS])
+        """Validate that the trainable layers exist in the learners."""
+        layers = unique([L for b in self.LEARNERS for L in b.TRAINABLE_LAYERS])
         if not self.TRAINABLE_LAYERS:
             self.TRAINABLE_LAYERS.extend(layers)
         if unknown := set(self.TRAINABLE_LAYERS) - set(layers):
@@ -485,8 +485,8 @@ class UserDefinedBackward(Serializable):
             raise SpecError("MIXED_PRECISION must be a boolean or a dictionary when MIXED_PRECISION_TYPE is not None.")
 
     @model_validator(mode="after")
-    def _validate_user_defined_backward(self) -> Self:
-        """Validate the user-defined backward configuration."""
+    def _validate_user_defined_learner(self) -> Self:
+        """Validate the user-defined learner configuration."""
         self._validate_mixed_precision()
         self._validate_trainable_layers()
         train_inputs: list[str] = []
@@ -494,18 +494,18 @@ class UserDefinedBackward(Serializable):
         losses: list[str] = []
         infer_inputs: list[str] = []
         infer_outputs: list[str] = []
-        for backward in self.BACKWARDS:
-            backward_inputs, backward_outputs = resolve_flow(backward.FLOW, existing_values=train_outputs)
-            train_inputs += backward_inputs
-            train_outputs += backward_outputs
-            if backward.LOSS not in train_outputs:
-                msg = f'Loss "{backward.LOSS}" must be in the outputs of the backward flow but got: {train_outputs}.'
+        for learner in self.LEARNERS:
+            learner_inputs, learner_outputs = resolve_flow(learner.FLOW, existing_values=train_outputs)
+            train_inputs += learner_inputs
+            train_outputs += learner_outputs
+            if learner.LOSS not in train_outputs:
+                msg = f'Loss "{learner.LOSS}" must be in the outputs of the learner flow but got: {train_outputs}.'
                 raise SpecError(msg)
-            losses.append(backward.LOSS)
-            flow = backward.INFERENCE_FLOW or backward.FLOW
-            backward_inputs, backward_outputs = resolve_flow(flow, existing_values=infer_outputs)
-            infer_inputs += backward_inputs
-            infer_outputs += backward_outputs
+            losses.append(learner.LOSS)
+            flow = learner.INFERENCE_FLOW or learner.FLOW
+            learner_inputs, learner_outputs = resolve_flow(flow, existing_values=infer_outputs)
+            infer_inputs += learner_inputs
+            infer_outputs += learner_outputs
         train_inputs, train_outputs, losses = unique(train_inputs), unique(train_outputs), unique(losses)
         if not self.INPUTS:
             self.INPUTS.extend(train_inputs)
@@ -602,25 +602,25 @@ class TemplateLayer(Template[UserDefinedLayer]):
     target_type: ClassVar[type[UserDefinedLayer]] = UserDefinedLayer
 
 
-class TemplateBackward(Template[UserDefinedBackward]):
-    """Template for user-defined backwards."""
+class TemplateLearner(Template[UserDefinedLearner]):
+    """Template for user-defined learners."""
 
-    target_type: ClassVar[type[UserDefinedBackward]] = UserDefinedBackward
+    target_type: ClassVar[type[UserDefinedLearner]] = UserDefinedLearner
 
 
 __all__ = [
     "SPEC_EVAL",
-    "BackwardBehavior",
     "DTypeName",
     "LayerBehavior",
+    "LearnerBehavior",
     "Parameters",
     "Template",
-    "TemplateBackward",
     "TemplateLayer",
+    "TemplateLearner",
     "TensorSpec",
     "TensorSpecTree",
-    "UserDefinedBackward",
     "UserDefinedLayer",
+    "UserDefinedLearner",
     "UserLayer",
     "resolve_flow",
     "resolve_inputs",

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from structcast.utils.security import register_dir, unregister_dir
+from structcast.utils.base import register_dir, unregister_dir
 
 from structcast_model.utils.base import (
     load_any,

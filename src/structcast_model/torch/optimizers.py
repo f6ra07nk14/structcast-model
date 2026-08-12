@@ -1,24 +1,20 @@
 """Build optimizers."""
 
+from collections.abc import Callable, Mapping
 from logging import getLogger
 from re import Pattern as RePattern, compile as re_compile
 from typing import TYPE_CHECKING, Any
 
 from timm.optim import create_optimizer_v2
-from timm.scheduler.scheduler_factory import create_scheduler_v2
-from torch.optim import lr_scheduler
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS
 import torch
 
 if TYPE_CHECKING:
     from torch.nn import Parameter
     from torch.optim import Optimizer
-    from torch.optim.lr_scheduler import LRScheduler
 else:
     Parameter = Any
     Optimizer = Any
-    LRScheduler = Any
 
 
 logger = getLogger(__name__)
@@ -112,16 +108,99 @@ def _param_groups_weight_decay(
     ]
 
 
-def _create_opt(
+def _native_optimizer(name: str) -> "type[Optimizer] | None":
+    """Return the `torch.optim` class for an explicit ``torch.optim.X`` (or ``torch.X``) name, else None.
+
+    Bare names ("sgd", "adamw") deliberately do NOT resolve here: timm's registry configures
+    different defaults for several shared names (e.g. sgd with nesterov momentum), so bare names keep
+    going to timm and the native engine must be requested explicitly.
+    """
+    attribute = name.removeprefix("torch.optim.") if name.startswith("torch.optim.") else name.removeprefix("torch.")
+    if attribute == name:
+        return None
+    candidate = getattr(torch.optim, attribute, None)
+    if isinstance(candidate, type) and issubclass(candidate, torch.optim.Optimizer):
+        return candidate
+    raise ValueError(f'"{name}" does not name a torch.optim optimizer class.')
+
+
+def get_decays(optimizers: "Mapping[str, Optimizer]") -> dict[str, float]:
+    """Flatten the per-group weight decay and layer-decay scale of every optimizer into metrics.
+
+    Keys follow ``{optimizer}_group{index}_weight_decay`` / ``{optimizer}_group{index}_lr_scale``,
+    so a logger can track how a schedule moves the values `create_opt` grouped, epoch by epoch.
+    ``lr_scale`` only appears on the timm engine, which keeps it for its schedulers.
+    """
+    metrics: dict[str, float] = {}
+    for name, optimizer in optimizers.items():
+        for index, group in enumerate(optimizer.param_groups):
+            for key in ("weight_decay", "lr_scale"):
+                if key in group:
+                    metrics[f"{name}_group{index}_{key}"] = group[key]
+    return metrics
+
+
+def set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
+    """Bake the `lr_scale` of every parameter group into its learning rate.
+
+    Args:
+        optimizer (Optimizer): The optimizer whose parameter groups to scale. Groups without an
+            `lr_scale` key are left untouched.
+        delete_lr_scale (bool): Whether to drop the `lr_scale` key afterwards, so a later call
+            cannot apply the same scale twice.
+    """
+    for group in optimizer.param_groups:
+        if "lr_scale" in group:
+            if isinstance(group["lr"], torch.Tensor):
+                group["lr"].mul_(group["lr_scale"])
+            else:
+                group["lr"] = group["lr"] * group["lr_scale"]
+            if delete_lr_scale:
+                del group["lr_scale"]
+
+
+def create_opt(
     params: list[tuple[str, Parameter]],
+    *,
+    opt: "str | Callable[..., Optimizer]",
     layer_decay: float | None = None,
     layer_group_regexes: list[str] | None = None,
     weight_decay: float = 0.0,
     weight_decay_regexes: list[str] | None = None,
     no_weight_decay_regexes: list[str] | None = None,
     **kwargs: Any,
-) -> tuple[bool, Optimizer]:
-    """Create an optimizer with optional layer-wise learning rate decay and weight decay handling."""
+) -> Optimizer:
+    """Create an optimizer over regex-grouped parameters.
+
+    Grouping runs first and is engine-agnostic: layer decay emits one group per layer group and
+    weight decay class, otherwise weight-decay regexes emit a decay and a no-decay group. When a
+    group carries the weight decay, `weight_decay` is passed on as 0.0 so the engine default cannot
+    override it.
+
+    The engine is then chosen from *opt*: a callable is instantiated directly, an explicit
+    `torch.optim.X` (or `torch.X`) name instantiates that class natively, and every bare name goes to
+    `timm.optim.create_optimizer_v2` -- bare names keep timm's defaults (e.g. `sgd` with nesterov
+    momentum), so configurations migrated from `create_with_scheduler` behave identically.
+
+    Layer decay emits an `lr_scale` per group, which only timm schedulers consume. For the callable
+    and native engines the scale is therefore baked into the learning rate right away; on the timm
+    fallback the `lr_scale` keys are kept for the scheduler, and callers running such an optimizer
+    without a timm scheduler have to call `set_lr_scale` themselves.
+
+    Args:
+        params (list[tuple[str, Parameter]]): The named model parameters to optimize.
+        opt (str | Callable[..., Optimizer]): The optimizer class, factory, or name.
+        layer_decay (float | None): The per-layer-group learning rate decay, disabled when None or 0.
+        layer_group_regexes (list[str] | None): Regexes matching the parameters of each layer group,
+            in order; parameters matching none of them form the first group.
+        weight_decay (float): The weight decay applied to the decaying parameters.
+        weight_decay_regexes (list[str] | None): Regexes matching parameters that must decay.
+        no_weight_decay_regexes (list[str] | None): Regexes matching parameters that must not decay.
+        **kwargs: Further keyword arguments for the optimizer engine, e.g. `lr`.
+
+    Returns:
+        Optimizer: The created optimizer.
+    """
     wd_regexes = [re_compile(r) for r in weight_decay_regexes or []]
     nwd_regexes = [re_compile(r) for r in no_weight_decay_regexes or []]
     has_lr_scale = False
@@ -147,122 +226,16 @@ def _create_opt(
         weight_decay = 0.0
     else:
         parameters = params
-    return has_lr_scale, create_optimizer_v2(parameters, weight_decay=weight_decay, **kwargs)
-
-
-def _get_native_scheduler(optimizer: Optimizer, name: str, **kwargs: Any) -> LRScheduler:
-    """Get the native scheduler."""
-    # process "schedulers" key for SequentialLR, ChainedScheduler
-    if "schedulers" in kwargs:
-        kwargs["schedulers"] = [_get_native_scheduler(optimizer=optimizer, **s) for s in kwargs["schedulers"]]
-    return getattr(lr_scheduler, name)(optimizer=optimizer, **kwargs)
-
-
-def _create_native_scheduler(
-    optimizer: Optimizer,
-    name: str,
-    has_lr_scale: bool,
-    criterion: str | None = None,
-    updates_per_epoch: int | None = None,
-    **kwargs: Any,
-) -> None:
-    """Create the native scheduler."""
-    scheduler = _get_native_scheduler(optimizer, name, **kwargs)
-    if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
-        # ReduceLROnPlateau: step(self, metrics: SupportsFloat, epoch=None)
-        if criterion is None:
-            raise ValueError("criterion must be specified for ReduceLROnPlateau scheduler")
-        GLOBAL_CALLBACKS.on_epoch_end.register(
-            "lr_scheduler_step",
-            lambda i, **kw: scheduler.step(i.logs()[criterion], i.epoch),  # type: ignore[arg-type]
-        )
-        if has_lr_scale:
-            GLOBAL_CALLBACKS.on_epoch_end.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
-    elif isinstance(scheduler, lr_scheduler.CosineAnnealingWarmRestarts):
-        # CosineAnnealingWarmRestarts: step(epoch + i / iters)
-        if updates_per_epoch is None or updates_per_epoch <= 0:
-            raise ValueError("updates_per_epoch must be a positive integer for CosineAnnealingWarmRestarts scheduler")
-        GLOBAL_CALLBACKS.on_update.register(
-            "lr_scheduler_step",
-            lambda i, **kw: scheduler.step((i.update - 1) / updates_per_epoch),  # type: ignore[arg-type]
-        )
-        if has_lr_scale:
-            GLOBAL_CALLBACKS.on_update.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
-    else:
-        GLOBAL_CALLBACKS.on_epoch_end.register("lr_scheduler_step", lambda i, **kw: scheduler.step())  # type: ignore[arg-type]
-        if has_lr_scale:
-            GLOBAL_CALLBACKS.on_epoch_end.register("lr_scale_set", lambda i, **kw: _set_lr_scale(optimizer))  # type: ignore[arg-type]
-
-
-def _create_timm_scheduler(optimizer: Optimizer, criterion: str, name: str, **kwargs: Any) -> None:
-    """Create the timm scheduler."""
-    scheduler, epochs = create_scheduler_v2(optimizer, sched=name, **kwargs)
-    logger.info(f"Scheduled epochs: {epochs}. LR stepped per {'epoch' if scheduler.t_in_epochs else 'update'}.")
-    GLOBAL_CALLBACKS.on_update.register(
-        "lr_scheduler_step_update",
-        lambda i, **kw: scheduler.step_update(i.update, i.logs()[criterion]),  # type: ignore[arg-type]
-    )
-    GLOBAL_CALLBACKS.on_epoch_end.register(
-        "lr_scheduler_step",
-        lambda i, **kw: scheduler.step(i.epoch, i.logs()[criterion]),  # type: ignore[arg-type]
-    )
-
-
-def _create_scheduler(optimizer: Optimizer, name: str, has_lr_scale: bool, **kwargs: Any) -> None:
-    """Create the scheduler."""
-    if hasattr(lr_scheduler, name):
-        return _create_native_scheduler(optimizer=optimizer, name=name, has_lr_scale=has_lr_scale, **kwargs)
-    return _create_timm_scheduler(optimizer=optimizer, name=name, **kwargs)
-
-
-def _set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
-    for group in optimizer.param_groups:
-        if "lr_scale" in group:
-            if isinstance(group["lr"], torch.Tensor):
-                group["lr"].mul_(group["lr_scale"])
-            else:
-                group["lr"] = group["lr"] * group["lr_scale"]
-            if delete_lr_scale:
-                del group["lr_scale"]
-
-
-def create(params: list[tuple[str, Parameter]], **kwargs: Any) -> Optimizer:
-    """Create an optimizer.
-
-    Args:
-        params (List[Tuple[str, Parameter]]): The model parameters.
-        **kwargs: The optimizer arguments.
-
-    Returns:
-        Optimizer: The optimizer.
-    """
-    has_lr_scale, opt = _create_opt(params, **kwargs)
+    engine = opt if callable(opt) else _native_optimizer(opt)
+    if engine is None:
+        return create_optimizer_v2(parameters, opt=opt, weight_decay=weight_decay, **kwargs)
+    optimizer = engine(parameters, weight_decay=weight_decay, **kwargs)
     if has_lr_scale:
-        _set_lr_scale(opt, True)
-    return opt
+        set_lr_scale(optimizer, True)
+    return optimizer
 
 
-def create_with_scheduler(
-    params: list[tuple[str, Parameter]],
-    optimizer_kwargs: dict[str, Any],
-    scheduler_kwargs: dict[str, Any],
-) -> Optimizer:
-    """Create an optimizer with scheduler.
-
-    Args:
-        params (List[Tuple[str, torch.nn.Parameter]]): The model parameters.
-        optimizer_kwargs (Dict[str, Any]): The optimizer arguments.
-        scheduler_kwargs (Dict[str, Any]): The scheduler arguments.
-
-    Returns:
-        Optimizer: The optimizer with scheduler.
-    """
-    has_lr_scale, opt = _create_opt(params, **optimizer_kwargs)
-    _create_scheduler(opt, has_lr_scale=has_lr_scale, **scheduler_kwargs)
-    return opt
-
-
-__all__ = ["create", "create_with_scheduler"]
+__all__ = ["create_opt", "get_decays", "set_lr_scale"]
 
 
 if not TYPE_CHECKING:

@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from typing import Any
 
 import pytest
 from torch.nn import Linear
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS
-from structcast_model.torch.optimizers import create, create_with_scheduler
+from structcast_model.base_trainer import BaseInfo
+from structcast_model.torch.optimizers import create_opt, get_decays, set_lr_scale
 import torch
 
 # Access private helpers via the exported function's __globals__
 # (the module uses LazySelectedImporter, blocking direct private imports)
-_g = create.__globals__
+_g = create_opt.__globals__
 _match_no_weight_decay = _g["_match_no_weight_decay"]
 _get_layer_group_id = _g["_get_layer_group_id"]
 _param_groups_layer_decay = _g["_param_groups_layer_decay"]
 _param_groups_weight_decay = _g["_param_groups_weight_decay"]
-_set_lr_scale = _g["_set_lr_scale"]
 re_compile = _g["re_compile"]
 
 # ---------------------------------------------------------------------------
@@ -29,31 +30,6 @@ re_compile = _g["re_compile"]
 def _named_params() -> list[tuple[str, torch.nn.Parameter]]:
     """Return a minimal set of named parameters from a Linear layer."""
     return list(Linear(4, 2).named_parameters())
-
-
-@pytest.fixture(autouse=True)
-def _clean_global_callbacks() -> Any:
-    """Restore GLOBAL_CALLBACKS callback lists after each test."""
-    _cb_attrs = (
-        "on_update",
-        "on_training_begin",
-        "on_training_end",
-        "on_training_step_begin",
-        "on_training_step_end",
-        "on_validation_begin",
-        "on_validation_end",
-        "on_validation_step_begin",
-        "on_validation_step_end",
-        "on_epoch_begin",
-        "on_epoch_end",
-    )
-    saved = {a: (list(getattr(GLOBAL_CALLBACKS, a)), list(getattr(GLOBAL_CALLBACKS, a)._names)) for a in _cb_attrs}
-    yield
-    for attr, (cbs, names) in saved.items():
-        ncl = getattr(GLOBAL_CALLBACKS, attr)
-        ncl.clear()
-        for name, cb in zip(names, cbs, strict=True):
-            ncl.register(name, cb)
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +197,7 @@ def test_param_groups_weight_decay_excludes_frozen_params() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _set_lr_scale
+# set_lr_scale
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +206,7 @@ def test_set_lr_scale_multiplies_lr_by_lr_scale() -> None:
     model = Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
     optimizer.param_groups[0]["lr_scale"] = 0.5
-    _set_lr_scale(optimizer)
+    set_lr_scale(optimizer)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
 
 
@@ -239,7 +215,7 @@ def test_set_lr_scale_removes_key_when_delete_true() -> None:
     model = Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
     optimizer.param_groups[0]["lr_scale"] = 0.5
-    _set_lr_scale(optimizer, delete_lr_scale=True)
+    set_lr_scale(optimizer, delete_lr_scale=True)
     assert "lr_scale" not in optimizer.param_groups[0]
 
 
@@ -248,279 +224,259 @@ def test_set_lr_scale_skips_groups_without_lr_scale() -> None:
     model = Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     original_lr = optimizer.param_groups[0]["lr"]
-    _set_lr_scale(optimizer)
+    set_lr_scale(optimizer)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(original_lr)
 
 
-# ---------------------------------------------------------------------------
-# create (public API)
-# ---------------------------------------------------------------------------
-
-
-def test_create_returns_optimizer_instance() -> None:
-    """create() returns a valid torch Optimizer."""
-    params = _named_params()
-    opt = create(params, opt="sgd", lr=0.01)
-    assert isinstance(opt, torch.optim.Optimizer)
-
-
-def test_create_with_layer_decay() -> None:
-    """create() applies layer-wise learning rate decay when layer_decay > 0."""
-    params = _named_params()
-    opt = create(
-        params,
-        opt="sgd",
-        lr=0.01,
-        layer_decay=0.8,
-        layer_group_regexes=[],
-        weight_decay=0.01,
-    )
-    assert isinstance(opt, torch.optim.Optimizer)
-
-
-def test_create_with_weight_decay_and_no_wd_regexes() -> None:
-    """create() creates separate parameter groups when weight_decay + regexes are used."""
-    params = _named_params()
-    opt = create(
-        params,
-        opt="sgd",
-        lr=0.01,
-        weight_decay=0.01,
-        no_weight_decay_regexes=["bias"],
-    )
-    assert isinstance(opt, torch.optim.Optimizer)
-    assert len(opt.param_groups) >= 1
-
-
-def test_create_with_weight_decay_and_wd_regexes() -> None:
-    """create() handles weight_decay_regexes correctly."""
-    params = _named_params()
-    opt = create(
-        params,
-        opt="sgd",
-        lr=0.01,
-        weight_decay=0.01,
-        weight_decay_regexes=["weight"],
-    )
-    assert isinstance(opt, torch.optim.Optimizer)
-
-
-def test_create_no_decay_no_regexes() -> None:
-    """create() with weight_decay=0 and no regexes passes params directly."""
-    params = _named_params()
-    opt = create(params, opt="adam", lr=0.001)
-    assert isinstance(opt, torch.optim.Optimizer)
-
-
-# ---------------------------------------------------------------------------
-# create_with_scheduler – native StepLR
-# ---------------------------------------------------------------------------
-
-
-def test_create_with_scheduler_steplr_registers_epoch_callback() -> None:
-    """StepLR scheduler registers an on_epoch_end callback in GLOBAL_CALLBACKS."""
-    before = len(GLOBAL_CALLBACKS.on_epoch_end)
-    params = _named_params()
-    opt = create_with_scheduler(
-        params,
-        optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-        scheduler_kwargs={"name": "StepLR", "step_size": 1},
-    )
-    assert isinstance(opt, torch.optim.Optimizer)
-    assert len(GLOBAL_CALLBACKS.on_epoch_end) > before
-
-
-def test_create_with_scheduler_cosine_warm_restarts_registers_update_callback() -> None:
-    """CosineAnnealingWarmRestarts registers an on_update callback."""
-    before = len(GLOBAL_CALLBACKS.on_update)
-    params = _named_params()
-    create_with_scheduler(
-        params,
-        optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-        scheduler_kwargs={
-            "name": "CosineAnnealingWarmRestarts",
-            "T_0": 10,
-            "updates_per_epoch": 100,
-        },
-    )
-    assert len(GLOBAL_CALLBACKS.on_update) > before
-
-
-def test_create_with_scheduler_cosine_warm_restarts_missing_updates_raises() -> None:
-    """CosineAnnealingWarmRestarts raises when updates_per_epoch is absent."""
-    with pytest.raises(ValueError, match="updates_per_epoch must be a positive integer"):
-        create_with_scheduler(
-            _named_params(),
-            optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-            scheduler_kwargs={"name": "CosineAnnealingWarmRestarts", "T_0": 10},
-        )
-
-
-def test_create_with_scheduler_cosine_warm_restarts_zero_updates_raises() -> None:
-    """CosineAnnealingWarmRestarts raises when updates_per_epoch <= 0."""
-    with pytest.raises(ValueError, match="updates_per_epoch must be a positive integer"):
-        create_with_scheduler(
-            _named_params(),
-            optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-            scheduler_kwargs={
-                "name": "CosineAnnealingWarmRestarts",
-                "T_0": 10,
-                "updates_per_epoch": 0,
-            },
-        )
-
-
-def test_create_with_scheduler_reduce_lr_on_plateau_registers_epoch_callback() -> None:
-    """ReduceLROnPlateau registers an on_epoch_end callback."""
-    before = len(GLOBAL_CALLBACKS.on_epoch_end)
-    create_with_scheduler(
-        _named_params(),
-        optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-        scheduler_kwargs={"name": "ReduceLROnPlateau", "criterion": "loss"},
-    )
-    assert len(GLOBAL_CALLBACKS.on_epoch_end) > before
-
-
-def test_create_with_scheduler_reduce_lr_on_plateau_missing_criterion_raises() -> None:
-    """ReduceLROnPlateau raises ValueError when criterion is absent."""
-    with pytest.raises(ValueError, match="criterion must be specified"):
-        create_with_scheduler(
-            _named_params(),
-            optimizer_kwargs={"opt": "sgd", "lr": 0.01},
-            scheduler_kwargs={"name": "ReduceLROnPlateau"},
-        )
-
-
-def test_create_with_scheduler_step_lr_with_layer_decay() -> None:
-    """create_with_scheduler applies layer decay and lr_scale correctly."""
-    params = _named_params()
-    opt = create_with_scheduler(
-        params,
-        optimizer_kwargs={
-            "opt": "sgd",
-            "lr": 0.01,
-            "layer_decay": 0.8,
-            "layer_group_regexes": [],
-            "weight_decay": 0.01,
-        },
-        scheduler_kwargs={"name": "StepLR", "step_size": 1},
-    )
-    assert isinstance(opt, torch.optim.Optimizer)
-
-
-# ---------------------------------------------------------------------------
-# _get_native_scheduler — nested schedulers (SequentialLR)
-# ---------------------------------------------------------------------------
-
-_get_native_scheduler = _g["_get_native_scheduler"]
-
-
-def test_get_native_scheduler_sequential_lr() -> None:
-    """SequentialLR with nested scheduler specs creates a composite scheduler."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    scheduler = _get_native_scheduler(
-        optimizer,
-        "SequentialLR",
-        schedulers=[
-            {"name": "ConstantLR", "factor": 0.5, "total_iters": 2},
-            {"name": "StepLR", "step_size": 1},
-        ],
-        milestones=[2],
-    )
-    assert type(scheduler).__name__ == "SequentialLR"
-
-
-# ---------------------------------------------------------------------------
-# _set_lr_scale — tensor lr branch
-# ---------------------------------------------------------------------------
-
-
 def test_set_lr_scale_with_tensor_lr() -> None:
-    """lr_scale multiplies tensor-type LR via .mul_()."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+    """A tensor learning rate is scaled in place, since optimizers may hold lr as a tensor."""
+    optimizer = torch.optim.SGD(Linear(4, 2).parameters(), lr=1.0)
     optimizer.param_groups[0]["lr"] = torch.tensor(1.0)
     optimizer.param_groups[0]["lr_scale"] = 0.5
-    _set_lr_scale(optimizer)
+    set_lr_scale(optimizer)
     assert optimizer.param_groups[0]["lr"].item() == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
-# _create_native_scheduler — ReduceLROnPlateau + lr_scale, default + lr_scale
+# create_opt - engine selection
 # ---------------------------------------------------------------------------
 
-_create_native_scheduler = _g["_create_native_scheduler"]
 
-
-def test_create_native_scheduler_reduce_lr_on_plateau_with_lr_scale() -> None:
-    """ReduceLROnPlateau with lr_scale registers both scheduler and lr_scale callbacks."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    optimizer.param_groups[0]["lr_scale"] = 0.5
-    _create_native_scheduler(optimizer, "ReduceLROnPlateau", has_lr_scale=True, criterion="loss")
-    names = GLOBAL_CALLBACKS.on_epoch_end.names()
-    assert "lr_scheduler_step" in names
-    assert "lr_scale_set" in names
-
-
-def test_create_native_scheduler_default_with_lr_scale() -> None:
-    """Default scheduler type (StepLR) with lr_scale registers both callbacks on epoch_end."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    optimizer.param_groups[0]["lr_scale"] = 0.5
-    _create_native_scheduler(optimizer, "StepLR", has_lr_scale=True, step_size=1)
-    names = GLOBAL_CALLBACKS.on_epoch_end.names()
-    assert "lr_scheduler_step" in names
-    assert "lr_scale_set" in names
-
-
-def test_create_native_scheduler_cosine_warm_restarts_with_lr_scale() -> None:
-    """CosineAnnealingWarmRestarts with lr_scale registers both callbacks on update."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    optimizer.param_groups[0]["lr_scale"] = 0.5
-    _create_native_scheduler(
-        optimizer,
-        "CosineAnnealingWarmRestarts",
-        has_lr_scale=True,
-        T_0=10,
-        updates_per_epoch=100,
+def test_get_decays_reports_per_group_weight_decay() -> None:
+    """A logger tracks the decay values create_opt grouped, so each group must surface under its own key."""
+    optimizer = create_opt(
+        _named_params(), opt="torch.optim.AdamW", lr=0.01, weight_decay=0.05, no_weight_decay_regexes=["bias"]
     )
-    names = GLOBAL_CALLBACKS.on_update.names()
-    assert "lr_scheduler_step" in names
-    assert "lr_scale_set" in names
+    assert get_decays({"optimizer": optimizer}) == {
+        "optimizer_group0_weight_decay": 0.0,
+        "optimizer_group1_weight_decay": 0.05,
+    }
+
+
+def test_get_decays_reports_lr_scale_on_the_timm_engine() -> None:
+    """The timm engine keeps lr_scale for its schedulers, so layer decay must stay observable per group."""
+    optimizer = create_opt(
+        _named_params(), opt="sgd", lr=0.01, layer_decay=0.5, layer_group_regexes=["weight"], momentum=0.9
+    )
+    decays = get_decays({"optimizer": optimizer})
+    scales = {key: value for key, value in decays.items() if key.endswith("lr_scale")}
+    assert len(scales) == 2
+    assert sorted(scales.values()) == [0.5, 1.0]
+
+
+def test_get_decays_reports_the_single_group_of_a_plain_optimizer() -> None:
+    """Without create_opt grouping the engine default still lands in the run as group 0."""
+    optimizer = torch.optim.AdamW(Linear(4, 2).parameters(), lr=0.01, weight_decay=0.01)
+    assert get_decays({"optimizer": optimizer}) == {"optimizer_group0_weight_decay": 0.01}
+
+
+@pytest.mark.parametrize("opt", ["torch.optim.AdamW", "torch.AdamW", "torch.optim.SGD"])
+def test_create_opt_builds_a_native_optimizer_by_explicit_name(opt: str) -> None:
+    """Only an explicit torch.optim.X name selects the native engine: bare names keep timm's defaults."""
+    optimizer = create_opt(_named_params(), opt=opt, lr=0.01)
+    assert type(optimizer) is getattr(torch.optim, opt.rsplit(".", 1)[-1])
+
+
+def test_create_opt_sends_bare_names_to_timm() -> None:
+    """Bare names like "sgd" must keep timm's defaults (nesterov momentum), or migrated cfgs change behavior."""
+    optimizer = create_opt(_named_params(), opt="sgd", lr=0.01, momentum=0.9)
+    assert optimizer.param_groups[0]["nesterov"] is True
+
+
+def test_create_opt_applies_regex_weight_decay_on_the_native_engine() -> None:
+    """Native torch.optim reads per-group weight_decay: the regex groups must override the engine default."""
+    optimizer = create_opt(
+        _named_params(), opt="torch.optim.AdamW", lr=0.01, weight_decay=0.05, no_weight_decay_regexes=["bias"]
+    )
+    decays = {tuple(group["param_names"]): group["weight_decay"] for group in optimizer.param_groups}
+    assert decays == {("bias",): 0.0, ("weight",): 0.05}
+
+
+def test_native_engine_weight_decay_shrinks_only_decayed_parameters() -> None:
+    """One SGD step with zero gradients proves decay is applied: the weight shrinks, the bias stays put."""
+    layer = Linear(4, 2)
+    params = list(layer.named_parameters())
+    optimizer = create_opt(params, opt="torch.optim.SGD", lr=0.1, weight_decay=0.5, no_weight_decay_regexes=["bias"])
+    weight_before, bias_before = layer.weight.detach().clone(), layer.bias.detach().clone()
+    for _, parameter in params:
+        parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    assert torch.allclose(layer.weight.detach(), weight_before * (1 - 0.1 * 0.5))
+    assert torch.equal(layer.bias.detach(), bias_before)
+
+
+def test_native_engine_layer_decay_scales_each_group_learning_rate() -> None:
+    """One SGD step with unit gradients proves layer decay reaches native optim: each group moves by its scaled lr."""
+    layer = Linear(4, 2)
+    params = list(layer.named_parameters())
+    optimizer = create_opt(params, opt="torch.optim.SGD", lr=0.1, layer_decay=0.5, layer_group_regexes=["weight"])
+    weight_before, bias_before = layer.weight.detach().clone(), layer.bias.detach().clone()
+    for _, parameter in params:
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    # "weight" matches group 0 (scale 0.5); "bias" matches none and lands in the unscaled group.
+    assert torch.allclose(layer.weight.detach(), weight_before - 0.5 * 0.1)
+    assert torch.allclose(layer.bias.detach(), bias_before - 1.0 * 0.1)
+
+
+def test_create_opt_rejects_a_bad_explicit_native_name() -> None:
+    """An explicit torch.optim.X name that is not an optimizer must fail loudly, not fall back to timm."""
+    with pytest.raises(ValueError, match="does not name a torch.optim optimizer class"):
+        create_opt(_named_params(), opt="torch.optim.NoSuchOptimizer", lr=0.01)
+
+
+def test_create_opt_builds_the_given_optimizer_class() -> None:
+    """A callable is used as the engine directly, so any optimizer class works without a name lookup."""
+    optimizer = create_opt(_named_params(), opt=torch.optim.Adagrad, lr=0.01)
+    assert type(optimizer) is torch.optim.Adagrad
+
+
+def test_create_opt_falls_back_to_timm_for_unknown_names() -> None:
+    """Names torch does not know reach timm, which is what makes its extra optimizers available."""
+    optimizer = create_opt(_named_params(), opt="lamb", lr=0.01)
+    assert type(optimizer).__name__ == "Lamb"
+
+
+def test_create_opt_rejects_unknown_optimizer_names() -> None:
+    """An unknown name must fail loudly rather than silently fall back to a default optimizer."""
+    with pytest.raises(ValueError, match="not found in registry"):
+        create_opt(_named_params(), opt="definitely-not-an-optimizer", lr=0.01)
 
 
 # ---------------------------------------------------------------------------
-# _create_timm_scheduler
+# create_opt - parameter grouping
 # ---------------------------------------------------------------------------
 
-_create_timm_scheduler = _g["_create_timm_scheduler"]
+
+def test_create_opt_groups_by_weight_decay_regexes() -> None:
+    """Regex grouping is what lets a run decay weights but not biases, whatever the engine is."""
+    optimizer = create_opt(_named_params(), opt="sgd", lr=0.01, weight_decay=0.05, no_weight_decay_regexes=["bias"])
+    decays = {tuple(group["param_names"]): group["weight_decay"] for group in optimizer.param_groups}
+    assert decays == {("bias",): 0.0, ("weight",): 0.05}
 
 
-def test_create_timm_scheduler_registers_update_and_epoch_callbacks() -> None:
-    """Timm scheduler registers both on_update and on_epoch_end callbacks."""
+def test_create_opt_passes_weight_decay_through_when_no_group_consumed_it() -> None:
+    """Without grouping regexes the weight decay must still reach the engine."""
+    optimizer = create_opt(_named_params(), opt="sgd", lr=0.01, weight_decay=0.05)
+    assert all(group["weight_decay"] == pytest.approx(0.05) for group in optimizer.param_groups)
+
+
+def test_create_opt_bakes_layer_scales_into_lr_on_the_native_engine() -> None:
+    """Native schedulers ignore lr_scale, so the scale has to be applied to lr before training."""
+    optimizer = create_opt(
+        _named_params(),
+        opt="torch.optim.SGD",
+        lr=1.0,
+        layer_decay=0.5,
+        layer_group_regexes=["weight"],
+        weight_decay=0.05,
+    )
+    assert not any("lr_scale" in group for group in optimizer.param_groups)
+    assert sorted(group["lr"] for group in optimizer.param_groups) == [pytest.approx(0.5), pytest.approx(1.0)]
+
+
+def test_create_opt_keeps_lr_scale_on_the_timm_engine() -> None:
+    """Timm schedulers read lr_scale themselves, so removing it would double-apply the decay."""
+    optimizer = create_opt(
+        _named_params(), opt="lamb", lr=1.0, layer_decay=0.5, layer_group_regexes=["weight"], weight_decay=0.05
+    )
+    assert sorted(group["lr_scale"] for group in optimizer.param_groups) == [pytest.approx(0.5), pytest.approx(1.0)]
+    assert all(group["lr"] == pytest.approx(1.0) for group in optimizer.param_groups)
+
+
+# ---------------------------------------------------------------------------
+# examples/torch/optimizers.py - AdamWWithCosine
+# ---------------------------------------------------------------------------
+
+
+def _load_example_module() -> Any:
+    """Load the example module the way a configuration does: by file path, not by import name."""
+    path = Path(__file__).resolve().parents[2] / "examples" / "torch" / "optimizers.py"
+    spec = importlib.util.spec_from_file_location("example_optimizers", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_example_adamw_with_cosine_requires_a_criterion() -> None:
+    """The schedule reads a tracked criterion; leaving it out is a configuration error, not a default."""
+    module = _load_example_module()
+    with pytest.raises(ValueError, match="criterion"):
+        module.AdamWWithCosine(
+            _named_params(), optimizer_kwargs={"opt": "adamw", "lr": 0.1}, scheduler_kwargs={"num_epochs": 2}
+        )
+
+
+def test_example_adamw_with_cosine_proxies_the_optimizer_interface() -> None:
+    """Generated learner code calls step/zero_grad/param_groups on it, so the proxy must be transparent."""
+    module = _load_example_module()
     model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    before_update = len(GLOBAL_CALLBACKS.on_update)
-    before_epoch = len(GLOBAL_CALLBACKS.on_epoch_end)
-    _create_timm_scheduler(optimizer, criterion="loss", name="cosine", num_epochs=10)
-    assert len(GLOBAL_CALLBACKS.on_update) > before_update
-    assert len(GLOBAL_CALLBACKS.on_epoch_end) > before_epoch
+    optimizer = module.AdamWWithCosine(
+        list(model.named_parameters()),
+        optimizer_kwargs={"opt": "adamw", "lr": 0.1},
+        scheduler_kwargs={"sched": "cosine", "num_epochs": 2, "criterion": "loss"},
+    )
+    model(torch.ones(1, 4)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+
+
+def test_example_adamw_with_cosine_steps_the_schedule_on_epoch_end() -> None:
+    """Routed as a callback, the wrapper is what advances the schedule -- nothing else does."""
+    module = _load_example_module()
+    optimizer = module.AdamWWithCosine(
+        _named_params(),
+        optimizer_kwargs={"opt": "adamw", "lr": 0.1},
+        scheduler_kwargs={"sched": "cosine", "num_epochs": 4, "min_lr": 0.0, "criterion": "loss"},
+    )
+    info = BaseInfo(epoch=3)
+    info.logs()["loss"] = 0.5
+    optimizer.on_epoch_end(info)
+    assert optimizer.param_groups[0]["lr"] < 0.1
+
+
+def test_example_adamw_with_cosine_state_dict_covers_both_halves() -> None:
+    """Schedule state was lost on resume before; the merged state dict is the fix."""
+    module = _load_example_module()
+    optimizer = module.AdamWWithCosine(
+        _named_params(),
+        optimizer_kwargs={"opt": "adamw", "lr": 0.1},
+        scheduler_kwargs={"sched": "cosine", "num_epochs": 2, "criterion": "loss"},
+    )
+    state = optimizer.state_dict()
+    assert set(state) == {"optimizer", "scheduler"}
+    optimizer.load_state_dict(state)
 
 
 # ---------------------------------------------------------------------------
-# _create_scheduler - dispatch to timm
+# examples/torch/optimizers.py - OptimizerWithNativeScheduler
 # ---------------------------------------------------------------------------
 
-_create_scheduler = _g["_create_scheduler"]
+
+def test_example_native_scheduler_steps_the_schedule_on_epoch_end() -> None:
+    """A native scheduler counts epochs on its own, so the wrapper only has to step it once per epoch."""
+    module = _load_example_module()
+    optimizer = module.OptimizerWithNativeScheduler(
+        _named_params(),
+        optimizer_kwargs={"opt": "adam", "lr": 0.1},
+        scheduler_kwargs={"name": "LambdaLR", "lr_lambda": lambda epoch: 1.0 - 0.5 * epoch},
+    )
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    optimizer.on_epoch_end(BaseInfo(epoch=1))
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
 
 
-def test_create_scheduler_dispatches_to_timm_for_unknown_native() -> None:
-    """Scheduler names not in torch.optim.lr_scheduler dispatch to timm."""
-    model = Linear(4, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    before_update = len(GLOBAL_CALLBACKS.on_update)
-    _create_scheduler(optimizer, name="cosine", has_lr_scale=False, criterion="loss", num_epochs=10)
-    assert len(GLOBAL_CALLBACKS.on_update) > before_update
+def test_example_native_scheduler_state_dict_covers_both_halves() -> None:
+    """Schedule state must survive a resume, exactly as for the timm-scheduled combination."""
+    module = _load_example_module()
+    optimizer = module.OptimizerWithNativeScheduler(
+        _named_params(),
+        optimizer_kwargs={"opt": "adam", "lr": 0.1},
+        scheduler_kwargs={"name": "LambdaLR", "lr_lambda": lambda epoch: 1.0},
+    )
+    state = optimizer.state_dict()
+    assert set(state) == {"optimizer", "scheduler"}
+    optimizer.load_state_dict(state)
