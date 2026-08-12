@@ -16,31 +16,23 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
-from typing import TYPE_CHECKING, Any
+import os
+from typing import TYPE_CHECKING, Any, Literal, overload
 
+from structcast.utils.lazy_import import try_import
+from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 from typing_extensions import Protocol, runtime_checkable
 
 import torch
 
 logger = getLogger(__name__)
 
-try:  # torch >= 2.6 ships the stable per-parameter sharding (FSDP2) API.
-    from torch.distributed.fsdp import (
-        FSDPModule as _FSDP_MODULE,
-        MixedPrecisionPolicy as _MIXED_PRECISION_POLICY,
-        fully_shard as _fully_shard,
-    )
-except ImportError:  # pragma: no cover - exercised only on old torch builds
-    _FSDP_MODULE = None
-    _MIXED_PRECISION_POLICY = None
-    _fully_shard = None
+with try_import() as _fsdp_imports:  # torch >= 2.6 ships the stable per-parameter sharding (FSDP2) API.
+    from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 
-try:  # torch >= 2.2; the older builds admitted by the torch-cpu extra floor lack both modules.
+with try_import() as _dcp_imports:  # torch >= 2.2; older builds admitted by the torch-cpu extra floor lack both.
     from torch.distributed.checkpoint import state_dict as _dcp_state_dict
-    from torch.distributed.device_mesh import init_device_mesh as _init_device_mesh
-except ImportError:  # pragma: no cover - exercised only on old torch builds
-    _dcp_state_dict = None
-    _init_device_mesh = None
+    from torch.distributed.device_mesh import init_device_mesh
 
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
@@ -49,7 +41,94 @@ _WRAPPER_PREFIXES = ("module.", "_orig_mod.")
 
 def _state_dict_api() -> Any:
     """Return the ``torch.distributed.checkpoint.state_dict`` module, or ``None`` on old torch."""
-    return _dcp_state_dict
+    return _dcp_state_dict if _dcp_imports.is_successful else None
+
+
+def get_torch_device(device: str | None = None) -> str:
+    """Get the device to run the model on."""
+    if device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if "cpu" in device:
+        return device
+    if "cuda" in device:
+        if torch.cuda.is_available():
+            return device
+        logger.warning("CUDA is not available. Using CPU instead.")
+        return "cpu"
+    raise ValueError(f'Only "cpu" and "cuda" (with optional rank suffix) are supported. Got invalid device: {device}')
+
+
+def get_torch_device_type(device: str | None = None) -> str:
+    """Get the device type (cpu or cuda) from the device string."""
+    return get_torch_device(device).split(":")[0]
+
+
+@overload
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: Literal[True] = True,
+) -> dict[str, Any]: ...
+
+
+@overload
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: Literal[False] = False,
+) -> tuple[str, int, int, int, bool]: ...
+
+
+def initial_distributed_env(
+    device: str | None = None,
+    dist_backend: str | None = None,
+    dist_url: str | None = None,
+    *,
+    return_dict: bool = True,
+) -> dict[str, Any] | tuple[str, int, int, int, bool]:
+    """Initialize the distributed environment.
+
+    One process group serves every strategy: DDP all-reduces over it, and
+    :class:`FullyShardedDataParallelStrategy` derives its device mesh from it at wrap time, so
+    there is no FSDP2-specific environment setup.
+
+    Args:
+        device (str | None): The device to run the model on, e.g., 'cuda' or 'cpu'.
+        dist_backend (str | None): The backend to use for distributed training.
+            If None, the backend will be automatically selected based on the device.
+        dist_url (str | None): The URL to use for distributed training initialization.
+            If None, the URL will be automatically generated based on the environment.
+        return_dict (bool): Whether to return the result as a dictionary.
+
+    Returns:
+        If return_dict is False, returns a tuple of (device, global_rank, local_rank, world_size, distributed).
+        If return_dict is True, returns a dictionary with device, global_rank, local_rank, world_size, distributed keys.
+    """
+    if is_distributed_env() and torch.distributed.is_initialized():
+        if "SLURM_PROCID" in os.environ:
+            local_rank, global_rank, world_size = world_info_from_env()
+        else:
+            local_rank, _, _ = world_info_from_env()
+            world_size = torch.distributed.get_world_size()
+            global_rank = torch.distributed.get_rank()
+        device_type = get_torch_device_type(device)
+        result = {
+            "device": f"{device_type}:{local_rank}" if device_type != "cpu" else "cpu",
+            "global_rank": global_rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
+            "distributed": True,
+        }
+    else:
+        device = get_torch_device(device)
+        result = init_distributed_device_so(device=device, dist_backend=dist_backend, dist_url=dist_url)
+    if return_dict:
+        return result
+    return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
 
 
 def _strip_wrapper_prefixes(state: dict[str, Any]) -> dict[str, Any]:
@@ -79,7 +158,7 @@ def sync_gate(module: Any, armed: bool) -> AbstractContextManager[None]:
     """
     if isinstance(module, torch.nn.parallel.DistributedDataParallel):
         return nullcontext() if armed else module.no_sync()
-    if _FSDP_MODULE is not None and isinstance(module, _FSDP_MODULE):
+    if _fsdp_imports.is_successful and isinstance(module, FSDPModule):
         return nullcontext() if armed else _NoGradientSync(module)
     return nullcontext()
 
@@ -301,7 +380,14 @@ class SingleDeviceStrategy(_StateDictMixin):
 
 @dataclass(kw_only=True)
 class DistributedDataParallelStrategy(_StateDictMixin):
-    """Strategy wrapping every model in ``DistributedDataParallel``."""
+    """Strategy wrapping every model in ``DistributedDataParallel``.
+
+    ``initial_distributed_env`` is exposed on the class because initializing the process group is
+    the first step of every run trained under this strategy (the CLI calls it before the strategy
+    is instantiated, since the strategy's constructor arguments come from its result).
+    """
+
+    initial_distributed_env = staticmethod(initial_distributed_env)
 
     device: str
     """Device this rank trains on."""
@@ -341,7 +427,12 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
     Requires torch >= 2.6. fp16 learners built under this strategy use the plain
     ``torch.amp.GradScaler``: since torch 2.5 the DTensor dispatcher all-reduces ``found_inf``
     across ranks inside ``unscale_``, so no sharded scaler class is needed.
+
+    Environment initialization is identical to DDP's — one default process group serves both;
+    the FSDP2-specific device mesh is derived from it lazily at wrap time.
     """
+
+    initial_distributed_env = staticmethod(initial_distributed_env)
 
     device: str
     """Device this rank trains on."""
@@ -362,7 +453,7 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
 
     def __post_init__(self) -> None:
         """Fail loud when the installed torch has no stable ``fully_shard``."""
-        if _fully_shard is None:
+        if not _fsdp_imports.is_successful:
             raise ImportError(
                 "FullyShardedDataParallelStrategy requires torch>=2.6 for the stable fully_shard "
                 "(FSDP2) API; the installed torch does not provide torch.distributed.fsdp.fully_shard."
@@ -375,11 +466,11 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
             # CUDA-enabled builds even when this strategy trains on CPU — the mesh must follow the
             # strategy's device instead.
             device_type = "cpu" if "cpu" in self.device else self.device.split(":")[0]
-            self._mesh = _init_device_mesh(device_type, (torch.distributed.get_world_size(),))
+            self._mesh = init_device_mesh(device_type, (torch.distributed.get_world_size(),))
         kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
-            kwargs["mp_policy"] = _MIXED_PRECISION_POLICY(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
-        return OrderedDict((n, _fully_shard(m, **kwargs)) for n, m in models.items())
+            kwargs["mp_policy"] = MixedPrecisionPolicy(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
+        return OrderedDict((n, fully_shard(m, **kwargs)) for n, m in models.items())
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
         """Broadcast rank 0's parameters and buffers; ``fully_shard`` performs no such synchronization."""
@@ -412,6 +503,9 @@ __all__ = [
     "DistributedStrategy",
     "FullyShardedDataParallelStrategy",
     "SingleDeviceStrategy",
+    "get_torch_device",
+    "get_torch_device_type",
+    "initial_distributed_env",
     "sync_gate",
 ]
 

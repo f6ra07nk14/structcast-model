@@ -466,7 +466,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     """Train a PyTorch model, recording the run to an experiment tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    device, global_rank, local_rank, world_size, distributed = torch_trainer.initial_distributed_env(
+    device, global_rank, local_rank, world_size, distributed = torch_distributed.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
     torch.backends.cudnn.benchmark = True

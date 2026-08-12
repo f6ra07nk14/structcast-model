@@ -210,10 +210,16 @@ def test_ddp_strategy_round_trips_through_wrapped_models(single_process_gloo: No
 # ---------------------------------------------------------------------------
 
 
+class _FailedImports:
+    """Stand-in for a try_import context whose imports failed."""
+
+    is_successful = False
+
+
 def test_fsdp2_strategy_requires_fully_shard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Selecting FSDP2 on a torch without fully_shard must fail with an actionable message."""
     # The lazy-import shim hides module privates, so patch the globals the class actually reads.
-    monkeypatch.setitem(FullyShardedDataParallelStrategy.__post_init__.__globals__, "_fully_shard", None)
+    monkeypatch.setitem(FullyShardedDataParallelStrategy.__post_init__.__globals__, "_fsdp_imports", _FailedImports())
     with pytest.raises(ImportError, match="torch>=2.6"):
         FullyShardedDataParallelStrategy(device="cpu")
 

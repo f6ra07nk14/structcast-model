@@ -4,15 +4,18 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from logging import getLogger
-import os
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 
 from pydantic import TypeAdapter, ValidationError
-from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
-from structcast_model.torch.distributed import DistributedStrategy
+from structcast_model.torch.distributed import (
+    DistributedStrategy,
+    get_torch_device,
+    get_torch_device_type,
+    initial_distributed_env,
+)
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.logger import Logger
 from structcast_model.torch.types import Tensor, TensorInitializer
@@ -66,25 +69,6 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     return [create_torch_inputs(v, batch_size=batch_size) for v in node]
 
 
-def get_torch_device(device: str | None = None) -> str:
-    """Get the device to run the model on."""
-    if device is None:
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if "cpu" in device:
-        return device
-    if "cuda" in device:
-        if torch.cuda.is_available():
-            return device
-        logger.warning("CUDA is not available. Using CPU instead.")
-        return "cpu"
-    raise ValueError(f'Only "cpu" and "cuda" (with optional rank suffix) are supported. Got invalid device: {device}')
-
-
-def get_torch_device_type(device: str | None = None) -> str:
-    """Get the device type (cpu or cuda) from the device string."""
-    return get_torch_device(device).split(":")[0]
-
-
 def _low_precision_dtype(inputs: Any) -> Any:
     """Return the first `float16` or `bfloat16` element type found in the inputs, or `None` if there is none."""
     if isinstance(inputs, torch.Tensor):
@@ -113,70 +97,6 @@ def autocast_inputs(inputs: Any, device_type: str) -> AbstractContextManager[Any
     """
     dtype = _low_precision_dtype(inputs)
     return nullcontext() if dtype is None else torch.autocast(device_type, dtype=dtype)
-
-
-@overload
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: Literal[True] = True,
-) -> dict[str, Any]: ...
-
-
-@overload
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: Literal[False] = False,
-) -> tuple[str, int, int, int, bool]: ...
-
-
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: bool = True,
-) -> dict[str, Any] | tuple[str, int, int, int, bool]:
-    """Initialize the distributed environment.
-
-    Args:
-        device (str | None): The device to run the model on, e.g., 'cuda' or 'cpu'.
-        dist_backend (str | None): The backend to use for distributed training.
-            If None, the backend will be automatically selected based on the device.
-        dist_url (str | None): The URL to use for distributed training initialization.
-            If None, the URL will be automatically generated based on the environment.
-        return_dict (bool): Whether to return the result as a dictionary.
-
-    Returns:
-        If return_dict is False, returns a tuple of (device, global_rank, local_rank, world_size, distributed).
-        If return_dict is True, returns a dictionary with device, global_rank, local_rank, world_size, distributed keys.
-    """
-    if is_distributed_env() and torch.distributed.is_initialized():
-        if "SLURM_PROCID" in os.environ:
-            local_rank, global_rank, world_size = world_info_from_env()
-        else:
-            local_rank, _, _ = world_info_from_env()
-            world_size = torch.distributed.get_world_size()
-            global_rank = torch.distributed.get_rank()
-        device_type = get_torch_device_type(device)
-        result = {
-            "device": f"{device_type}:{local_rank}" if device_type != "cpu" else "cpu",
-            "global_rank": global_rank,
-            "local_rank": local_rank,
-            "world_size": world_size,
-            "distributed": True,
-        }
-    else:
-        device = get_torch_device(device)
-        result = init_distributed_device_so(device=device, dist_backend=dist_backend, dist_url=dist_url)
-    if return_dict:
-        return result
-    return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
 
 
 def initial_model(model: Any, shapes: dict[str, Any] | None = None) -> tuple[Any, Any]:
