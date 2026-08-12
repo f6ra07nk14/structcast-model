@@ -145,7 +145,8 @@ def test_learner_clip_grad_norm_in_script() -> None:
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" in script
     assert "unscale_" not in script  # bf16 default has no scaler to unscale
-    fp16_script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": {**FP16, "clip_grad_norm": 2.0}}).scripts[0]
+    fp16_params = {"DEFAULT": {**FP16, "clip_grad_norm": 2.0}}
+    fp16_script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=fp16_params).scripts[0]
     assert "optimizer_grad_scaler.unscale_(optimizer)" in fp16_script
 
 

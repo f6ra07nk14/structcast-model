@@ -103,7 +103,8 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         """Emit one pure flow function plus the self-assignment that makes it rebindable (compilable)."""
         indent = " " * 4
         header = f"def {name}(__need_update__{''.join(f', {p}' for p in params)}):"
-        return [header, *[f"{indent}{line}" for line in body], f"{indent}return {', '.join(returns)}", f"self.{name} = {name}"]
+        tail = [f"{indent}return {', '.join(returns)}", f"self.{name} = {name}"]
+        return [header, *[f"{indent}{line}" for line in body], *tail]
 
     def _analyze_segment(self, units: list[tuple[str, str, str | None]]) -> dict[str, Any]:
         """Collect a segment's generated lines, external loads, stores, and per-model call counts."""
@@ -130,8 +131,8 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         for line, layer in info["lines"]:
             if layer in self.models:
                 seen[layer] += 1
-                armed = "__need_update__" if layer in trainable_layers and seen[layer] == info["counts"][layer] else "False"
-                line = f"with sync_gate({layer}, {armed}): {line}"
+                last_owned = layer in trainable_layers and seen[layer] == info["counts"][layer]
+                line = f"with sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
             body.append(line)
         return body
 
@@ -171,7 +172,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         available = set(self.inputs)
         defs: list[str] = []
         step: list[str] = []
-        for i, ((_, opt_unit), info) in enumerate(zip(segments, infos)):
+        for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
             loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = opt_unit
             backward_line = (
                 f"{loss}.backward({backward_kwargs})"
@@ -188,7 +189,8 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             )
             step += [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
             step += [f"{m}.requires_grad_({m in trainable_layers})" for m in self.models]
-            step.append(f"{', '.join(returns)} = self.{function_name}(__need_update__{''.join(f', {p}' for p in params)})")
+            arguments = "__need_update__" + "".join(f", {p}" for p in params)
+            step.append(f"{', '.join(returns)} = self.{function_name}({arguments})")
             if self.accumulate_gradients:
                 step.append(f"{loss} = {loss} / {self.accumulate_gradients}")
             step.append(backward_line)
