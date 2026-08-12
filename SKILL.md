@@ -215,7 +215,7 @@ What happens:
 
 - Model arguments for `ptflops`, `calflops`, `time`, and `train` are [StructCast](https://github.com/f6ra07nk14/structcast) object patterns, not plain import strings.
 - Dataset arguments can be rendered YAML files or inline StructCast patterns.
-- `configure_security()` is called in CLI paths before generated local modules are imported via `_file_`.
+- Generated local modules are imported via `_file_` patterns; structcast 2.0 needs no security configuration for this.
 - Flax and Keras use channel-last tensor layout (*H × W × C*); PyTorch uses channel-first (*C × H × W*).
 
 ## Builder APIs
@@ -284,8 +284,8 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | Device selection | `get_torch_device(device=None)` | Resolve `cpu` vs `cuda` with fallback |
 | Initialize model | `initial_model(model, shapes=None)` | Run warm-up forward pass, return `(inputs, outputs)` |
 | Build AMP context | `autocast_inputs(inputs, device_type)` | Return `torch.autocast` matching the inputs, or a null context |
-| Optimizer construction | `create_opt(params, opt=..., ...)` | Regex weight-decay and layer-decay grouping over torch and timm engines |
-| Decay metrics | `get_decays(optimizers)` | Flatten per-group weight decay / lr_scale into loggable metrics |
+| Optimizer construction | `create_opt(params, opt=..., ...)` (`structcast_model.torch.optimizers`) | Regex weight-decay and layer-decay grouping over callable, torch, and timm engines |
+| Decay metrics | `get_decays(optimizers)` (`structcast_model.torch.optimizers`) | Flatten per-group weight decay / lr_scale into loggable metrics |
 
 ### Learner, tracker, and trainer layer
 
@@ -367,7 +367,7 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 | Best-criterion monitor | `BestCriterion` (notifies its `on_best` participants, `OnBest` protocol) |
 | Built-in reporting callbacks | `ProgressBar`, `Printer` |
 
-Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and, on first use (first event or `describe()`), routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, its `training_dataset` and `validation_dataset`, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.
+Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and, on first use (the first dispatched event; `describe()` only previews), routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, its `training_dataset` and `validation_dataset`, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.
 
 The eleven events: `on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`. Every handler takes `(info: BaseInfo, **models)`, where `info` is the trainer.
 
@@ -420,7 +420,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 
 **`TypeError: ... missing ... 'data'` at trainer construction**
 - Cause: the trainer was built without `data=`; the field is required.
-- Solution: pass a `DataProvider` (e.g. `SimpleDataProvider`), or call `train(dataset)` / `evaluate(dataset)` directly.
+- Solution: pass a `DataProvider`, e.g. `data=SimpleDataProvider(training_dataset=...)`.
 
 **A callback never runs**
 - Cause: the object was not passed to the trainer, or its method name does not match an event.

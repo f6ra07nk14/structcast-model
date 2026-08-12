@@ -26,7 +26,8 @@ cfg/keras/
 
 examples/torch/
 ├── simple_training.py         # Runnable programmatic training tutorial
-└── optimizers.py              # Optimizer + scheduler compositions referenced by _file_
+├── optimizers.py              # Optimizer + scheduler compositions referenced by _file_
+└── data.py                    # timm dataset/dataloader wrappers and TimmDataProvider, referenced by _file_
 
 src/structcast_model/
 ├── base_trainer.py            # Generic trainer, event protocols, best-criterion handling
@@ -169,7 +170,7 @@ The generated learner class supports:
 - Automatic train/eval mode switching per entry
 - Gradient accumulation, AMP scaler logic, and gradient clipping
 
-It implements the `Learner` protocol (`models`, `update`, `training_step`, `inference_step`) and exposes `optimizers`, `grad_scalers`, `learning_rates`, `weight_decays`, `param_group_names`, `inputs`, and `outputs`.
+It implements the `Learner` protocol (the `models`, `optimizers`, and `learning_rates` properties plus `update`, `training_step`, `inference_step`) and additionally exposes `grad_scalers`, `weight_decays`, `param_group_names`, `inputs`, and `outputs`.
 
 ### `scm torch ptflops` and `scm torch calflops`
 
@@ -328,7 +329,7 @@ Important generation details:
 - `BestCriterion`: criterion monitor for best-value callbacks
 - `ProgressBar`, `Printer`: the two built-in reporting callbacks
 
-Routing rule: on first use (the first dispatched event or `describe()`) the trainer scans the learner, the learner's `optimizers` values, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then `callbacks` in order, registering each object for every event whose `runtime_checkable` protocol it satisfies, never twice for the same event. There is no registry and no `register()` call.
+Routing rule: on first use (the first dispatched event; `describe()` only previews) the trainer scans the learner, the learner's `optimizers` values, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then `callbacks` in order, registering each object for every event whose `runtime_checkable` protocol it satisfies, never twice for the same event. There is no registry and no `register()` call.
 
 ### PyTorch runtime layer
 
@@ -456,7 +457,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Google-style docstrings are expected.
 - Dataclasses use `@dataclass(kw_only=True, slots=True)`.
 - Lazy import wrappers are used broadly:
-  - `LazyModuleImporter` for optional heavy dependencies (torch, timm, mlflow).
+  - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
   - `LazySelectedImporter` for module export surfaces (`__all__`).
 - Generated code should stay minimal and preserve current public APIs.
 - The `outputs` attribute on a generated learner is significant — the CLI reads it to determine which keys `TorchTracker` should track, falling back to `--learner-outputs`.
@@ -481,7 +482,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 | Flax/Keras GPU not detected | JAX cannot find NVIDIA libraries. | Set `LD_LIBRARY_PATH` to include CUDA/cuDNN paths. |
 | `RuntimeError: Address already in use` during distributed training | Another process is using the `MASTER_PORT`. | Change `--master_port` or kill the conflicting process. |
 | All ranks log to the tracking service / print progress bars | Rank gating is not working correctly. | Verify `initial_distributed_env()` is called before logging setup. |
-| `TypeError: ... missing ... 'data'` at trainer construction | The trainer was built without `data=`; the field is required. | Pass a `DataProvider` (e.g. `SimpleDataProvider`), or call `train(dataset)` / `evaluate(dataset)` directly. |
+| `TypeError: ... missing ... 'data'` at trainer construction | The trainer was built without `data=`; the field is required. | Pass a `DataProvider`, e.g. `data=SimpleDataProvider(training_dataset=...)`. |
 | A callback never fires | Its method name does not match an event, or the object was not passed to the trainer. | Check `trainer.describe()` and the spelling against `EVENTS`. |
 
 ## Key Integration Example

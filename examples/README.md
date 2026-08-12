@@ -47,9 +47,10 @@ The optimizer lives on the learner, together with its schedule. `SimpleLearner` 
 `on_epoch_end`, which advances the schedule after each epoch. The trainer finds that method by
 checking the learner against the `OnEpochEnd` protocol, so no registration call is needed.
 
-Two optional properties are read by the rest of the toolkit when present: `optimizers` (the CLI
-saves their state between epochs, and the trainer scans them for event protocols as well) and
-`learning_rates` (printed next to the criteria by `Printer` and logged by the loggers).
+Two more properties are required by the protocol: `optimizers` (the CLI saves their state between
+epochs, and the trainer scans them for event protocols as well) and `learning_rates` (printed next
+to the criteria by `Printer` and logged by the loggers). Optional extras — `grad_scalers`,
+`weight_decays`, `param_group_names` — are read by the toolkit when present.
 
 ### The tracker
 

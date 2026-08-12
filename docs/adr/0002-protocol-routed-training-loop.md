@@ -2,7 +2,7 @@
 
 This ADR records the decisions behind the redesign of `src/structcast_model/base_trainer.py` and its PyTorch
 consumers: callback registration, the `Learner` rename, construction-time datasets, per-learner optimizer
-ownership, logger-owned run lifecycle, and the learner factory boundary.
+ownership, logger-owned run lifecycle, and the inline CLI assembly boundary.
 
 ## Callbacks are routed by protocol, not registered globally
 
@@ -42,7 +42,7 @@ release.
 `steps_per_epoch` / `validation_steps`) given to the trainer at construction, so a fully wired trainer is one
 object. The trainer scans the provider *and its datasets* for event protocols, so the data side's
 epoch-synchronization hooks participate in the same scan as everything else without being registered as
-callbacks. `fit()` keeps only loop parameters (epochs, start epoch, validation
+callbacks; the dataset properties must therefore return the same object on every read. `fit()` keeps only loop parameters (epochs, start epoch, validation
 frequency) and feeds the provider's datasets into `train(dataset)` / `evaluate(dataset)`, whose signatures are
 deliberately unchanged so they remain usable standalone. The CLI keeps its two dataset options
 (`--training-dataset` / `--validation-dataset`) and composes the provider internally; a single provider pattern
@@ -54,9 +54,11 @@ time.
 `create_with_scheduler` built optimizers and registered scheduler steps into the global registry as a side
 effect, forcing one package module (`torch/optimizers.py`) to anticipate every optimizer/scheduler combination.
 That side channel is deleted. What stays in the package is `create_opt`: regex-based weight-decay and layer-decay
-parameter grouping, applied before the optimizer engine, over two engines — native `torch.optim` classes and
-`timm.optim.create_optimizer_v2`. Grouping happens on named parameters and emits standard parameter groups, so it
-is engine-agnostic by construction.
+parameter grouping, applied before the optimizer engine, over three engines — a caller-supplied optimizer
+callable, native `torch.optim` classes (explicit `torch.optim.X` names), and `timm.optim.create_optimizer_v2`
+for bare names. Grouping happens on named parameters and emits standard parameter groups, so it is
+engine-agnostic by construction; the callable and native engines bake the layer-decay `lr_scale` into the
+learning rate immediately, while the timm engine keeps it for its schedulers.
 
 Optimizer+scheduler combinations (e.g. `AdamWWithCosine`) are example code under `examples/torch/`, referenced
 from configuration by file path — they are use-case-specific compositions, not package API. Such a combination is
@@ -75,12 +77,14 @@ run — start, parameter logging, teardown — and additionally implements event
 logging. The CLI selects the backend with `--logger mlflow|wandb` (default `mlflow`); state saving and
 best-criterion recording go through the Logger interface so both backends receive them.
 
-## The learner factory excludes the tracker and DDP wrapping
+## Learner assembly is inline in the CLI, excluding the tracker and DDP wrapping
 
-The factory that builds a Learner from object patterns covers model instantiation, input-shape resolution,
-initializers, learner construction, and step-function compilation. It deliberately does not create the tracker
-(a metrics concern, and a separate trainer field) and does not apply `DistributedDataParallel` wrapping, which
-stays in `cmd_torch.py`. Consequence, recorded as a known limitation rather than fixed here: models are
-DDP-wrapped after the learner captures them, so the learner's step closures call the raw modules and
+`scm torch train` assembles the learner inline — model instantiation, input-shape resolution, initializers,
+learner construction, and step-function compilation — rather than through a factory class; an intermediate
+`TorchLearnerFactory` was tried and reverted, because the CLI is its only consumer and the class added a second
+place to understand the same five steps. The assembly deliberately does not create the tracker (a metrics
+concern, and a separate trainer field, though its buffers are built inside the device scope) and does not apply
+`DistributedDataParallel` wrapping. Consequence, recorded as a known limitation rather than fixed here: models
+are DDP-wrapped after the learner captures them, so the learner's step closures call the raw modules and
 `TorchTrainer.no_sync` never sees a DDP instance — distributed gradient synchronization does not actually flow
 through the wrapper.

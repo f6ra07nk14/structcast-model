@@ -59,7 +59,7 @@ iterable.
 **DataProvider**:
 Supplies the training dataset, the optional validation dataset, and their step counts (`steps_per_epoch`,
 `validation_steps`) for a whole training run; given to a Trainer at construction, which scans the provider and its
-datasets for event protocols.
+datasets for event protocols. The dataset properties must return the same object on every read.
 _Avoid_: DataModule, dataset wrapper
 
 ### Configuration
@@ -67,6 +67,3 @@ _Avoid_: DataModule, dataset wrapper
 **Object pattern**:
 A YAML/CLI expression describing how to instantiate an object (`_obj_` / `_addr_` / `_call_`).
 
-**Learner factory**:
-Builds a ready-to-train Learner from object patterns: instantiates models, resolves input shapes, applies
-initializers, and constructs the Learner.

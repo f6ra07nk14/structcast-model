@@ -273,7 +273,7 @@ MIXED_PRECISION:
   enabled: True
 ```
 
-**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Has no effect when `MIXED_PRECISION` is `false`.
+**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Must be omitted when `MIXED_PRECISION` is `false`; setting both raises a `SpecError` at build time.
 
 ```yaml
 MIXED_PRECISION_TYPE: bfloat16
@@ -290,7 +290,7 @@ ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
 
 An ordered list of `LearnerBehavior` entries. Each entry defines one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
 
-During code generation, each entry's trainable layers are automatically set to training mode before its flow executes, and set back to eval mode after the optimizer step.
+During code generation, a mode preset runs before each entry's flow segment: the entry's trainable layers are set to training mode and every other model to eval mode. Nothing restores modes after the optimizer step — a later entry's preset (or nothing, for the last entry) is what changes them next.
 
 ```yaml
 # Single-optimizer example (classification)
@@ -452,7 +452,7 @@ Required fields: `learner` (`Learner`), `tracker` (callable returning `dict[str,
 
 Optional fields: `callbacks` (sequence of participants, default `()`), `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
 
-On first use (the first dispatched event or `describe()` call) the trainer scans, in this order, the learner, the values of the learner's `optimizers` mapping, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then the `callbacks` in the order given. Each object is routed into every event whose protocol it implements, and is never registered twice for the same event. Because the scan is deferred, callbacks appended to the given sequence after construction — the CLI builds its display callbacks from the constructed trainer's prefixes — still take part.
+On first use (the first dispatched event) the trainer scans, in this order, the learner, the values of the learner's `optimizers` mapping, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then the `callbacks` in the order given. Each object is routed into every event whose protocol it implements, and is never registered twice for the same event. Because the scan is deferred, callbacks appended to the given sequence after construction — the CLI builds its display callbacks from the constructed trainer's prefixes — still take part.
 
 Key methods:
 
@@ -494,9 +494,11 @@ Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` 
 
 ### Utility functions
 
-**`create_torch_inputs(shape, batch_size=1)`** — Creates dummy tensors from a tensor specification, or from a dict or list nesting more of them, using each specification's dtype and initializer. Used for model initialization and FLOPs inspection.
+**`create_torch_inputs(shape, *, batch_size=1)`** — Creates dummy tensors from a tensor specification, or from a dict or list nesting more of them, using each specification's dtype and initializer. Used for model initialization and FLOPs inspection.
 
 **`get_torch_device(device=None)`** — Returns the runtime device. Selects `cuda` when available and requested, otherwise falls back to `cpu`. `get_torch_device_type(device=None)` strips the rank suffix.
+
+**`resolve_input_shapes(model, shapes=None)`** — Returns the input shapes to initialize with: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (or the merged attributes of a model mapping), otherwise `None`.
 
 **`initial_model(model, shapes=None)`** — Walks a module or nested module structure, builds dummy inputs from the resolved shapes, and runs one forward pass to materialize lazy layers. Returns `(inputs, outputs)`; when no shapes are available, `inputs` is `None` and no forward pass is run.
 
@@ -540,6 +542,16 @@ trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=dat
 ```
 
 The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, and handed to the learner by name.
+
+---
+
+## API Reference: `optimizers.py`
+
+**`create_opt(params, *, opt, layer_decay=None, layer_group_regexes=None, weight_decay=0.0, weight_decay_regexes=None, no_weight_decay_regexes=None, **kwargs)`** — Creates an optimizer over regex-grouped named parameters. Grouping runs first and is engine-agnostic; the engine is then chosen from *opt* across three paths: a callable is instantiated directly, an explicit `torch.optim.X` (or `torch.X`) name instantiates that class natively, and every bare name goes to `timm.optim.create_optimizer_v2` with timm's defaults. Layer decay emits an `lr_scale` per group: the callable and native engines bake it into the learning rate immediately, while the timm engine keeps it for its schedulers.
+
+**`get_decays(optimizers)`** — Flattens the per-group `weight_decay` and `lr_scale` of every optimizer in the mapping into loggable metrics, keyed `{optimizer}_group{index}_weight_decay` / `{optimizer}_group{index}_lr_scale`. Generated learners expose the result as `weight_decays`, which the loggers merge into the epoch metrics.
+
+**`set_lr_scale(optimizer, delete_lr_scale=False)`** — Bakes the `lr_scale` of every parameter group into its learning rate; groups without the key are untouched. Pass `delete_lr_scale=True` to drop the key so a later call cannot apply the same scale twice.
 
 ### Loggers
 
