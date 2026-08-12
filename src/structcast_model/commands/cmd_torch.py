@@ -452,7 +452,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
         logger = logger_type(experiment=experiment)
         saver = torch_trainer.TrainingStateSaver(logger=logger)
-        trainer.callbacks += [
+        trainer.callbacks = [
             Printer()
             if ci
             else ProgressBar(
