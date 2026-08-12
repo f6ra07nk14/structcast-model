@@ -29,7 +29,14 @@ def get_dataset(dataset: DatasetLike | Callable[[], DatasetLike]) -> Iterable[di
 
 
 def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
-    """Get the size of the dataset."""
+    """Get the size of the dataset.
+
+    A ``__len__`` on the object itself wins, even for a callable dataset, so counting a loader
+    wrapper never materializes an epoch of data. Iterating is the last resort and consumes a
+    one-shot iterable.
+    """
+    if hasattr(dataset, "__len__"):
+        return dataset.__len__()
     dataset = get_dataset(dataset)
     if hasattr(dataset, "__len__"):
         return dataset.__len__()
@@ -68,7 +75,12 @@ class Learner(Protocol):
 
 @runtime_checkable
 class DataProvider(Protocol):
-    """Protocol supplying the datasets of a whole training run."""
+    """Protocol supplying the datasets of a whole training run.
+
+    Both dataset properties must return the same object on every read: the trainer reads them for
+    the event-protocol scan and again in ``fit()``, so a getter that builds a fresh dataset per
+    read would train a different object than the one receiving events.
+    """
 
     @property
     def training_dataset(self) -> DatasetLike | Callable[[], DatasetLike]:
@@ -78,15 +90,28 @@ class DataProvider(Protocol):
     def validation_dataset(self) -> DatasetLike | Callable[[], DatasetLike] | None:
         """The dataset used for validation, or None to skip validation."""
 
+    @property
+    def steps_per_epoch(self) -> int:
+        """Number of training steps in one epoch."""
+
+    @property
+    def validation_steps(self) -> int:
+        """Number of validation steps in one epoch, 0 when there is no validation dataset."""
+
 
 @dataclass(kw_only=True, slots=True)
 class SimpleDataProvider:
     """Data provider holding an already-built training dataset and an optional validation dataset.
 
+    The step counts come from :func:`get_dataset_size`: a dataset exposing no ``__len__`` is
+    counted by iterating it, so reading them consumes a one-shot iterable.
+
     Example:
         >>> provider = SimpleDataProvider(training_dataset=[{"x": 1}])
         >>> provider.validation_dataset is None
         True
+        >>> provider.steps_per_epoch, provider.validation_steps
+        (1, 0)
     """
 
     training_dataset: DatasetLike | Callable[[], DatasetLike]
@@ -94,6 +119,16 @@ class SimpleDataProvider:
 
     validation_dataset: DatasetLike | Callable[[], DatasetLike] | None = None
     """The dataset used for validation, or None to skip validation."""
+
+    @property
+    def steps_per_epoch(self) -> int:
+        """Number of training steps in one epoch, counted from the training dataset."""
+        return get_dataset_size(self.training_dataset)
+
+    @property
+    def validation_steps(self) -> int:
+        """Number of validation steps in one epoch, 0 when there is no validation dataset."""
+        return 0 if self.validation_dataset is None else get_dataset_size(self.validation_dataset)
 
 
 @dataclass(kw_only=True)
@@ -119,33 +154,6 @@ class BaseInfo:
         if epoch in self.history:
             return self.history[epoch]
         raise KeyError(f"No logs found for key: {epoch}.")
-
-
-@runtime_checkable
-class Callback(Protocol, Generic[ModelT_contra]):
-    """Protocol for callbacks."""
-
-    def __call__(self, info: BaseInfo, **models: ModelT_contra) -> None:
-        """Call the callback with the given information."""
-
-
-@runtime_checkable
-class BestCallback(Protocol[ModelT_contra]):
-    """Protocol for best criterion callback."""
-
-    def __call__(self, info: BaseInfo, best: "BestCriterion", **models: ModelT_contra) -> None:
-        """Call the callback with the given info, target criterion, and best value."""
-
-
-def invoke_callback(
-    callbacks: Sequence[Callable[..., None]],
-    info: BaseInfo,
-    *args: Any,
-    **models: ModelT_contra,
-) -> None:
-    """Invoke callback."""
-    for callback in callbacks:
-        callback(info, *args, **models)
 
 
 EVENTS: tuple[str, ...] = (
@@ -273,8 +281,8 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
     """Base trainer for training a model.
 
     Every participant given to the trainer -- the learner, its optimizers, the tracker, the data
-    provider, and the explicit callbacks -- is scanned once at construction and routed into the
-    lifecycle events whose protocol it implements.
+    provider and its datasets, and the explicit callbacks -- is scanned once when first used (the
+    first dispatched event) and routed into the lifecycle events whose protocol it implements.
     """
 
     learner: Learner
@@ -301,21 +309,40 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
     _events: dict[str, list[tuple[str, Callable[..., None]]]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Route every participant into the events whose protocol it implements."""
+        """Extension hook kept for subclasses; the participant scan runs lazily via ``_scan``."""
+
+    def _routed_events(self) -> dict[str, list[tuple[str, Callable[..., None]]]]:
+        """Return event name to participants, scanning the current candidates.
+
+        The datasets join the scan so hooks such as a distributed sampler's set_epoch fire on
+        every rank without explicit registration.
+        """
         candidates: list[Any] = [
             self.learner,
             *self.learner.optimizers.values(),
             self.tracker,
             self.data,
+            self.data.training_dataset,
+            self.data.validation_dataset,
             *self.callbacks,
         ]
-        self._events = {event: [] for event in EVENTS}
+        events: dict[str, list[tuple[str, Callable[..., None]]]] = {event: [] for event in EVENTS}
         registered: dict[str, set[int]] = {event: set() for event in EVENTS}
         for candidate in candidates:
             for event, protocol in EVENT_PROTOCOLS.items():
                 if isinstance(candidate, protocol) and id(candidate) not in registered[event]:
                     registered[event].add(id(candidate))
-                    self._events[event].append((type(candidate).__name__, getattr(candidate, event)))
+                    events[event].append((type(candidate).__name__, getattr(candidate, event)))
+        return events
+
+    def _scan(self) -> None:
+        """Freeze the participant routing at the first dispatched event.
+
+        Deferring past construction lets callbacks appended to the given sequence afterwards (the
+        CLI builds its display callbacks from the constructed trainer's prefixes) take part; the
+        dead-callback warning also fires here.
+        """
+        self._events = self._routed_events()
         # The learner/tracker/data participants legitimately may implement no event, but an entry of
         # the explicit callbacks sequence that matches nothing is almost certainly a typo'd hook name.
         for callback in self.callbacks:
@@ -328,14 +355,20 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
     def describe(self) -> dict[str, list[str]]:
         """Return a mapping of event name to registered callback display names.
 
+        Before the first dispatched event this previews the current participants without freezing
+        the scan, so callbacks appended after a ``describe()`` call still take part.
+
         Returns:
             A dict keyed by event name (e.g. ``"on_epoch_end"``) whose values are
             lists of display names.  Events with no registered callbacks are omitted.
         """
-        return {event: [name for name, _ in registered] for event, registered in self._events.items() if registered}
+        events = self._events or self._routed_events()
+        return {event: [name for name, _ in registered] for event, registered in events.items() if registered}
 
     def _dispatch(self, event: str, **models: Any) -> None:
         """Call every callback registered for *event* with this trainer and the models."""
+        if not self._events:
+            self._scan()
         for _, callback in self._events[event]:
             callback(self, **models)
 
@@ -448,6 +481,17 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
         return self.history
 
 
+class OnBest(Protocol, Generic[ModelT_contra]):
+    """Protocol for participants notified after a monitored criterion has been checked.
+
+    Deliberately not ``runtime_checkable``: ``BestCriterion`` itself carries an ``on_best`` list
+    field, so an attribute-presence isinstance check would wrongly match every criterion.
+    """
+
+    def on_best(self, info: BaseInfo, best: "BestCriterion[Any]", **models: ModelT_contra) -> None:
+        """React to the check of *best* for the current epoch."""
+
+
 @dataclass(kw_only=True, slots=True)
 class BestCriterion(Generic[ModelT_contra]):
     """Callback to track the best criterion during training or validation."""
@@ -458,8 +502,9 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    on_best: list[BestCallback[ModelT_contra]] = field(default_factory=list)
-    """Callbacks to be called when a new best criterion is found."""
+    on_best: list[OnBest[ModelT_contra]] = field(default_factory=list)
+    """Participants notified whenever the target was produced, the way a trainer routes events:
+    each implements the ``OnBest`` protocol and receives this criterion alongside the info."""
 
     _step: int = field(default=0, repr=False)
     _best: float = field(init=False, repr=False)
@@ -487,7 +532,8 @@ class BestCriterion(Generic[ModelT_contra]):
             if self._compare(current, self._best):
                 self._step = info.step
                 self._best = current
-            invoke_callback(self.on_best, info, self, **models)
+            for callback in self.on_best:
+                callback.on_best(info, self, **models)
 
 
 def _format_criteria(info: BaseInfo) -> str:
@@ -500,29 +546,28 @@ def _format_criteria(info: BaseInfo) -> str:
     return "\n".join([f"epoch: {info.epoch}", *(f"  {key}: {value}" for key, value in values.items())])
 
 
+@dataclass(kw_only=True, slots=True)
 class ProgressBar:
     """Callback showing training and validation progress on a ``tqdm`` bar."""
 
-    def __init__(
-        self,
-        steps_per_epoch: int,
-        validation_steps: int = 0,
-        training_criteria: Sequence[str] = (),
-        validation_criteria: Sequence[str] = (),
-    ) -> None:
-        """Create the progress bar.
+    steps_per_epoch: int
+    """Number of training steps in one epoch."""
 
-        Args:
-            steps_per_epoch: Number of training steps in one epoch.
-            validation_steps: Number of validation steps in one epoch.
-            training_criteria: Log keys shown next to the bar during training.
-            validation_criteria: Log keys shown next to the bar during validation.
-        """
-        self.steps_per_epoch = steps_per_epoch
-        self.validation_steps = validation_steps
-        self.training_criteria = training_criteria
-        self.validation_criteria = validation_criteria
-        self.bar = tqdm.tqdm(total=steps_per_epoch, unit="batch")
+    validation_steps: int = 0
+    """Number of validation steps in one epoch."""
+
+    training_criteria: Sequence[str] = ()
+    """Log keys shown next to the bar during training."""
+
+    validation_criteria: Sequence[str] = ()
+    """Log keys shown next to the bar during validation."""
+
+    bar: "tqdm.tqdm" = field(init=False, repr=False)
+    """The underlying bar, created at construction."""
+
+    def __post_init__(self) -> None:
+        """Create the bar sized to one training epoch."""
+        self.bar = tqdm.tqdm(total=self.steps_per_epoch, unit="batch")
 
     def _set_postfix(self, info: BaseInfo, criteria: Sequence[str]) -> None:
         """Show the values of *criteria* that the current epoch has produced."""
@@ -560,6 +605,7 @@ class ProgressBar:
         self.bar.write(_format_criteria(info))
 
 
+@dataclass(kw_only=True, slots=True)
 class Printer:
     """Callback printing the criteria of each epoch, for environments without a terminal."""
 
@@ -573,12 +619,11 @@ __all__ = [
     "EVENT_PROTOCOLS",
     "BaseInfo",
     "BaseTrainer",
-    "BestCallback",
     "BestCriterion",
-    "Callback",
     "DataProvider",
     "DatasetLike",
     "Learner",
+    "OnBest",
     "OnEpochBegin",
     "OnEpochEnd",
     "OnTrainingBegin",
@@ -595,7 +640,6 @@ __all__ = [
     "SimpleDataProvider",
     "get_dataset",
     "get_dataset_size",
-    "invoke_callback",
 ]
 
 

@@ -11,13 +11,9 @@ from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.base_trainer import (
-    EVENT_PROTOCOLS,
-    BaseInfo,
-    BestCriterion,
     Printer,
     ProgressBar,
     SimpleDataProvider,
-    get_dataset_size,
 )
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
@@ -158,14 +154,6 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
     )
-
-
-def _on_best(info: BaseInfo, best: BestCriterion, logger: Any, save: bool, **kwargs: Any) -> None:
-    """Log the best value of a criterion, and save the models that reached it when asked to."""
-    name = f"best_{best.target}"
-    logger.log_metric(name, best.value, step=info.epoch)
-    if save and info.step == best.step:
-        logger.log_state_dict(torch_trainer._get_state_dict(torch_trainer._unwrap_ddp(kwargs)), name)
 
 
 @app.command(name="time")
@@ -433,20 +421,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
-    # A dataset implementing an event protocol (e.g. a distributed sampler needing set_epoch) must be
-    # called on every rank, unlike the display and logging callbacks gated on the main rank below.
-    dataset_callbacks = [
-        dataset
-        for dataset in (training_dataset, validation_dataset)
-        if dataset is not None and isinstance(dataset, tuple(EVENT_PROTOCOLS.values()))
-    ]
+    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     if is_main:
         print("Count the dataset sizes...")
-    steps_per_epoch = get_dataset_size(training_dataset)
-    validation_steps = 0 if validation_dataset is None else get_dataset_size(validation_dataset)
     if is_main:
-        print(f"Training dataset size: {steps_per_epoch} steps.")
-        print(f"Validation dataset size: {validation_steps} steps.")
+        print(f"Training dataset size: {provider.steps_per_epoch} steps.")
+        print(f"Validation dataset size: {provider.validation_steps} steps.")
     # Everything below runs on the training device: the models, and the tracker buffers, which are
     # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
     # CPU buffers.
@@ -466,41 +446,25 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         learner.forward_training_step = compile_fn(learner.forward_training_step)
     if hasattr(learner, "forward_inference_step"):
         learner.forward_inference_step = compile_fn(learner.forward_inference_step)
-    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
-    callbacks: list[Any] = []
+    trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
     if is_main:
-        logger = (
-            mlflow_logger.MLflowLogger(experiment) if logger_name == "mlflow" else wandb_logger.WandbLogger(experiment)
-        )
-        if ci:
-            callbacks.append(Printer())
-        else:
-            callbacks.append(
-                ProgressBar(
-                    steps_per_epoch,
-                    validation_steps,
-                    training_criteria=[f"{trainer_type.training_prefix}{n}" for n in learner_outputs],
-                    validation_criteria=[f"{trainer_type.validation_prefix}{n}" for n in learner_outputs],
-                )
-            )
-        saver = torch_trainer.TrainingStateSaver(logger)
-        callbacks += [logger, saver]
-        for target in higher_criteria:
-            best = torch_trainer.TorchBestCriterion(target=target, mode="max")
-            best.on_best.append(partial(_on_best, logger=logger, save=target in save_criteria))
-            callbacks.append(best)
-        for target in lower_criteria:
-            best = torch_trainer.TorchBestCriterion(target=target, mode="min")
-            best.on_best.append(partial(_on_best, logger=logger, save=target in save_criteria))
-            callbacks.append(best)
-    trainer = trainer_type(
-        device=device,
-        learner=learner,
-        tracker=tracker,
-        data=provider,
-        callbacks=[*dataset_callbacks, *callbacks],
-    )
+        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
+        logger = logger_type(experiment=experiment)
+        saver = torch_trainer.TrainingStateSaver(logger=logger)
+        trainer.callbacks += [
+            Printer()
+            if ci
+            else ProgressBar(
+                steps_per_epoch=provider.steps_per_epoch,
+                validation_steps=provider.validation_steps,
+                training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
+                validation_criteria=[f"{trainer.validation_prefix}{n}" for n in learner_outputs],
+            ),
+            logger,
+            saver,
+            *torch_trainer.TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger),
+        ]
     try:
         if is_main:
             arguments = {
@@ -536,8 +500,8 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                         "cuda_version": torch.version.cuda,
                         "torch_version": torch.__version__,
                         "epochs": epochs,
-                        "steps_per_epoch": steps_per_epoch,
-                        "validation_steps": validation_steps,
+                        "steps_per_epoch": provider.steps_per_epoch,
+                        "validation_steps": provider.validation_steps,
                     }
                 )
                 logger.log_dict(arguments, "arguments.yaml")

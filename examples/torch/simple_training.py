@@ -193,9 +193,9 @@ def main() -> None:
     # `BestCriterion` watches one criterion; validation criteria carry the `val_` prefix.
     best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
 
-    # Every participant -- learner, its optimizers, tracker, data provider, then the callbacks in
-    # the order given -- is scanned once here and routed into the events whose protocol it
-    # implements.
+    # Every participant -- learner, its optimizers, tracker, data provider and its datasets, then
+    # the callbacks in the order given -- is scanned once on first use and routed into the events
+    # whose protocol it implements.
     trainer = TorchTrainer(
         device="cpu",
         learner=SimpleLearner(model),

@@ -48,7 +48,7 @@ class _FakeWandb:
 def test_wandb_logger_requires_the_optional_dependency() -> None:
     """Wandb is an optional extra: the failure must name the missing package, not a missing attribute."""
     with pytest.raises(ImportError, match="Tried to import 'wandb'"):
-        WandbLogger("phase-two")
+        WandbLogger(experiment="phase-two")
 
 
 def test_wandb_logger_records_a_run_through_the_wandb_module(
@@ -57,7 +57,7 @@ def test_wandb_logger_records_a_run_through_the_wandb_module(
     """The wandb backend must offer the same lifecycle and calls as MLflow, so the CLI can swap them."""
     fake = _FakeWandb(tmp_path)
     module = wandb_logger_with(fake)
-    with module.WandbLogger("phase-two") as logger:
+    with module.WandbLogger(experiment="phase-two") as logger:
         logger.log_params({"epochs": 1})
         logger.log_dict({"epochs": 1}, "arguments.yaml")
         logger.log_artifact("config.yaml")
@@ -67,7 +67,7 @@ def test_wandb_logger_records_a_run_through_the_wandb_module(
     assert fake.finished == 1
     assert fake.params == {"epochs": 1}
     assert fake.saved == ["config.yaml"]
-    assert fake.logged == [({"lr": 0.1, "loss": 0.5}, 1)]
+    assert fake.logged == [({"lr": 0.1, "opt_group0_weight_decay": 0.05, "loss": 0.5}, 1)]
     assert "epochs: 1" in (tmp_path / "arguments.yaml").read_text()
     assert torch.load(tmp_path / "training_state.pt")["weight"].tolist() == [0.0, 0.0]
 
@@ -75,4 +75,4 @@ def test_wandb_logger_records_a_run_through_the_wandb_module(
 def test_wandb_logger_satisfies_the_logger_protocol(wandb_logger_with: Callable[[Any], Any], tmp_path: Path) -> None:
     """The CLI picks a backend by name, so a member missing from one of them breaks that choice."""
     module = wandb_logger_with(_FakeWandb(tmp_path))
-    assert isinstance(module.WandbLogger("phase-two"), Logger)
+    assert isinstance(module.WandbLogger(experiment="phase-two"), Logger)

@@ -1,6 +1,7 @@
 """Logger recording a training run to Weights & Biases."""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,14 +16,17 @@ with try_import() as _imports:
     import wandb
 
 
+@dataclass(kw_only=True, slots=True)
 class WandbLogger(Logger):
     """Logger recording a run to Weights & Biases, with the same interface as `MLflowLogger`."""
 
-    def __init__(self, experiment: str) -> None:
-        """Create the logger for the given experiment, without starting a run yet."""
+    experiment: str
+    """The project the run is recorded under."""
+
+    def __post_init__(self) -> None:
+        """Fail with an explanatory error when wandb is not installed."""
         if not _imports.is_successful:
             _imports.check()
-        self.experiment = experiment
 
     def __enter__(self) -> "WandbLogger":
         """Start a run in the project named after the experiment."""

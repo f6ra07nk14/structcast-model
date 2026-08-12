@@ -1,11 +1,11 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from logging import getLogger
 import os
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, cast, overload
 
 from pydantic import TypeAdapter, ValidationError
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
@@ -316,6 +316,47 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
 class TorchBestCriterion(BestCriterion[torch.nn.Module]):
     """A callback to track the best criterion during training or validation for PyTorch models."""
 
+    @classmethod
+    def from_criteria(
+        cls,
+        higher_criteria: Sequence[str],
+        lower_criteria: Sequence[str],
+        save_criteria: Collection[str],
+        logger: Logger,
+    ) -> list[Self]:
+        """Build one monitor per criterion, each logging its best value through *logger*.
+
+        Criteria named in *save_criteria* also save the model states that reached the best value.
+        """
+        monitors: list[Self] = []
+        for target in higher_criteria:
+            best = cls(target=target, mode="max")
+            best.on_best.append(_BestLogger(logger=logger, save=target in save_criteria))
+            monitors.append(best)
+        for target in lower_criteria:
+            best = cls(target=target, mode="min")
+            best.on_best.append(_BestLogger(logger=logger, save=target in save_criteria))
+            monitors.append(best)
+        return monitors
+
+
+@dataclass(kw_only=True, slots=True)
+class _BestLogger:
+    """Log the best value of a criterion, and save the models that reached it when asked to."""
+
+    logger: Logger
+    """The logger the best values and model states are written through."""
+
+    save: bool
+    """Whether to also save the model states that reached the best value."""
+
+    def on_best(self, info: BaseInfo, best: BestCriterion[torch.nn.Module], **models: torch.nn.Module) -> None:
+        """Log the best value, and save the states of *models* when this epoch reached it."""
+        name = f"best_{best.target}"
+        self.logger.log_metric(name, best.value, step=info.epoch)
+        if self.save and info.step == best.step:
+            self.logger.log_state_dict(_get_state_dict(_unwrap_ddp(models)), name)
+
 
 def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return a mapping of name to state dict for all given modules."""
@@ -327,12 +368,12 @@ def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
 
 
+@dataclass(kw_only=True, slots=True)
 class TrainingStateSaver:
     """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
 
-    def __init__(self, logger: Logger) -> None:
-        """Create the saver writing to the given logger."""
-        self.logger = logger
+    logger: Logger
+    """The logger the training-state artifacts are written through."""
 
     def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
@@ -347,7 +388,7 @@ class TrainingStateSaver:
 
 
 # `_get_state_dict` and `_unwrap_ddp` are listed because the LazySelectedImporter tail below only
-# exposes the names in `__all__`, and the CLI reuses them for the best-criterion callback.
+# exposes the names in `__all__`, and the unit tests import them directly.
 __all__ = [
     "CriteriaTracker",
     "TorchBestCriterion",

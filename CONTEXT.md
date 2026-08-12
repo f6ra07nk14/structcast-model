@@ -47,7 +47,8 @@ model state.
 _Avoid_: tracker
 
 **Best criterion**:
-Monitors one criterion for its best value seen so far and reacts when a new best appears.
+Monitors one criterion for its best value seen so far and notifies its on-best participants after every epoch
+that produced the criterion.
 
 ### Data
 
@@ -56,8 +57,9 @@ An iterable of input dictionaries consumed by training or validation steps, or a
 iterable.
 
 **DataProvider**:
-Supplies the training dataset and the optional validation dataset for a whole training run; given to a Trainer at
-construction.
+Supplies the training dataset, the optional validation dataset, and their step counts (`steps_per_epoch`,
+`validation_steps`) for a whole training run; given to a Trainer at construction, which scans the provider and its
+datasets for event protocols.
 _Avoid_: DataModule, dataset wrapper
 
 ### Configuration

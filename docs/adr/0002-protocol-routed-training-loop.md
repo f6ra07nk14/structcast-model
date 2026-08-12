@@ -11,11 +11,11 @@ internals mutated as a side effect of object construction (scoped by the `callba
 per-event `NamedCallbackList.register()` calls on the trainer instance. The global registry leaked state across
 runs, made registration order depend on object construction order, and hid who attached what.
 
-Both channels are replaced by one: a trainer receives participant objects at construction and routes each into
-lifecycle events by checking which of the eleven event protocols (`OnUpdate`, `OnTrainingBegin`, …,
-`OnEpochEnd`) the object implements. The scan order is fixed — learner, the learner's optimizers, tracker, data
-provider, then the explicit `callbacks` sequence in the order given — and the same object is never registered
-twice for the same event. A dual-track design (keeping `register()` for ad-hoc lambdas alongside protocol routing)
+Both channels are replaced by one: a trainer receives participant objects at construction and, on first use,
+routes each into lifecycle events by checking which of the eleven event protocols (`OnUpdate`,
+`OnTrainingBegin`, …, `OnEpochEnd`) the object implements. The scan order is fixed — learner, the learner's
+optimizers, tracker, data provider, its training and validation datasets, then the explicit `callbacks`
+sequence in the order given — and the same object is never registered twice for the same event. A dual-track design (keeping `register()` for ad-hoc lambdas alongside protocol routing)
 was rejected: it means two registration mechanisms to learn and maintain, for a single in-repo consumer
 (`cmd_torch.py`) whose lambdas collapse naturally into small callback classes (`ProgressBar`, `Printer`).
 
@@ -38,9 +38,11 @@ release.
 ## Datasets arrive at construction through a `DataProvider`
 
 `fit()` used to receive the training and validation datasets on every call. They now come from a `DataProvider`
-(training dataset plus optional validation dataset — `None` skips validation) given to the trainer at
-construction, so a fully wired trainer is one object and the data side's epoch-synchronization hooks participate
-in the same protocol scan as everything else. `fit()` keeps only loop parameters (epochs, start epoch, validation
+(training dataset plus optional validation dataset — `None` skips validation — and their step counts,
+`steps_per_epoch` / `validation_steps`) given to the trainer at construction, so a fully wired trainer is one
+object. The trainer scans the provider *and its datasets* for event protocols, so the data side's
+epoch-synchronization hooks participate in the same scan as everything else without being registered as
+callbacks. `fit()` keeps only loop parameters (epochs, start epoch, validation
 frequency) and feeds the provider's datasets into `train(dataset)` / `evaluate(dataset)`, whose signatures are
 deliberately unchanged so they remain usable standalone. The CLI keeps its two dataset options
 (`--training-dataset` / `--validation-dataset`) and composes the provider internally; a single provider pattern

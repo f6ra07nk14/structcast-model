@@ -192,6 +192,12 @@ class {self.classname}:
         return {{k: _get_lr(v) for k, v in self.optimizers.items()}}
 
     @property
+    def weight_decays(self):
+        from structcast_model.torch.optimizers import get_decays
+
+        return get_decays(self.optimizers)
+
+    @property
     def param_group_names(self):
         def _get_param_groups(opt):
             return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]

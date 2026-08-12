@@ -43,13 +43,16 @@ class Logger(Protocol):
 
 
 def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
-    """Merge the learning rates reported by the learner into the criteria of the current epoch.
+    """Merge the learner's learning rates and decay values into the criteria of the current epoch.
 
     Schedules step in the learner's own on_epoch_end hooks, which the trainer dispatches before the
     logger's, so the recorded learning rate is the one the NEXT epoch will use -- the same one-epoch
-    offset the pre-redesign global callbacks produced.
+    offset the pre-redesign global callbacks produced. ``weight_decays`` is an optional learner
+    member (generated learners flatten it from `create_opt`'s parameter groups), so weight and
+    layer decay dynamics land in the same run.
     """
-    return {**cast("BaseTrainer[Any]", info).learner.learning_rates, **info.logs()}
+    learner = cast("BaseTrainer[Any]", info).learner
+    return {**learner.learning_rates, **getattr(learner, "weight_decays", {}), **info.logs()}
 
 
 # `_epoch_metrics` is listed because the LazySelectedImporter tail below only exposes the names in

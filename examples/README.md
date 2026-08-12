@@ -82,8 +82,8 @@ trainer = TorchTrainer(
 )
 ```
 
-Every participant is scanned once here, in a fixed order — learner, the learner's optimizers,
-tracker, data provider, then the `callbacks` sequence in the order given — and routed into each
+Every participant is scanned once on first use, in a fixed order — learner, the learner's optimizers,
+tracker, data provider and its datasets, then the `callbacks` sequence in the order given — and routed into each
 lifecycle event whose protocol it implements. `trainer.describe()` prints the result:
 
 ```text
@@ -121,8 +121,8 @@ scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs
 ```
 
 `learner.py` holds a `Learner` class with exactly the members the tutorial writes by hand — `models`,
-`update`, `training_step`, `inference_step`, plus `optimizers`, `grad_scalers`, `learning_rates`, and
-`param_group_names`.
+`update`, `training_step`, `inference_step`, plus `optimizers`, `grad_scalers`, `learning_rates`,
+`weight_decays`, and `param_group_names`.
 
 Then render the dataset configurations and train:
 
@@ -204,7 +204,7 @@ schedules, which count in epochs and therefore only need `on_epoch_end`.
 the package's training loop takes any iterable of dictionaries, so a timm integration is use-case
 code. [`cfg/torch/others/default_timm.yaml`](../cfg/torch/others/default_timm.yaml) addresses
 `TimmDataLoaderWrapper` there with `_addr_` plus `_file_`, and `scm torch train` stays timm-agnostic:
-it adds every dataset implementing an event protocol to the trainer's callbacks — on every rank, so
+the trainer scans the provider datasets for event protocols — on every rank, so
 `TimmDataLoaderWrapper.on_epoch_begin` reaches the `DistributedSampler` of each process — and
-`on_training_begin` applies the mixup cutoff. `TimmDataProvider` in the same file does the forwarding
-when you wire a trainer by hand instead.
+`on_training_begin` applies the mixup cutoff. `TimmDataProvider` in the same file is the
+programmatic wiring when you build a trainer by hand instead.

@@ -72,7 +72,7 @@ Losses and metrics are declared inline in the learner's `FLOW`, so there is no s
 scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 ```
 
-The generated class implements the `Learner` protocol: `models`, `update(step)`, `training_step(**inputs)`, `inference_step(**inputs)`, plus `optimizers`, `grad_scalers`, `learning_rates`, `param_group_names`, and `outputs`.
+The generated class implements the `Learner` protocol: `models`, `update(step)`, `training_step(**inputs)`, `inference_step(**inputs)`, plus `optimizers`, `grad_scalers`, `learning_rates`, `weight_decays`, `param_group_names`, and `outputs`.
 
 Optimizer + scheduler combinations are not package API: they are referenced by file path, as in `examples/torch/optimizers.py` (`AdamWWithCosine`, `OptimizerWithNativeScheduler`). The package provides `create_opt` for the optimizer itself.
 
@@ -125,11 +125,11 @@ scm torch train \
 
 What happens:
 
-1. Datasets are instantiated, counted, and composed into a `SimpleDataProvider`; every dataset implementing an event protocol is also collected as a callback.
+1. Datasets are instantiated and composed into a `SimpleDataProvider`, which reports `steps_per_epoch` / `validation_steps`; the trainer scans the provider datasets, so every dataset implementing an event protocol joins the loop.
 2. The command builds the models and the learner on the training device, initializing and compiling them.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
-4. Callbacks are collected: the event-protocol datasets on every rank, then on rank 0 `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
-5. `TorchTrainer` routes every participant into its events, and `fit(epochs=...)` runs inside the logger's run context.
+4. `TorchTrainer` is built, then the callbacks are collected on rank 0 from its prefixes: `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
+5. Every participant is routed into its events on first use, and `fit(epochs=...)` runs inside the logger's run context.
 
 ### Workflow 6: Measure Inference Time
 
@@ -190,7 +190,7 @@ What happens:
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
 3. Each model is wrapped with `DistributedDataParallel`.
-4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the CLI routes event-protocol datasets into the callbacks of every rank.
+4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
 6. Experiment logging and checkpoints are gated to rank 0 only.
 7. DDP gradient sync is skipped during gradient accumulation steps.
@@ -285,16 +285,17 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | Initialize model | `initial_model(model, shapes=None)` | Run warm-up forward pass, return `(inputs, outputs)` |
 | Build AMP context | `autocast_inputs(inputs, device_type)` | Return `torch.autocast` matching the inputs, or a null context |
 | Optimizer construction | `create_opt(params, opt=..., ...)` | Regex weight-decay and layer-decay grouping over torch and timm engines |
+| Decay metrics | `get_decays(optimizers)` | Flatten per-group weight decay / lr_scale into loggable metrics |
 
 ### Learner, tracker, and trainer layer
 
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
-| Save the training state | `TrainingStateSaver(logger)` | Save models, optimizers, gradient scalers, and loop counters each epoch |
+| Save the training state | `TrainingStateSaver(logger=...)` | Save models, optimizers, gradient scalers, and loop counters each epoch |
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Average criteria per pass, reset on training/validation begin, reduce across ranks |
 | Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization and DDP `no_sync` |
-| Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion |
-| Experiment logging | `MLflowLogger(experiment)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
+| Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion; `.from_criteria(...)` builds the CLI's wired monitors |
+| Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment=...)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
 ### timm integration layer (example code)
@@ -305,7 +306,7 @@ These live in `examples/torch/data.py` and are referenced from a configuration b
 | -- | -- | -- |
 | Dataset wrapper | `TimmDatasetWrapper` | Lazily call `timm.data.create_dataset(...)` |
 | Dataloader wrapper | `TimmDataLoaderWrapper` | Lazily call `timm.data.create_loader(...)`; `on_epoch_begin` reshuffles, `on_training_begin` applies the mixup cutoff |
-| Data provider | `TimmDataProvider` | Supply both splits and forward those two events to the training wrapper |
+| Data provider | `TimmDataProvider` | Supply both splits and their step counts; the trainer scans the datasets directly |
 
 ### Distributed training layer
 
@@ -363,11 +364,10 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 | Dataset supply | `DataProvider` protocol, `SimpleDataProvider` |
 | Event names and their gates | `EVENTS`, `EVENT_PROTOCOLS` |
 | Generic train/eval loop | `BaseTrainer` (`train`, `evaluate`, `fit`, `describe`) |
-| Best-criterion monitor | `BestCriterion` |
-| Best-callback invocation | `invoke_callback(callbacks, info, ...)` |
+| Best-criterion monitor | `BestCriterion` (notifies its `on_best` participants, `OnBest` protocol) |
 | Built-in reporting callbacks | `ProgressBar`, `Printer` |
 
-Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.
+Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and, on first use (first event or `describe()`), routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, its `training_dataset` and `validation_dataset`, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.
 
 The eleven events: `on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`. Every handler takes `(info: BaseInfo, **models)`, where `info` is the trainer.
 
@@ -418,9 +418,9 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Cause: `_file_` path in the StructCast pattern does not point to an existing generated module. Learner templates also reference `examples/torch/optimizers.py` this way, resolved relative to the working directory.
 - Solution: regenerate the file and verify the exact path used in the pattern.
 
-**`ValueError: No data provider was given to the trainer`**
-- Cause: `fit()` was called on a trainer built without `data=`.
-- Solution: pass a `DataProvider`, or call `train(dataset)` / `evaluate(dataset)` directly.
+**`TypeError: ... missing ... 'data'` at trainer construction**
+- Cause: the trainer was built without `data=`; the field is required.
+- Solution: pass a `DataProvider` (e.g. `SimpleDataProvider`), or call `train(dataset)` / `evaluate(dataset)` directly.
 
 **A callback never runs**
 - Cause: the object was not passed to the trainer, or its method name does not match an event.

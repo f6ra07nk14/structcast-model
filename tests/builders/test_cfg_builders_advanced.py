@@ -68,13 +68,14 @@ def test_learner_script_defines_training_and_inference_steps() -> None:
 
 
 def test_learner_script_exposes_properties() -> None:
-    """Script exposes models, optimizers, grad_scalers, learning_rates, param_group_names."""
+    """Script exposes models, optimizers, grad_scalers, learning_rates, weight_decays, param_group_names."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     for prop in (
         "def models(self)",
         "def optimizers(self)",
         "def grad_scalers(self)",
         "def learning_rates(self)",
+        "def weight_decays(self)",
         "def param_group_names(self)",
     ):
         assert prop in script

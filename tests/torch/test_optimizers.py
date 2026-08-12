@@ -10,7 +10,7 @@ import pytest
 from torch.nn import Linear
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.optimizers import create_opt, set_lr_scale
+from structcast_model.torch.optimizers import create_opt, get_decays, set_lr_scale
 import torch
 
 # Access private helpers via the exported function's __globals__
@@ -240,6 +240,34 @@ def test_set_lr_scale_with_tensor_lr() -> None:
 # ---------------------------------------------------------------------------
 # create_opt - engine selection
 # ---------------------------------------------------------------------------
+
+
+def test_get_decays_reports_per_group_weight_decay() -> None:
+    """A logger tracks the decay values create_opt grouped, so each group must surface under its own key."""
+    optimizer = create_opt(
+        _named_params(), opt="torch.optim.AdamW", lr=0.01, weight_decay=0.05, no_weight_decay_regexes=["bias"]
+    )
+    assert get_decays({"optimizer": optimizer}) == {
+        "optimizer_group0_weight_decay": 0.0,
+        "optimizer_group1_weight_decay": 0.05,
+    }
+
+
+def test_get_decays_reports_lr_scale_on_the_timm_engine() -> None:
+    """The timm engine keeps lr_scale for its schedulers, so layer decay must stay observable per group."""
+    optimizer = create_opt(
+        _named_params(), opt="sgd", lr=0.01, layer_decay=0.5, layer_group_regexes=["weight"], momentum=0.9
+    )
+    decays = get_decays({"optimizer": optimizer})
+    scales = {key: value for key, value in decays.items() if key.endswith("lr_scale")}
+    assert len(scales) == 2
+    assert sorted(scales.values()) == [0.5, 1.0]
+
+
+def test_get_decays_reports_the_single_group_of_a_plain_optimizer() -> None:
+    """Without create_opt grouping the engine default still lands in the run as group 0."""
+    optimizer = torch.optim.AdamW(Linear(4, 2).parameters(), lr=0.01, weight_decay=0.01)
+    assert get_decays({"optimizer": optimizer}) == {"optimizer_group0_weight_decay": 0.01}
 
 
 @pytest.mark.parametrize("opt", ["torch.optim.AdamW", "torch.AdamW", "torch.optim.SGD"])

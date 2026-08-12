@@ -9,7 +9,7 @@ from structcast_model.torch.trainer import TorchTracker, TorchTrainer
 
 
 class _LearningRateLearner:
-    """Minimal learner reporting one learning rate, which is what a logger merges into the epoch."""
+    """Minimal learner reporting one learning rate and one decay value, which a logger merges into the epoch."""
 
     @property
     def models(self) -> dict[str, Any]:
@@ -25,6 +25,11 @@ class _LearningRateLearner:
     def learning_rates(self) -> dict[str, float]:
         """The rate the finished epoch is logged with."""
         return {"lr": 0.1}
+
+    @property
+    def weight_decays(self) -> dict[str, float]:
+        """The optional decay metrics the finished epoch is logged with."""
+        return {"opt_group0_weight_decay": 0.05}
 
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""

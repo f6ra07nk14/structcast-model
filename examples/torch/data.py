@@ -15,10 +15,10 @@ _obj_:
       input_size: [3, 224, 224]
 ```
 
-`TimmDataLoaderWrapper` implements `on_epoch_begin` and `on_training_begin`, so the trainer reshuffles
-the distributed sampler and turns mixup off at its cutoff epoch without any registration.
-`TimmDataProvider` is the programmatic counterpart: give it to a trainer as `data=` and it forwards
-both events to the training wrapper.
+`TimmDataLoaderWrapper` implements `on_epoch_begin` and `on_training_begin`, and the trainer scans
+the provider datasets for event protocols, so it reshuffles the distributed sampler and turns mixup
+off at its cutoff epoch without any registration. `TimmDataProvider` is the programmatic wiring:
+give it to a trainer as `data=`.
 """
 
 from collections.abc import Iterable
@@ -39,7 +39,7 @@ from timm.data import (
 )
 from torch.utils.data import DataLoader
 
-from structcast_model.base_trainer import BaseInfo
+from structcast_model.base_trainer import BaseInfo, get_dataset_size
 from structcast_model.torch.trainer import initial_distributed_env
 from structcast_model.torch.types import Tensor
 import torch
@@ -454,19 +454,18 @@ class TimmDataLoaderWrapper(WithExtra):
 
 
 class TimmDataProvider(BaseModel):
-    """Data provider supplying timm data loaders and keeping the training split in sync with the loop.
+    """Data provider supplying timm data loaders.
 
-    The trainer scans the provider for event protocols, so the epoch synchronization and the mixup
-    cutoff of the training wrapper run without any registration.
+    The trainer scans the provider datasets for event protocols, so the epoch synchronization and
+    the mixup cutoff of the training wrapper run without any registration; the wrappers themselves
+    ignore those events on validation splits.
     """
 
     training: TimmDataLoaderWrapper
     """The wrapper producing the training dataset."""
 
     validation: Any = None
-    """The validation dataset: a timm wrapper, any other dataset object, or None to skip validation.
-
-    Only the training wrapper needs per-epoch hooks, so the validation side accepts any dataset."""
+    """The validation dataset: a timm wrapper, any other dataset object, or None to skip validation."""
 
     @property
     def training_dataset(self) -> TimmDataLoaderWrapper:
@@ -478,10 +477,12 @@ class TimmDataProvider(BaseModel):
         """The dataset used for validation, or None when no validation dataset was given."""
         return self.validation
 
-    def on_epoch_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Forward the new epoch to the training wrapper."""
-        self.training.on_epoch_begin(info, **models)
+    @property
+    def steps_per_epoch(self) -> int:
+        """Number of training steps in one epoch: the length of the training loader."""
+        return get_dataset_size(self.training)
 
-    def on_training_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
-        """Let the training wrapper turn mixup off once its cutoff epoch is reached."""
-        self.training.on_training_begin(info, **models)
+    @property
+    def validation_steps(self) -> int:
+        """Number of validation steps in one epoch, 0 when there is no validation dataset."""
+        return 0 if self.validation is None else get_dataset_size(self.validation)

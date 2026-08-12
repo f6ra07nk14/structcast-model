@@ -1,6 +1,6 @@
 """Build optimizers."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from logging import getLogger
 from re import Pattern as RePattern, compile as re_compile
 from typing import TYPE_CHECKING, Any
@@ -124,6 +124,22 @@ def _native_optimizer(name: str) -> "type[Optimizer] | None":
     raise ValueError(f'"{name}" does not name a torch.optim optimizer class.')
 
 
+def get_decays(optimizers: "Mapping[str, Optimizer]") -> dict[str, float]:
+    """Flatten the per-group weight decay and layer-decay scale of every optimizer into metrics.
+
+    Keys follow ``{optimizer}_group{index}_weight_decay`` / ``{optimizer}_group{index}_lr_scale``,
+    so a logger can track how a schedule moves the values `create_opt` grouped, epoch by epoch.
+    ``lr_scale`` only appears on the timm engine, which keeps it for its schedulers.
+    """
+    metrics: dict[str, float] = {}
+    for name, optimizer in optimizers.items():
+        for index, group in enumerate(optimizer.param_groups):
+            for key in ("weight_decay", "lr_scale"):
+                if key in group:
+                    metrics[f"{name}_group{index}_{key}"] = group[key]
+    return metrics
+
+
 def set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
     """Bake the `lr_scale` of every parameter group into its learning rate.
 
@@ -219,7 +235,7 @@ def create_opt(
     return optimizer
 
 
-__all__ = ["create_opt", "set_lr_scale"]
+__all__ = ["create_opt", "get_decays", "set_lr_scale"]
 
 
 if not TYPE_CHECKING:

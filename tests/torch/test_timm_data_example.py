@@ -269,13 +269,12 @@ def test_timm_dataloader_on_epoch_begin_ignores_a_validation_split() -> None:
 
 
 def test_timm_dataloader_is_routed_into_the_epoch_events_by_the_trainer() -> None:
-    """The renamed hooks are what let the CLI pass the dataset itself as a callback."""
+    """The renamed hooks are what let the trainer pick the dataset up from the provider scan."""
     trainer = TorchTrainer(
         device="cpu",
         learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        callbacks=[_training_wrapper()],
-        data=SimpleDataProvider(training_dataset=[]),
+        data=SimpleDataProvider(training_dataset=_training_wrapper()),
     )
     described = trainer.describe()
     assert described["on_epoch_begin"] == ["TimmDataLoaderWrapper"]
@@ -467,33 +466,29 @@ def test_timm_data_provider_exposes_the_validation_wrapper_as_dataset() -> None:
     assert provider.validation_dataset is validation
 
 
-def test_timm_data_provider_forwards_the_epoch_only_to_the_training_wrapper() -> None:
-    """Only the training split is reshuffled per epoch; forwarding to validation would be wrong."""
-    training_epochs: list[int] = []
-    validation_epochs: list[int] = []
-    training, validation = _training_wrapper(), TimmDataLoaderWrapper()
-    training.__dict__["dataset_wrapper"] = SimpleNamespace(set_epoch=training_epochs.append)
-    validation.__dict__["dataset_wrapper"] = SimpleNamespace(set_epoch=validation_epochs.append)
-    TimmDataProvider(training=training, validation=validation).on_epoch_begin(BaseInfo(epoch=2))
-    assert training_epochs == [1]
-    assert validation_epochs == []
+def test_timm_data_provider_counts_validation_steps_of_a_plain_dataset() -> None:
+    """Anything with a length works as validation data, so the count must not require a wrapper."""
+    provider = TimmDataProvider(training=_training_wrapper(), validation=[{"x": 1}, {"x": 2}])
+    assert provider.validation_steps == 2
 
 
-def test_timm_data_provider_disables_mixup_of_the_training_wrapper() -> None:
-    """The mixup cutoff used to be a globally registered callback; the provider now carries it."""
-    training = _training_wrapper(mixup_alpha=0.5, mixup_off_epoch=2)
-    TimmDataProvider(training=training).on_training_begin(BaseInfo(epoch=2))
-    assert training.mixup.mixup_enabled is False
+def test_timm_data_provider_reports_zero_validation_steps_when_absent() -> None:
+    """No validation dataset means fit() skips validation, so the count must be 0, not an error."""
+    assert TimmDataProvider(training=_training_wrapper()).validation_steps == 0
 
 
-def test_timm_data_provider_is_routed_into_the_epoch_events_by_the_trainer() -> None:
-    """Passing the provider to the trainer is the whole wiring: no registration call is involved."""
+def test_timm_data_provider_wrappers_are_routed_into_the_epoch_events_by_the_trainer() -> None:
+    """Passing the provider to the trainer is the whole wiring: its datasets are scanned directly.
+
+    The provider forwards nothing. A validation wrapper registers too -- its hooks no-op
+    internally (see the split-guard tests above).
+    """
     trainer = TorchTrainer(
         device="cpu",
         learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        data=TimmDataProvider(training=_training_wrapper()),
+        data=TimmDataProvider(training=_training_wrapper(), validation=TimmDataLoaderWrapper()),
     )
     described = trainer.describe()
-    assert described["on_epoch_begin"] == ["TimmDataProvider"]
-    assert described["on_training_begin"] == ["TorchTracker", "TimmDataProvider"]
+    assert described["on_epoch_begin"] == ["TimmDataLoaderWrapper", "TimmDataLoaderWrapper"]
+    assert described["on_training_begin"] == ["TorchTracker", "TimmDataLoaderWrapper", "TimmDataLoaderWrapper"]

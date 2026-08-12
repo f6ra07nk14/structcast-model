@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from functools import partial
 import os
 import pathlib
 import traceback
@@ -20,10 +21,9 @@ from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatc
 from typer import Typer
 from typer.testing import CliRunner
 
-from structcast_model.base_trainer import BaseInfo, BestCriterion
+from structcast_model.base_trainer import BaseInfo
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.mlflow_logger import MLflowLogger
 from structcast_model.torch.trainer import TorchTrainer, _get_state_dict, _unwrap_ddp
 from tests import ASSETS_DIR
 import torch
@@ -42,7 +42,6 @@ _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 _compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
-_on_best = _CMD_GLOBALS["_on_best"]
 
 
 @contextmanager
@@ -473,81 +472,6 @@ def test_get_module_outputs_raises_when_no_outputs_and_no_default() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _get_state_dict / _unwrap_ddp
-# ---------------------------------------------------------------------------
-
-
-def test_get_state_dict_returns_state_dicts() -> None:
-    """_get_state_dict returns a name-to-state_dict mapping."""
-    model = torch.nn.Linear(4, 2)
-    result = _get_state_dict({"model": model})
-    assert "model" in result
-    assert "weight" in result["model"]
-    assert "bias" in result["model"]
-
-
-def test_unwrap_ddp_passes_through_non_ddp_models() -> None:
-    """_unwrap_ddp returns non-DDP modules unchanged."""
-    model = torch.nn.Linear(4, 2)
-    result = _unwrap_ddp({"model": model})
-    assert result["model"] is model
-
-
-def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
-    """_unwrap_ddp extracts the .module from DistributedDataParallel models."""
-    model = torch.nn.Linear(4, 2)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    result = _unwrap_ddp({"model": ddp_model})
-    assert result["model"] is model
-
-
-# ---------------------------------------------------------------------------
-# _on_best
-# ---------------------------------------------------------------------------
-
-
-def _best_at_step(step: int, value: float = 0.3) -> BestCriterion[torch.nn.Module]:
-    """Return a best criterion that reached *value* at *step*."""
-    best = BestCriterion[torch.nn.Module](target="val_loss", mode="min")
-    best._best = value
-    best._step = step
-    return best
-
-
-def _run_on_best(tmp_path: pathlib.Path, experiment: str, *, save: bool, step: int = 5) -> str:
-    """Record one best value through a real MLflow logger and return the run id it wrote to."""
-    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
-    info = BaseInfo()
-    info.epoch = 1
-    info.step = 5
-    with MLflowLogger(experiment) as logger:
-        run = mlflow.active_run()
-        assert run is not None
-        _on_best(info, _best_at_step(step), logger=logger, save=save, model=torch.nn.Linear(4, 2))
-        return str(run.info.run_id)
-
-
-def test_on_best_logs_the_best_value_through_the_logger(tmp_path: pathlib.Path) -> None:
-    """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
-    run_id = _run_on_best(tmp_path, "test_on_best", save=False)
-    assert mlflow.get_run(run_id).data.metrics["best_val_loss"] == 0.3
-
-
-@pytest.mark.parametrize(("save", "expected"), [(True, True), (False, False)])
-def test_on_best_saves_the_state_only_when_asked(tmp_path: pathlib.Path, save: bool, expected: bool) -> None:
-    """Weights are only written for criteria the user asked to save, since every save costs disk space."""
-    run_id = _run_on_best(tmp_path, f"test_on_best_save_{save}", save=save)
-    artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run_id)]
-    assert ("best_val_loss" in artifacts) is expected
-
-
-def test_on_best_does_not_save_a_stale_best(tmp_path: pathlib.Path) -> None:
-    """A best reached at an earlier step must not overwrite the saved weights of the current models."""
-    run_id = _run_on_best(tmp_path, "test_on_best_stale", save=True, step=1)
-    assert [artifact.path for artifact in MlflowClient().list_artifacts(run_id)] == []
-
-
-# ---------------------------------------------------------------------------
 # `train` command — validation errors
 # ---------------------------------------------------------------------------
 
@@ -671,12 +595,16 @@ class _EpochAwareDataset(list[dict[str, torch.Tensor]]):
 
 
 def _recording_trainer(captured: list[Any]) -> Any:
-    """Return a trainer type that records the callbacks the command hands it."""
+    """Return a trainer type that records the callbacks the command hands it.
+
+    Captured at ``fit()`` time: the command builds the trainer first and appends its callbacks
+    afterwards, relying on the first-use scan.
+    """
 
     class _RecordingTrainer(TorchTrainer):
-        def __post_init__(self) -> None:
+        def fit(self, *args: Any, **kwargs: Any) -> dict[int, dict[str, Any]]:
             captured.extend(self.callbacks)
-            super().__post_init__()
+            return super().fit(*args, **kwargs)
 
     return _RecordingTrainer
 
@@ -773,11 +701,16 @@ def test_train_non_ci_mode_uses_pbar(tmp_path: pathlib.Path) -> None:
     _invoke_train(tmp_path, ci=False)
 
 
-def test_train_routes_a_dataset_implementing_an_event_protocol_into_the_callbacks(tmp_path: pathlib.Path) -> None:
-    """The CLI knows no dataset type: a dataset with a lifecycle hook becomes a callback and is called.
+def test_train_accepts_a_trainer_factory_without_class_attributes(tmp_path: pathlib.Path) -> None:
+    """A --trainer pattern may yield a factory, not a class: prefixes must come off the built instance."""
+    _invoke_train(tmp_path, ci=False, trainer_pattern=partial(TorchTrainer))
 
-    It is placed before the main-rank callbacks because it must run on every rank -- a
-    `DistributedSampler` reshuffles only if `set_epoch` reaches all of them.
+
+def test_train_routes_a_dataset_implementing_an_event_protocol_without_a_callback(tmp_path: pathlib.Path) -> None:
+    """A dataset with a lifecycle hook is called without ever entering the callbacks.
+
+    The CLI knows no dataset type: the trainer scans the provider datasets -- on every rank,
+    because a `DistributedSampler` reshuffles only if `set_epoch` reaches all of them.
     """
     captured: list[Any] = []
     training = _EpochAwareDataset(_make_training_dataset())
@@ -789,8 +722,7 @@ def test_train_routes_a_dataset_implementing_an_event_protocol_into_the_callback
         trainer_pattern=_recording_trainer(captured),
         epochs=2,
     )
-    assert captured[0] is training
-    assert all(cb is not validation for cb in captured)
+    assert all(cb is not training and cb is not validation for cb in captured)
     assert training.epochs == [1, 2]
 
 

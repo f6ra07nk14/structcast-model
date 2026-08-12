@@ -10,9 +10,12 @@ from torch.nn import Module
 
 from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
 from structcast_model.torch.trainer import (
+    TorchBestCriterion,
     TorchTracker,
     TorchTrainer,
     TrainingStateSaver,
+    _get_state_dict,
+    _unwrap_ddp,
     autocast_inputs,
     create_torch_inputs,
     get_torch_device,
@@ -606,9 +609,105 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     )
     trainer.epoch, trainer.step, trainer.update = 3, 7, 2
     recorder = _RecordingLogger()
-    TrainingStateSaver(recorder).on_epoch_end(trainer, model=model)
+    TrainingStateSaver(logger=recorder).on_epoch_end(trainer, model=model)
     states, name = recorder.states[0]
     assert name == "training_state"
     assert "weight" in states["models"]["model"]
     assert states["optimizers"]["opt"]["param_groups"][0]["lr"] == 0.1
     assert states["meta"] == {"epoch": 3, "step": 7, "update": 2}
+
+
+# ---------------------------------------------------------------------------
+# _get_state_dict / _unwrap_ddp
+# ---------------------------------------------------------------------------
+
+
+def test_get_state_dict_returns_state_dicts() -> None:
+    """_get_state_dict returns a name-to-state_dict mapping."""
+    model = torch.nn.Linear(4, 2)
+    result = _get_state_dict({"model": model})
+    assert "model" in result
+    assert "weight" in result["model"]
+    assert "bias" in result["model"]
+
+
+def test_unwrap_ddp_passes_through_non_ddp_models() -> None:
+    """_unwrap_ddp returns non-DDP modules unchanged."""
+    model = torch.nn.Linear(4, 2)
+    result = _unwrap_ddp({"model": model})
+    assert result["model"] is model
+
+
+def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
+    """_unwrap_ddp extracts the .module from DistributedDataParallel models."""
+    model = torch.nn.Linear(4, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    result = _unwrap_ddp({"model": ddp_model})
+    assert result["model"] is model
+
+
+# ---------------------------------------------------------------------------
+# TorchBestCriterion.from_criteria
+# ---------------------------------------------------------------------------
+
+
+class _BestRecordingLogger:
+    """Logger recording the metrics and state-dict names the best monitors produce."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.metrics: list[tuple[str, float, int]] = []
+        self.states: list[str] = []
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        """Record a logged best value."""
+        self.metrics.append((name, value, step))
+
+    def log_state_dict(self, states: Any, name: str) -> None:
+        """Record the name a state dictionary was saved under."""
+        self.states.append(name)
+
+
+def test_from_criteria_builds_one_wired_monitor_per_criterion() -> None:
+    """The CLI hands its criteria lists straight to this factory, so the modes must map correctly."""
+    monitors = TorchBestCriterion.from_criteria(["acc"], ["loss"], ["acc"], _BestRecordingLogger())
+    assert [(monitor.target, monitor.mode) for monitor in monitors] == [("acc", "max"), ("loss", "min")]
+    assert all(len(monitor.on_best) == 1 for monitor in monitors)
+
+
+def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
+    """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.metrics == [("best_val_loss", 0.3, 1)]
+    assert logger.states == []
+
+
+@pytest.mark.parametrize(("save_criteria", "expected"), [(["val_loss"], ["best_val_loss"]), ([], [])])
+def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: list[str], expected: list[str]) -> None:
+    """Weights are only written for criteria the user asked to save, since every save costs disk space."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], save_criteria, logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.states == expected
+
+
+def test_from_criteria_does_not_save_a_stale_best() -> None:
+    """A best reached at an earlier step must not overwrite the saved weights of the current models."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    info.epoch, info.step = 2, 9
+    info.history[2] = {"val_loss": 0.9}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.states == ["best_val_loss"]

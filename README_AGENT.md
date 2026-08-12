@@ -47,7 +47,7 @@ src/structcast_model/
 │   ├── logger.py              # Logger protocol shared by the experiment tracking backends
 │   ├── mlflow_logger.py       # MLflowLogger
 │   ├── wandb_logger.py        # WandbLogger
-│   ├── optimizers.py          # create_opt: regex parameter grouping over optimizer engines
+│   ├── optimizers.py          # create_opt: regex parameter grouping; get_decays: decay metrics
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
 ├── flax/
@@ -169,7 +169,7 @@ The generated learner class supports:
 - Automatic train/eval mode switching per entry
 - Gradient accumulation, AMP scaler logic, and gradient clipping
 
-It implements the `Learner` protocol (`models`, `update`, `training_step`, `inference_step`) and exposes `optimizers`, `grad_scalers`, `learning_rates`, `param_group_names`, `inputs`, and `outputs`.
+It implements the `Learner` protocol (`models`, `update`, `training_step`, `inference_step`) and exposes `optimizers`, `grad_scalers`, `learning_rates`, `weight_decays`, `param_group_names`, `inputs`, and `outputs`.
 
 ### `scm torch ptflops` and `scm torch calflops`
 
@@ -217,11 +217,10 @@ Purpose:
 
 Key runtime behavior:
 
-- `configure_security()` is called because commands frequently import generated local files via `_file_` patterns.
 - `torch.compile` is optional and configured via `-c/--compile`; it is applied to the models and to the learner's step functions.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
 - The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
-- Callbacks passed to the trainer: first each dataset that implements at least one event protocol (on every rank), then — on rank 0 only — `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
+- Callbacks passed to the trainer (rank 0 only): `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
 - `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`, and a `KeyboardInterrupt` saves the current training state before leaving it.
 - `trainer.describe()` is printed before fitting, showing which object handles which event.
 
@@ -230,7 +229,7 @@ Distributed training behavior (when launched through `torchrun`):
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
 - All models are wrapped with `DistributedDataParallel`.
-- The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the CLI adds event-protocol datasets to the callbacks of every rank, so the sampler epoch advances on all of them.
+- The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank, so the sampler epoch advances on all of them.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - Experiment logging, checkpoints, and progress bars are gated to rank 0 only.
 - DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
@@ -325,11 +324,11 @@ Important generation details:
 - `Learner`, `DataProvider`: the two protocols a trainer is built around
 - `EVENTS` / `EVENT_PROTOCOLS`: the eleven lifecycle events and the protocol gating each one
 - `BaseTrainer`: `train()`, `evaluate()`, `fit()` loop, plus `describe()` for the routing table
-- `SimpleDataProvider`: dataclass holding a training dataset and an optional validation dataset
+- `SimpleDataProvider`: keyword-only dataclass holding a training dataset and an optional validation dataset, reporting `steps_per_epoch` / `validation_steps`
 - `BestCriterion`: criterion monitor for best-value callbacks
 - `ProgressBar`, `Printer`: the two built-in reporting callbacks
 
-Routing rule: at construction the trainer scans the learner, the learner's `optimizers` values, the tracker, the data provider, and then `callbacks` in order, registering each object for every event whose `runtime_checkable` protocol it satisfies, never twice for the same event. There is no registry and no `register()` call.
+Routing rule: on first use (the first dispatched event or `describe()`) the trainer scans the learner, the learner's `optimizers` values, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then `callbacks` in order, registering each object for every event whose `runtime_checkable` protocol it satisfies, never twice for the same event. There is no registry and no `register()` call.
 
 ### PyTorch runtime layer
 
@@ -359,8 +358,8 @@ Loggers (run-owning context managers that also implement `on_epoch_end`):
 timm data integrations — example code in `examples/torch/data.py`, not package API; a configuration loads them by file path (`_addr_` plus `_file_`):
 
 - `TimmDatasetWrapper`
-- `TimmDataLoaderWrapper` — implements `on_epoch_begin` (sampler reshuffling) and `on_training_begin` (mixup cutoff), so the CLI routes it into those events like any other callback
-- `TimmDataProvider` — the programmatic `DataProvider` forwarding both events to the training wrapper
+- `TimmDataLoaderWrapper` — implements `on_epoch_begin` (sampler reshuffling) and `on_training_begin` (mixup cutoff); the trainer scans the provider datasets, so it joins those events without registration
+- `TimmDataProvider` — the programmatic `DataProvider`; its datasets are scanned directly and its step counts come from the loaders
 
 ### Flax runtime layer
 
@@ -384,12 +383,12 @@ Utility functions:
 
 ### Training flow in practice
 
-1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`; those implementing an event protocol are also collected as callbacks.
+1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`, which reports the step counts; the trainer scans the provider datasets, so those implementing an event protocol join the loop.
 2. The `train` command instantiates the models on the training device, initializes them with dummy inputs, applies initializers on the main rank, and builds the learner with those models.
 3. Models are DDP-wrapped and compiled where requested.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).
-5. Callbacks are assembled: progress reporting, logger, state saver, best criteria.
-6. `TorchTrainer` is constructed — routing every participant into its events — and `fit()` runs inside the logger's run context.
+5. `TorchTrainer` is constructed, then the callbacks are assembled from its prefixes: progress reporting, logger, state saver, best criteria.
+6. Every participant is routed into its events on first use, and `fit()` runs inside the logger's run context.
 7. The logger receives arguments, metrics, artifacts, training state, and best-checkpoint snapshots.
 
 When running under `torchrun`, the flow gains additional distributed steps:
@@ -428,12 +427,10 @@ These are [StructCast](https://github.com/f6ra07nk14/structcast) object pattern 
 
 `cfg/torch/others/default_timm.yaml` uses a `FlexSpec`-compatible mapping so dataloader batches can be transformed from positional `(input, target)` tuples into structured dictionaries such as `{image: ..., label: ...}`.
 
-## Dynamic Import and Security Notes
+## Dynamic Import Notes
 
-- CLI commands call `configure_security()` to install the StructCast security settings before importing anything through `_file_` patterns.
-- Generated modules are loaded with `_file_` patterns pointing at local files.
+- Generated modules are loaded with `_file_` patterns pointing at local files; structcast 2.0 needs no security configuration for this.
 - When debugging command failures, verify that generated files exist at the exact paths referenced in `_file_`.
-- Code used outside the CLI must explicitly configure StructCast security settings to permit local imports.
 
 ## Development Commands
 
@@ -484,7 +481,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 | Flax/Keras GPU not detected | JAX cannot find NVIDIA libraries. | Set `LD_LIBRARY_PATH` to include CUDA/cuDNN paths. |
 | `RuntimeError: Address already in use` during distributed training | Another process is using the `MASTER_PORT`. | Change `--master_port` or kill the conflicting process. |
 | All ranks log to the tracking service / print progress bars | Rank gating is not working correctly. | Verify `initial_distributed_env()` is called before logging setup. |
-| `ValueError: No data provider was given to the trainer` | `fit()` was called on a trainer constructed without `data=`. | Pass a `DataProvider`, or call `train(dataset)` / `evaluate(dataset)` directly. |
+| `TypeError: ... missing ... 'data'` at trainer construction | The trainer was built without `data=`; the field is required. | Pass a `DataProvider` (e.g. `SimpleDataProvider`), or call `train(dataset)` / `evaluate(dataset)` directly. |
 | A callback never fires | Its method name does not match an event, or the object was not passed to the trainer. | Check `trainer.describe()` and the spelling against `EVENTS`. |
 
 ## Key Integration Example

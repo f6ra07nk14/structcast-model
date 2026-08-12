@@ -25,7 +25,7 @@ def mlflow_store(tmp_path: Path) -> Any:
 
 def test_mlflow_logger_owns_the_run_and_logs_the_epoch_metrics(mlflow_store: Any, epoch_info: TorchTrainer) -> None:
     """No event fires once per fit, so the run lifecycle lives in the context manager, not a callback."""
-    with MLflowLogger("phase-two") as logger:
+    with MLflowLogger(experiment="phase-two") as logger:
         run_id = mlflow_store.active_run().info.run_id
         logger.log_params({"epochs": 1})
         logger.log_metric("best_loss", 0.25, step=1)
@@ -33,14 +33,16 @@ def test_mlflow_logger_owns_the_run_and_logs_the_epoch_metrics(mlflow_store: Any
     assert mlflow_store.active_run() is None
     run = mlflow_store.get_run(run_id)
     assert run.data.params == {"epochs": "1"}
-    assert run.data.metrics == pytest.approx({"best_loss": 0.25, "loss": 0.5, "lr": 0.1})
+    assert run.data.metrics == pytest.approx(
+        {"best_loss": 0.25, "loss": 0.5, "lr": 0.1, "opt_group0_weight_decay": 0.05}
+    )
 
 
 def test_mlflow_logger_stores_dicts_states_and_files_as_artifacts(mlflow_store: Any, tmp_path: Path) -> None:
     """Arguments, model states and config files must survive the run for it to be reproducible."""
     artifact = tmp_path / "config.yaml"
     artifact.write_text("epochs: 1\n")
-    with MLflowLogger("phase-two") as logger:
+    with MLflowLogger(experiment="phase-two") as logger:
         run_id = mlflow_store.active_run().info.run_id
         logger.log_dict({"epochs": 1}, "arguments.yaml")
         logger.log_artifact(str(artifact))
@@ -51,4 +53,4 @@ def test_mlflow_logger_stores_dicts_states_and_files_as_artifacts(mlflow_store: 
 
 def test_mlflow_logger_satisfies_the_logger_protocol() -> None:
     """The CLI picks a backend by name, so a member missing from one of them breaks that choice."""
-    assert isinstance(MLflowLogger("phase-two"), Logger)
+    assert isinstance(MLflowLogger(experiment="phase-two"), Logger)

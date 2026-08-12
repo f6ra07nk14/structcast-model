@@ -313,7 +313,7 @@ The generated class manages:
 - optimizer stepping, zeroing, and automatic train/eval mode switching
 - learning-rate and parameter-group inspection helpers
 
-The result implements the `Learner` protocol — a `models` property, `update`, `training_step`, and `inference_step` — plus the optional `optimizers`, `grad_scalers`, `learning_rates`, and `param_group_names` properties the CLI reads when they are present. Any object with those members can be trained, generated or hand-written; see [`examples/torch/simple_training.py`](examples/torch/simple_training.py).
+The result implements the `Learner` protocol — a `models` property, `update`, `training_step`, and `inference_step` — plus the `optimizers`, `grad_scalers`, `learning_rates`, `weight_decays`, and `param_group_names` properties the toolkit reads (the loggers merge `learning_rates` and `weight_decays` into the epoch metrics). Any object with those members can be trained, generated or hand-written; see [`examples/torch/simple_training.py`](examples/torch/simple_training.py).
 
 For example, a CycleGAN learner template defines three `LEARNERS` entries — one for the generator pair and one for each discriminator — each with its own flow, optimizer, and trainable layers:
 
@@ -426,12 +426,12 @@ Key arguments:
 
 What the train command does internally:
 
-1. Instantiates the datasets, determines their lengths, and composes them into a `SimpleDataProvider`. A dataset implementing one of the event protocols also becomes a callback, so it receives the lifecycle events it defines.
+1. Instantiates the datasets and composes them into a `SimpleDataProvider`, which reports `steps_per_epoch` and `validation_steps`. The trainer scans the provider datasets for event protocols, so a dataset implementing one receives the lifecycle events it defines.
 2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers, builds the learner from the models, and compiles the step functions.
 3. Wraps the models in `DistributedDataParallel` when the run is distributed.
 4. Builds a `TorchTracker` from the learner's output names.
-5. Collects the callbacks: the datasets that implement an event protocol (on every rank), then — on rank 0 only — a `ProgressBar` (or a `Printer` under `--ci`), the logger, a training-state saver, and one `TorchBestCriterion` per monitored criterion.
-6. Creates the `TorchTrainer` with the learner, the tracker, the data provider, and those callbacks, and prints the resulting event routing.
+5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
+6. Collects the callbacks — on rank 0 only — a `ProgressBar` (or a `Printer` under `--ci`) labeled with the trainer's prefixes, the logger, a training-state saver, and one `TorchBestCriterion` per monitored criterion; they join the trainer's events on first use, and the resulting routing is printed.
 7. Runs `fit()` inside the logger's run context, recording metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints.
 
 #### Distributed Training with `torchrun`
@@ -449,7 +449,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 1. **Process group initialization** — The NCCL backend is initialized via [`torch.distributed.init_process_group`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group).
 2. **Per-rank device assignment** — Each process is assigned to `cuda:<LOCAL_RANK>`.
 3. **DDP model wrapping** — All models are wrapped with [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
-4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; `scm torch train` routes any dataset implementing an event protocol into the callbacks of every rank, so the hook runs everywhere it must.
+4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; the trainer scans the provider datasets for event protocols on every rank, so the hook runs everywhere it must.
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — Experiment logging, progress bars, and checkpoint saving are performed only on rank 0.
 7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
@@ -566,7 +566,7 @@ Whether it is built by the CLI or by hand, a training run is the same five objec
 | ---------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
 | **Learner**      | Owns the models; decides when to update and how a training and an inference step run                | `scm torch create learner`                                    |
 | **Tracker**      | Turns the criteria of each step into the values recorded for the epoch                             | `TorchTracker` (averages, and reduces across ranks)           |
-| **DataProvider** | Supplies the training dataset and the optional validation dataset for the whole run                | `SimpleDataProvider`                                          |
+| **DataProvider** | Supplies the datasets and their step counts (`steps_per_epoch`, `validation_steps`) for the run    | `SimpleDataProvider`                                          |
 | **Callbacks**    | React to lifecycle events                                                                          | `ProgressBar`, `Printer`, `BestCriterion`                     |
 | **Logger**       | Owns the run on an experiment tracking service and logs the epoch metrics                          | `MLflowLogger`, `WandbLogger`                                 |
 
@@ -581,7 +581,7 @@ trainer = TorchTrainer(
 trainer.fit(epochs=3)
 ```
 
-There is no registration call and no global registry. Every participant — the learner, the learner's `optimizers`, the tracker, the data provider, then the `callbacks` in the order given — is scanned once at construction, and is routed into each lifecycle event whose protocol it implements:
+There is no registration call and no global registry. Every participant — the learner, the learner's `optimizers`, the tracker, the data provider and its datasets, then the `callbacks` in the order given — is scanned once on first use (the first event or `describe()` call), and is routed into each lifecycle event whose protocol it implements:
 
 `on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`.
 
@@ -786,7 +786,7 @@ The training loop was redesigned around protocol-routed callbacks. The rationale
 
 - **`Backward` is now `Learner`** — The rename cascades through the runtime, the CLI (`scm torch create learner`, `--learner/-L`), the builder and schema names (`LEARNERS`, `LearnerBehavior`, `UserDefinedLearner`), and the template directory (`cfg/torch/learners/`).
 - **Callbacks are routed by protocol** — The `GLOBAL_CALLBACKS` registry, the `callbacks_session` context manager, and `NamedCallbackList.register()` are gone. Pass participants to the trainer as `callbacks=[...]`; each one joins the events whose `on_*` method it defines. Ad-hoc lambdas become small callback classes — `ProgressBar` and `Printer` ship with the package.
-- **Datasets are given at construction** — `fit()` no longer takes datasets. Build a `DataProvider` (`SimpleDataProvider`, or your own object with `training_dataset` and `validation_dataset`) and pass it as `data=`. `fit()` keeps `epochs`, `start_epoch`, and `validation_frequency`; `train(dataset)` and `evaluate(dataset)` are unchanged.
+- **Datasets are given at construction** — `fit()` no longer takes datasets. Build a `DataProvider` (`SimpleDataProvider`, or your own object with `training_dataset`, `validation_dataset`, `steps_per_epoch`, and `validation_steps`) and pass it as `data=`. The trainer also scans the provider datasets for event protocols, so a dataset with an `on_*` hook (e.g. a distributed sampler wrapper) takes part in the loop without being passed as a callback. `fit()` keeps `epochs`, `start_epoch`, and `validation_frequency`; `train(dataset)` and `evaluate(dataset)` are unchanged.
 - **`create_with_scheduler` is removed** — The package keeps `create_opt` (regex weight-decay and layer-decay grouping over `torch.optim` and timm engines). Optimizer + scheduler combinations move to example code referenced by file path; `AdamWWithCosine` (timm schedules) and `OptimizerWithNativeScheduler` (per-epoch native schedules) in [`examples/torch/optimizers.py`](examples/torch/optimizers.py) cover the cosine and per-epoch native cases and also keep the schedule in their `state_dict`; metric-driven (`ReduceLROnPlateau`), per-update, and composite schedules need a wrapper of their own modeled on these.
 - **Loggers own the run** — `MLflowLogger` (`structcast_model.torch.mlflow_logger`) and `WandbLogger` (`structcast_model.torch.wandb_logger`) are context managers that start and end the run and log epoch metrics; both follow the `Logger` protocol in `structcast_model.torch.logger`. Select the backend with `--logger mlflow|wandb`.
 - **Trackers reset themselves** — `TorchTracker` clears its averages from `on_training_begin` and `on_validation_begin`; the explicit `reset()` call in the loop is gone.

@@ -394,8 +394,6 @@ LEARNERS:
 
 **`get_dataset_size(dataset)`** — Returns the number of batches. Uses `__len__` when available, otherwise iterates to count.
 
-**`invoke_callback(callbacks, info, *args, **models)`** — Iterates over a callback list and calls each entry with `info` and keyword model arguments. Used by `BestCriterion` to fire its `on_best` list.
-
 ### Protocols
 
 **`Learner`** — The object that owns the models and defines how they learn. Members:
@@ -405,11 +403,11 @@ LEARNERS:
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
 
-Optional members read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer), `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers).
+Two required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer) and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
 
-**`DataProvider`** — Supplies the datasets of a whole run: a `training_dataset` property and a `validation_dataset` property that may be `None` to skip validation. Each may be a dataset or a zero-argument callable returning one.
+**`DataProvider`** — Supplies the datasets of a whole run and their step counts: a `training_dataset` property, a `validation_dataset` property that may be `None` to skip validation, and `steps_per_epoch` / `validation_steps` properties (`validation_steps` is `0` without a validation dataset). Each dataset may be a dataset or a zero-argument callable returning one, and the dataset properties must return the same object on every read: the trainer reads them for the event-protocol scan and again in `fit()`. Both datasets are scanned against every event protocol, so a validation dataset implementing training-phase hooks receives those events too — guard on the split inside the hook, as `TimmDataLoaderWrapper` does.
 
-**`Callback` and `BestCallback`** — Callable signatures used by `BestCriterion.on_best`: `Callback` is called with `(info: BaseInfo, **models)`, `BestCallback` with `(info: BaseInfo, best: BestCriterion, **models)`.
+**`OnBest`** — Protocol for the participants of `BestCriterion.on_best`, mirroring how the trainer routes events: an object with an `on_best(info: BaseInfo, best: BestCriterion, **models)` method.
 
 ### Event protocols
 
@@ -442,7 +440,7 @@ Every handler has the signature `(info: BaseInfo, **models) -> None`, where `inf
 provider = SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader)
 ```
 
-**`ProgressBar`** — Callback showing training and validation progress on a `tqdm` bar (`tqdm` must be installed). Constructor: `ProgressBar(steps_per_epoch, validation_steps=0, training_criteria=(), validation_criteria=())`, where the two criteria sequences name the log keys shown next to the bar. It writes the criteria of each finished epoch above the bar.
+**`ProgressBar`** — Callback showing training and validation progress on a `tqdm` bar (`tqdm` must be installed). Constructor (keyword-only): `ProgressBar(steps_per_epoch=..., validation_steps=0, training_criteria=(), validation_criteria=())`, where the two criteria sequences name the log keys shown next to the bar. It writes the criteria of each finished epoch above the bar.
 
 **`Printer`** — Callback printing the criteria of each finished epoch, for environments without a terminal. Both callbacks prepend the learner's `learning_rates` when it reports them.
 
@@ -450,11 +448,11 @@ provider = SimpleDataProvider(training_dataset=train_loader, validation_dataset=
 
 **`BaseTrainer`** — The main training loop driver, and itself the `BaseInfo` passed to every event.
 
-Required fields: `learner` (`Learner`), `tracker` (callable returning `dict[str, float]`, called once per step with the criteria of that step).
+Required fields: `learner` (`Learner`), `tracker` (callable returning `dict[str, float]`, called once per step with the criteria of that step), `data` (`DataProvider`).
 
-Optional fields: `data` (`DataProvider`, required by `fit()`), `callbacks` (sequence of participants, default `()`), `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
+Optional fields: `callbacks` (sequence of participants, default `()`), `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
 
-At construction the trainer scans, in this order, the learner, the values of the learner's `optimizers` mapping, the tracker, the data provider, and then the `callbacks` in the order given. Each object is routed into every event whose protocol it implements, and is never registered twice for the same event.
+On first use (the first dispatched event or `describe()` call) the trainer scans, in this order, the learner, the values of the learner's `optimizers` mapping, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then the `callbacks` in the order given. Each object is routed into every event whose protocol it implements, and is never registered twice for the same event. Because the scan is deferred, callbacks appended to the given sequence after construction — the CLI builds its display callbacks from the constructed trainer's prefixes — still take part.
 
 Key methods:
 
@@ -469,7 +467,7 @@ Key methods:
 trainer = BaseTrainer(
     learner=my_learner,
     tracker=my_tracker,
-    data=SimpleDataProvider(train_loader, valid_loader),
+    data=SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader),
     callbacks=[Printer()],
 )
 history = trainer.fit(epochs=10)
@@ -478,11 +476,15 @@ history = trainer.fit(epochs=10)
 **`BestCriterion`** — Callback monitoring one criterion for its best value. It implements `on_epoch_end`, so passing it in `callbacks` is all that is needed.
 
 ```python
-checkpoint = BestCriterion(target="val_acc1", mode="max", on_best=[save_checkpoint])
+class SaveCheckpoint:
+    def on_best(self, info: BaseInfo, best: BestCriterion, **models) -> None:
+        ...  # log or save by best.value / best.step
+
+checkpoint = BestCriterion(target="val_acc1", mode="max", on_best=[SaveCheckpoint()])
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[checkpoint])
 ```
 
-Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `BestCallback`, called after every epoch in which the target appeared, whether or not it improved). Properties: `value` (the best value so far) and `step` (the step at which it was reached).
+Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `OnBest` participants, notified after every epoch in which the target appeared, whether or not it improved). Properties: `value` (the best value so far) and `step` (the step at which it was reached).
 
 ---
 
@@ -514,22 +516,26 @@ logs = tracker(ce_loss=loss_tensor, acc1=acc1_tensor, acc5=acc5_tensor)
 **`TorchTrainer`** — Extends `BaseTrainer` with a `device` field, CUDA synchronization, and `no_sync`, which suppresses `DistributedDataParallel` gradient synchronization on steps that do not update.
 
 ```python
+data = SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader)
 trainer = TorchTrainer(
     device="cuda",
     learner=learner,
     tracker=tracker,
-    data=SimpleDataProvider(train_loader, valid_loader),
-    callbacks=[ProgressBar(len(train_loader), len(valid_loader)), TorchBestCriterion(target="val_acc1", mode="max")],
+    data=data,
+    callbacks=[
+        ProgressBar(steps_per_epoch=data.steps_per_epoch, validation_steps=data.validation_steps),
+        TorchBestCriterion(target="val_acc1", mode="max"),
+    ],
 )
 history = trainer.fit(epochs=5)
 ```
 
-**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models.
+**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it; the CLI appends the returned monitors to its callbacks.
 
 **`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it: the model state dicts (unwrapping `DistributedDataParallel`), the learner's optimizer and gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact.
 
 ```python
-saver = TrainingStateSaver(logger)
+saver = TrainingStateSaver(logger=logger)
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
@@ -539,12 +545,12 @@ The models and the learner of a CLI run are assembled inline by `scm torch train
 
 **`Logger`** (`structcast_model.torch.logger`) — The runtime-checkable protocol both backends implement: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, `log_state_dict`, `on_epoch_end`, and the `__enter__` / `__exit__` pair that owns the run.
 
-**`MLflowLogger`** (`structcast_model.torch.mlflow_logger`) and **`WandbLogger`** (`structcast_model.torch.wandb_logger`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates — so passing a logger in `callbacks` is enough to get per-epoch metrics.
+**`MLflowLogger`** (`structcast_model.torch.mlflow_logger`) and **`WandbLogger`** (`structcast_model.torch.wandb_logger`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates and its optional `weight_decays` — so passing a logger in `callbacks` is enough to get per-epoch metrics, including weight/layer-decay dynamics.
 
 ```python
 from structcast_model.torch.mlflow_logger import MLflowLogger
 
-with MLflowLogger("my-experiment") as logger:
+with MLflowLogger(experiment="my-experiment") as logger:
     trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger])
     logger.log_params({"epochs": 5})
     trainer.fit(epochs=5)
@@ -567,11 +573,11 @@ These are example code in [`examples/torch/data.py`](examples/torch/data.py), no
 - Distributed device initialization
 - Optional `FlexSpec` output remapping
 
-It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to its dataset or `DistributedSampler` (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. `scm torch train` routes every dataset implementing an event protocol into the trainer's callbacks — on every rank — so these hooks run without any further wiring.
+It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to its dataset or `DistributedSampler` (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. The trainer scans the provider datasets for event protocols — on every rank — so these hooks run without any further wiring.
 
 The dataset template at [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml) formats into this wrapper.
 
-**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` wrapper, forwarding `on_epoch_begin` and `on_training_begin` to the training wrapper. The CLI always composes a `SimpleDataProvider`; use this one when wiring a trainer programmatically.
+**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` dataset. The trainer scans both datasets directly, and the wrapper hooks no-op on validation splits, so the provider forwards nothing. The CLI always composes a `SimpleDataProvider`; use this one when wiring a trainer programmatically.
 
 ```python
 provider = TimmDataProvider(training=training_wrapper, validation=validation_wrapper)

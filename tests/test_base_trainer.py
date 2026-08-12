@@ -14,12 +14,12 @@ from structcast_model.base_trainer import (
     BaseInfo,
     BaseTrainer,
     BestCriterion,
+    DataProvider,
     Printer,
     ProgressBar,
     SimpleDataProvider,
     get_dataset,
     get_dataset_size,
-    invoke_callback,
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,47 @@ def test_get_dataset_size_via_callable_with_len() -> None:
     assert get_dataset_size(lambda: data) == 2
 
 
+def test_get_dataset_size_prefers_len_over_calling_a_callable_dataset() -> None:
+    """A loader wrapper is callable but sized; counting it must not materialize an epoch of data."""
+
+    class _SizedFactory:
+        called = False
+
+        def __len__(self) -> int:
+            return 7
+
+        def __call__(self) -> Iterator[dict[str, int]]:
+            self.called = True
+            yield {"x": 1}
+
+    factory = _SizedFactory()
+    assert get_dataset_size(factory) == 7
+    assert factory.called is False
+
+
+# ---------------------------------------------------------------------------
+# SimpleDataProvider – steps_per_epoch / validation_steps
+# ---------------------------------------------------------------------------
+
+
+def test_simple_data_provider_counts_steps_from_its_datasets() -> None:
+    """The provider owns the step counts, so consumers need no dataset-size logic of their own."""
+    provider = SimpleDataProvider(training_dataset=[{"x": 1}, {"x": 2}], validation_dataset=[{"x": 3}])
+    assert provider.steps_per_epoch == 2
+    assert provider.validation_steps == 1
+
+
+def test_simple_data_provider_satisfies_the_data_provider_protocol() -> None:
+    """Widening the protocol must not orphan the package's own provider."""
+    assert isinstance(SimpleDataProvider(training_dataset=[]), DataProvider)
+
+
+def test_simple_data_provider_reports_zero_validation_steps_without_a_validation_dataset() -> None:
+    """No validation dataset means fit() skips validation, so the count must be 0, not an error."""
+    provider = SimpleDataProvider(training_dataset=[{"x": 1}])
+    assert provider.validation_steps == 0
+
+
 # ---------------------------------------------------------------------------
 # BaseInfo.logs
 # ---------------------------------------------------------------------------
@@ -106,32 +147,6 @@ def test_base_info_logs_raises_key_error_for_unknown_epoch() -> None:
     info = BaseInfo()
     with pytest.raises(KeyError, match="No logs found for key: 99"):
         info.logs(99)
-
-
-# ---------------------------------------------------------------------------
-# invoke_callback
-# ---------------------------------------------------------------------------
-
-
-def test_invoke_callback_calls_all_in_order() -> None:
-    """All callbacks are invoked in insertion order."""
-    info = BaseInfo()
-    calls: list[int] = []
-    invoke_callback([lambda i, **kw: calls.append(1), lambda i, **kw: calls.append(2)], info)
-    assert calls == [1, 2]
-
-
-def test_invoke_callback_forwards_model_kwargs() -> None:
-    """Extra keyword arguments are forwarded to each callback."""
-    info = BaseInfo()
-    received: list[dict] = []
-    invoke_callback([lambda i, **kw: received.append(kw)], info, model="my_model")
-    assert received[0] == {"model": "my_model"}
-
-
-def test_invoke_callback_empty_list_is_noop() -> None:
-    """Empty callback list does not raise."""
-    invoke_callback([], BaseInfo())
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +232,8 @@ class _RecordingProvider:
         self.log = log
         self.training_dataset = [{"x": 1}]
         self.validation_dataset = None
+        self.steps_per_epoch = 1
+        self.validation_steps = 0
 
     def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
         """Record that the data provider received the event."""
@@ -316,15 +333,64 @@ def test_explicit_callback_matching_no_event_warns(caplog: pytest.LogCaptureFixt
             raise AssertionError("never called")
 
     with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
-        _make_trainer(callbacks=[Typoed()])
+        _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[Typoed()]).fit(epochs=1)
     assert any("Typoed" in record.message and "no event protocol" in record.message for record in caplog.records)
 
 
 def test_scanned_participants_without_events_do_not_warn(caplog: pytest.LogCaptureFixture) -> None:
     """The learner/tracker/data legitimately may implement no event: only explicit callbacks warn."""
     with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
-        _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]))
+        _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}])).fit(epochs=1)
     assert not caplog.records
+
+
+def test_callbacks_appended_after_construction_join_on_first_use() -> None:
+    """Late-appended callbacks still join the loop: the scan runs on first use.
+
+    The CLI relies on this to build the trainer first and read display prefixes off the instance.
+    """
+    log: list[str] = []
+    callbacks: list[Any] = []
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=callbacks)
+    callbacks.append(_Recorder(log, "late", ("on_epoch_end",)))
+    trainer.fit(epochs=1)
+    assert log == ["late:on_epoch_end"]
+
+
+def test_describe_before_fit_does_not_freeze_the_scan() -> None:
+    """describe() is a preview: inspecting the wiring must not drop callbacks appended afterwards."""
+    log: list[str] = []
+    callbacks: list[Any] = []
+    trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=callbacks)
+    assert trainer.describe() == {}
+    callbacks.append(_Recorder(log, "late", ("on_epoch_end",)))
+    trainer.fit(epochs=1)
+    assert log == ["late:on_epoch_end"]
+    assert "on_epoch_end" in trainer.describe()
+
+
+def test_provider_datasets_are_scanned_for_events_before_the_callbacks() -> None:
+    """Provider datasets join the events without registration, ahead of the explicit callbacks.
+
+    A dataset hook (e.g. a distributed sampler's set_epoch) must fire on the scan alone, and
+    reshuffling must precede reporters.
+    """
+    log: list[str] = []
+
+    class _EventfulDataset(list[dict[str, Any]]):
+        def on_epoch_begin(self, info: BaseInfo, **models: Any) -> None:
+            """Record that the trainer reached this dataset."""
+            log.append("dataset:on_epoch_begin")
+
+    trainer = _make_trainer(
+        data=SimpleDataProvider(
+            training_dataset=_EventfulDataset([{"x": 1}]),
+            validation_dataset=_EventfulDataset([{"x": 2}]),
+        ),
+        callbacks=[_Recorder(log, "rec", ("on_epoch_begin",))],
+    )
+    trainer.fit(epochs=1)
+    assert log == ["dataset:on_epoch_begin", "dataset:on_epoch_begin", "rec:on_epoch_begin"]
 
 
 def test_scan_order_is_learner_then_tracker_then_data_then_callbacks() -> None:
@@ -569,25 +635,32 @@ def test_best_criterion_tracks_the_best_value(
     assert criterion.step == 1 + values.index(expected)
 
 
+class _BestRecorder:
+    """OnBest participant recording what the criterion reports, the way a logger would."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[int, float, dict[str, Any]]] = []
+
+    def on_best(self, info: BaseInfo, best: BestCriterion[Any], **models: Any) -> None:
+        """Record the epoch, the best value, and the models."""
+        self.seen.append((info.epoch, best.value, models))
+
+
 def test_best_criterion_on_best_receives_info_best_and_models() -> None:
-    """on_best callbacks get the criterion itself, so they can log or save by its value/step."""
-    seen: list[tuple[int, float, dict[str, Any]]] = []
-
-    def cb(info: BaseInfo, best: BestCriterion, **models: Any) -> None:
-        seen.append((info.epoch, best.value, models))
-
-    criterion = BestCriterion(target="loss", on_best=[cb])
+    """on_best participants get the criterion itself, so they can log or save by its value/step."""
+    recorder = _BestRecorder()
+    criterion = BestCriterion(target="loss", on_best=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
     criterion.on_epoch_end(info, model="the-model")
-    assert seen == [(1, 0.5, {"model": "the-model"})]
+    assert recorder.seen == [(1, 0.5, {"model": "the-model"})]
 
 
 def test_best_criterion_on_best_called_even_without_improvement() -> None:
     """on_best fires whenever the target is present, so consumers can log the best value each epoch."""
-    calls: list[float] = []
-    criterion = BestCriterion(target="loss", on_best=[lambda info, best, **kw: calls.append(best.value)])
+    recorder = _BestRecorder()
+    criterion = BestCriterion(target="loss", on_best=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
@@ -595,18 +668,18 @@ def test_best_criterion_on_best_called_even_without_improvement() -> None:
     info.epoch = 2
     info.history[2] = {"loss": 0.9}
     criterion.on_epoch_end(info)
-    assert calls == [0.5, 0.5]
+    assert [value for _, value, _ in recorder.seen] == [0.5, 0.5]
 
 
 def test_best_criterion_on_best_skipped_when_target_missing() -> None:
     """A criterion that was not produced this epoch must not trigger best-value side effects."""
-    called: list[bool] = []
-    criterion = BestCriterion(target="loss", on_best=[lambda info, best, **kw: called.append(True)])
+    recorder = _BestRecorder()
+    criterion = BestCriterion(target="loss", on_best=[recorder])
     info = BaseInfo()
     info.epoch = 1
     info.history[1] = {}
     criterion.on_epoch_end(info)
-    assert not called
+    assert not recorder.seen
 
 
 def test_best_criterion_routes_through_the_trainer() -> None:
