@@ -260,13 +260,12 @@ def test_learner_behavior_instance_passthrough() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedLearner – MIXED_PRECISION without type raises
+# UserDefinedLearner – gradient scaling is only valid for float16
 # ---------------------------------------------------------------------------
 
 
-def test_user_defined_learner_mixed_precision_type_without_mixed_precision_raises() -> None:
-    """MIXED_PRECISION_TYPE set when MIXED_PRECISION is False raises SpecError."""
-    raw = {
+def _mixed_precision_learner(mixed_precision: Any, mixed_precision_type: str | None) -> dict[str, Any]:
+    return {
         "LEARNERS": [
             {
                 "LOSS": "ce_loss",
@@ -275,11 +274,33 @@ def test_user_defined_learner_mixed_precision_type_without_mixed_precision_raise
                 "FLOW": [["x", "ce_loss"]],
             }
         ],
-        "MIXED_PRECISION": False,
-        "MIXED_PRECISION_TYPE": "bfloat16",
+        "MIXED_PRECISION": mixed_precision,
+        "MIXED_PRECISION_TYPE": mixed_precision_type,
     }
+
+
+def test_user_defined_learner_grad_scaling_with_bfloat16_raises() -> None:
+    """A gradient scaler counteracts float16 underflow; pairing it with bfloat16 is a config bug."""
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedLearner.model_validate(raw)
+        UserDefinedLearner.model_validate(_mixed_precision_learner({"enabled": True}, "bfloat16"))
+
+
+def test_user_defined_learner_grad_scaling_requires_a_type() -> None:
+    """MIXED_PRECISION without any dtype cannot mean float16 scaling implicitly."""
+    with pytest.raises((SpecError, ValidationError)):
+        UserDefinedLearner.model_validate(_mixed_precision_learner(True, None))
+
+
+def test_user_defined_learner_bfloat16_autocast_without_scaler_is_valid() -> None:
+    """bfloat16 autocast alone needs no scaler and must validate."""
+    learner = UserDefinedLearner.model_validate(_mixed_precision_learner(False, "bfloat16"))
+    assert learner.MIXED_PRECISION_TYPE == "bfloat16"
+
+
+def test_user_defined_learner_float16_with_scaler_is_valid() -> None:
+    """float16 with gradient scaling is the supported scaler configuration."""
+    learner = UserDefinedLearner.model_validate(_mixed_precision_learner(True, "float16"))
+    assert learner.MIXED_PRECISION is True
 
 
 # ---------------------------------------------------------------------------

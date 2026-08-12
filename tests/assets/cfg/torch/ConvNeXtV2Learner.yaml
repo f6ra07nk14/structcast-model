@@ -10,6 +10,8 @@ PARAMETERS:
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: null # set to null or a positive integer
     label_smoothing: 0.0
+    use_grad_scaler: false # gradient scaling; only valid with mixed_precision_type float16
+    mixed_precision_type: bfloat16
   SHARED:
     layer_decay: 0.9
   # backbone model parameters
@@ -23,18 +25,13 @@ PARAMETERS:
   large: {depths: [3, 3, 27, 3], group: 3}
   huge: {depths: [3, 3, 27, 3], group: 3}
 IMPORTS: {}
-# "MIXED_PRECISION" can be set to a boolean or a dictionary of keyword arguments for
-# configuring Torch's automatic mixed precision ("torch.amp.GradScaler").
-MIXED_PRECISION:
-  init_scale: "eval: 2.0**16"
-  growth_factor: 2.0
-  backoff_factor: 0.5
-  growth_interval: 2000
-  enabled: True
-MIXED_PRECISION_TYPE: bfloat16
+# "MIXED_PRECISION" enables gradient scaling ("torch.amp.GradScaler"), which only applies to
+# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler.
 # "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
 # specify the number of steps to accumulate gradients before updating parameters.
 _jinja_yaml_: |- 
+  MIXED_PRECISION: {{use_grad_scaler}}
+  MIXED_PRECISION_TYPE: {{mixed_precision_type}}
   {% if accumulate_gradients is none %}
   ACCUMULATE_GRADIENTS: null
   {% else %}

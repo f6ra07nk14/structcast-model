@@ -9,6 +9,9 @@ from tests import ASSETS_DIR
 
 LEARNER_YAML = ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml"
 
+FP16 = {"use_grad_scaler": True, "mixed_precision_type": "float16"}
+"""Parameters selecting the float16 + gradient-scaler configuration."""
+
 
 # ---------------------------------------------------------------------------
 # TorchLearnerBuilder: basic build
@@ -31,9 +34,16 @@ def test_learner_default_models_and_optimizers() -> None:
 
 
 def test_learner_default_mixed_precision_type() -> None:
-    """Default config uses bfloat16 mixed precision."""
+    """Default config uses bfloat16 autocast, which must not construct a gradient scaler."""
     built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     assert built.mixed_precision_type == "bfloat16"
+    assert built.mixed_precision_scales == []
+
+
+def test_learner_float16_builds_a_grad_scaler() -> None:
+    """float16 gradients underflow without scaling, so fp16 configs must build a scaler."""
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16})
+    assert built.mixed_precision_type == "float16"
     assert built.mixed_precision_scales == ["optimizer_grad_scaler"]
 
 
@@ -55,9 +65,23 @@ def test_learner_script_contains_autocast() -> None:
 
 
 def test_learner_script_contains_grad_scaler() -> None:
-    """GradScaler instantiation appears in the generated script."""
+    """fp16 scripts build the scaler through the injectable creator, on the training device."""
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).scripts[0]
+    assert "__grad_scaler_creator__=torch.amp.GradScaler" in script
+    assert "__grad_scaler_creator__(device=device_type" in script
+
+
+def test_learner_bfloat16_script_has_no_grad_scaler() -> None:
+    """bfloat16 shares float32's exponent range: a scaler would be pure overhead."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "torch.amp.GradScaler(" in script
+    assert "GradScaler" not in script
+
+
+def test_learner_script_gates_model_invocations() -> None:
+    """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
+    assert "with sync_gate(model, __need_update__): cls = model(image)" in script
+    assert "model.requires_grad_(True)" in script
 
 
 def test_learner_script_defines_training_and_inference_steps() -> None:
@@ -116,11 +140,13 @@ def test_learner_accumulate_gradients_script_patterns() -> None:
 
 
 def test_learner_clip_grad_norm_in_script() -> None:
-    """Gradient clipping function appears in the script when configured."""
+    """Gradient clipping appears in the script; with fp16 it unscales before clipping."""
     params = {"DEFAULT": {"clip_grad_norm": 2.0}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" in script
-    assert "optimizer_grad_scaler.unscale_(optimizer)" in script
+    assert "unscale_" not in script  # bf16 default has no scaler to unscale
+    fp16_script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": {**FP16, "clip_grad_norm": 2.0}}).scripts[0]
+    assert "optimizer_grad_scaler.unscale_(optimizer)" in fp16_script
 
 
 def test_learner_no_clip_when_null() -> None:
@@ -138,7 +164,7 @@ def test_learner_no_clip_when_null() -> None:
 
 def test_learner_mp_scale_backward_without_accumulation() -> None:
     """Without accumulation the scaler.scale().backward() has no division."""
-    params = {"DEFAULT": {"accumulate_gradients": None}}
+    params = {"DEFAULT": {**FP16, "accumulate_gradients": None}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
     assert "ce_loss = ce_loss /" not in script
@@ -146,7 +172,7 @@ def test_learner_mp_scale_backward_without_accumulation() -> None:
 
 def test_learner_mp_scale_backward_with_accumulation() -> None:
     """With accumulation loss is divided and backward uses scaler."""
-    params = {"DEFAULT": {"accumulate_gradients": 2}}
+    params = {"DEFAULT": {**FP16, "accumulate_gradients": 2}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "ce_loss = ce_loss / 2" in script
     assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
@@ -201,11 +227,13 @@ def test_learner_backbone_variants_compile(backbone: str) -> None:
 
 
 def test_learner_collected_imports_include_torch_and_amp() -> None:
-    """Collected imports include torch and torch.amp for mixed precision."""
-    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
-    imports = built.collected_imports
+    """Collected imports include torch always, the sync gate always, and torch.amp only for fp16."""
+    imports = TorchLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
     assert "torch" in imports
-    assert "torch.amp" in imports
+    assert "sync_gate" in imports["structcast_model.torch.distributed"]
+    assert "torch.amp" not in imports
+    fp16_imports = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).collected_imports
+    assert "torch.amp" in fp16_imports
 
 
 def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Path) -> None:
@@ -232,7 +260,7 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
 
 def test_learner_full_combo_accumulate_clip_mp() -> None:
     """Combine accumulation, clipping, and mixed precision in one build."""
-    params = {"DEFAULT": {"accumulate_gradients": 4, "clip_grad_norm": 2.0, "layer_decay_type": "single"}}
+    params = {"DEFAULT": {**FP16, "accumulate_gradients": 4, "clip_grad_norm": 2.0, "layer_decay_type": "single"}}
     built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params, classname="FullCombo")
     script = built.scripts[0]
     assert built.classname == "FullCombo"

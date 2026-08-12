@@ -688,6 +688,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
+        mixed_precision_type: str | None,
     ) -> tuple[str, str | None]:
         logger.warning(
             "Mixed precision is not implemented in the base learner builder. Returning None for mixed precision."
@@ -772,7 +773,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
 
         learner_flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]] = []
         inference_flow: list[tuple[str, str, str | None]] = []
-        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
+        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION, module.MIXED_PRECISION_TYPE)
         for learner in module.LEARNERS:
             opt_inst, opt_cls = self._get_optimizer(imports, learner.OPTIMIZER, learner.TRAINABLE_LAYERS)
             if (opt_name := learner.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
