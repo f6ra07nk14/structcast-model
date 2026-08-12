@@ -218,22 +218,22 @@ Purpose:
 
 Key runtime behavior:
 
-- `torch.compile` is optional and configured via `-c/--compile`; it is applied to the models and to the learner's step functions.
+- `torch.compile` is optional and configured via `-c/--compile`; it is applied to each model before the distributed strategy wraps it (so the wrapper stays outermost) and to the learner's generated `_flow_*` functions. Whole wrapped models and step closures are never compiled; `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
 - The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
-- Callbacks passed to the trainer (rank 0 only): `ProgressBar` (or `Printer` under `--ci`), the logger, `TrainingStateSaver`, and one `TorchBestCriterion` per `-LC`/`-HC` criterion. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
-- `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`, and a `KeyboardInterrupt` saves the current training state before leaving it.
+- Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`) and the logger on rank 0 only; `TrainingStateSaver` and one `TorchBestCriterion` per `-LC`/`-HC` criterion on every rank, since producing their states is a collective — off rank 0 they carry a `None` logger and write nothing. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
+- `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`. A `KeyboardInterrupt` saves nothing — the recovery point is the `training_state` artifact of the last finished epoch, which `--resume` reads back.
 - `trainer.describe()` is printed before fitting, showing which object handles which event.
 
 Distributed training behavior (when launched through `torchrun`):
 
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
-- All models are wrapped with `DistributedDataParallel`.
+- All models are wrapped by the selected `DistributedStrategy` before the learner is constructed; `--strategy-pattern` chooses it (called with `device` and `local_rank`), defaulting to `DistributedDataParallelStrategy` under `torchrun` and `SingleDeviceStrategy` otherwise. `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) is the sharded alternative.
 - The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank, so the sampler epoch advances on all of them.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
-- Experiment logging, checkpoints, and progress bars are gated to rank 0 only.
-- DDP gradient synchronization is skipped during gradient accumulation steps via `TorchTrainer.no_sync()`.
+- Experiment logging and progress bars are gated to rank 0. Checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
+- Gradient synchronization is gated per model call inside the generated learner: `sync_gate(model, armed)` arms only on the last call of a model owned by the running optimizer segment, on steps that update. This subsumes gradient-accumulation `no_sync`; models a segment does not own are frozen with `requires_grad_(False)` for that segment.
 - CLI options `--dist-backend` and `--dist-url` (also settable via `DIST_BACKEND` / `DIST_URL` env vars) control the distributed backend.
 
 Launch command for distributed training:
@@ -346,9 +346,9 @@ Utility functions:
 Training/evaluation helpers:
 
 - `TorchTracker` — averaging tracker that resets itself on training/validation begin
-- `TorchTrainer` — adds `device`, `sync()`, and `no_sync()` to `BaseTrainer`
+- `TorchTrainer` — adds `device` and `sync()` to `BaseTrainer`; gradient sync is gated inside the generated training step, not by the trainer
 - `TorchBestCriterion`
-- `TrainingStateSaver` — saves models, optimizers, gradient scalers, and loop counters through a logger
+- `TrainingStateSaver` — saves models, optimizers, gradient scalers, and loop counters through a logger, using the strategy's state dict
 
 Loggers (run-owning context managers that also implement `on_epoch_end`):
 
@@ -385,8 +385,8 @@ Utility functions:
 ### Training flow in practice
 
 1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`, which reports the step counts; the trainer scans the provider datasets, so those implementing an event protocol join the loop.
-2. The `train` command instantiates the models on the training device, initializes them with dummy inputs, applies initializers on the main rank, and builds the learner with those models.
-3. Models are DDP-wrapped and compiled where requested.
+2. The `train` command instantiates the models on the training device, initializes them with dummy inputs, and applies initializers on the main rank.
+3. Each model is compiled where requested and then wrapped by the distributed strategy; the learner is built with those wrapped models, and its generated `_flow_*` functions are compiled.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).
 5. `TorchTrainer` is constructed, then the callbacks are assembled from its prefixes: progress reporting, logger, state saver, best criteria.
 6. Every participant is routed into its events on first use, and `fit()` runs inside the logger's run context.
@@ -395,9 +395,9 @@ Utility functions:
 When running under `torchrun`, the flow gains additional distributed steps:
 
 8. Process group is initialized and per-rank device is assigned.
-9. Models are wrapped with `DistributedDataParallel`.
+9. Models are wrapped by the distributed strategy (DDP by default) before the learner is built.
 10. Metrics are synchronized across ranks via `all_reduce`.
-11. Only rank 0 writes experiment logs, checkpoints, and progress output.
+11. Checkpoint states are produced on every rank; only rank 0 writes experiment logs, checkpoints, and progress output.
 12. `destroy_process_group()` is called during cleanup.
 
 ## Pattern Alias Quick Reference
