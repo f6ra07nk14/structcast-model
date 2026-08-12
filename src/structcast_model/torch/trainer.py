@@ -10,15 +10,11 @@ from pydantic import TypeAdapter, ValidationError
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
-from structcast_model.torch.distributed import (
-    DistributedStrategy,
-    get_torch_device,
-    get_torch_device_type,
-    initial_distributed_env,
-)
+from structcast_model.torch.distributed import DistributedStrategy, initial_distributed_env
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.logger import Logger
 from structcast_model.torch.types import Tensor, TensorInitializer
+from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
 

@@ -101,6 +101,8 @@ class TorchLearnerIntermediate(LearnerIntermediate):
 
     def _flow_function(self, name: str, params: list[str], body: list[str], returns: list[str]) -> list[str]:
         """Emit one pure flow function plus the self-assignment that makes it rebindable (compilable)."""
+        if not returns:
+            raise ValueError(f"Flow function {name} produces no value any later code needs; check the learner FLOW.")
         indent = " " * 4
         header = f"def {name}(__need_update__{''.join(f', {p}' for p in params)}):"
         tail = [f"{indent}return {', '.join(returns)}", f"self.{name} = {name}"]
@@ -170,7 +172,15 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         infos = [self._analyze_segment(seg_units) for seg_units, _ in segments]
 
         available = set(self.inputs)
-        defs: list[str] = []
+        # Freezing restores each owned model's construction-time requires_grad states instead of a
+        # blanket True, so submodules the user froze stay frozen across optimizer segments.
+        defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
+        defs: list[str] = [
+            f"_requires_grad_defaults = {{{defaults}}}",
+            "def _restore_requires_grad(module, defaults):",
+            "    for p, d in zip(module.parameters(), defaults):",
+            "        p.requires_grad_(d)",
+        ]
         step: list[str] = []
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
             loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = opt_unit
@@ -188,7 +198,12 @@ class TorchLearnerIntermediate(LearnerIntermediate):
                 function_name, params, self._with_autocast(self._gated_body(info, trainable_layers)), returns
             )
             step += [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
-            step += [f"{m}.requires_grad_({m in trainable_layers})" for m in self.models]
+            step += [
+                f'_restore_requires_grad({m}, _requires_grad_defaults["{m}"])'
+                if m in trainable_layers
+                else f"{m}.requires_grad_(False)"
+                for m in self.models
+            ]
             arguments = "__need_update__" + "".join(f", {p}" for p in params)
             step.append(f"{', '.join(returns)} = self.{function_name}({arguments})")
             if self.accumulate_gradients:

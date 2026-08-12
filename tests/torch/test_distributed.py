@@ -28,23 +28,24 @@ def test_sync_gate_is_a_null_context_for_plain_modules() -> None:
         assert not hasattr(model, "require_backward_grad_sync")
 
 
-def test_sync_gate_disarms_ddp_reducer_until_exit(single_process_gloo: None) -> None:
-    """An unarmed gate must stop DDP from all-reducing the next backward, and restore afterwards."""
+def test_sync_gate_sets_the_ddp_flag_and_leaves_it_for_the_next_gate(single_process_gloo: None) -> None:
+    """The gate sets the sync flag on entry and must NOT restore it on exit.
+
+    FSDP2 reads its flag at backward time, which happens after the gated forward exits; a
+    forward-scoped restore would re-enable gradient sync before any backward ran. The next gate on
+    the same module overwrites the flag instead.
+    """
     ddp = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(2, 2))
     with sync_gate(ddp, armed=False):
         assert ddp.require_backward_grad_sync is False
+    assert ddp.require_backward_grad_sync is False
+    with sync_gate(ddp, armed=True):
+        assert ddp.require_backward_grad_sync is True
     assert ddp.require_backward_grad_sync is True
 
 
-def test_sync_gate_armed_leaves_ddp_untouched(single_process_gloo: None) -> None:
-    """An armed gate must leave the DDP reducer live so the final backward synchronizes."""
-    ddp = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(2, 2))
-    with sync_gate(ddp, armed=True):
-        assert ddp.require_backward_grad_sync is True
-
-
-def test_sync_gate_toggles_fsdp2_gradient_sync(single_process_gloo: None) -> None:
-    """The FSDP2 branch must route through set_requires_gradient_sync and restore it on exit."""
+def test_sync_gate_sets_fsdp2_gradient_sync_without_restoring(single_process_gloo: None) -> None:
+    """The FSDP2 branch must route through set_requires_gradient_sync and leave the flag in place."""
     fsdp = pytest.importorskip("torch.distributed.fsdp")
     model = fsdp.fully_shard(torch.nn.Linear(2, 2))
     calls: list[bool] = []
@@ -57,6 +58,9 @@ def test_sync_gate_toggles_fsdp2_gradient_sync(single_process_gloo: None) -> Non
     model.set_requires_gradient_sync = _recording
     with sync_gate(model, armed=False):
         assert calls == [False]
+    assert calls == [False]
+    with sync_gate(model, armed=True):
+        pass
     assert calls == [False, True]
 
 
@@ -91,11 +95,7 @@ def test_single_device_state_dict_strips_the_compile_wrapper() -> None:
     models = _linear_models()
     compiled = OrderedDict(model=torch.compile(models["model"]))
     states = strategy.state_dict(compiled)
-    assert set(states["models"]["model"]) == {"model.weight", "model.bias"} or set(states["models"]["model"]) == {
-        "weight",
-        "bias",
-    }
-    assert not any(key.startswith("_orig_mod.") for key in states["models"]["model"])
+    assert set(states["models"]["model"]) == {"weight", "bias"}
 
 
 def test_single_device_round_trips_models_and_optimizers() -> None:

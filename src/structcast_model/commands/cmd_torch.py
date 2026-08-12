@@ -456,7 +456,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     strategy_pattern: Any | None = Option(
         None,
-        "--strategy-pattern",
+        "--strategy",
         parser=path_or_any_parser,
         help="Object pattern instantiating a distributed strategy factory; called with device=... and local_rank=.... "
         "Defaults to DistributedDataParallelStrategy when a distributed environment is detected, "

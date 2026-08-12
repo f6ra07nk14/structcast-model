@@ -53,7 +53,7 @@ that produced the criterion.
 **Distributed strategy**:
 The replaceable unit that decides how models are wrapped, gradient-synchronized, weight-initialized across
 ranks, and turned into checkpointable state during distributed training. Exactly one strategy is active per
-training run; single-device training uses a no-op strategy rather than a special case.
+training run.
 _Avoid_: dist_fn, wrapper function, backend
 
 **Training state**:

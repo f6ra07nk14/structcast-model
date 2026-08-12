@@ -423,7 +423,7 @@ Key arguments:
 - `-E/--experiment`: experiment name passed to the logger
 - `-A/--log-artifacts`: files to store as run artifacts
 - `--trainer`: StructCast pattern for a `TorchTrainer` replacement, when the default loop is not enough
-- `--strategy-pattern`: StructCast pattern for the `DistributedStrategy`; it is called with the resolved `device` and `local_rank`. Defaults to `DistributedDataParallelStrategy` when a distributed environment is detected, and `SingleDeviceStrategy` otherwise
+- `--strategy`: StructCast pattern for the `DistributedStrategy`; it is called with the resolved `device` and `local_rank`. Defaults to `DistributedDataParallelStrategy` when a distributed environment is detected, and `SingleDeviceStrategy` otherwise
 - `--resume`: training state to restore before the loop starts — a local path, a `runs:/<run_id>/<artifact>` MLflow URI, or a `wandb://entity/project/run/file` URI. Models, optimizers, and gradient scalers are restored and training continues from the saved epoch (`--start-epoch` is overridden, with a warning)
 
 What the train command does internally:
@@ -450,7 +450,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 
 1. **Process group initialization** — The NCCL backend is initialized via [`torch.distributed.init_process_group`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group).
 2. **Per-rank device assignment** — Each process is assigned to `cuda:<LOCAL_RANK>`.
-3. **Strategy model wrapping** — Every model is wrapped by the selected `DistributedStrategy` before the learner is built. The default in a distributed environment is [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html); `SingleDeviceStrategy` and `FullyShardedDataParallelStrategy` ([FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), requires `torch>=2.6`) are selectable through `--strategy-pattern`.
+3. **Strategy model wrapping** — Every model is wrapped by the selected `DistributedStrategy` before the learner is built. The default in a distributed environment is [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html); `SingleDeviceStrategy` and `FullyShardedDataParallelStrategy` ([FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), requires `torch>=2.6`) are selectable through `--strategy`.
 4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; the trainer scans the provider datasets for event protocols on every rank, so the hook runs everywhere it must.
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — Experiment logging and progress bars run only on rank 0. Checkpoint states are produced on **every** rank, because the strategy's state dict is a collective, and written only by rank 0.

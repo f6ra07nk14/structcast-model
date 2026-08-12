@@ -23,6 +23,7 @@ from structcast.utils.lazy_import import try_import
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 from typing_extensions import Protocol, runtime_checkable
 
+from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 import torch
 
 logger = getLogger(__name__)
@@ -42,25 +43,6 @@ _WRAPPER_PREFIXES = ("module.", "_orig_mod.")
 def _state_dict_api() -> Any:
     """Return the ``torch.distributed.checkpoint.state_dict`` module, or ``None`` on old torch."""
     return _dcp_state_dict if _dcp_imports.is_successful else None
-
-
-def get_torch_device(device: str | None = None) -> str:
-    """Get the device to run the model on."""
-    if device is None:
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if "cpu" in device:
-        return device
-    if "cuda" in device:
-        if torch.cuda.is_available():
-            return device
-        logger.warning("CUDA is not available. Using CPU instead.")
-        return "cpu"
-    raise ValueError(f'Only "cpu" and "cuda" (with optional rank suffix) are supported. Got invalid device: {device}')
-
-
-def get_torch_device_type(device: str | None = None) -> str:
-    """Get the device type (cpu or cuda) from the device string."""
-    return get_torch_device(device).split(":")[0]
 
 
 @overload
@@ -148,32 +130,37 @@ def _strip_wrapper_prefixes(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def sync_gate(module: Any, armed: bool) -> AbstractContextManager[None]:
-    """Return a context gating whether *module*'s next backward participates in gradient sync.
+    """Return a context deciding whether *module*'s next backward participates in gradient sync.
 
     Generated training steps wrap every model invocation in this gate. ``armed`` is computed at
     code-generation time as "the model is owned by the current optimizer segment AND this is its
     last invocation in the segment", multiplied at runtime by the update-step flag, so gradient
     all-reduce (DDP) or reduce-scatter (FSDP2) fires exactly once per update, on the final backward.
     Plain modules get a null context, keeping single-device flow functions fully traceable.
+
+    Entering the gate SETS the wrapper's sync flag and exiting leaves it in place: DDP reads its
+    flag when the forward prepares the reducer, but FSDP2 reads its flag at backward time — a
+    forward-scoped restore would re-enable reduce-scatter before any backward ran. The next gate
+    on the same module overwrites the flag, so no restore is needed.
     """
     if isinstance(module, torch.nn.parallel.DistributedDataParallel):
-        return nullcontext() if armed else module.no_sync()
+        return _SetOnEnter(lambda: setattr(module, "require_backward_grad_sync", armed))
     if _fsdp_imports.is_successful and isinstance(module, FSDPModule):
-        return nullcontext() if armed else _NoGradientSync(module)
+        return _SetOnEnter(lambda: module.set_requires_gradient_sync(armed))
     return nullcontext()
 
 
-class _NoGradientSync:
-    """Context manager disabling FSDP2 gradient reduce-scatter while it is active."""
+class _SetOnEnter(AbstractContextManager[None]):
+    """Context manager applying a wrapper-flag update on entry and leaving it in place on exit."""
 
-    def __init__(self, module: Any) -> None:
-        self._module = module
+    def __init__(self, apply: Callable[[], Any]) -> None:
+        self._apply = apply
 
     def __enter__(self) -> None:
-        self._module.set_requires_gradient_sync(False)
+        self._apply()
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        self._module.set_requires_gradient_sync(True)
+        return None
 
 
 @runtime_checkable
@@ -230,6 +217,17 @@ def _optimizer_container(
     return torch.nn.ModuleDict({n: models[n] for n in names})
 
 
+def _innermost_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Peel DDP and torch.compile wrappers off *module*, in whatever order they were applied."""
+    while True:
+        if isinstance(module, torch.nn.parallel.DistributedDataParallel):
+            module = module.module
+        elif isinstance(inner := getattr(module, "_orig_mod", None), torch.nn.Module):
+            module = inner
+        else:
+            return module
+
+
 class _StateDictMixin:
     """Shared DCP-based state production and loading."""
 
@@ -283,8 +281,10 @@ class _StateDictMixin:
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
         if api is None:
+            # The old-torch fallback saved wrapper-free keys, so it must load into the innermost
+            # module of whatever wrappers the CLI applied.
             for name, module in models.items():
-                module.load_state_dict(model_states[name])
+                _innermost_module(module).load_state_dict(model_states[name])
             for name, optimizer in optimizers.items():
                 optimizer.load_state_dict(optimizer_states[name])
             return state
@@ -378,39 +378,23 @@ class SingleDeviceStrategy(_StateDictMixin):
         """Nothing to synchronize on a single device."""
 
 
-@dataclass(kw_only=True)
-class DistributedDataParallelStrategy(_StateDictMixin):
-    """Strategy wrapping every model in ``DistributedDataParallel``.
+class _MultiRankMixin:
+    """Behavior shared by the strategies that train across ranks.
 
-    ``initial_distributed_env`` is exposed on the class because initializing the process group is
-    the first step of every run trained under this strategy (the CLI calls it before the strategy
-    is instantiated, since the strategy's constructor arguments come from its result).
+    ``initial_distributed_env`` is exposed on the classes because initializing the process group is
+    the first step of every run trained under them (the CLI calls it before the strategy is
+    instantiated, since the strategy's constructor arguments come from its result).
     """
 
     initial_distributed_env = staticmethod(initial_distributed_env)
 
-    device: str
-    """Device this rank trains on."""
-
-    local_rank: int = 0
-    """Local rank used as the single CUDA device id; ignored on CPU."""
-
-    grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
-
     _broadcast_on_load = True
-
-    def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
-        """Wrap every model in DDP. ``device_ids`` must be ``None`` on CPU, where passing one raises."""
-        device_ids = None if "cpu" in self.device else [self.local_rank]
-        return OrderedDict(
-            (n, torch.nn.parallel.DistributedDataParallel(m, device_ids=device_ids)) for n, m in models.items()
-        )
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
         """Broadcast rank 0's parameters and buffers, making rank-0-only initializers authoritative.
 
-        DDP's constructor also broadcasts, but that is a side effect of a later call; this method
-        owns the guarantee explicitly, on plain pre-wrap tensors, uniformly with FSDP2.
+        The broadcast runs on plain pre-wrap tensors, so one implementation serves DDP (whose
+        constructor's own broadcast is a side effect nobody owns) and FSDP2 (which performs none).
         """
         for module in models.values():
             for tensor in chain(module.parameters(), module.buffers()):
@@ -421,7 +405,27 @@ class DistributedDataParallelStrategy(_StateDictMixin):
 
 
 @dataclass(kw_only=True)
-class FullyShardedDataParallelStrategy(_StateDictMixin):
+class DistributedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
+    """Strategy wrapping every model in ``DistributedDataParallel``."""
+
+    device: str
+    """Device this rank trains on."""
+
+    local_rank: int = 0
+    """Local rank used as the single CUDA device id; ignored on CPU."""
+
+    grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
+
+    def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
+        """Wrap every model in DDP. ``device_ids`` must be ``None`` on CPU, where passing one raises."""
+        device_ids = None if "cpu" in self.device else [self.local_rank]
+        return OrderedDict(
+            (n, torch.nn.parallel.DistributedDataParallel(m, device_ids=device_ids)) for n, m in models.items()
+        )
+
+
+@dataclass(kw_only=True)
+class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
     """Strategy sharding every model in place with ``fully_shard`` (FSDP2).
 
     Requires torch >= 2.6. fp16 learners built under this strategy use the plain
@@ -431,8 +435,6 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
     Environment initialization is identical to DDP's — one default process group serves both;
     the FSDP2-specific device mesh is derived from it lazily at wrap time.
     """
-
-    initial_distributed_env = staticmethod(initial_distributed_env)
 
     device: str
     """Device this rank trains on."""
@@ -503,8 +505,6 @@ __all__ = [
     "DistributedStrategy",
     "FullyShardedDataParallelStrategy",
     "SingleDeviceStrategy",
-    "get_torch_device",
-    "get_torch_device_type",
     "initial_distributed_env",
     "sync_gate",
 ]

@@ -98,6 +98,59 @@ def test_sync_gate_defers_ddp_all_reduce_until_armed(tmp_path: pathlib.Path) -> 
     assert torch.equal(rank1["armed"], expected)
 
 
+def _fsdp2_sync_gate_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Run one unarmed and one armed micro-step under fully_shard, reporting the gradient state."""
+    _init(rank, world_size, init_file)
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.weight.zero_()
+        strategy = FullyShardedDataParallelStrategy(device="cpu")
+        wrapped = strategy.wrap(OrderedDict(model=model))["model"]
+        x = torch.tensor([[1.0, 0.0]]) if rank == 0 else torch.tensor([[0.0, 1.0]])
+        target = torch.tensor([[1.0]]) if rank == 0 else torch.tensor([[2.0]])
+
+        with sync_gate(wrapped, False):
+            out = wrapped(x)
+        ((out - target) ** 2).sum().backward()
+        # With sync deferred, no reduce-scatter ran, so the sharded parameter has no gradient yet;
+        # the accumulating gradients live on the unsharded parameters until the armed backward.
+        unarmed_grad_missing = wrapped.weight.grad is None
+
+        with sync_gate(wrapped, True):
+            out = wrapped(x)
+        ((out - target) ** 2).sum().backward()
+        grad = wrapped.weight.grad
+        armed = grad.full_tensor().detach().clone() if hasattr(grad, "full_tensor") else grad.detach().clone()
+
+        _report(result_dir, rank, {"unarmed_grad_missing": unarmed_grad_missing, "armed": armed})
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sync_gate_defers_fsdp2_reduce_scatter_until_armed(tmp_path: pathlib.Path) -> None:
+    """The gate's flag must survive past the forward: FSDP2 reads it at backward time.
+
+    A forward-scoped restore would re-enable reduce-scatter before any backward ran, making the
+    unarmed backward reduce immediately (a sharded gradient would appear after micro-step one) —
+    the bug this test pins.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    rank0, rank1 = _spawn(_fsdp2_sync_gate_worker, tmp_path)
+
+    assert rank0["unarmed_grad_missing"] is True
+    assert rank1["unarmed_grad_missing"] is True
+
+    # Accumulated per-rank gradients are [-4, 0] and [0, -8]; the armed backward reduces the AVG.
+    expected = torch.tensor([[-2.0, -4.0]])
+    assert torch.equal(rank0["armed"], expected)
+    assert torch.equal(rank1["armed"], expected)
+
+
 # ---------------------------------------------------------------------------
 # sync_initial_weights
 # ---------------------------------------------------------------------------

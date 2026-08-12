@@ -229,7 +229,7 @@ Distributed training behavior (when launched through `torchrun`):
 
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
-- All models are wrapped by the selected `DistributedStrategy` before the learner is constructed; `--strategy-pattern` chooses it (called with `device` and `local_rank`), defaulting to `DistributedDataParallelStrategy` under `torchrun` and `SingleDeviceStrategy` otherwise. `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) is the sharded alternative.
+- All models are wrapped by the selected `DistributedStrategy` before the learner is constructed; `--strategy` chooses it (called with `device` and `local_rank`), defaulting to `DistributedDataParallelStrategy` under `torchrun` and `SingleDeviceStrategy` otherwise. `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) is the sharded alternative.
 - The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank, so the sampler epoch advances on all of them.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - Experiment logging and progress bars are gated to rank 0. Checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.

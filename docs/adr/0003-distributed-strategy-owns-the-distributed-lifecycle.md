@@ -43,7 +43,7 @@ reseed point) whose failure mode is silent divergence, undetectable without cros
 
 ## Strategy selection is an object pattern
 
-The CLI takes `--strategy-pattern`, an object pattern like every other configurable in this CLI, and calls
+The CLI takes `--strategy`, an object pattern like every other configurable in this CLI, and calls
 the instantiated factory with the runtime arguments (`device`, `local_rank`). Without a pattern, a detected
 distributed environment defaults to `DistributedDataParallelStrategy` (preserving the existing torchrun UX)
 and a single device to `SingleDeviceStrategy`. FSDP2's wrap-time knobs (`reshard_after_forward`,

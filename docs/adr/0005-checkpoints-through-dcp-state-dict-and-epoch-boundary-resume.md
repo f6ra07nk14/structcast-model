@@ -12,7 +12,10 @@ alike — subsuming `_unwrap_ddp`, which was a no-op on the dispatch path (it re
 insufficient on the interrupt path (it cannot strip `_orig_mod.`). Optimizer state is keyed by parameter
 FQNs, which requires the model↔optimizer pairing that generated learners now expose as
 `optimizer_models`; without the pairing, plain optimizer `state_dict` keys are used with a warning, except
-under FSDP2 where sharded state is unresolvable without FQNs and the strategy fails loud instead. Old torch
+under FSDP2 where sharded state is unresolvable without FQNs and the strategy fails loud instead. Optimizer
+proxies that are not `torch.optim.Optimizer` instances (the example `AdamWWithCosine`) also save and load
+through their own state dicts: DCP rejects the object and would drop the scheduler state the proxy merges in,
+and FSDP2 refuses them outright since a proxy's state cannot represent sharded parameters. Old torch
 without the DCP module falls back to plain state dicts with wrapper prefixes stripped.
 
 ## Produce on every rank, write on rank 0

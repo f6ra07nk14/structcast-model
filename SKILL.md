@@ -189,7 +189,7 @@ What happens:
 
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
-3. The selected `DistributedStrategy` wraps every model before the learner is constructed — `DistributedDataParallelStrategy` by default in a distributed environment, `SingleDeviceStrategy` or `FullyShardedDataParallelStrategy` (FSDP2) via `--strategy-pattern`.
+3. The selected `DistributedStrategy` wraps every model before the learner is constructed — `DistributedDataParallelStrategy` by default in a distributed environment, `SingleDeviceStrategy` or `FullyShardedDataParallelStrategy` (FSDP2) via `--strategy`.
 4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
 6. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.

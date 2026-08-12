@@ -81,7 +81,7 @@ def test_learner_script_gates_model_invocations() -> None:
     """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     assert "with sync_gate(model, __need_update__): cls = model(image)" in script
-    assert "model.requires_grad_(True)" in script
+    assert '_restore_requires_grad(model, _requires_grad_defaults["model"])' in script
 
 
 def test_learner_script_defines_training_and_inference_steps() -> None:
