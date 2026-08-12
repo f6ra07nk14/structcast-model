@@ -1,7 +1,7 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Collection, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Callable, Collection, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from logging import getLogger
 import os
@@ -12,6 +12,7 @@ from timm.utils.distributed import init_distributed_device_so, is_distributed_en
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.torch.distributed import DistributedStrategy
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.logger import Logger
 from structcast_model.torch.types import Tensor, TensorInitializer
@@ -277,29 +278,11 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
         if "cuda" in self.device:
             torch.cuda.synchronize()
 
-    @contextmanager
-    def no_sync(self, __updated__: bool) -> Generator[None, None, None]:
-        """Context manager to disable gradient synchronizations for DistributedDataParallel models when not updating.
-
-        Args:
-            __updated__ (bool): Whether the model is being updated.
-        """
-        if __updated__:
-            yield
-        else:
-            models, old_values = self.learner.models, {}
-            try:
-                for name, model in models.items():
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                        old_values[name] = model.require_backward_grad_sync
-                        model.require_backward_grad_sync = False
-                yield
-            finally:
-                for name, value in old_values.items():
-                    models[name].require_backward_grad_sync = value
-
     def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
         """Perform a training step and update the models.
+
+        Gradient synchronization is gated inside the generated training step, per model invocation,
+        so the trainer runs the step without any surrounding context.
 
         Args:
             __inputs__ (Any): The inputs for the training step.
@@ -308,8 +291,8 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
             tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
                 a dictionary of criteria for tracking.
         """
-        with self.no_sync(updated := self.learner.update(self.step)):
-            return updated, self.learner.training_step(**__inputs__)
+        updated = self.learner.update(self.step)
+        return updated, self.learner.training_step(**__inputs__)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -322,20 +305,22 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
         higher_criteria: Sequence[str],
         lower_criteria: Sequence[str],
         save_criteria: Collection[str],
-        logger: Logger,
+        logger: Logger | None,
+        strategy: DistributedStrategy,
     ) -> list[Self]:
         """Build one monitor per criterion, each logging its best value through *logger*.
 
-        Criteria named in *save_criteria* also save the model states that reached the best value.
+        Criteria named in *save_criteria* also save the model states that reached the best value,
+        produced through *strategy*. *logger* is `None` on the ranks that write nothing.
         """
         monitors: list[Self] = []
         for target in higher_criteria:
             best = cls(target=target, mode="max")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         for target in lower_criteria:
             best = cls(target=target, mode="min")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         return monitors
 
@@ -344,59 +329,58 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
 class _BestLogger:
     """Log the best value of a criterion, and save the models that reached it when asked to."""
 
-    logger: Logger
-    """The logger the best values and model states are written through."""
+    logger: Logger | None
+    """The logger the best values and model states are written through; `None` on non-writing ranks."""
 
     save: bool
     """Whether to also save the model states that reached the best value."""
 
+    strategy: DistributedStrategy
+    """The strategy producing the model states to save."""
+
     def on_best(self, info: BaseInfo, best: BestCriterion[torch.nn.Module], **models: torch.nn.Module) -> None:
         """Log the best value, and save the states of *models* when this epoch reached it."""
         name = f"best_{best.target}"
-        self.logger.log_metric(name, best.value, step=info.epoch)
+        if self.logger is not None:
+            self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
-            self.logger.log_state_dict(_get_state_dict(_unwrap_ddp(models)), name)
-
-
-def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to state dict for all given modules."""
-    return {n: m.state_dict() for n, m in kwargs.items()}
-
-
-def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
-    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
+            # Producing the states is a collective, so every rank must reach it. That the ranks agree
+            # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
+            states = self.strategy.state_dict(dict(models))["models"]
+            if self.logger is not None:
+                self.logger.log_state_dict(states, name)
 
 
 @dataclass(kw_only=True, slots=True)
 class TrainingStateSaver:
     """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
 
-    logger: Logger
-    """The logger the training-state artifacts are written through."""
+    logger: Logger | None
+    """The logger the training-state artifacts are written through; `None` on non-writing ranks."""
+
+    strategy: DistributedStrategy
+    """The strategy producing the model and optimizer states to save."""
 
     def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
-        states: dict[str, Any] = {
-            "models": _get_state_dict(_unwrap_ddp(kwargs)),
-            "optimizers": _get_state_dict(getattr(learner, "optimizers", {})),
-            "grad_scalers": _get_state_dict(getattr(learner, "grad_scalers", {})),
-            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
-        }
-        self.logger.log_state_dict(states, "training_state")
+        # Producing the states is a collective: every rank runs it, only the ranks with a logger write.
+        states = self.strategy.state_dict(
+            dict(kwargs), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
+        )
+        states.setdefault("optimizers", {})
+        states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
+        states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
+        if self.logger is not None:
+            self.logger.log_state_dict(states, "training_state")
 
 
-# `_get_state_dict` and `_unwrap_ddp` are listed because the LazySelectedImporter tail below only
-# exposes the names in `__all__`, and the unit tests import them directly.
 __all__ = [
     "CriteriaTracker",
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
     "TrainingStateSaver",
-    "_get_state_dict",
-    "_unwrap_ddp",
     "autocast_inputs",
     "create_torch_inputs",
     "get_torch_device",

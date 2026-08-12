@@ -9,13 +9,12 @@ import pytest
 from torch.nn import Module
 
 from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
+from structcast_model.torch.distributed import SingleDeviceStrategy
 from structcast_model.torch.trainer import (
     TorchBestCriterion,
     TorchTracker,
     TorchTrainer,
     TrainingStateSaver,
-    _get_state_dict,
-    _unwrap_ddp,
     autocast_inputs,
     create_torch_inputs,
     get_torch_device,
@@ -517,69 +516,6 @@ def test_torch_tracker_from_criteria_auto_detects_non_distributed() -> None:
     assert tracker.distributed is False
 
 
-# --- TorchTrainer.no_sync ---
-
-
-def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: None) -> None:
-    """no_sync(__updated__=False) sets require_backward_grad_sync=False on DDP models."""
-    model = torch.nn.Linear(2, 2)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    trainer = TorchTrainer(
-        device="cpu",
-        learner=_StubLearner(models={"m": ddp_model}),
-        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        data=SimpleDataProvider(training_dataset=[]),
-    )
-    assert ddp_model.require_backward_grad_sync is True
-    with trainer.no_sync(False):
-        assert ddp_model.require_backward_grad_sync is False
-    # restored after exiting
-    assert ddp_model.require_backward_grad_sync is True
-
-
-def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo: None) -> None:
-    """no_sync(__updated__=True) yields without touching DDP grad sync flag."""
-    model = torch.nn.Linear(2, 2)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    trainer = TorchTrainer(
-        device="cpu",
-        learner=_StubLearner(models={"m": ddp_model}),
-        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        data=SimpleDataProvider(training_dataset=[]),
-    )
-    with trainer.no_sync(True):
-        assert ddp_model.require_backward_grad_sync is True
-
-
-def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) -> None:
-    """no_sync restores require_backward_grad_sync even when the body raises."""
-    model = torch.nn.Linear(2, 2)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    trainer = TorchTrainer(
-        device="cpu",
-        learner=_StubLearner(models={"m": ddp_model}),
-        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        data=SimpleDataProvider(training_dataset=[]),
-    )
-    with pytest.raises(RuntimeError, match="boom"):
-        with trainer.no_sync(False):
-            raise RuntimeError("boom")
-    assert ddp_model.require_backward_grad_sync is True
-
-
-def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
-    """no_sync leaves non-DDP models untouched when __updated__=False."""
-    model = torch.nn.Linear(2, 2)
-    trainer = TorchTrainer(
-        device="cpu",
-        learner=_StubLearner(models={"m": model}),
-        tracker=TorchTracker.from_criteria(["loss"]),
-        data=SimpleDataProvider(training_dataset=[]),
-    )
-    with trainer.no_sync(False):
-        assert not hasattr(model, "require_backward_grad_sync")
-
-
 # ---------------------------------------------------------------------------
 # TrainingStateSaver
 # ---------------------------------------------------------------------------
@@ -609,7 +545,7 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     )
     trainer.epoch, trainer.step, trainer.update = 3, 7, 2
     recorder = _RecordingLogger()
-    TrainingStateSaver(logger=recorder).on_epoch_end(trainer, model=model)
+    TrainingStateSaver(logger=recorder, strategy=SingleDeviceStrategy(device="cpu")).on_epoch_end(trainer, model=model)
     states, name = recorder.states[0]
     assert name == "training_state"
     assert "weight" in states["models"]["model"]
@@ -617,33 +553,34 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     assert states["meta"] == {"epoch": 3, "step": 7, "update": 2}
 
 
-# ---------------------------------------------------------------------------
-# _get_state_dict / _unwrap_ddp
-# ---------------------------------------------------------------------------
+class _RecordingStrategy:
+    """A strategy recording that its collective state production ran, returning a recognisable state."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.calls: list[dict[str, Any]] = []
+
+    def state_dict(self, models: Any, optimizers: Any = None, optimizer_models: Any = None) -> dict[str, Any]:
+        """Record the models handed over and return a state no plain `state_dict()` call could produce."""
+        self.calls.append(dict(models))
+        return {"models": {"gathered": True}, "optimizers": {}}
 
 
-def test_get_state_dict_returns_state_dicts() -> None:
-    """_get_state_dict returns a name-to-state_dict mapping."""
+def test_training_state_saver_produces_state_without_a_logger() -> None:
+    """Producing the state is a collective, so a rank that writes nothing must still take part in it.
+
+    Skipping the producer on the non-writing ranks hangs the job under FSDP2.
+    """
     model = torch.nn.Linear(4, 2)
-    result = _get_state_dict({"model": model})
-    assert "model" in result
-    assert "weight" in result["model"]
-    assert "bias" in result["model"]
-
-
-def test_unwrap_ddp_passes_through_non_ddp_models() -> None:
-    """_unwrap_ddp returns non-DDP modules unchanged."""
-    model = torch.nn.Linear(4, 2)
-    result = _unwrap_ddp({"model": model})
-    assert result["model"] is model
-
-
-def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
-    """_unwrap_ddp extracts the .module from DistributedDataParallel models."""
-    model = torch.nn.Linear(4, 2)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-    result = _unwrap_ddp({"model": ddp_model})
-    assert result["model"] is model
+    trainer = TorchTrainer(
+        device="cpu",
+        learner=_StubLearner(models={"model": model}),
+        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
+    )
+    strategy = _RecordingStrategy()
+    TrainingStateSaver(logger=None, strategy=strategy).on_epoch_end(trainer, model=model)
+    assert strategy.calls == [{"model": model}]
 
 
 # ---------------------------------------------------------------------------
@@ -658,19 +595,23 @@ class _BestRecordingLogger:
         """Start with nothing recorded."""
         self.metrics: list[tuple[str, float, int]] = []
         self.states: list[str] = []
+        self.payloads: list[Any] = []
 
     def log_metric(self, name: str, value: float, step: int) -> None:
         """Record a logged best value."""
         self.metrics.append((name, value, step))
 
     def log_state_dict(self, states: Any, name: str) -> None:
-        """Record the name a state dictionary was saved under."""
+        """Record the name a state dictionary was saved under, and the state itself."""
         self.states.append(name)
+        self.payloads.append(states)
 
 
 def test_from_criteria_builds_one_wired_monitor_per_criterion() -> None:
     """The CLI hands its criteria lists straight to this factory, so the modes must map correctly."""
-    monitors = TorchBestCriterion.from_criteria(["acc"], ["loss"], ["acc"], _BestRecordingLogger())
+    monitors = TorchBestCriterion.from_criteria(
+        ["acc"], ["loss"], ["acc"], _BestRecordingLogger(), SingleDeviceStrategy(device="cpu")
+    )
     assert [(monitor.target, monitor.mode) for monitor in monitors] == [("acc", "max"), ("loss", "min")]
     assert all(len(monitor.callbacks) == 1 for monitor in monitors)
 
@@ -678,7 +619,7 @@ def test_from_criteria_builds_one_wired_monitor_per_criterion() -> None:
 def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
     """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
     logger = _BestRecordingLogger()
-    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger)
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger, SingleDeviceStrategy(device="cpu"))
     info = BaseInfo()
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
@@ -691,7 +632,9 @@ def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
 def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: list[str], expected: list[str]) -> None:
     """Weights are only written for criteria the user asked to save, since every save costs disk space."""
     logger = _BestRecordingLogger()
-    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], save_criteria, logger)
+    (monitor,) = TorchBestCriterion.from_criteria(
+        [], ["val_loss"], save_criteria, logger, SingleDeviceStrategy(device="cpu")
+    )
     info = BaseInfo()
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
@@ -702,7 +645,9 @@ def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: lis
 def test_from_criteria_does_not_save_a_stale_best() -> None:
     """A best reached at an earlier step must not overwrite the saved weights of the current models."""
     logger = _BestRecordingLogger()
-    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger)
+    (monitor,) = TorchBestCriterion.from_criteria(
+        [], ["val_loss"], ["val_loss"], logger, SingleDeviceStrategy(device="cpu")
+    )
     info = BaseInfo()
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
@@ -711,3 +656,21 @@ def test_from_criteria_does_not_save_a_stale_best() -> None:
     info.history[2] = {"val_loss": 0.9}
     monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
     assert logger.states == ["best_val_loss"]
+
+
+def test_from_criteria_saves_the_states_the_strategy_produced() -> None:
+    """The saved weights must come from the strategy, which is what makes them wrapper-free and gathered.
+
+    Calling `state_dict()` on the models directly would write shards under FSDP2 and `module.*` keys
+    under DDP, neither of which any loader accepts.
+    """
+    logger = _BestRecordingLogger()
+    strategy = _RecordingStrategy()
+    model = torch.nn.Linear(4, 2)
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger, strategy)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=model)
+    assert strategy.calls == [{"model": model}]
+    assert logger.payloads == [{"gathered": True}]

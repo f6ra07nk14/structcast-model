@@ -2,8 +2,10 @@
 
 from collections import OrderedDict
 from functools import partial
+import inspect
 from pathlib import Path
 import random
+from tempfile import TemporaryDirectory
 from time import time
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,21 +28,31 @@ from structcast_model.commands.utils import (
 
 if TYPE_CHECKING:
     import calflops
+    import mlflow
     import numpy as np
     import ptflops
     from structcast.core import instantiator
+    import wandb
 
     from structcast_model.builders import torch_builder
-    from structcast_model.torch import mlflow_logger, trainer as torch_trainer, wandb_logger
+    from structcast_model.torch import (
+        distributed as torch_distributed,
+        mlflow_logger,
+        trainer as torch_trainer,
+        wandb_logger,
+    )
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     calflops = LazyModuleImporter("calflops")
+    mlflow = LazyModuleImporter("mlflow")
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
+    wandb = LazyModuleImporter("wandb")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
+    torch_distributed = LazyModuleImporter("structcast_model.torch.distributed")
     mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
     wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
@@ -154,6 +166,39 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
     )
+
+
+def _fetch_training_state(reference: str) -> dict[str, Any]:
+    """Load a saved training state from a local path, an MLflow `runs:/` URI, or a `wandb://` reference.
+
+    Args:
+        reference (str): The training state location: a local path, `runs:/<run_id>/<artifact>`, or
+            `wandb://<entity>/<project>/<run_id>/<file>`.
+
+    Returns:
+        dict[str, Any]: The loaded training state.
+
+    Raises:
+        ValueError: If a downloaded MLflow artifact directory holds no state file.
+    """
+    if reference.startswith("runs:/"):
+        path = Path(mlflow.artifacts.download_artifacts(artifact_uri=reference))
+        if path.is_dir():
+            # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
+            states = sorted(path.glob("*.pth"))
+            if not states:
+                raise ValueError(f'No "*.pth" training state found in the downloaded MLflow artifact "{path}".')
+            path = states[0]
+    elif reference.startswith("wandb://"):
+        entity, project, run_id, filename = reference.removeprefix("wandb://").split("/", 3)
+        with TemporaryDirectory() as directory:
+            wandb.Api().run(f"{entity}/{project}/{run_id}").file(filename).download(root=directory, replace=True)
+            # The download is deleted with the temporary directory, so it is read inside the block.
+            return torch.load(Path(directory) / filename, map_location="cpu", weights_only=True)
+    else:
+        path = Path(reference)
+    # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 @app.command(name="time")
@@ -335,6 +380,13 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
     start_epoch: int = Option(1, help="Starting epoch number."),
+    resume: str | None = Option(
+        None,
+        "--resume",
+        help="Training state to resume from: a local path, an MLflow 'runs:/<run_id>/<artifact>' URI, "
+        "or 'wandb://<entity>/<project>/<run_id>/<file>'. "
+        "Restores models, optimizers, grad scalers, and continues from the saved epoch.",
+    ),
     training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
@@ -402,11 +454,19 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     dist_url: str | None = Option(
         None, envvar="DIST_URL", help="URL to use for setting up distributed training. If None, it will use 'env://'."
     ),
+    strategy_pattern: Any | None = Option(
+        None,
+        "--strategy-pattern",
+        parser=path_or_any_parser,
+        help="Object pattern instantiating a distributed strategy factory; called with device=... and local_rank=.... "
+        "Defaults to DistributedDataParallelStrategy when a distributed environment is detected, "
+        "else SingleDeviceStrategy.",
+    ),
 ) -> None:
     """Train a PyTorch model, recording the run to an experiment tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    device, global_rank, _, world_size, distributed = torch_trainer.initial_distributed_env(
+    device, global_rank, local_rank, world_size, distributed = torch_trainer.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
     torch.backends.cudnn.benchmark = True
@@ -414,11 +474,16 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     torch.manual_seed(seed + global_rank)
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
+    if strategy_pattern is not None:
+        strategy = instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
+    elif distributed:
+        strategy = torch_distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
+    else:
+        strategy = torch_distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
     is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
     initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
-    dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
     provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
@@ -434,24 +499,58 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         models = _instantiate_models(model_patterns)
         input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
         torch_trainer.initial_model(models, input_shapes)
-        if is_main:
+        # A resumed run loads its weights below, which would overwrite whatever the initializers and
+        # the initial-weight broadcast produce here.
+        if is_main and resume is None:
             for model_name, model in models.items():
                 if model_name in initializers:
                     model.apply(initializers[model_name])
-        learner = instantiate_object(learner_pattern)(**models)
+        if resume is None:
+            strategy.sync_initial_weights(models)
+        models = OrderedDict((n, compile_fn(m)) for n, m in models.items())
+        models = strategy.wrap(models)
+        factory = instantiate_object(learner_pattern)
+        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
+        # its models as **kwargs would otherwise record the creator as one more model.
+        try:
+            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
+        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
+            takes_scaler_creator = False
+        if takes_scaler_creator:
+            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
+        else:
+            learner = factory(**models)
         learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
         tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
-    models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
-    if hasattr(learner, "forward_training_step"):
-        learner.forward_training_step = compile_fn(learner.forward_training_step)
-    if hasattr(learner, "forward_inference_step"):
-        learner.forward_inference_step = compile_fn(learner.forward_inference_step)
+    # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
+    if hasattr(learner, "flow_functions"):
+        for flow_name in list(learner.flow_functions):
+            setattr(learner, flow_name, compile_fn(getattr(learner, flow_name)))
+    if resume is not None:
+        raw_state = _fetch_training_state(resume) if is_main else None
+        state = strategy.load_state_dict(
+            models, getattr(learner, "optimizers", {}), getattr(learner, "optimizer_models", None), raw_state
+        )
+        for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
+            if state.get("grad_scalers", {}).get(scaler_name):
+                scaler.load_state_dict(state["grad_scalers"][scaler_name])
+        resumed_epoch = state["meta"]["epoch"] + 1
+        if start_epoch != 1 and is_main:
+            print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+        start_epoch = resumed_epoch
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
+    logger = None
     if is_main:
         logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
         logger = logger_type(experiment=experiment)
-        saver = torch_trainer.TrainingStateSaver(logger=logger)
+    # The saver and the best-criterion monitors run collectives, so they are built on every rank;
+    # only rank 0 holds a logger and writes anything. See ADR-0005.
+    saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
+    bests = torch_trainer.TorchBestCriterion.from_criteria(
+        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
+    )
+    if logger is not None:
         trainer.callbacks = [
             Printer()
             if ci
@@ -463,10 +562,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             ),
             logger,
             saver,
-            *torch_trainer.TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger),
+            *bests,
         ]
+    else:
+        trainer.callbacks = [saver, *bests]
     try:
-        if is_main:
+        if logger is not None:
             arguments = {
                 **reduce_dict(log_arguments),
                 "models": model_patterns,
@@ -510,11 +611,7 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 for artifact in log_artifacts or []:
                     logger.log_artifact(str(artifact))
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
-                try:
-                    trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
-                except KeyboardInterrupt:
-                    print("Training interrupted by user. Saving current state.")
-                    saver.on_epoch_end(trainer, **models)
+                trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
         else:
             trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
     finally:

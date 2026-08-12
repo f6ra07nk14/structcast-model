@@ -1,0 +1,4 @@
+# Distributed strategy pattern: DistributedDataParallel (the default when a distributed
+# environment is detected; listed here for explicitness and as a template).
+- _obj_
+- _addr_: structcast_model.torch.distributed.DistributedDataParallelStrategy

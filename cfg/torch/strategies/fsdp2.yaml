@@ -1,0 +1,6 @@
+# Distributed strategy pattern: FSDP2 (fully_shard, torch>=2.6). The pattern is called with
+# device=... and local_rank=...; bind wrap-time knobs here.
+- _obj_
+- _addr_: structcast_model.torch.distributed.FullyShardedDataParallelStrategy
+- _bind_:
+    reshard_after_forward: true
