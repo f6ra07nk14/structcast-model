@@ -25,8 +25,7 @@ class WandbLogger(Logger):
 
     def __post_init__(self) -> None:
         """Fail with an explanatory error when wandb is not installed."""
-        if not _imports.is_successful:
-            _imports.check()
+        _imports.check()
 
     def __enter__(self) -> "WandbLogger":
         """Start a run in the project named after the experiment."""
