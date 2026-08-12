@@ -433,7 +433,7 @@ What the train command does internally:
 3. Builds a `TorchTracker` from the learner's output names, still inside the device scope so its buffers live on the training device.
 4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
-6. Collects the callbacks from the trainer's prefixes: a `ProgressBar` (or a `Printer` under `--ci`) and the logger on rank 0 only, plus a training-state saver and one `TorchBestCriterion` per monitored criterion on every rank — producing their states is a collective, and off rank 0 they hold a `None` logger and write nothing. They join the trainer's events on first use, and the resulting routing is printed.
+6. Collects the callbacks from the trainer's prefixes: a `ProgressBar` (or a `Printer` under `--ci`) and the logger on rank 0 only, plus a training-state saver and one `TorchBestCriterion` per monitored criterion on every rank — producing their states is a collective, and off rank 0 they hold a `NullLogger` and write nothing. They join the trainer's events on first use, and the resulting routing is printed.
 7. Runs `fit()` inside the logger's run context, recording metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints.
 
 #### Distributed Training with `torchrun`

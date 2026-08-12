@@ -173,8 +173,10 @@ class DistributedStrategy(Protocol):
     implementations broadcast plain tensors.
     """
 
-    grad_scaler_creator: Callable[..., Any]
-    """Callable creating gradient scalers for fp16 learners built under this strategy."""
+    @property
+    def grad_scaler_creator(self) -> Callable[..., Any]:
+        """Callable creating gradient scalers for fp16 learners built under this strategy."""
+        ...
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap the models for this strategy and return the wrapped mapping."""

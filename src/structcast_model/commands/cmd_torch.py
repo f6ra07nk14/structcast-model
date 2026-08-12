@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from structcast_model.builders import torch_builder
     from structcast_model.torch import (
         distributed as torch_distributed,
+        logger as torch_logger,
         mlflow_logger,
         trainer as torch_trainer,
         wandb_logger,
@@ -53,6 +54,7 @@ else:
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_distributed = LazyModuleImporter("structcast_model.torch.distributed")
+    torch_logger = LazyModuleImporter("structcast_model.torch.logger")
     mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
     wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
@@ -540,18 +542,20 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         start_epoch = resumed_epoch
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
-    logger = None
     if is_main:
         logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
-        logger = logger_type(experiment=experiment)
+        logger: torch_logger.Logger = logger_type(experiment=experiment)
+    else:
+        logger = torch_logger.NullLogger()
     # The saver and the best-criterion monitors run collectives, so they are built on every rank;
-    # only rank 0 holds a logger and writes anything. See ADR-0005.
+    # only rank 0 holds a real logger and writes anything. See ADR-0005.
     saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
     bests = torch_trainer.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
-    if logger is not None:
-        trainer.callbacks = [
+    display: list[Any] = []
+    if is_main:
+        display.append(
             Printer()
             if ci
             else ProgressBar(
@@ -559,60 +563,55 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 validation_steps=provider.validation_steps,
                 training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
                 validation_criteria=[f"{trainer.validation_prefix}{n}" for n in learner_outputs],
-            ),
-            logger,
-            saver,
-            *bests,
-        ]
-    else:
-        trainer.callbacks = [saver, *bests]
+            )
+        )
+    trainer.callbacks = [*display, logger, saver, *bests]
+    arguments = {
+        **reduce_dict(log_arguments),
+        "models": model_patterns,
+        "parameters": {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()},
+        "initializers": initializer_patterns,
+        "shapes": input_shapes,
+        "device": device,
+        "distributed": distributed,
+        "world_size": world_size,
+        "learner": learner_pattern,
+        "learner_outputs": learner_outputs,
+        "compile": compile_pattern,
+        "trainer": trainer_pattern,
+        "epochs": epochs,
+        "start_epoch": start_epoch,
+        "training_dataset": training_dataset_pattern,
+        "validation_dataset": validation_dataset_pattern,
+        "validation_frequency": validation_frequency,
+        "lower_criteria": lower_criteria,
+        "higher_criteria": higher_criteria,
+        "save_criteria": save_criteria,
+        "seed": seed,
+        "matmul_precision": matmul_precision,
+        "experiment": experiment,
+        "logger": logger_name,
+        "ci": ci,
+    }
     try:
-        if logger is not None:
-            arguments = {
-                **reduce_dict(log_arguments),
-                "models": model_patterns,
-                "parameters": {n: sum(p.numel() for p in m.parameters() if p.requires_grad) for n, m in models.items()},
-                "initializers": initializer_patterns,
-                "shapes": input_shapes,
-                "device": device,
-                "distributed": distributed,
-                "world_size": world_size,
-                "learner": learner_pattern,
-                "learner_outputs": learner_outputs,
-                "compile": compile_pattern,
-                "trainer": trainer_pattern,
-                "epochs": epochs,
-                "start_epoch": start_epoch,
-                "training_dataset": training_dataset_pattern,
-                "validation_dataset": validation_dataset_pattern,
-                "validation_frequency": validation_frequency,
-                "lower_criteria": lower_criteria,
-                "higher_criteria": higher_criteria,
-                "save_criteria": save_criteria,
-                "seed": seed,
-                "matmul_precision": matmul_precision,
-                "experiment": experiment,
-                "logger": logger_name,
-                "ci": ci,
-            }
-            with logger:
-                logger.log_params(
-                    {
-                        "cuda_version": torch.version.cuda,
-                        "torch_version": torch.__version__,
-                        "epochs": epochs,
-                        "steps_per_epoch": provider.steps_per_epoch,
-                        "validation_steps": provider.validation_steps,
-                    }
-                )
-                logger.log_dict(arguments, "arguments.yaml")
-                if hasattr(learner, "param_group_names"):
-                    logger.log_dict(learner.param_group_names, "param_groups.yaml")
-                for artifact in log_artifacts or []:
-                    logger.log_artifact(str(artifact))
+        # One path for every rank: the NullLogger ranks run the same lifecycle and discard it all.
+        with logger:
+            logger.log_params(
+                {
+                    "cuda_version": torch.version.cuda,
+                    "torch_version": torch.__version__,
+                    "epochs": epochs,
+                    "steps_per_epoch": provider.steps_per_epoch,
+                    "validation_steps": provider.validation_steps,
+                }
+            )
+            logger.log_dict(arguments, "arguments.yaml")
+            if hasattr(learner, "param_group_names"):
+                logger.log_dict(learner.param_group_names, "param_groups.yaml")
+            for artifact in log_artifacts or []:
+                logger.log_artifact(str(artifact))
+            if is_main:
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
-                trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
-        else:
             trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
     finally:
         if distributed:

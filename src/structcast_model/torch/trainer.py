@@ -221,13 +221,13 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
         higher_criteria: Sequence[str],
         lower_criteria: Sequence[str],
         save_criteria: Collection[str],
-        logger: Logger | None,
+        logger: Logger,
         strategy: DistributedStrategy,
     ) -> list[Self]:
         """Build one monitor per criterion, each logging its best value through *logger*.
 
         Criteria named in *save_criteria* also save the model states that reached the best value,
-        produced through *strategy*. *logger* is `None` on the ranks that write nothing.
+        produced through *strategy*. Ranks that write nothing pass a :class:`NullLogger`.
         """
         monitors: list[Self] = []
         for target in higher_criteria:
@@ -245,8 +245,8 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
 class _BestLogger:
     """Log the best value of a criterion, and save the models that reached it when asked to."""
 
-    logger: Logger | None
-    """The logger the best values and model states are written through; `None` on non-writing ranks."""
+    logger: Logger
+    """The logger the best values and model states are written through; a NullLogger on non-writing ranks."""
 
     save: bool
     """Whether to also save the model states that reached the best value."""
@@ -257,22 +257,19 @@ class _BestLogger:
     def on_best(self, info: BaseInfo, best: BestCriterion[torch.nn.Module], **models: torch.nn.Module) -> None:
         """Log the best value, and save the states of *models* when this epoch reached it."""
         name = f"best_{best.target}"
-        if self.logger is not None:
-            self.logger.log_metric(name, best.value, step=info.epoch)
+        self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
             # Producing the states is a collective, so every rank must reach it. That the ranks agree
             # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
-            states = self.strategy.state_dict(dict(models))["models"]
-            if self.logger is not None:
-                self.logger.log_state_dict(states, name)
+            self.logger.log_state_dict(self.strategy.state_dict(dict(models))["models"], name)
 
 
 @dataclass(kw_only=True, slots=True)
 class TrainingStateSaver:
     """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
 
-    logger: Logger | None
-    """The logger the training-state artifacts are written through; `None` on non-writing ranks."""
+    logger: Logger
+    """The logger the training-state artifacts are written through; a NullLogger on non-writing ranks."""
 
     strategy: DistributedStrategy
     """The strategy producing the model and optimizer states to save."""
@@ -280,15 +277,14 @@ class TrainingStateSaver:
     def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
-        # Producing the states is a collective: every rank runs it, only the ranks with a logger write.
+        # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
         states = self.strategy.state_dict(
             dict(kwargs), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
         )
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
         states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
-        if self.logger is not None:
-            self.logger.log_state_dict(states, "training_state")
+        self.logger.log_state_dict(states, "training_state")
 
 
 __all__ = [

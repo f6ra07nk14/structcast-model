@@ -221,7 +221,7 @@ Key runtime behavior:
 - `torch.compile` is optional and configured via `-c/--compile`; it is applied to each model before the distributed strategy wraps it (so the wrapper stays outermost) and to the learner's generated `_flow_*` functions. Whole wrapped models and step closures are never compiled; `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
 - The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
-- Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`) and the logger on rank 0 only; `TrainingStateSaver` and one `TorchBestCriterion` per `-LC`/`-HC` criterion on every rank, since producing their states is a collective — off rank 0 they carry a `None` logger and write nothing. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
+- Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`) and the logger on rank 0 only; `TrainingStateSaver` and one `TorchBestCriterion` per `-LC`/`-HC` criterion on every rank, since producing their states is a collective — off rank 0 they carry a `NullLogger` and write nothing. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
 - `--logger mlflow|wandb` selects the backend; the logger is entered as a context manager around `fit()`. A `KeyboardInterrupt` saves nothing — the recovery point is the `training_state` artifact of the last finished epoch, which `--resume` reads back.
 - `trainer.describe()` is printed before fitting, showing which object handles which event.
 

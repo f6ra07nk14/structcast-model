@@ -10,6 +10,7 @@ from torch.nn import Module
 
 from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
 from structcast_model.torch.distributed import SingleDeviceStrategy
+from structcast_model.torch.logger import NullLogger
 from structcast_model.torch.trainer import (
     TorchBestCriterion,
     TorchTracker,
@@ -521,7 +522,7 @@ def test_torch_tracker_from_criteria_auto_detects_non_distributed() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _RecordingLogger:
+class _RecordingLogger(NullLogger):
     """Logger recording only the state dictionaries, which is all the saver produces."""
 
     def __init__(self) -> None:
@@ -553,11 +554,12 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     assert states["meta"] == {"epoch": 3, "step": 7, "update": 2}
 
 
-class _RecordingStrategy:
+class _RecordingStrategy(SingleDeviceStrategy):
     """A strategy recording that its collective state production ran, returning a recognisable state."""
 
     def __init__(self) -> None:
         """Start with nothing recorded."""
+        super().__init__(device="cpu")
         self.calls: list[dict[str, Any]] = []
 
     def state_dict(self, models: Any, optimizers: Any = None, optimizer_models: Any = None) -> dict[str, Any]:
@@ -566,10 +568,10 @@ class _RecordingStrategy:
         return {"models": {"gathered": True}, "optimizers": {}}
 
 
-def test_training_state_saver_produces_state_without_a_logger() -> None:
+def test_training_state_saver_produces_state_on_null_logger_ranks() -> None:
     """Producing the state is a collective, so a rank that writes nothing must still take part in it.
 
-    Skipping the producer on the non-writing ranks hangs the job under FSDP2.
+    Skipping the producer on the null-logger ranks hangs the job under FSDP2.
     """
     model = torch.nn.Linear(4, 2)
     trainer = TorchTrainer(
@@ -579,7 +581,7 @@ def test_training_state_saver_produces_state_without_a_logger() -> None:
         data=SimpleDataProvider(training_dataset=[]),
     )
     strategy = _RecordingStrategy()
-    TrainingStateSaver(logger=None, strategy=strategy).on_epoch_end(trainer, model=model)
+    TrainingStateSaver(logger=NullLogger(), strategy=strategy).on_epoch_end(trainer, model=model)
     assert strategy.calls == [{"model": model}]
 
 
@@ -588,7 +590,7 @@ def test_training_state_saver_produces_state_without_a_logger() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _BestRecordingLogger:
+class _BestRecordingLogger(NullLogger):
     """Logger recording the metrics and state-dict names the best monitors produce."""
 
     def __init__(self) -> None:
