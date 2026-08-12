@@ -215,3 +215,9 @@ __marimo__/
 # Machine-local Claude Code settings (permission mode, approvals), written by
 # .devcontainer/post-create.sh -- not meant to be tracked in git.
 .claude/settings.local.json
+
+# Rewritten by the Dev Containers extension / devcontainer CLI on every build
+# whenever devcontainer.json declares features. There is no project-level way
+# to turn this off: the only switches are the CLI's --no-lockfile flag and the
+# application-scoped "dev.containers.lockfile" VS Code user setting.
+.devcontainer/devcontainer-lock.json

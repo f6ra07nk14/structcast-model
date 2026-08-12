@@ -37,43 +37,6 @@ alias codex-safe='command codex --sandbox workspace-write --ask-for-approval on-
 EOF
 fi
 
-if ! grep -q 'export NVM_DIR="$HOME/.nvm"' "$HOME/.bashrc"; then
-  cat >> "$HOME/.bashrc" <<'EOF'
-
-# Load nvm installed in the devcontainer image.
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
-EOF
-fi
-
-if [ -s "$HOME/.nvm/nvm.sh" ]; then
-  export NVM_DIR="$HOME/.nvm"
-  . "$NVM_DIR/nvm.sh"
-
-  NODE_VERSION="${NODE_VERSION:-20}"
-  if [ -f ".nvmrc" ]; then
-    NODE_VERSION="$(tr -d '[:space:]' < .nvmrc)"
-  fi
-
-  nvm install "$NODE_VERSION"
-  nvm alias default "$NODE_VERSION"
-  nvm use default >/dev/null
-  corepack enable
-
-  # Non-interactive shells do not load the .bashrc nvm block, so expose the
-  # active nvm tools through a directory already present in the image PATH.
-  # claude is deliberately absent: the native installer already puts its
-  # launcher in ~/.local/bin, so relinking it here would point the symlink at
-  # itself and break the command.
-  for tool in node npm npx corepack; do
-    tool_path="$(command -v "$tool" || true)"
-    if [ -n "$tool_path" ]; then
-      ln -sfn "$tool_path" "$HOME/.local/bin/$tool"
-    fi
-  done
-fi
-
 if ! codex --version >/dev/null 2>&1; then
   echo "Codex CLI is not runnable. Rebuild the devcontainer image to reinstall it." >&2
   exit 1
@@ -143,7 +106,6 @@ fi
 if ! command -v claude >/dev/null 2>&1; then
   echo "Claude CLI not found. Skipping Claude plugin setup."
 else
-  CLAUDE_PLUGINS="$(claude plugin list 2>/dev/null || true)"
   claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail
 fi
 

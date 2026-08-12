@@ -1,21 +1,33 @@
 {
-    "name": "codex-cli-devcontainer",
+    "name": "${localWorkspaceFolderBasename}-devcontainer",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".",
         "args": {
-            "UV_VERSION": "latest",
-            "NVM_VERSION": "v0.40.5",
-            "NODE_VERSION": "20"
+            "UV_VERSION": "latest"
         }
     },
     "remoteUser": "vscode",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
     "features": {
-        "ghcr.io/devcontainers/features/github-cli:1": {}
+        // docker-outside-of-docker declares its own bind mount of the host
+        // /var/run/docker.sock to /var/run/docker-host.sock and installs an
+        // entrypoint that socat-proxies it back to /var/run/docker.sock owned
+        // by remoteUser. Do not add a manual /var/run/docker.sock mount below:
+        // it would occupy the path that proxy has to create.
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:latest": {},
+        "ghcr.io/devcontainers/features/git:latest": {},
+        "ghcr.io/devcontainers/features/git-lfs:latest": {},
+        "ghcr.io/devcontainers/features/github-cli:latest": {},
+        "ghcr.io/devcontainers/features/node:latest": {
+            "version": "20"
+        }
     },
     "initializeCommand": "bash -lc 'mkdir -p \"$HOME/.codex\" \"$HOME/.claude\" && if [ ! -e \"$HOME/.claude.json\" ]; then printf \"{}\\n\" > \"$HOME/.claude.json\" && chmod 600 \"$HOME/.claude.json\"; fi'",
     "runArgs": [
+        // GPUs for this container itself. Sibling containers started through
+        // the forwarded Docker socket are created by the host daemon, so they
+        // get GPUs from the host nvidia runtime via their own --gpus flag.
         "--gpus=all",
         "--cap-add=SYS_ADMIN",
         "--cap-add=SYS_CHROOT",
@@ -29,15 +41,9 @@
         "UV_LINK_MODE": "copy",
         "CODEX_HOME": "/home/vscode/.codex",
         "CLAUDE_HOME": "/home/vscode/.claude",
-        "NVM_DIR": "/home/vscode/.nvm",
-        "NODE_VERSION": "20",
         "TERM": "xterm-256color"
     },
-    // "remoteEnv": {
-    //     "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}"
-    // },
     "mounts": [
-        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
         "source=uv-cache,target=/home/vscode/.cache/uv,type=volume",
         // Bind-mount Codex state so auth, config, and session history are
         // shared between the host and this devcontainer. The Codex binary
@@ -56,7 +62,6 @@
         "source=commandhistory,target=/commandhistory,type=volume"
     ],
     "postCreateCommand": "bash .devcontainer/post-create.sh",
-    "postStartCommand": "bash .devcontainer/post-start.sh",
     "customizations": {
         "vscode": {
             "settings": {
