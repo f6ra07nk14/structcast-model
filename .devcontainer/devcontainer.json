@@ -11,6 +11,9 @@
     },
     "remoteUser": "vscode",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "features": {
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
     "initializeCommand": "bash -lc 'mkdir -p \"$HOME/.codex\" \"$HOME/.claude\" && if [ ! -e \"$HOME/.claude.json\" ]; then printf \"{}\\n\" > \"$HOME/.claude.json\" && chmod 600 \"$HOME/.claude.json\"; fi'",
     "runArgs": [
         "--gpus=all",

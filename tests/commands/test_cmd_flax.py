@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from structcast.utils.security import configure_security
 from typer import Typer
 from typer.testing import CliRunner
 
@@ -56,7 +55,6 @@ def test_time_help_exits_zero(cli_runner: CliRunner) -> None:
 
 def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' generates a script from a simple Linear config."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -67,7 +65,6 @@ def test_create_model_linear(tmp_path: Any, cli_runner: CliRunner) -> None:
 
 def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --classname' honours the custom class name."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
     out = str(tmp_path / "net.py")
     result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--classname", "MyLinear", "--output", out])
     assert result.exit_code == 0, result.output
@@ -76,7 +73,6 @@ def test_create_model_linear_classname(tmp_path: Any, cli_runner: CliRunner) -> 
 
 def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model --no-structured-output' does not return a dict."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", LINEAR_CFG, "--no-structured-output", "--output", out])
     assert result.exit_code == 0, result.output
@@ -86,7 +82,6 @@ def test_create_model_no_structured_output(tmp_path: Any, cli_runner: CliRunner)
 
 def test_create_model_convnextv2(tmp_path: Any, cli_runner: CliRunner) -> None:
     """'create model' generates a script from the ConvNeXtV2 config."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
     assert result.exit_code == 0, result.output
@@ -100,7 +95,6 @@ def test_create_model_convnextv2(tmp_path: Any, cli_runner: CliRunner) -> None:
 
 def test_time_linear(cli_runner: CliRunner) -> None:
     """'time' measures inference on a simple flax Linear layer."""
-    configure_security(allowed_modules_check=False, blocked_modules_check=False)
     pattern = (
         "[_obj_, {_addr_: flax.nnx.Linear},"
         " {_call_: {in_features: 4, out_features: 2,"

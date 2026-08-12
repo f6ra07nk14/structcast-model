@@ -12,17 +12,19 @@
       - [`FLOW` and `INFERENCE_FLOW`](#flow-and-inference_flow)
       - [`FLOW` Entry Format](#flow-entry-format)
       - [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)
-    - [Backward Template Schema](#backward-template-schema)
-      - [`BACKWARDS`](#backwards)
-      - [`BACKWARDS` Entry Keys](#backwards-entry-keys)
+    - [Learner Template Schema](#learner-template-schema)
+      - [`LEARNERS`](#learners)
+      - [`LEARNERS` Entry Keys](#learners-entry-keys)
   - [API Reference: `base_trainer.py`](#api-reference-base_trainerpy)
     - [Utility functions](#utility-functions)
     - [Protocols](#protocols)
+    - [Event protocols](#event-protocols)
     - [State and callbacks](#state-and-callbacks)
     - [Core classes](#core-classes)
   - [API Reference: `trainer.py`](#api-reference-trainerpy)
     - [Utility functions](#utility-functions-1)
     - [Tracking and orchestration](#tracking-and-orchestration)
+    - [Loggers](#loggers)
     - [timm integrations](#timm-integrations)
 
 ---
@@ -189,14 +191,14 @@ FLOW:
 **`NAME`** — `NAME` appears in two contexts:
 
 1. **As the third element of a `FLOW` entry** — sets the Python attribute name of the generated submodule (e.g., `"block0"`, `"head"`). Must be a valid Python identifier.
-2. **As a key in a `BACKWARDS` entry** — sets the generated attribute name for that backward pass and its optimizer.
+2. **As a key in a `LEARNERS` entry** — sets the generated attribute name for that entry's optimizer.
 
 ```yaml
 # In FLOW:
 - [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40}}}]
 
-# In BACKWARDS:
-BACKWARDS:
+# In LEARNERS:
+LEARNERS:
   - NAME: optimizer
     LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
@@ -237,20 +239,20 @@ These three keys form the `UserLayer` dict that activates a named sublayer:
 
 ---
 
-### Backward Template Schema
+### Learner Template Schema
 
-The following keys appear in backward configuration files such as [`cfg/torch/backwards/ConvNeXtV2.yaml`](cfg/torch/backwards/ConvNeXtV2.yaml) and [`cfg/torch/backwards/CycleGAN.yaml`](cfg/torch/backwards/CycleGAN.yaml).
+The following keys appear in learner configuration files such as [`cfg/torch/learners/ConvNeXtV2.yaml`](cfg/torch/learners/ConvNeXtV2.yaml) and [`cfg/torch/learners/CycleGAN.yaml`](cfg/torch/learners/CycleGAN.yaml). `scm torch create learner` turns them into a class implementing the `Learner` protocol.
 
-**`IMPORTS`** — Same format as in the model schema. Injects additional Python imports into the generated backward file.
+**`IMPORTS`** — Same format as in the model schema. Injects additional Python imports into the generated learner file.
 
 ```yaml
 IMPORTS: {}
 ```
 
-**`INPUTS` and `OUTPUTS`** — `INPUTS` lists the tensor names the generated backward class expects as keyword arguments during training and inference. `OUTPUTS` lists the tensor names produced by the backward flow. Both default to `[]`, which instructs the code generator to infer them automatically from the `BACKWARDS` entries' `FLOW` definitions.
+**`INPUTS` and `OUTPUTS`** — `INPUTS` lists the tensor names the generated learner expects as keyword arguments during training and inference. `OUTPUTS` lists the criterion names produced by the flow; they become the learner's `outputs` attribute, which `scm torch train` reads to build the tracker. Both default to `[]`, which instructs the code generator to infer them automatically from the `LEARNERS` entries' `FLOW` definitions.
 
 ```yaml
-INPUTS: []                # auto-inferred from BACKWARDS[*].FLOW
+INPUTS: []                # auto-inferred from LEARNERS[*].FLOW
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
@@ -271,28 +273,28 @@ MIXED_PRECISION:
   enabled: True
 ```
 
-**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Has no effect when `MIXED_PRECISION` is `false`.
+**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Must be omitted when `MIXED_PRECISION` is `false`; setting both raises a `SpecError` at build time.
 
 ```yaml
 MIXED_PRECISION_TYPE: bfloat16
 ```
 
-**`ACCUMULATE_GRADIENTS`** — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches.
+**`ACCUMULATE_GRADIENTS`** — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches, and the generated `update(step)` returns `True` only on those steps — which is what makes the trainer fire `on_update` once per update rather than once per step.
 
 ```yaml
 ACCUMULATE_GRADIENTS: null   # disabled
 ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
 ```
 
-#### `BACKWARDS`
+#### `LEARNERS`
 
-An ordered list of `BackwardBehavior` entries. Each entry defines one backward pass — i.e., one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
+An ordered list of `LearnerBehavior` entries. Each entry defines one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
 
-During code generation, each entry's trainable layers are automatically set to training mode before its flow executes, and set back to eval mode after the optimizer step.
+During code generation, a mode preset runs before each entry's flow segment: the entry's trainable layers are set to training mode and every other model to eval mode. Nothing restores modes after the optimizer step — a later entry's preset (or nothing, for the last entry) is what changes them next.
 
 ```yaml
 # Single-optimizer example (classification)
-BACKWARDS:
+LEARNERS:
   - NAME: optimizer
     LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
@@ -307,7 +309,7 @@ BACKWARDS:
       - [{target: label, input: cls}, ce_loss, cross_entropy_loss]
 
 # Multi-optimizer example (GAN)
-BACKWARDS:
+LEARNERS:
   - NAME: optimizer_G
     LOSS: loss_G
     TRAINABLE_LAYERS: [G_AB, G_BA]
@@ -326,45 +328,47 @@ BACKWARDS:
     FLOW: [...]          # discriminator B forward + loss computation
 ```
 
-**`LOSSES` and `TRAINABLE_LAYERS`** — Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `BACKWARDS` entries.
+**`LOSSES` and `TRAINABLE_LAYERS`** — Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `LEARNERS` entries.
 
-- **`LOSSES`** (`list[str]`): Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`.
-- **`TRAINABLE_LAYERS`** (`list[str]`): Explicit list of trainable model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].TRAINABLE_LAYERS` when left as `[]`.
+- **`LOSSES`** (`list[str]`): Explicit list of loss key names that the generated learner tracks. Auto-inferred from `LEARNERS[*].LOSS` when left as `[]`.
+- **`TRAINABLE_LAYERS`** (`list[str]`): Explicit list of trainable model names the generated learner expects as constructor arguments. Auto-inferred from `LEARNERS[*].TRAINABLE_LAYERS` when left as `[]`.
 
 ```yaml
 LOSSES: []           # auto-inferred
 TRAINABLE_LAYERS: [] # auto-inferred
 ```
 
-#### `BACKWARDS` Entry Keys
+#### `LEARNERS` Entry Keys
 
-Each entry in `BACKWARDS` is a `BackwardBehavior` with the following fields:
+Each entry in `LEARNERS` is a `LearnerBehavior` with the following fields:
 
-- **`NAME`** (`str`): Optional identifier for this backward pass. Used as the generated attribute name for the optimizer. Must be a valid Python identifier.
-- **`LOSS`** (`str`): The loss key (produced by the `FLOW`) that this backward pass differentiates.
-- **`TRAINABLE_LAYERS`** (`list[str]`): Model names whose parameters this optimizer manages. Each value must match a model passed to the backward class constructor.
-- **`FLOW`** (`list`): Training-time execution graph for this backward entry. Uses the same entry format as model `FLOW` (see [`FLOW` Entry Format](#flow-entry-format)), plus support for `"eval: ..."` expressions and inline layer instantiation via StructCast patterns.
+- **`NAME`** (`str`): Optional identifier for this entry. Used as the generated attribute name for the optimizer, and as its key in the learner's `optimizers` property. Must be a valid Python identifier.
+- **`LOSS`** (`str`): The loss key (produced by the `FLOW`) that this entry differentiates.
+- **`TRAINABLE_LAYERS`** (`list[str]`): Model names whose parameters this optimizer manages. Each value must match a model passed to the learner constructor.
+- **`FLOW`** (`list`): Training-time execution graph for this entry. Uses the same entry format as model `FLOW` (see [`FLOW` Entry Format](#flow-entry-format)), plus support for `"eval: ..."` expressions and inline layer instantiation via StructCast patterns.
 - **`INFERENCE_FLOW`** (`list`): Optional inference-time execution graph. When absent, `FLOW` is used for inference as well.
-- **`OPTIMIZER`** (StructCast pattern): A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`.
+- **`OPTIMIZER`** (StructCast pattern): A StructCast `ObjectPattern` that constructs the optimizer, called with the named parameters of `TRAINABLE_LAYERS`. It may address `structcast_model.torch.optimizers.create_opt` directly, or an optimizer + scheduler composition loaded from a file with `_file_` — see [`examples/torch/optimizers.py`](examples/torch/optimizers.py). Such a composition implements the event protocols itself, so the trainer steps its schedule when it scans the learner's `optimizers`.
 - **`CLIP`** (StructCast pattern or `null`): Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `TRAINABLE_LAYERS`. Set to `null` to disable gradient clipping.
-- **`EXTRA`** (`dict`): Extra keyword arguments forwarded to the backward/optimizer logic. Default is `{}`.
+- **`EXTRA`** (`dict`): Extra keyword arguments forwarded to the optimizer or the update logic in general. Default is `{}`.
 
 ```yaml
-BACKWARDS:
+LEARNERS:
   - NAME: optimizer
     LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: AdamWWithCosine
+        _file_: examples/torch/optimizers.py
       - _bind_:
           optimizer_kwargs:
             opt: adamw
             lr: 4.0e-3
             weight_decay: 0.001
           scheduler_kwargs:
-            name: cosine
+            sched: cosine
             num_epochs: 300
+            criterion: ce_loss
     CLIP:
       - _obj_
       - _addr_: timm.utils.clip_grad.dispatch_clip_grad
@@ -382,7 +386,7 @@ BACKWARDS:
 
 ## API Reference: `base_trainer.py`
 
-[`src/structcast_model/base_trainer.py`](src/structcast_model/base_trainer.py) provides the framework-agnostic training loop, state management, and callback system. Concrete trainers such as `TorchTrainer` build on top of these abstractions.
+[`src/structcast_model/base_trainer.py`](src/structcast_model/base_trainer.py) provides the framework-agnostic training loop, state management, and the protocol-routed callback system. Concrete trainers such as `TorchTrainer` build on top of these abstractions.
 
 ### Utility functions
 
@@ -390,15 +394,35 @@ BACKWARDS:
 
 **`get_dataset_size(dataset)`** — Returns the number of batches. Uses `__len__` when available, otherwise iterates to count.
 
-**`invoke_callback(callbacks, info, *args, **models)`** — Iterates over a callback list and calls each entry with `info` and keyword model arguments.
-
 ### Protocols
 
-**`Forward`** — Called once per batch during training or validation. Accepts an `inputs` dictionary and keyword model arguments; returns a `dict[str, Any]` of named outputs and criteria.
+**`Learner`** — The object that owns the models and defines how they learn. Members:
 
-**`Backward`** — Called once per training step. Receives the step index and criterion keyword arguments; returns `True` when the optimizer has stepped, `False` when gradients are being accumulated.
+- `models` (property) — `dict[str, Any]` of the models to train; the trainer passes them to every event as keyword arguments.
+- `update(step) -> bool` — whether the given training step applied the optimizers. `False` means gradients are still accumulating.
+- `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
+- `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
 
-**`Callback` and `BestCallback`** — Lifecycle hooks called with `(info: BaseInfo, **models)`. `BestCallback` additionally receives `target: str` and `best: float` arguments.
+Two required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer) and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
+
+**`DataProvider`** — Supplies the datasets of a whole run and their step counts: a `training_dataset` property, a `validation_dataset` property that may be `None` to skip validation, and `steps_per_epoch` / `validation_steps` properties (`validation_steps` is `0` without a validation dataset). Each dataset may be a dataset or a zero-argument callable returning one, and the dataset properties must return the same object on every read: the trainer reads them for the event-protocol scan and again in `fit()`. Both datasets are scanned against every event protocol, so a validation dataset implementing training-phase hooks receives those events too — guard on the split inside the hook, as `TimmDataLoaderWrapper` does.
+
+**`OnBest`** — Protocol for the participants of `BestCriterion.on_best`, mirroring how the trainer routes events: an object with an `on_best(info: BaseInfo, best: BestCriterion, **models)` method.
+
+### Event protocols
+
+`EVENTS` lists the eleven lifecycle events, and `EVENT_PROTOCOLS` maps each event name to the `runtime_checkable` protocol an object must implement to receive it:
+
+| Event                                              | Protocol                                        | Fired                                        |
+| -------------------------------------------------- | ----------------------------------------------- | -------------------------------------------- |
+| `on_update`                                        | `OnUpdate`                                      | after a step in which the learner updated     |
+| `on_training_begin` / `on_training_end`            | `OnTrainingBegin` / `OnTrainingEnd`             | around the training pass of an epoch          |
+| `on_training_step_begin` / `on_training_step_end`  | `OnTrainingStepBegin` / `OnTrainingStepEnd`     | around each training step                     |
+| `on_validation_begin` / `on_validation_end`        | `OnValidationBegin` / `OnValidationEnd`         | around the validation pass                    |
+| `on_validation_step_begin` / `on_validation_step_end` | `OnValidationStepBegin` / `OnValidationStepEnd` | around each validation step                |
+| `on_epoch_begin` / `on_epoch_end`                  | `OnEpochBegin` / `OnEpochEnd`                   | around a whole epoch, validation included     |
+
+Every handler has the signature `(info: BaseInfo, **models) -> None`, where `info` is the trainer itself. An object joins an event by defining the matching method — there is no registration call and no global registry. Because the protocols are `runtime_checkable`, only the method name is checked, not its signature.
 
 ### State and callbacks
 
@@ -410,61 +434,57 @@ BACKWARDS:
 - `history` — per-epoch log dictionaries
 - `logs(epoch=None)` — returns the log dict for the current (or given) epoch
 
-**`Callbacks`** — Dataclass holding callback lists for each lifecycle hook:
+**`SimpleDataProvider`** — Dataclass implementing `DataProvider` over an already-built training dataset and an optional validation dataset.
 
-- `on_update` — after each optimizer update
-- `on_training_begin` / `on_training_end`
-- `on_training_step_begin` / `on_training_step_end`
-- `on_validation_begin` / `on_validation_end`
-- `on_validation_step_begin` / `on_validation_step_end`
-- `on_epoch_begin` / `on_epoch_end`
+```python
+provider = SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader)
+```
 
-When `add_global_callbacks=True` (the default), entries from `GLOBAL_CALLBACKS` are copied into each list at construction time.
+**`ProgressBar`** — Callback showing training and validation progress on a `tqdm` bar (`tqdm` must be installed). Constructor (keyword-only): `ProgressBar(steps_per_epoch=..., validation_steps=0, training_criteria=(), validation_criteria=())`, where the two criteria sequences name the log keys shown next to the bar. It writes the criteria of each finished epoch above the bar.
 
-**`GLOBAL_CALLBACKS`** — A shared `Callbacks[Any]` instance. Callbacks registered here are automatically picked up by every newly created trainer.
+**`Printer`** — Callback printing the criteria of each finished epoch, for environments without a terminal. Both callbacks prepend the learner's `learning_rates` when it reports them.
 
 ### Core classes
 
-**`BaseTrainer`** — The main training loop driver. Inherits both `BaseInfo` and `Callbacks`.
+**`BaseTrainer`** — The main training loop driver, and itself the `BaseInfo` passed to every event.
 
-Required fields: `training_step` (`Forward`), `backward` (`Backward`), `tracker` (callable returning `dict[str, float]`).
+Required fields: `learner` (`Learner`), `tracker` (callable returning `dict[str, float]`, called once per step with the criteria of that step), `data` (`DataProvider`).
 
-Optional fields: `validation_step`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
+Optional fields: `callbacks` (sequence of participants, default `()`), `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
+
+On first use (the first dispatched event) the trainer scans, in this order, the learner, the values of the learner's `optimizers` mapping, the tracker, the data provider, its `training_dataset` and `validation_dataset`, and then the `callbacks` in the order given. Each object is routed into every event whose protocol it implements, and is never registered twice for the same event. Because the scan is deferred, callbacks appended to the given sequence after construction — the CLI builds its display callbacks from the constructed trainer's prefixes — still take part.
 
 Key methods:
 
-- `train(dataset, **models)` — runs one training epoch, returns the final step logs
-- `evaluate(dataset, **models)` — runs one validation epoch, returns the final step logs
-- `fit(epochs, training_dataset, validation_dataset=None, start_epoch=1, validation_frequency=1, **models)` — runs the full loop and returns the complete history dict
+- `describe()` — returns `dict[event, list[str]]` of the registered display names, omitting empty events
+- `train(dataset)` — runs one training pass, returns the final step logs
+- `evaluate(dataset)` — runs one validation pass, returns the final step logs
+- `fit(epochs, start_epoch=1, validation_frequency=1)` — runs the full loop over the data provider's datasets and returns the complete history dict
+- `update_models(inputs)` — performs one training step, returning `(updated, criteria)`; overridden in `TorchTrainer` to disable DDP gradient synchronization while accumulating
 - `sync()` — optional synchronization hook, no-op by default (overridden in `TorchTrainer`)
 
 ```python
-trainer = MyTrainer(
-    training_step=my_forward,
-    backward=my_backward,
+trainer = BaseTrainer(
+    learner=my_learner,
     tracker=my_tracker,
-    validation_step=my_val_forward,
+    data=SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader),
+    callbacks=[Printer()],
 )
-history = trainer.fit(
-    epochs=10,
-    training_dataset=train_loader,
-    validation_dataset=val_loader,
-    model=model,
-)
+history = trainer.fit(epochs=10)
 ```
 
-**`BestCriterion`** — A callable that monitors a log key and fires `on_best` callbacks whenever a new best is found. Attach it to `on_epoch_end` or `on_validation_end`.
+**`BestCriterion`** — Callback monitoring one criterion for its best value. It implements `on_epoch_end`, so passing it in `callbacks` is all that is needed.
 
 ```python
-checkpoint = BestCriterion(
-    target="val_acc1",
-    mode="max",
-    on_best=[save_checkpoint],
-)
-trainer.on_epoch_end.append(checkpoint)
+class SaveCheckpoint:
+    def on_best(self, info: BaseInfo, best: BestCriterion, **models) -> None:
+        ...  # log or save by best.value / best.step
+
+checkpoint = BestCriterion(target="val_acc1", mode="max", callbacks=[SaveCheckpoint()])
+trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[checkpoint])
 ```
 
-Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `BestCallback`).
+Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `callbacks` (list of `OnBest` participants, notified after every epoch in which the target appeared, whether or not it improved; named `callbacks` so the field cannot shadow the protocol method in an isinstance check). Properties: `value` (the best value so far) and `step` (the step at which it was reached).
 
 ---
 
@@ -474,50 +494,85 @@ Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` 
 
 ### Utility functions
 
-**`create_torch_inputs(shape)`** — Creates dummy `float32` tensors from tuple, list, or dict shape descriptions. Used for model initialization and FLOPs inspection.
+**`create_torch_inputs(shape, *, batch_size=1)`** — Creates dummy tensors from a tensor specification, or from a dict or list nesting more of them, using each specification's dtype and initializer. Used for model initialization and FLOPs inspection.
 
-**`get_torch_device(device=None)`** — Returns the runtime device. Selects `cuda` when available and requested, otherwise falls back to `cpu`.
+**`get_torch_device(device=None)`** — Returns the runtime device. Selects `cuda` when available and requested, otherwise falls back to `cpu`. `get_torch_device_type(device=None)` strips the rank suffix.
 
-**`initial_model(model, shapes=None, compile_fn=None)`** — Walks a module or nested module structure, optionally builds dummy inputs, runs a forward pass, and applies a compile function to each module. Returns:
+**`resolve_input_shapes(model, shapes=None)`** — Returns the input shapes to initialize with: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (or the merged attributes of a model mapping), otherwise `None`.
 
-```python
-(initialized_model, inputs, outputs)
-```
+**`initial_model(model, shapes=None)`** — Walks a module or nested module structure, builds dummy inputs from the resolved shapes, and runs one forward pass to materialize lazy layers. Returns `(inputs, outputs)`; when no shapes are available, `inputs` is `None` and no forward pass is run.
 
-**`get_autocast(mixed_precision_type, device)`** — Returns a context manager for automatic mixed precision:
+**`autocast_inputs(inputs, device_type)`** — Returns the autocast context matching the element type of the dummy inputs, or a null context when they contain no low-precision floating point tensor.
 
-- `contextlib.suppress` when AMP is disabled.
-- A configured `torch.autocast(...)` partial when AMP is enabled.
+**`initial_distributed_env(device=None, dist_backend=None, dist_url=None, *, return_dict=True)`** — Initializes the distributed environment and reports the resolved device, ranks, world size, and whether the run is distributed.
 
 ### Tracking and orchestration
 
-**`TorchTracker`** — Wraps `CriteriaTracker` instances for losses and metrics, resets them through global callbacks, and returns float-valued logs suitable for history storage and MLflow logging.
+**`TorchTracker`** — Wraps a `CriteriaTracker`, averaging the criteria of the current pass and returning float-valued logs. It implements `on_training_begin` and `on_validation_begin`, which reset the averages, so training and validation values never mix. In a distributed run it reduces each value across ranks with `all_reduce`.
 
 ```python
-tracker = TorchTracker.from_criteria(["ce_loss"], ["acc1", "acc5"])
+tracker = TorchTracker.from_criteria(["ce_loss", "acc1", "acc5"])
 logs = tracker(ce_loss=loss_tensor, acc1=acc1_tensor, acc5=acc5_tensor)
 ```
 
-**`TorchTrainer`** — `TorchTrainer` extends the generic `BaseTrainer` with PyTorch-specific synchronization.
+**`TorchTrainer`** — Extends `BaseTrainer` with a `device` field, CUDA synchronization, and `no_sync`, which suppresses `DistributedDataParallel` gradient synchronization on steps that do not update.
 
 ```python
+data = SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader)
 trainer = TorchTrainer(
     device="cuda",
-    training_step=TrainingStep(models=["model"], losses=loss_module, metrics=metric_module),
-    validation_step=ValidationStep(models=["model"], losses=loss_module, metrics=metric_module),
-    backward=backward,
+    learner=learner,
     tracker=tracker,
+    data=data,
+    callbacks=[
+        ProgressBar(steps_per_epoch=data.steps_per_epoch, validation_steps=data.validation_steps),
+        TorchBestCriterion(target="val_acc1", mode="max"),
+    ],
 )
-
-history = trainer.fit(
-    epochs=5,
-    training_dataset=train_loader,
-    validation_dataset=valid_loader,
-    model=model,
-)
+history = trainer.fit(epochs=5)
 ```
 
+**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it; the CLI appends the returned monitors to its callbacks.
+
+**`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it: the model state dicts (unwrapping `DistributedDataParallel`), the learner's optimizer and gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact.
+
+```python
+saver = TrainingStateSaver(logger=logger)
+trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
+```
+
+The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, and handed to the learner by name.
+
+---
+
+## API Reference: `optimizers.py`
+
+**`create_opt(params, *, opt, layer_decay=None, layer_group_regexes=None, weight_decay=0.0, weight_decay_regexes=None, no_weight_decay_regexes=None, **kwargs)`** — Creates an optimizer over regex-grouped named parameters. Grouping runs first and is engine-agnostic; the engine is then chosen from *opt* across three paths: a callable is instantiated directly, an explicit `torch.optim.X` (or `torch.X`) name instantiates that class natively, and every bare name goes to `timm.optim.create_optimizer_v2` with timm's defaults. Layer decay emits an `lr_scale` per group: the callable and native engines bake it into the learning rate immediately, while the timm engine keeps it for its schedulers.
+
+**`get_decays(optimizers)`** — Flattens the per-group `weight_decay` and `lr_scale` of every optimizer in the mapping into loggable metrics, keyed `{optimizer}_group{index}_weight_decay` / `{optimizer}_group{index}_lr_scale`. Generated learners expose the result as `weight_decays`, which the loggers merge into the epoch metrics.
+
+**`set_lr_scale(optimizer, delete_lr_scale=False)`** — Bakes the `lr_scale` of every parameter group into its learning rate; groups without the key are untouched. Pass `delete_lr_scale=True` to drop the key so a later call cannot apply the same scale twice.
+
+### Loggers
+
+**`Logger`** (`structcast_model.torch.logger`) — The runtime-checkable protocol both backends implement: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, `log_state_dict`, `on_epoch_end`, and the `__enter__` / `__exit__` pair that owns the run.
+
+**`MLflowLogger`** (`structcast_model.torch.mlflow_logger`) and **`WandbLogger`** (`structcast_model.torch.wandb_logger`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates and its optional `weight_decays` — so passing a logger in `callbacks` is enough to get per-epoch metrics, including weight/layer-decay dynamics.
+
+```python
+from structcast_model.torch.mlflow_logger import MLflowLogger
+
+with MLflowLogger(experiment="my-experiment") as logger:
+    trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger])
+    logger.log_params({"epochs": 5})
+    trainer.fit(epochs=5)
+```
+
+`MLflowLogger` needs the `mlflow` extra, `WandbLogger` the `wandb` extra; each module imports its backend at import time and raises a descriptive `ImportError` from the constructor when it is missing.
+
 ### timm integrations
+
+These are example code in [`examples/torch/data.py`](examples/torch/data.py), not package API: the CLI knows nothing about timm and loads them from a configuration by file path (`_addr_` plus `_file_`), the same way the optimizer compositions are loaded.
 
 **`TimmDatasetWrapper`** — Holds validated dataset configuration and lazily calls `timm.data.create_dataset(...)`.
 
@@ -530,4 +585,12 @@ history = trainer.fit(
 - Distributed device initialization
 - Optional `FlexSpec` output remapping
 
+It implements `on_epoch_begin` and `on_training_begin`, which forward the new epoch to its dataset or `DistributedSampler` (`set_epoch`) and turn mixup off once `mixup_off_epoch` is reached. The trainer scans the provider datasets for event protocols — on every rank — so these hooks run without any further wiring.
+
 The dataset template at [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml) formats into this wrapper.
+
+**`TimmDataProvider`** — `DataProvider` over a `training` wrapper and an optional `validation` dataset. The trainer scans both datasets directly, and the wrapper hooks no-op on validation splits, so the provider forwards nothing. The CLI always composes a `SimpleDataProvider`; use this one when wiring a trainer programmatically.
+
+```python
+provider = TimmDataProvider(training=training_wrapper, validation=validation_wrapper)
+```

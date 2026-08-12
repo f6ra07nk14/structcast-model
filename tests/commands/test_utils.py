@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pydantic
 import pytest
-from structcast.utils.security import register_dir, unregister_dir
+from structcast.utils.base import register_dir, unregister_dir
 
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,

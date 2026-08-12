@@ -12,14 +12,15 @@ IMPORTS: {}
 MIXED_PRECISION: false
 ACCUMULATE_GRADIENTS: null
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
-BACKWARDS:
-  # ==================== Generator backward ====================
+LEARNERS:
+  # ==================== Generator learner ====================
   - NAME: optimizer_G
     LOSS: loss_G
     TRAINABLE_LAYERS: [G_AB, G_BA]
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: OptimizerWithNativeScheduler
+        _file_: examples/torch/optimizers.py
       - _bind_:
           optimizer_kwargs:
             opt: adam
@@ -76,13 +77,14 @@ BACKWARDS:
       - [{input: recov_B, target: real_B}, loss_cycle_B, criterion_cycle]
       - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle, null]
       - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G, null]'
-  # ==================== Discriminator A backward ====================
+  # ==================== Discriminator A learner ====================
   - NAME: optimizer_D_A
     LOSS: loss_D_A
     TRAINABLE_LAYERS: [D_A]
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: OptimizerWithNativeScheduler
+        _file_: examples/torch/optimizers.py
       - _bind_:
           optimizer_kwargs:
             opt: adam
@@ -99,13 +101,14 @@ BACKWARDS:
       - [fake_A_sample, pred_fake_A, D_A]
       - [{input: pred_fake_A, target: "eval: torch.zeros_like(pred_fake_A)"}, loss_fake_A, criterion_GAN]
       - ["eval: (loss_real_A + loss_fake_A) / 2", loss_D_A, null]
-  # ==================== Discriminator B backward ====================
+  # ==================== Discriminator B learner ====================
   - NAME: optimizer_D_B
     LOSS: loss_D_B
     TRAINABLE_LAYERS: [D_B]
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: OptimizerWithNativeScheduler
+        _file_: examples/torch/optimizers.py
       - _bind_:
           optimizer_kwargs:
             opt: adam

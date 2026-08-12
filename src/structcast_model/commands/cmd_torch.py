@@ -5,13 +5,16 @@ from functools import partial
 from pathlib import Path
 import random
 from time import time
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 from structcast.utils.base import dump_yaml_to_string
-from structcast.utils.security import configure_security
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import BaseInfo, BestCriterion, callbacks_session, get_dataset_size
+from structcast_model.base_trainer import (
+    Printer,
+    ProgressBar,
+    SimpleDataProvider,
+)
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
@@ -23,34 +26,30 @@ from structcast_model.commands.utils import (
 
 if TYPE_CHECKING:
     import calflops
-    import mlflow
     import numpy as np
     import ptflops
     from structcast.core import instantiator
-    import timm
-    import tqdm
 
     from structcast_model.builders import torch_builder
-    from structcast_model.torch import trainer as torch_trainer
+    from structcast_model.torch import mlflow_logger, trainer as torch_trainer, wandb_logger
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     calflops = LazyModuleImporter("calflops")
-    mlflow = LazyModuleImporter("mlflow")
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
-    timm = LazyModuleImporter("timm")
-    tqdm = LazyModuleImporter("tqdm")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
+    mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
     torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
+    wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
     torch = LazyModuleImporter("torch")
 
 
 app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
-app.add_typer(creator, name="create", help="Commands for creating PyTorch models and backward classes.")
+app.add_typer(creator, name="create", help="Commands for creating PyTorch models and learner classes.")
 
 template_param = Option(
     None,
@@ -117,15 +116,15 @@ def create_model(
     )(output)
 
 
-@creator.command(name="backward")
-def create_backward(
-    cfg_path: str = Argument(..., help="Path to the backward configuration file."),
+@creator.command(name="learner")
+def create_learner(
+    cfg_path: str = Argument(..., help="Path to the learner configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Backward", "--classname", "-c", help="Name the backward class."),
+    classname: str = Option("Learner", "--classname", "-c", help="Name the learner class."),
 ) -> None:
-    """Create a PyTorch backward class from the given configuration file and parameters."""
-    builder = torch_builder.TorchBackwardBuilder.from_path(cfg_path)
+    """Create a PyTorch learner class from the given configuration file and parameters."""
+    builder = torch_builder.TorchLearnerBuilder.from_path(cfg_path)
     builder(parameters=reduce_dict(parameters), classname=classname)(output)
 
 
@@ -140,7 +139,7 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
     for raw in patterns:
         if len(raw) != 1:
             raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
-        model_name, ptn = list(raw.items())[0]
+        model_name, ptn = next(iter(raw.items()))
         res[model_name] = instantiate_object(ptn)
     return res
 
@@ -155,43 +154,6 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
     )
-
-
-def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to state dict for all given modules."""
-    return {n: m.state_dict() for n, m in kwargs.items()}
-
-
-def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
-    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
-
-
-def _on_best(info: BaseInfo, best: BestCriterion, save: bool, **kwargs: Any) -> None:
-    """Log best metric value and optionally save model state dict to MLflow."""
-    name = f"best_{best.target}"
-    mlflow.log_metric(name, best.value, step=info.epoch)
-    if save and info.step == best.step:
-        mlflow.pytorch.log_state_dict(_get_state_dict(_unwrap_ddp(kwargs)), name)
-
-
-def _save_training_state(info: BaseInfo, **kwargs: Any) -> None:
-    """Save full training state (models, optimizers, grad scalers, meta) to MLflow."""
-    backward = cast("torch_trainer.TorchTrainer", info).backward
-    states: dict[str, Any] = {
-        "models": _get_state_dict(_unwrap_ddp(kwargs)),
-        "optimizers": _get_state_dict(getattr(backward, "optimizers", {})),
-        "grad_scalers": _get_state_dict(getattr(backward, "grad_scalers", {})),
-        "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
-    }
-    mlflow.pytorch.log_state_dict(states, artifact_path="training_state")
-
-
-def _log_criteria(info: BaseInfo) -> str:
-    """Format current epoch criteria as YAML and log metrics to MLflow, returning a display string."""
-    values = {**getattr(cast("torch_trainer.TorchTrainer", info).backward, "learning_rates", {}), **info.logs()}
-    mlflow.log_metrics(values, step=info.epoch)
-    return f"epoch: {info.epoch}\n{dump_yaml_to_string(values)}"
 
 
 @app.command(name="time")
@@ -213,7 +175,6 @@ def measure_inference_time(
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
-    configure_security(allowed_modules_check=False)
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
     device = torch_trainer.get_torch_device(device)
@@ -266,7 +227,6 @@ def call_ptflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    configure_security(allowed_modules_check=False)
     device = torch_trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
@@ -301,7 +261,6 @@ def call_calflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    configure_security(allowed_modules_check=False)
     device = torch_trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
@@ -328,7 +287,6 @@ def call_calflops(
 
 
 @app.command()
-@callbacks_session()
 def train(  # noqa: PLR0912,PLR0913,PLR0915
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
@@ -349,21 +307,21 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     ),
     shapes: list[dict] | None = shapes,
     device: str | None = device,
-    backward_pattern: Any = Option(
+    learner_pattern: Any = Option(
         ...,
-        "--backward",
-        "-B",
+        "--learner",
+        "-L",
         parser=path_or_any_parser,
-        help="The object pattern used to instantiate the backward class. "
-        "For example, if the backward class is defined as `my_package.MyBackward(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyBackward, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyBackward, my_package.py], {_call_: {...}}]".',
+        help="The object pattern used to instantiate the learner class. "
+        "For example, if the learner class is defined as `my_package.MyLearner(...)`, then the pattern should be "
+        '"[_obj_, {_addr_: my_package.MyLearner, _file_: my_package.py}, {_call_: {...}}]" or '
+        '"[_obj_, [_addr_, my_package.MyLearner, my_package.py], {_call_: {...}}]".',
     ),
-    backward_outputs: list[str] | None = Option(
+    learner_outputs: list[str] | None = Option(
         None,
-        "--backward-outputs",
-        "-BO",
-        help="Default outputs for the backward module if it doesn't have an 'outputs' attribute.",
+        "--learner-outputs",
+        "-LO",
+        help="Default outputs for the learner module if it doesn't have an 'outputs' attribute.",
     ),
     compile_pattern: dict[str, Any] | None = compile_pattern,
     trainer_pattern: Any | None = Option(
@@ -422,12 +380,15 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
     experiment: str = Option(
-        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for MLflow logging."
+        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for the logger."
+    ),
+    logger_name: Literal["mlflow", "wandb"] = Option(
+        "mlflow", "--logger", help="Experiment tracking service to record the run to."
     ),
     log_arguments: list[dict] | None = Option(
-        None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log in MLflow."
+        None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log."
     ),
-    log_artifacts: list[Path] | None = Option(None, "--log-artifacts", "-A", help="Artifacts to log in MLflow."),
+    log_artifacts: list[Path] | None = Option(None, "--log-artifacts", "-A", help="Artifacts to log."),
     ci: bool = Option(
         False,
         help="Whether to run in CI mode. "
@@ -442,10 +403,9 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         None, envvar="DIST_URL", help="URL to use for setting up distributed training. If None, it will use 'env://'."
     ),
 ) -> None:
-    """Train a PyTorch model with MLflow tracking."""
+    """Train a PyTorch model, recording the run to an experiment tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    configure_security(allowed_modules_check=False)
     device, global_rank, _, world_size, distributed = torch_trainer.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
@@ -454,20 +414,22 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     torch.manual_seed(seed + global_rank)
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
+    is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
     initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
-    is_main = global_rank == 0
     compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
     dist_fn = partial(torch.nn.parallel.DistributedDataParallel, device_ids=[device]) if distributed else lambda m: m
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
+    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     if is_main:
         print("Count the dataset sizes...")
-    steps_per_epoch = get_dataset_size(training_dataset)
-    validation_steps = 0 if validation_dataset is None else get_dataset_size(validation_dataset)
     if is_main:
-        print(f"Training dataset size: {steps_per_epoch} steps.")
-        print(f"Validation dataset size: {validation_steps} steps.")
+        print(f"Training dataset size: {provider.steps_per_epoch} steps.")
+        print(f"Validation dataset size: {provider.validation_steps} steps.")
+    # Everything below runs on the training device: the models, and the tracker buffers, which are
+    # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
+    # CPU buffers.
     with torch.device(device):
         models = _instantiate_models(model_patterns)
         input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
@@ -476,54 +438,33 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
             for model_name, model in models.items():
                 if model_name in initializers:
                     model.apply(initializers[model_name])
-        backward = instantiate_object(backward_pattern)(**models)
-        backward_outputs = _get_module_outputs(backward, backward_outputs, "backward")
-        tracker = torch_trainer.TorchTracker.from_criteria(backward_outputs, compile_fn, distributed)
+        learner = instantiate_object(learner_pattern)(**models)
+        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
+        tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
     models = OrderedDict((n, compile_fn(dist_fn(m))) for n, m in models.items())
-    if hasattr(backward, "forward_training_step"):
-        backward.forward_training_step = compile_fn(backward.forward_training_step)
-    if hasattr(backward, "forward_inference_step"):
-        backward.forward_inference_step = compile_fn(backward.forward_inference_step)
+    if hasattr(learner, "forward_training_step"):
+        learner.forward_training_step = compile_fn(learner.forward_training_step)
+    if hasattr(learner, "forward_inference_step"):
+        learner.forward_inference_step = compile_fn(learner.forward_inference_step)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
-    trainer = trainer_type(device=device, backward=backward, tracker=tracker)
+    trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
     if is_main:
-        if ci:
-            trainer.on_epoch_end.register("log_criteria", lambda i, **_: print(_log_criteria(i)))  # type: ignore[arg-type]
-        else:
-            pbar = tqdm.tqdm(unit="batch")
-
-            def _update_criteria(info: BaseInfo, criteria: list[str], **_: Any) -> None:
-                logs = info.logs()
-                pbar.update()
-                pbar.set_postfix([(n, logs[n]) for n in criteria])
-
-            trainer.on_training_begin.register("pbar_reset_training", lambda i, **_: pbar.reset(steps_per_epoch))  # type: ignore[arg-type]
-            train_losses = [f"{trainer.training_prefix}{n}" for n in backward_outputs]
-            pbar_update_training = partial(_update_criteria, criteria=train_losses)
-            trainer.on_training_step_end.register("pbar_update_training", pbar_update_training)
-            trainer.on_training_end.register("pbar_refresh_training", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
-            trainer.on_validation_begin.register("pbar_reset_validation", lambda i, **_: pbar.reset(validation_steps))  # type: ignore[arg-type]
-            valid_losses = [f"{trainer.validation_prefix}{n}" for n in backward_outputs]
-            pbar_update_validation = partial(_update_criteria, criteria=valid_losses)
-            trainer.on_validation_step_end.register("pbar_update_validation", pbar_update_validation)
-            trainer.on_validation_end.register("pbar_refresh_validation", lambda i, **_: pbar.refresh())  # type: ignore[arg-type]
-            trainer.on_epoch_end.register("pbar_log_criteria", lambda i, **_: pbar.write(_log_criteria(i)))  # type: ignore[arg-type]
-        trainer.on_epoch_end.register("save_training_state", _save_training_state)
-        for target in higher_criteria:
-            best = torch_trainer.TorchBestCriterion(target=target, mode="max")
-            best.on_best.register(f"track_best_{target}", partial(_on_best, save=target in save_criteria))
-            trainer.on_epoch_end.register(f"best_{target}", best)
-        for target in lower_criteria:
-            best = torch_trainer.TorchBestCriterion(target=target, mode="min")
-            best.on_best.register(f"track_best_{target}", partial(_on_best, save=target in save_criteria))
-            trainer.on_epoch_end.register(f"best_{target}", best)
-    fit_kwargs: dict[str, Any] = {
-        "epochs": epochs,
-        "training_dataset": training_dataset,
-        "validation_dataset": validation_dataset,
-        "start_epoch": start_epoch,
-        "validation_frequency": validation_frequency,
-    }
+        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
+        logger = logger_type(experiment=experiment)
+        saver = torch_trainer.TrainingStateSaver(logger=logger)
+        trainer.callbacks = [
+            Printer()
+            if ci
+            else ProgressBar(
+                steps_per_epoch=provider.steps_per_epoch,
+                validation_steps=provider.validation_steps,
+                training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
+                validation_criteria=[f"{trainer.validation_prefix}{n}" for n in learner_outputs],
+            ),
+            logger,
+            saver,
+            *torch_trainer.TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger),
+        ]
     try:
         if is_main:
             arguments = {
@@ -535,8 +476,8 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "device": device,
                 "distributed": distributed,
                 "world_size": world_size,
-                "backward": backward_pattern,
-                "backward_outputs": backward_outputs,
+                "learner": learner_pattern,
+                "learner_outputs": learner_outputs,
                 "compile": compile_pattern,
                 "trainer": trainer_pattern,
                 "epochs": epochs,
@@ -550,29 +491,32 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
                 "seed": seed,
                 "matmul_precision": matmul_precision,
                 "experiment": experiment,
+                "logger": logger_name,
                 "ci": ci,
             }
-            mlflow.set_experiment(experiment)
-            with mlflow.start_run():
-                mlflow.log_param("cuda_version", torch.version.cuda)
-                mlflow.log_param("torch_version", torch.__version__)
-                mlflow.log_param("timm_version", timm.__version__)
-                mlflow.log_param("epochs", epochs)
-                mlflow.log_param("steps_per_epoch", steps_per_epoch)
-                mlflow.log_param("validation_steps", validation_steps)
-                if hasattr(backward, "param_group_names"):
-                    mlflow.log_dict(backward.param_group_names, "param_groups.yaml")
-                mlflow.log_dict(arguments, "arguments.yaml")
+            with logger:
+                logger.log_params(
+                    {
+                        "cuda_version": torch.version.cuda,
+                        "torch_version": torch.__version__,
+                        "epochs": epochs,
+                        "steps_per_epoch": provider.steps_per_epoch,
+                        "validation_steps": provider.validation_steps,
+                    }
+                )
+                logger.log_dict(arguments, "arguments.yaml")
+                if hasattr(learner, "param_group_names"):
+                    logger.log_dict(learner.param_group_names, "param_groups.yaml")
                 for artifact in log_artifacts or []:
-                    mlflow.log_artifact(str(artifact))
+                    logger.log_artifact(str(artifact))
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
                 try:
-                    trainer.fit(**fit_kwargs)
+                    trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
                 except KeyboardInterrupt:
-                    print("Training interrupted by user. Saving current state to MLflow.")
-                    _save_training_state(trainer, **models)
+                    print("Training interrupted by user. Saving current state.")
+                    saver.on_epoch_end(trainer, **models)
         else:
-            trainer.fit(**fit_kwargs)
+            trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
     finally:
         if distributed:
             torch.distributed.destroy_process_group()

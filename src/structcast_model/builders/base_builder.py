@@ -1,4 +1,4 @@
-"""Base builder for building layers or backward operators from templates."""
+"""Base builder for building layers or learners from templates."""
 
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -16,7 +16,7 @@ from structcast.core.constants import SPEC_SOURCE
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import AddressPattern, AttributePattern, BindPattern, CallPattern, ObjectPattern
 from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
-from structcast.utils.security import resolve_address, split_attribute
+from structcast.utils.base import resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName
@@ -24,14 +24,17 @@ from structcast_model.builders.schema import (
     SPEC_EVAL,
     LayerBehavior,
     Parameters,
-    TemplateBackward,
     TemplateLayer,
+    TemplateLearner,
     TensorSpecTree,
     UserLayer,
 )
 from structcast_model.utils.base import load_any, to_pascal, to_snake, unique
 
 logger = getLogger(__name__)
+
+FILE_IMPORT_PREFIX = "__file__:"
+"""Prefix marking a collected import that refers to a file path instead of a module name."""
 
 
 def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
@@ -85,7 +88,11 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
         if isinstance(first, AddressPattern):
             module, res = resolve_address(first.address)
             classes.append(res)
-            if module:
+            if first.file:
+                # File-addressed objects cannot be imported by module name: record the file under a
+                # special key so the script renderer emits an import_from_address binding instead.
+                imports[f"{FILE_IMPORT_PREFIX}{first.file}"].add(first.address)
+            elif module:
                 imports[module].add(res)
         elif isinstance(first, ObjectPattern):
             res = _resolve(first)
@@ -200,12 +207,41 @@ class _Intermediate(Serializable):
 
     def __call__(self, module_path: PathLike | None = None) -> None:
         """Save the script for the layer to the given path."""
-        from_imports = {p: {m for m in i if m} for p, i in self.collected_imports.items()}
+        module_imports = {p: i for p, i in self.collected_imports.items() if not p.startswith(FILE_IMPORT_PREFIX)}
+        file_imports = {
+            p.removeprefix(FILE_IMPORT_PREFIX): i
+            for p, i in self.collected_imports.items()
+            if p.startswith(FILE_IMPORT_PREFIX)
+        }
+        from_imports = {p: {m for m in i if m} for p, i in module_imports.items()}
         imported_code = "\n".join(
             [f"from {p} import {', '.join([m for m in i if m])}" for p, i in from_imports.items() if i]
-            + [f"import {p}" for p, i in self.collected_imports.items() if None in i]
+            + [f"import {p}" for p, i in module_imports.items() if None in i]
+            + (["from structcast.utils.base import import_from_address"] if file_imports else [])
         ).strip()
-        code = "\n\n".join([s for s in [(imported_code + "\n"), *self.scripts] if s])
+        module_names = {name for names in from_imports.values() for name in names}
+        bound: dict[str, str] = {}
+        binding_lines: list[str] = []
+        for file, addresses in sorted(file_imports.items()):
+            for address in sorted(a for a in addresses if a):
+                leaf = resolve_address(address)[1]
+                if bound.get(leaf, file) != file:
+                    raise SpecError(
+                        f'File-addressed name "{leaf}" is bound from both "{bound[leaf]}" and "{file}": '
+                        "the generated script would silently shadow one of them. Rename one symbol."
+                    )
+                if leaf in module_names:
+                    raise SpecError(
+                        f'File-addressed name "{leaf}" collides with an imported module member of the same name: '
+                        "the generated script would silently shadow the import. Rename one symbol."
+                    )
+                bound[leaf] = file
+                # Resolve the config-relative path while it is resolvable, so the generated script
+                # imports the same file regardless of the directory it is later run from.
+                rendered_file = str(Path(file).resolve()) if Path(file).exists() else file
+                binding_lines.append(f"{leaf} = import_from_address({address!r}, module_file={rendered_file!r})")
+        file_bindings = "\n".join(binding_lines)
+        code = "\n\n".join([s for s in [(imported_code + "\n"), file_bindings, *self.scripts] if s])
         if module_path is None:
             module_path = Path(f"{to_snake(self.classname)}.py")
         elif not isinstance(module_path, Path):
@@ -498,18 +534,18 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         )
 
 
-class BackwardIntermediate(_Intermediate):
-    """Intermediate representation of a backward layer during the building process."""
+class LearnerIntermediate(_Intermediate):
+    """Intermediate representation of a learner during the building process."""
 
     imports: dict[str, set[str | None]]
-    """The imports required for the backward layer and its sub-layers,
+    """The imports required for the learner and its sub-layers,
     where the keys are module names and the values are sets of imported names from the corresponding modules."""
 
     classname: str
-    """The name of the backward layer class."""
+    """The name of the learner class."""
 
     mixed_precision_type: str | None
-    """The mixed precision type for the backward layer, or `None` if mixed precision is not used."""
+    """The mixed precision type for the learner, or `None` if mixed precision is not used."""
 
     accumulate_gradients: int | None
     """The number of steps to accumulate gradients for before performing an optimizer step,
@@ -522,11 +558,11 @@ class BackwardIntermediate(_Intermediate):
     """The names of the output layers."""
 
     layers: dict[str, Union["LayerIntermediate", str]]
-    """The layers used in the backward layer, where the keys are the layer names and the values are either the layer
+    """The layers used in the learner, where the keys are the layer names and the values are either the layer
     as a `LayerIntermediate` instance or a string representation of the layer to be used directly in the script."""
 
     others: dict[str, str]
-    """Other instances used in the backward layer that are not layers, where the keys are the instance names and
+    """Other instances used in the learner that are not layers, where the keys are the instance names and
     the values are the string representations of the instances to be used directly in the script."""
 
     flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]]
@@ -559,8 +595,8 @@ class BackwardIntermediate(_Intermediate):
         return unique([u[4] for u in self.flow if len(u) == 6 and u[4]])
 
     @cached_property
-    def _backward_models(self) -> str:
-        """Get the models used in the backward method."""
+    def _learner_models(self) -> str:
+        """Get the models used in the learner."""
         return ", ".join(self.models)
 
     @cached_property
@@ -594,9 +630,9 @@ class BackwardIntermediate(_Intermediate):
         """Get the code for the inference flow in the forward method."""
         return self._get_forward_inference_flow()
 
-    def _get_backward_script(self, initialized_layers: dict[str, str]) -> str:
-        """Get the script for the backward layer."""
-        raise NotImplementedError("The _get_backward_script method must be implemented in the subclass.")
+    def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
+        """Get the script for the learner."""
+        raise NotImplementedError("The _get_learner_script method must be implemented in the subclass.")
 
     def _get_scripts(self) -> list[str]:
         """Get the scripts for the layer and its sub-layers."""
@@ -616,33 +652,33 @@ class BackwardIntermediate(_Intermediate):
             return sub._get_class_instance(classname)
 
         init_layers = {k: v if isinstance(v, str) else _scripts(v) for k, v in self.layers.items()}
-        scripts.append(self._get_backward_script(init_layers))
+        scripts.append(self._get_learner_script(init_layers))
         return scripts
 
 
-BackwardIntermediateT = TypeVar("BackwardIntermediateT", bound=BackwardIntermediate)
+LearnerIntermediateT = TypeVar("LearnerIntermediateT", bound=LearnerIntermediate)
 
 
 @dataclass(kw_only=True, slots=True)
-class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
-    """Base backward builder for building backward layers from templates."""
+class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
+    """Base learner builder for building learners from templates."""
 
-    user_defined_backward_layer_type: ClassVar[type[BackwardIntermediateT]] = BackwardIntermediate
+    user_defined_learner_layer_type: ClassVar[type[LearnerIntermediateT]] = LearnerIntermediate
     layer_builder_type: ClassVar[type[BaseModelBuilder]] = BaseModelBuilder
 
     raw: Any
     current_path: str = ""
-    template: TemplateBackward = field(init=False)
+    template: TemplateLearner = field(init=False)
     layer_builder: BaseModelBuilder = field(init=False)
 
     @classmethod
-    def from_path(cls, path: PathLike) -> "BaseBackwardBuilder[BackwardIntermediateT]":
-        """Create a backward builder from the given configuration file path."""
+    def from_path(cls, path: PathLike) -> "BaseLearnerBuilder[LearnerIntermediateT]":
+        """Create a learner builder from the given configuration file path."""
         return cls(raw=load_any(path), current_path=str(path))
 
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
-        self.template = TemplateBackward.model_validate(self.raw)
+        self.template = TemplateLearner.model_validate(self.raw)
         from_references = {self.current_path: ["__root__"]} if self.current_path else {}
         self.layer_builder = self.layer_builder_type(
             raw=self.template.others, current_path=self.current_path, from_references=from_references
@@ -654,7 +690,7 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
         mixed_precision: bool | dict[str, Any],
     ) -> tuple[str, str | None]:
         logger.warning(
-            "Mixed precision is not implemented in the base backward builder. Returning None for mixed precision."
+            "Mixed precision is not implemented in the base learner builder. Returning None for mixed precision."
         )
         return "", None
 
@@ -669,19 +705,19 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
     def __call__(  # noqa: PLR0915
         self,
         parameters: dict[str, dict[str, Any]] | Parameters | None = None,
-        classname: str = "Backward",
-    ) -> BackwardIntermediateT:
-        """Build the backward class from the template with the given parameters and class name.
+        classname: str = "Learner",
+    ) -> LearnerIntermediateT:
+        """Build the learner class from the template with the given parameters and class name.
 
         Args:
             parameters (dict[str, dict[str, Any]] | Parameters | None):
                 The template keyword arguments to format the template with,
                 or a `Parameters` instance containing the template keyword arguments.
-            classname (str): The name of the backward class to use for the built backward operator.
-                Default is "Backward".
+            classname (str): The name of the learner class to use for the built learner.
+                Default is "Learner".
 
         Returns:
-            BackwardIntermediateT: The built backward class as a `BackwardIntermediateT` instance.
+            LearnerIntermediateT: The built learner class as a `LearnerIntermediateT` instance.
         """
         parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
         module = self.template(parameters, merged=False)
@@ -734,18 +770,18 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
                     )
             return flow
 
-        backward_flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]] = []
+        learner_flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]] = []
         inference_flow: list[tuple[str, str, str | None]] = []
         amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
-        for backward in module.BACKWARDS:
-            opt_inst, opt_cls = self._get_optimizer(imports, backward.OPTIMIZER, backward.TRAINABLE_LAYERS)
-            if (opt_name := backward.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
-                raise SpecError(f'Duplicate variable name "{opt_name}" for optimizer found in the backward flow.')
+        for learner in module.LEARNERS:
+            opt_inst, opt_cls = self._get_optimizer(imports, learner.OPTIMIZER, learner.TRAINABLE_LAYERS)
+            if (opt_name := learner.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
+                raise SpecError(f'Duplicate variable name "{opt_name}" for optimizer found in the learner flow.')
             others[opt_name] = opt_inst
-            if backward.CLIP:
-                clip_inst, clip_cls = resolve_object(imports, backward.CLIP)
+            if learner.CLIP:
+                clip_inst, clip_cls = resolve_object(imports, learner.CLIP)
                 if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers or clip_name in others:
-                    raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the backward flow.')
+                    raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the learner flow.')
                 others[clip_name] = clip_inst
             else:
                 clip_inst, clip_name = None, None
@@ -754,14 +790,14 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             else:
                 if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers or amp_name in others:
                     raise SpecError(
-                        f'Duplicate variable name "{amp_name}" for mixed precision instance found in the backward flow.'
+                        f'Duplicate variable name "{amp_name}" for mixed precision instance found in the learner flow.'
                     )
                 others[amp_name] = amp_inst
-            backward_flow += _create_flow(backward.FLOW)
-            inference_flow += _create_flow(backward.INFERENCE_FLOW or backward.FLOW)
-            backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in backward.EXTRA.items())
-            backward_flow.append((backward.LOSS, backward_kw, opt_name, clip_name, amp_name, backward.TRAINABLE_LAYERS))
-        return self.user_defined_backward_layer_type(
+            learner_flow += _create_flow(learner.FLOW)
+            inference_flow += _create_flow(learner.INFERENCE_FLOW or learner.FLOW)
+            backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in learner.EXTRA.items())
+            learner_flow.append((learner.LOSS, backward_kw, opt_name, clip_name, amp_name, learner.TRAINABLE_LAYERS))
+        return self.user_defined_learner_layer_type(
             imports=imports,
             classname=classname,
             mixed_precision_type=module.MIXED_PRECISION_TYPE,
@@ -770,16 +806,16 @@ class BaseBackwardBuilder(Generic[BackwardIntermediateT]):
             outputs=module.OUTPUTS,
             layers=layers,
             others=others,
-            flow=backward_flow,
+            flow=learner_flow,
             inference_flow=inference_flow,
         )
 
 
 __all__ = [
-    "BackwardIntermediate",
-    "BaseBackwardBuilder",
+    "BaseLearnerBuilder",
     "BaseModelBuilder",
     "LayerIntermediate",
+    "LearnerIntermediate",
     "resolve_getter",
     "resolve_object",
 ]

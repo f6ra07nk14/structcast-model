@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
-import numpy as np
-from PIL import Image
 import pytest
-from structcast.utils.security import configure_security
-from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 from torch.nn import Module
 
-from structcast_model.base_trainer import GLOBAL_CALLBACKS, BaseInfo
+from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
 from structcast_model.torch.trainer import (
-    TimmDataLoaderWrapper,
-    TimmDatasetWrapper,
+    TorchBestCriterion,
     TorchTracker,
     TorchTrainer,
+    TrainingStateSaver,
+    _get_state_dict,
+    _unwrap_ddp,
     autocast_inputs,
     create_torch_inputs,
     get_torch_device,
@@ -30,39 +27,6 @@ import torch
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _clean_global_callbacks() -> Any:
-    """Restore GLOBAL_CALLBACKS to its pre-test state after each test."""
-    _attrs = (
-        "on_update",
-        "on_training_begin",
-        "on_training_end",
-        "on_training_step_begin",
-        "on_training_step_end",
-        "on_validation_begin",
-        "on_validation_end",
-        "on_validation_step_begin",
-        "on_validation_step_end",
-        "on_epoch_begin",
-        "on_epoch_end",
-    )
-    saved = {a: (list(getattr(GLOBAL_CALLBACKS, a)), list(getattr(GLOBAL_CALLBACKS, a)._names)) for a in _attrs}
-    yield
-    for a, (cbs, names) in saved.items():
-        ncl = getattr(GLOBAL_CALLBACKS, a)
-        ncl.clear()
-        for name, cb in zip(names, cbs, strict=True):
-            ncl.register(name, cb)
-
-
-@pytest.fixture
-def allow_module_imports() -> Any:
-    """Allow `_INIT_` addresses to be imported, then restore the default security settings."""
-    configure_security(allowed_modules_check=False)
-    yield
-    configure_security()
 
 
 class _IdentityModel(Module):
@@ -79,17 +43,29 @@ class _LossModule(Module):
         return {"loss": torch.tensor(0.5)}
 
 
-class _StubBackward:
-    """A minimal stub implementing the Backward protocol for tests that don't exercise the backward pass."""
+class _StubLearner:
+    """A minimal stub implementing the Learner protocol for tests that don't exercise a real step."""
 
-    def __init__(self, models: dict[str, Any] | None = None) -> None:
-        """Initialize with optional models dict."""
+    def __init__(
+        self,
+        models: dict[str, Any] | None = None,
+        learning_rates: dict[str, float] | None = None,
+        optimizers: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize with optional models, optimizers, and the learning rates a real learner would report."""
         self._models = models or {}
+        self._optimizers = optimizers or {}
+        self.learning_rates = learning_rates or {}
 
     @property
     def models(self) -> dict[str, Any]:
         """Return the models dict."""
         return self._models
+
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """Return the optimizers dict; the trainer scan must handle an empty mapping."""
+        return self._optimizers
 
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""
@@ -109,21 +85,6 @@ class _MetricModule(Module):
 
     def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
         return {"acc": torch.tensor(0.9)}
-
-
-def _populate_image_folder(root: Path, *, num_classes: int = 2, images_per_class: int = 4) -> Path:
-    """Create an ImageFolder-compatible directory tree with random PNG images.
-
-    Returns the *root* path so callers can pass it directly to ``TimmDatasetWrapper(root=...)``.
-    """
-    rng = np.random.default_rng(0)
-    for cls_idx in range(num_classes):
-        cls_dir = root / f"class_{cls_idx}"
-        cls_dir.mkdir(parents=True, exist_ok=True)
-        for img_idx in range(images_per_class):
-            arr = rng.integers(0, 255, (32, 32, 3), dtype=np.uint8)
-            Image.fromarray(arr).save(cls_dir / f"{img_idx}.png")
-    return root
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +134,13 @@ def test_create_torch_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: 
     assert "Falling back to zeros" in caplog.text
 
 
-def test_create_torch_inputs_honours_explicit_initializer(allow_module_imports: None) -> None:
+def test_create_torch_inputs_honours_explicit_initializer() -> None:
     """An explicit `_INIT_` address replaces the dtype-based default initializer."""
     result = create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.ones"})
     assert torch.equal(result, torch.ones((1, 4), dtype=torch.bfloat16))
 
 
-def test_create_torch_inputs_rejects_non_callable_initializer(allow_module_imports: None) -> None:
+def test_create_torch_inputs_rejects_non_callable_initializer() -> None:
     """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
     with pytest.raises(TypeError, match="not callable as a tensor initializer"):
         create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.pi"})
@@ -312,6 +273,17 @@ def test_torch_tracker_from_criteria_with_metric_outputs() -> None:
     assert isinstance(tracker, TorchTracker)
 
 
+def test_torch_tracker_buffers_follow_the_ambient_device() -> None:
+    """The CLI builds the tracker inside `with torch.device(device)`.
+
+    The buffers must land on that device, or the first CUDA training step mixes CUDA criteria with
+    CPU buffers and crashes.
+    """
+    with torch.device("meta"):
+        tracker = TorchTracker.from_criteria(["loss"], None, False)
+    assert tracker.tracker.total.device.type == "meta"
+
+
 def test_torch_tracker_call_returns_float_values() -> None:
     """__call__ returns a dict of float values from Tensor criteria."""
     tracker = TorchTracker.from_criteria(["loss"])
@@ -329,11 +301,24 @@ def test_torch_tracker_call_with_metrics() -> None:
     assert "acc" in result
 
 
-def test_torch_tracker_post_init_registers_reset_callback() -> None:
-    """Creating a TorchTracker registers a reset callback in GLOBAL_CALLBACKS."""
-    before = len(GLOBAL_CALLBACKS.on_training_begin)
-    TorchTracker.from_criteria(["loss"])
-    assert len(GLOBAL_CALLBACKS.on_training_begin) > before
+def test_torch_tracker_is_routed_into_the_reset_events_by_the_trainer() -> None:
+    """The tracker is scanned like any participant: its reset methods alone put it on both events."""
+    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
+    trainer = TorchTrainer(
+        device="cpu", learner=_StubLearner(), tracker=tracker, data=SimpleDataProvider(training_dataset=[])
+    )
+    assert trainer.describe() == {
+        "on_training_begin": ["TorchTracker"],
+        "on_validation_begin": ["TorchTracker"],
+    }
+
+
+def test_torch_tracker_reset_clears_the_running_average_between_splits() -> None:
+    """Without the reset, validation averages would carry the training values of the same epoch."""
+    tracker = TorchTracker.from_criteria(["loss"], distributed=False)
+    tracker(loss=torch.tensor(1.0))
+    tracker.on_validation_begin(BaseInfo())
+    assert tracker(loss=torch.tensor(0.0))["loss"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +330,9 @@ def test_torch_trainer_sync_cpu_is_noop() -> None:
     """sync() on a CPU trainer should not raise."""
     trainer = TorchTrainer(
         device="cpu",
-        backward=_StubBackward(),
+        learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"]),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     trainer.sync()  # should not raise
 
@@ -406,325 +391,12 @@ def test_torch_trainer_sync_cuda_calls_synchronize(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: synced.append(True))
     trainer = TorchTrainer(
         device="cuda",
-        backward=_StubBackward(),
+        learner=_StubLearner(),
         tracker=TorchTracker.from_criteria(["loss"]),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     trainer.sync()
     assert synced == [True]
-
-
-# ---------------------------------------------------------------------------
-# TimmDatasetWrapper (lines 368, 388)
-# ---------------------------------------------------------------------------
-
-
-def test_timm_dataset_wrapper_default_kwargs_contains_all_keys() -> None:
-    """default_kwargs exposes all fields required by create_dataset (line 368)."""
-    ds = TimmDatasetWrapper()
-    kwargs = ds.default_kwargs
-    for key in (
-        "name",
-        "root",
-        "split",
-        "is_training",
-        "seed",
-        "batch_size",
-        "class_map",
-        "download",
-        "repeats",
-        "input_img_mode",
-        "input_key",
-        "target_key",
-        "trust_remote_code",
-        "num_samples",
-    ):
-        assert key in kwargs, f"Missing key: {key}"
-
-
-def test_timm_dataset_wrapper_dataset_calls_create_dataset(
-    tmp_path: Path,
-) -> None:
-    """Dataset cached_property delegates to create_dataset (line 388)."""
-    _populate_image_folder(tmp_path)
-    ds = TimmDatasetWrapper(name="", root=str(tmp_path))
-    assert isinstance(ds.dataset, ImageDataset)
-    assert len(ds.dataset) == 8  # 2 classes × 4 images
-
-
-# ---------------------------------------------------------------------------
-# TimmDataLoaderWrapper – utility properties (lines 533, 538)
-# ---------------------------------------------------------------------------
-
-
-def test_timm_dataloader_mixup_active_false_by_default() -> None:
-    """mixup_active returns False when all alpha/cutmix values are at defaults (line 533)."""
-    assert TimmDataLoaderWrapper().mixup_active is False
-
-
-def test_timm_dataloader_mixup_active_true_with_mixup_alpha() -> None:
-    """mixup_active returns True when mixup_alpha > 0 (line 533)."""
-    assert TimmDataLoaderWrapper(mixup_alpha=0.2).mixup_active is True
-
-
-def test_timm_dataloader_mixup_active_true_with_cutmix_alpha() -> None:
-    """mixup_active returns True when cutmix_alpha > 0 (line 533)."""
-    assert TimmDataLoaderWrapper(cutmix_alpha=0.2).mixup_active is True
-
-
-def test_timm_dataloader_mixup_kwargs_contains_expected_keys() -> None:
-    """mixup_kwargs exposes all fields expected by timm mixup constructors (line 538)."""
-    kwargs = TimmDataLoaderWrapper().mixup_kwargs
-    for key in (
-        "mixup_alpha",
-        "cutmix_alpha",
-        "cutmix_minmax",
-        "prob",
-        "switch_prob",
-        "mode",
-        "label_smoothing",
-        "num_classes",
-    ):
-        assert key in kwargs, f"Missing mixup kwarg: {key}"
-
-
-# ---------------------------------------------------------------------------
-# TimmDataLoaderWrapper – distributed_results & default_kwargs (lines 552, 557–590)
-# ---------------------------------------------------------------------------
-
-
-def test_timm_dataloader_distributed_results() -> None:
-    """distributed_results calls init_distributed_device_so (line 552)."""
-    result = TimmDataLoaderWrapper().distributed_results
-    assert result["device"] == "cpu"
-    assert result["distributed"] is False
-
-
-def test_timm_dataloader_default_kwargs_validation_branch() -> None:
-    """default_kwargs includes crop_pct (not training kwargs) when is_training=False (lines 557–568, 589)."""
-    kwargs = TimmDataLoaderWrapper().default_kwargs
-    assert "crop_pct" in kwargs
-    assert "no_aug" not in kwargs
-
-
-def test_timm_dataloader_default_kwargs_training_branch() -> None:
-    """default_kwargs includes training-specific keys when is_training=True (lines 568–587)."""
-    kwargs = TimmDataLoaderWrapper(dataset=TimmDatasetWrapper(is_training=True)).default_kwargs
-    assert "no_aug" in kwargs
-    assert "re_prob" in kwargs
-    assert "auto_augment" in kwargs
-    assert "crop_pct" not in kwargs
-
-
-# ---------------------------------------------------------------------------
-# TimmDataLoaderWrapper – mixup cached_property (lines 595–597)
-# ---------------------------------------------------------------------------
-
-
-def test_timm_dataloader_mixup_raises_when_inactive() -> None:
-    """Accessing mixup when mixup is not active raises ValueError (line 597)."""
-    with pytest.raises(ValueError, match="Mixup is not active"):
-        _ = TimmDataLoaderWrapper().mixup
-
-
-def test_timm_dataloader_mixup_returns_fast_collate_with_prefetcher() -> None:
-    """With use_prefetcher=True and mixup_alpha>0, mixup returns FastCollateMixup (lines 595–596)."""
-    assert isinstance(TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=True).mixup, FastCollateMixup)
-
-
-def test_timm_dataloader_mixup_returns_mixup_without_prefetcher() -> None:
-    """With use_prefetcher=False and mixup_alpha>0, mixup returns Mixup (lines 595–596)."""
-    assert isinstance(TimmDataLoaderWrapper(mixup_alpha=0.4, use_prefetcher=False).mixup, Mixup)
-
-
-# ---------------------------------------------------------------------------
-# TimmDataLoaderWrapper – disable_mixup (lines 601–602)
-# ---------------------------------------------------------------------------
-
-
-def test_timm_dataloader_disable_mixup_disables_when_epoch_reached() -> None:
-    """disable_mixup sets mixup.mixup_enabled=False when epoch >= mixup_off_epoch (lines 601–602)."""
-    wrapper = TimmDataLoaderWrapper(mixup_alpha=0.5, mixup_off_epoch=3)
-    _ = wrapper.mixup  # initialise cached_property
-    wrapper.disable_mixup(BaseInfo(epoch=3))
-    assert wrapper.mixup.mixup_enabled is False
-
-
-def test_timm_dataloader_disable_mixup_noop_before_epoch() -> None:
-    """disable_mixup is a no-op when epoch < mixup_off_epoch (line 601 – False branch)."""
-    wrapper = TimmDataLoaderWrapper(mixup_alpha=0.5, mixup_off_epoch=5)
-    _ = wrapper.mixup
-    wrapper.disable_mixup(BaseInfo(epoch=2))
-    assert wrapper.mixup.mixup_enabled is True
-
-
-# ---------------------------------------------------------------------------
-# TimmDataLoaderWrapper – dataloader, __len__, _call, __call__
-# (lines 607–616, 627, 631–646, 650–653)
-# ---------------------------------------------------------------------------
-
-
-_LOADER_BASE_KWARGS: dict[str, Any] = {
-    "input_size": (3, 32, 32),
-    "num_workers": 0,
-    "persistent_workers": False,
-}
-"""Shared kwargs for all ``TimmDataLoaderWrapper`` instances in tests that need a real loader."""
-
-
-@pytest.fixture
-def image_folder(tmp_path: Path) -> Path:
-    """Create a minimal ImageFolder tree and return its root."""
-    return _populate_image_folder(tmp_path)
-
-
-def test_timm_dataloader_wrapper_dataloader_validation(image_folder: Path) -> None:
-    """Dataloader property returns the object from create_loader in validation mode (lines 607–608)."""
-    loader = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        **_LOADER_BASE_KWARGS,
-    ).dataloader
-    assert len(loader) > 0
-
-
-def test_timm_dataloader_wrapper_dataloader_training_no_mixup(
-    image_folder: Path,
-) -> None:
-    """Dataloader is obtained in training mode without mixup (line 608)."""
-    loader = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
-        **_LOADER_BASE_KWARGS,
-    ).dataloader
-    assert len(loader) > 0
-
-
-def test_timm_dataloader_wrapper_dataloader_training_with_mixup_off_epoch(image_folder: Path) -> None:
-    """Dataloader with mixup and mixup_off_epoch>0 registers disable_mixup callback (lines 609–613)."""
-    before = len(GLOBAL_CALLBACKS.on_training_begin)
-    _ = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
-        mixup_alpha=0.5,
-        mixup_off_epoch=3,
-        use_prefetcher=True,
-        num_classes=2,
-        **_LOADER_BASE_KWARGS,
-    ).dataloader
-    assert len(GLOBAL_CALLBACKS.on_training_begin) > before
-
-
-def test_timm_dataloader_wrapper_dataloader_with_aug_splits(image_folder: Path) -> None:
-    """num_aug_splits>1 wraps the dataset in AugMixDataset (lines 614–615)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
-        num_aug_splits=2,
-        **_LOADER_BASE_KWARGS,
-    )
-    assert isinstance(wrapper.dataset_wrapper, AugMixDataset)
-
-
-def test_timm_dataloader_wrapper_len(image_folder: Path) -> None:
-    """__len__ delegates to the underlying dataloader (line 627)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        **_LOADER_BASE_KWARGS,
-    )
-    assert len(wrapper) == len(wrapper.dataloader)
-
-
-def test_timm_dataloader_call_prefetcher_no_channels_last(image_folder: Path) -> None:
-    """_call with prefetcher=True channels_last=False yields from dataloader directly (line 636)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        use_prefetcher=True,
-        channels_last=False,
-        **_LOADER_BASE_KWARGS,
-    )
-    batches = list(wrapper._call())
-    assert len(batches) > 0
-    inp, _ = batches[0]
-    assert inp.shape[1:] == (3, 32, 32)
-
-
-def test_timm_dataloader_call_prefetcher_channels_last(image_folder: Path) -> None:
-    """_call with prefetcher=True channels_last=True yields channels_last tensors (lines 633–634)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        use_prefetcher=True,
-        channels_last=True,
-        **_LOADER_BASE_KWARGS,
-    )
-    batches = list(wrapper._call())
-    assert len(batches) > 0
-    inp, _ = batches[0]
-    assert inp.is_contiguous(memory_format=torch.channels_last)
-
-
-def test_timm_dataloader_call_no_prefetcher(image_folder: Path) -> None:
-    """_call with prefetcher=False moves tensors to device/dtype (lines 638–641, 646)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        use_prefetcher=False,
-        **_LOADER_BASE_KWARGS,
-    )
-    batches = list(wrapper._call())
-    assert len(batches) > 0
-
-
-def test_timm_dataloader_call_no_prefetcher_with_mixup(image_folder: Path) -> None:
-    """_call with prefetcher=False and mixup_alpha>0 applies Mixup to each batch (lines 639, 642–643)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2, is_training=True),
-        use_prefetcher=False,
-        mixup_alpha=0.4,
-        num_classes=2,
-        **_LOADER_BASE_KWARGS,
-    )
-    batches = list(wrapper._call())
-    assert len(batches) > 0
-
-
-def test_timm_dataloader_call_no_prefetcher_channels_last(image_folder: Path) -> None:
-    """_call with prefetcher=False channels_last=True applies channels_last format (lines 644–645)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        use_prefetcher=False,
-        channels_last=True,
-        **_LOADER_BASE_KWARGS,
-    )
-    inp, _ = next(iter(wrapper._call()))
-    assert inp.is_contiguous(memory_format=torch.channels_last)
-
-
-def test_timm_dataloader_dunder_call_no_spec(image_folder: Path) -> None:
-    """__call__ with spec=None yields raw (inp, target) pairs (lines 650–651)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        spec=None,
-        **_LOADER_BASE_KWARGS,
-    )
-    batches = list(wrapper())
-    assert len(batches) > 0
-    inp, target = batches[0]
-    assert isinstance(inp, torch.Tensor)
-
-
-def test_timm_dataloader_dunder_call_with_spec(image_folder: Path) -> None:
-    """__call__ with a spec applies map(spec, _call()) (lines 652–653)."""
-    wrapper = TimmDataLoaderWrapper(
-        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
-        spec=None,
-        **_LOADER_BASE_KWARGS,
-    )
-    results: list[Any] = []
-
-    def fake_spec(x: Any) -> Any:
-        results.append(x)
-        return x
-
-    # bypass Pydantic validation to set a plain callable
-    wrapper.__dict__["spec"] = fake_spec
-    list(wrapper())
-    assert len(results) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -854,9 +526,9 @@ def test_torch_trainer_no_sync_disables_grad_sync_for_ddp(single_process_gloo: N
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        backward=_StubBackward(models={"m": ddp_model}),
+        learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     assert ddp_model.require_backward_grad_sync is True
     with trainer.no_sync(False):
@@ -871,9 +543,9 @@ def test_torch_trainer_no_sync_yields_directly_when_updated(single_process_gloo:
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        backward=_StubBackward(models={"m": ddp_model}),
+        learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with trainer.no_sync(True):
         assert ddp_model.require_backward_grad_sync is True
@@ -885,9 +557,9 @@ def test_torch_trainer_no_sync_restores_on_exception(single_process_gloo: None) 
     ddp_model = torch.nn.parallel.DistributedDataParallel(model)
     trainer = TorchTrainer(
         device="cpu",
-        backward=_StubBackward(models={"m": ddp_model}),
+        learner=_StubLearner(models={"m": ddp_model}),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with pytest.raises(RuntimeError, match="boom"):
         with trainer.no_sync(False):
@@ -900,9 +572,142 @@ def test_torch_trainer_no_sync_ignores_non_ddp_model() -> None:
     model = torch.nn.Linear(2, 2)
     trainer = TorchTrainer(
         device="cpu",
-        backward=_StubBackward(models={"m": model}),
+        learner=_StubLearner(models={"m": model}),
         tracker=TorchTracker.from_criteria(["loss"]),
-        add_global_callbacks=False,
+        data=SimpleDataProvider(training_dataset=[]),
     )
     with trainer.no_sync(False):
         assert not hasattr(model, "require_backward_grad_sync")
+
+
+# ---------------------------------------------------------------------------
+# TrainingStateSaver
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLogger:
+    """Logger recording only the state dictionaries, which is all the saver produces."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.states: list[tuple[dict[str, Any], str]] = []
+
+    def log_state_dict(self, states: Any, name: str) -> None:
+        """Record the state dictionary the saver hands over."""
+        self.states.append((dict(states), name))
+
+
+def test_training_state_saver_records_everything_needed_to_resume() -> None:
+    """A run is resumed from the weights, the optimizer state, and the loop counters together."""
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = TorchTrainer(
+        device="cpu",
+        learner=_StubLearner(models={"model": model}, optimizers={"opt": optimizer}),
+        tracker=TorchTracker.from_criteria(["loss"], distributed=False),
+        data=SimpleDataProvider(training_dataset=[]),
+    )
+    trainer.epoch, trainer.step, trainer.update = 3, 7, 2
+    recorder = _RecordingLogger()
+    TrainingStateSaver(logger=recorder).on_epoch_end(trainer, model=model)
+    states, name = recorder.states[0]
+    assert name == "training_state"
+    assert "weight" in states["models"]["model"]
+    assert states["optimizers"]["opt"]["param_groups"][0]["lr"] == 0.1
+    assert states["meta"] == {"epoch": 3, "step": 7, "update": 2}
+
+
+# ---------------------------------------------------------------------------
+# _get_state_dict / _unwrap_ddp
+# ---------------------------------------------------------------------------
+
+
+def test_get_state_dict_returns_state_dicts() -> None:
+    """_get_state_dict returns a name-to-state_dict mapping."""
+    model = torch.nn.Linear(4, 2)
+    result = _get_state_dict({"model": model})
+    assert "model" in result
+    assert "weight" in result["model"]
+    assert "bias" in result["model"]
+
+
+def test_unwrap_ddp_passes_through_non_ddp_models() -> None:
+    """_unwrap_ddp returns non-DDP modules unchanged."""
+    model = torch.nn.Linear(4, 2)
+    result = _unwrap_ddp({"model": model})
+    assert result["model"] is model
+
+
+def test_unwrap_ddp_extracts_module_from_ddp(single_process_gloo: None) -> None:
+    """_unwrap_ddp extracts the .module from DistributedDataParallel models."""
+    model = torch.nn.Linear(4, 2)
+    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    result = _unwrap_ddp({"model": ddp_model})
+    assert result["model"] is model
+
+
+# ---------------------------------------------------------------------------
+# TorchBestCriterion.from_criteria
+# ---------------------------------------------------------------------------
+
+
+class _BestRecordingLogger:
+    """Logger recording the metrics and state-dict names the best monitors produce."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.metrics: list[tuple[str, float, int]] = []
+        self.states: list[str] = []
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        """Record a logged best value."""
+        self.metrics.append((name, value, step))
+
+    def log_state_dict(self, states: Any, name: str) -> None:
+        """Record the name a state dictionary was saved under."""
+        self.states.append(name)
+
+
+def test_from_criteria_builds_one_wired_monitor_per_criterion() -> None:
+    """The CLI hands its criteria lists straight to this factory, so the modes must map correctly."""
+    monitors = TorchBestCriterion.from_criteria(["acc"], ["loss"], ["acc"], _BestRecordingLogger())
+    assert [(monitor.target, monitor.mode) for monitor in monitors] == [("acc", "max"), ("loss", "min")]
+    assert all(len(monitor.callbacks) == 1 for monitor in monitors)
+
+
+def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
+    """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.metrics == [("best_val_loss", 0.3, 1)]
+    assert logger.states == []
+
+
+@pytest.mark.parametrize(("save_criteria", "expected"), [(["val_loss"], ["best_val_loss"]), ([], [])])
+def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: list[str], expected: list[str]) -> None:
+    """Weights are only written for criteria the user asked to save, since every save costs disk space."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], save_criteria, logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.states == expected
+
+
+def test_from_criteria_does_not_save_a_stale_best() -> None:
+    """A best reached at an earlier step must not overwrite the saved weights of the current models."""
+    logger = _BestRecordingLogger()
+    (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger)
+    info = BaseInfo()
+    info.epoch, info.step = 1, 5
+    info.history[1] = {"val_loss": 0.3}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    info.epoch, info.step = 2, 9
+    info.history[2] = {"val_loss": 0.9}
+    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    assert logger.states == ["best_val_loss"]

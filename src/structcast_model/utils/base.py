@@ -7,8 +7,7 @@ import re
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic_core import from_json
-from structcast.utils.base import load_yaml
-from structcast.utils.security import check_path, import_from_address
+from structcast.utils.base import find_path, import_from_address, load_yaml
 from structcast.utils.types import PathLike
 
 logger = getLogger(__name__)
@@ -25,7 +24,7 @@ def load_json(path: PathLike) -> Any:
     Returns:
         The loaded data.
     """
-    with check_path(path).open("r", encoding="utf-8") as f:
+    with find_path(path).open("r", encoding="utf-8") as f:
         return from_json(f.read())
 
 
@@ -38,7 +37,7 @@ def load_any(path: PathLike) -> Any:
     Returns:
         The loaded data.
     """
-    path = check_path(path)
+    path = find_path(path)
     suffix = path.suffix.lower()
     if suffix in (".yaml", ".yml"):
         return load_yaml(path)

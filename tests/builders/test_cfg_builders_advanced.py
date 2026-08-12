@@ -1,106 +1,109 @@
 """Advanced builder tests using real cfg templates."""
 
+from pathlib import Path
+
 import pytest
 
-from structcast_model.builders.torch_builder import TorchBackwardBuilder
+from structcast_model.builders.torch_builder import TorchLearnerBuilder
 from tests import ASSETS_DIR
 
-BACKWARD_YAML = ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Backward.yaml"
+LEARNER_YAML = ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml"
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: basic build
+# TorchLearnerBuilder: basic build
 # ---------------------------------------------------------------------------
 
 
-def test_backward_default_params_classname_and_io() -> None:
-    """Build backward with defaults and check classname, inputs, outputs."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)(classname="ConvNeXtBackward")
-    assert built.classname == "ConvNeXtBackward"
+def test_learner_default_params_classname_and_io() -> None:
+    """Build the learner with defaults and check classname, inputs, outputs."""
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(classname="ConvNeXtLearner")
+    assert built.classname == "ConvNeXtLearner"
     assert built.inputs == ["image", "label"]
     assert built.outputs == ["ce_loss", "acc1", "acc5"]
 
 
-def test_backward_default_models_and_optimizers() -> None:
+def test_learner_default_models_and_optimizers() -> None:
     """Default build should expose one model and one optimizer."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)()
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     assert built.models == ["model"]
     assert built.optimizers == ["optimizer"]
 
 
-def test_backward_default_mixed_precision_type() -> None:
+def test_learner_default_mixed_precision_type() -> None:
     """Default config uses bfloat16 mixed precision."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)()
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     assert built.mixed_precision_type == "bfloat16"
     assert built.mixed_precision_scales == ["optimizer_grad_scaler"]
 
 
-def test_backward_default_no_accumulation() -> None:
+def test_learner_default_no_accumulation() -> None:
     """Default config does not accumulate gradients."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)()
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     assert built.accumulate_gradients is None
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: script content
+# TorchLearnerBuilder: script content
 # ---------------------------------------------------------------------------
 
 
-def test_backward_script_contains_autocast() -> None:
+def test_learner_script_contains_autocast() -> None:
     """Default bfloat16 config wraps forward in autocast."""
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)().scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     assert "torch.autocast(device_type, torch.bfloat16)" in script
 
 
-def test_backward_script_contains_grad_scaler() -> None:
+def test_learner_script_contains_grad_scaler() -> None:
     """GradScaler instantiation appears in the generated script."""
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)().scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     assert "torch.amp.GradScaler(" in script
 
 
-def test_backward_script_defines_training_and_inference_steps() -> None:
+def test_learner_script_defines_training_and_inference_steps() -> None:
     """Script defines both _training_step and _inference_step functions."""
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)().scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     assert "def _training_step(" in script
     assert "def _inference_step(" in script
 
 
-def test_backward_script_exposes_properties() -> None:
-    """Script exposes models, optimizers, grad_scalers, learning_rates, param_group_names."""
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)().scripts[0]
+def test_learner_script_exposes_properties() -> None:
+    """Script exposes models, optimizers, grad_scalers, learning_rates, weight_decays, param_group_names."""
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     for prop in (
         "def models(self)",
         "def optimizers(self)",
         "def grad_scalers(self)",
         "def learning_rates(self)",
+        "def weight_decays(self)",
         "def param_group_names(self)",
     ):
         assert prop in script
 
 
-def test_backward_script_is_compilable() -> None:
+def test_learner_script_is_compilable() -> None:
     """Generated script can be compiled without syntax errors."""
-    scripts = TorchBackwardBuilder.from_path(BACKWARD_YAML)().scripts
+    scripts = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts
     for script in scripts:
         compile(script, "<test>", "exec")
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: gradient accumulation
+# TorchLearnerBuilder: gradient accumulation
 # ---------------------------------------------------------------------------
 
 
-def test_backward_accumulate_gradients_stored() -> None:
+def test_learner_accumulate_gradients_stored() -> None:
     """Accumulation count is stored on the intermediate."""
     params = {"DEFAULT": {"accumulate_gradients": 4}}
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params)
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params)
     assert built.accumulate_gradients == 4
 
 
-def test_backward_accumulate_gradients_script_patterns() -> None:
+def test_learner_accumulate_gradients_script_patterns() -> None:
     """Script contains loss division, need_update guard, and modular update."""
     params = {"DEFAULT": {"accumulate_gradients": 4}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "ce_loss = ce_loss / 4" in script
     assert "if __need_update__:" in script
     assert "self.need_update = (step + 1) % 4 == 0" in script
@@ -108,43 +111,43 @@ def test_backward_accumulate_gradients_script_patterns() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: gradient clipping
+# TorchLearnerBuilder: gradient clipping
 # ---------------------------------------------------------------------------
 
 
-def test_backward_clip_grad_norm_in_script() -> None:
+def test_learner_clip_grad_norm_in_script() -> None:
     """Gradient clipping function appears in the script when configured."""
     params = {"DEFAULT": {"clip_grad_norm": 2.0}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" in script
     assert "optimizer_grad_scaler.unscale_(optimizer)" in script
 
 
-def test_backward_no_clip_when_null() -> None:
+def test_learner_no_clip_when_null() -> None:
     """No clipping code when clip_grad_norm is null."""
     params = {"DEFAULT": {"clip_grad_norm": None}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" not in script
     assert "unscale_" not in script
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: mixed precision backward
+# TorchLearnerBuilder: mixed precision backward pass
 # ---------------------------------------------------------------------------
 
 
-def test_backward_mp_scale_backward_without_accumulation() -> None:
+def test_learner_mp_scale_backward_without_accumulation() -> None:
     """Without accumulation the scaler.scale().backward() has no division."""
     params = {"DEFAULT": {"accumulate_gradients": None}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
     assert "ce_loss = ce_loss /" not in script
 
 
-def test_backward_mp_scale_backward_with_accumulation() -> None:
+def test_learner_mp_scale_backward_with_accumulation() -> None:
     """With accumulation loss is divided and backward uses scaler."""
     params = {"DEFAULT": {"accumulate_gradients": 2}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "ce_loss = ce_loss / 2" in script
     assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
     assert "optimizer_grad_scaler.step(optimizer)" in script
@@ -152,75 +155,85 @@ def test_backward_mp_scale_backward_with_accumulation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: layer decay types
+# TorchLearnerBuilder: layer decay types
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("decay_type", ["single", "group"])
-def test_backward_layer_decay_types_produce_regexes(decay_type: str) -> None:
+def test_learner_layer_decay_types_produce_regexes(decay_type: str) -> None:
     """Both single and group layer decay types produce layer_group_regexes."""
     params = {"DEFAULT": {"layer_decay_type": decay_type}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "layer_group_regexes" in script
 
 
-def test_backward_no_layer_decay_produces_empty_regexes() -> None:
+def test_learner_no_layer_decay_produces_empty_regexes() -> None:
     """Null layer_decay_type produces empty layer_group_regexes."""
     params = {"DEFAULT": {"layer_decay_type": None}}
-    script = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts[0]
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "'layer_group_regexes': []" in script
 
 
-def test_backward_invalid_layer_decay_type_raises() -> None:
+def test_learner_invalid_layer_decay_type_raises() -> None:
     """Raise from Jinja filter when unsupported layer_decay_type is provided."""
     params = {"DEFAULT": {"layer_decay_type": "not-supported"}}
     with pytest.raises(ValueError, match="Invalid layer_decay_type"):
-        TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params)
+        TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params)
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: backbone variants
+# TorchLearnerBuilder: backbone variants
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("backbone", ["atto", "femto", "pico", "nano", "tiny"])
-def test_backward_backbone_variants_compile(backbone: str) -> None:
+def test_learner_backbone_variants_compile(backbone: str) -> None:
     """Each backbone variant produces a compilable script."""
     params = {"DEFAULT": {"backbone": backbone}}
-    scripts = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params).scripts
+    scripts = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts
     for script in scripts:
         compile(script, "<test>", "exec")
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: collected imports
+# TorchLearnerBuilder: collected imports
 # ---------------------------------------------------------------------------
 
 
-def test_backward_collected_imports_include_torch_and_amp() -> None:
+def test_learner_collected_imports_include_torch_and_amp() -> None:
     """Collected imports include torch and torch.amp for mixed precision."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)()
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     imports = built.collected_imports
     assert "torch" in imports
     assert "torch.amp" in imports
 
 
-def test_backward_collected_imports_include_optimizer_module() -> None:
-    """Collected imports include the optimizer factory module."""
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)()
-    imports = built.collected_imports
-    assert "structcast_model.torch.optimizers" in imports
+def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Path) -> None:
+    """A `_file_` optimizer reference cannot be imported by module name.
+
+    The rendered script must bind the class through import_from_address, or the generated Learner
+    raises NameError at construction time.
+    """
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
+    assert "AdamWWithCosine(" in built.scripts[0]
+    assert "structcast_model.torch.optimizers" not in built.collected_imports
+    script_path = tmp_path / "learner.py"
+    built(script_path)
+    code = script_path.read_text(encoding="utf-8")
+    resolved = str(Path("examples/torch/optimizers.py").resolve())
+    assert f"AdamWWithCosine = import_from_address('AdamWWithCosine', module_file={resolved!r})" in code
+    assert "from structcast.utils.base import import_from_address" in code
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder: full accumulation + clipping + mp combo
+# TorchLearnerBuilder: full accumulation + clipping + mp combo
 # ---------------------------------------------------------------------------
 
 
-def test_backward_full_combo_accumulate_clip_mp() -> None:
+def test_learner_full_combo_accumulate_clip_mp() -> None:
     """Combine accumulation, clipping, and mixed precision in one build."""
     params = {"DEFAULT": {"accumulate_gradients": 4, "clip_grad_norm": 2.0, "layer_decay_type": "single"}}
-    built = TorchBackwardBuilder.from_path(BACKWARD_YAML)(parameters=params, classname="FullCombo")
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params, classname="FullCombo")
     script = built.scripts[0]
     assert built.classname == "FullCombo"
     assert built.accumulate_gradients == 4
