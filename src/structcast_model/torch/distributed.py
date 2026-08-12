@@ -178,16 +178,17 @@ class _StateDictMixin:
         options = self._options(api)
         states = {"models": {n: api.get_model_state_dict(m, options=options) for n, m in models.items()}}
         if optimizers is not None:
-            if optimizer_models:
-                states["optimizers"] = {
-                    n: api.get_optimizer_state_dict(
-                        _optimizer_container(models, optimizer_models[n]), o, options=options
-                    )
-                    for n, o in optimizers.items()
-                }
-            else:
+            if not optimizer_models and optimizers:
                 self._require_pairing_or_warn("saving")
-                states["optimizers"] = {n: o.state_dict() for n, o in optimizers.items()}
+            optimizer_states: dict[str, Any] = {}
+            for name, optimizer in optimizers.items():
+                if optimizer_models and self._dcp_handles(optimizer, "saving"):
+                    optimizer_states[name] = api.get_optimizer_state_dict(
+                        _optimizer_container(models, optimizer_models[name]), optimizer, options=options
+                    )
+                else:
+                    optimizer_states[name] = optimizer.state_dict()
+            states["optimizers"] = optimizer_states
         return states
 
     def load_state_dict(
@@ -210,19 +211,28 @@ class _StateDictMixin:
             return state
         for name, module in models.items():
             api.set_model_state_dict(module, model_states.get(name, {}), options=self._load_options(api))
-        if optimizer_models:
-            for name, optimizer in optimizers.items():
+        if not optimizer_models and optimizers:
+            self._require_pairing_or_warn("loading")
+        for name, optimizer in optimizers.items():
+            if optimizer_models and self._dcp_handles(optimizer, "loading"):
                 self._set_optimizer_state(
                     api,
                     _optimizer_container(models, optimizer_models[name]),
                     optimizer,
                     optimizer_states.get(name, {}),
                 )
-        elif optimizers:
-            self._require_pairing_or_warn("loading")
-            for name, optimizer in optimizers.items():
+            else:
                 optimizer.load_state_dict(optimizer_states[name])
         return state
+
+    def _dcp_handles(self, optimizer: Any, action: str) -> bool:
+        """Whether DCP can key this optimizer's state by parameter FQNs.
+
+        Optimizer proxies (e.g. the example ``AdamWWithCosine``) are not ``torch.optim.Optimizer``
+        instances and merge scheduler state into their own ``state_dict``; DCP would reject the
+        object and drop that merged state, so they save and load through their own state dicts.
+        """
+        return isinstance(optimizer, torch.optim.Optimizer)
 
     def _set_optimizer_state(self, api: Any, container: torch.nn.Module, optimizer: Any, osd: dict[str, Any]) -> None:
         """Load one optimizer's saved state, which arrives in full on every rank.
@@ -386,6 +396,15 @@ class FullyShardedDataParallelStrategy(_StateDictMixin):
             "optimizer_models pairing (optimizer name -> model names): sharded optimizer state can "
             "only be resolved through parameter FQNs."
         )
+
+    def _dcp_handles(self, optimizer: Any, action: str) -> bool:
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise ValueError(
+                f"{action.capitalize()} optimizer state under FSDP2 requires torch.optim.Optimizer "
+                f"instances, got {type(optimizer).__name__}: an optimizer proxy's own state dict "
+                "would hold unsharded DTensor fragments that no single artifact can represent."
+            )
+        return True
 
 
 __all__ = [

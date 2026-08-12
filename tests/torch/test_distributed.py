@@ -4,7 +4,6 @@ from collections import OrderedDict
 from typing import Any
 
 import pytest
-import torch
 
 from structcast_model.torch.distributed import (
     DistributedDataParallelStrategy,
@@ -13,6 +12,7 @@ from structcast_model.torch.distributed import (
     SingleDeviceStrategy,
     sync_gate,
 )
+import torch
 
 # ---------------------------------------------------------------------------
 # sync_gate
@@ -115,6 +115,43 @@ def test_single_device_round_trips_models_and_optimizers() -> None:
     assert torch.equal(fresh_models["model"].weight, models["model"].weight)
     assert fresh_optimizer.param_groups[0]["lr"] == 0.125
     assert returned is state
+
+
+class _ProxyOptimizer:
+    """An optimizer proxy in the AdamWWithCosine shape: not a torch.optim.Optimizer, own state dict."""
+
+    def __init__(self) -> None:
+        self.state = {"scale": 1.0, "scheduler": {"last_epoch": 4}}
+        self.param_groups = [{"lr": 0.25, "params": []}]
+
+    def state_dict(self) -> dict:
+        return dict(self.state)
+
+    def load_state_dict(self, state: dict) -> None:
+        self.state = dict(state)
+
+
+def test_single_device_round_trips_proxy_optimizers_through_their_own_state() -> None:
+    """Optimizer proxies merge scheduler state that DCP would reject and drop; it must survive."""
+    strategy = SingleDeviceStrategy(device="cpu")
+    models = _linear_models()
+    proxy = _ProxyOptimizer()
+    state = strategy.state_dict(models, {"opt": proxy}, {"opt": ["model"]})
+    assert state["optimizers"]["opt"] == {"scale": 1.0, "scheduler": {"last_epoch": 4}}
+
+    fresh = _ProxyOptimizer()
+    fresh.state = {}
+    strategy.load_state_dict(models, {"opt": fresh}, {"opt": ["model"]}, state)
+    assert fresh.state == {"scale": 1.0, "scheduler": {"last_epoch": 4}}
+
+
+def test_fsdp2_strategy_refuses_proxy_optimizers(single_process_gloo: None) -> None:
+    """A proxy's own state dict cannot represent sharded parameters; FSDP2 must fail loud."""
+    pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu")
+    wrapped = strategy.wrap(_linear_models())
+    with pytest.raises(ValueError, match="torch.optim.Optimizer"):
+        strategy.state_dict(wrapped, {"opt": _ProxyOptimizer()}, {"opt": ["model"]})
 
 
 def test_single_device_load_without_state_fails_loud() -> None:
