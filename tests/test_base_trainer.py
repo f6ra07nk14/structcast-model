@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from functools import partial
+import inspect
 from math import inf
 from typing import Any, Literal
 
@@ -14,7 +15,6 @@ from structcast_model.base_trainer import (
     BaseInfo,
     BaseTrainer,
     BestCriterion,
-    DataProvider,
     Printer,
     ProgressBar,
     SimpleDataProvider,
@@ -110,8 +110,14 @@ def test_simple_data_provider_counts_steps_from_its_datasets() -> None:
 
 
 def test_simple_data_provider_satisfies_the_data_provider_protocol() -> None:
-    """Widening the protocol must not orphan the package's own provider."""
-    assert isinstance(SimpleDataProvider(training_dataset=[]), DataProvider)
+    """Widening the protocol must not orphan the package's own provider.
+
+    Checked with getattr_static: DataProvider is deliberately not runtime_checkable, because on
+    Python 3.11 an isinstance check would execute the property getters.
+    """
+    provider = SimpleDataProvider(training_dataset=[])
+    for member in ("training_dataset", "validation_dataset", "steps_per_epoch", "validation_steps"):
+        assert inspect.getattr_static(provider, member, None) is not None
 
 
 def test_simple_data_provider_reports_zero_validation_steps_without_a_validation_dataset() -> None:

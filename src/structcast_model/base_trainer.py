@@ -73,13 +73,15 @@ class Learner(Protocol):
         """Perform the inference step for the given criteria."""
 
 
-@runtime_checkable
 class DataProvider(Protocol):
     """Protocol supplying the datasets of a whole training run.
 
     Both dataset properties must return the same object on every read: the trainer reads them for
     the event-protocol scan and again in ``fit()``, so a getter that builds a fresh dataset per
     read would train a different object than the one receiving events.
+
+    Deliberately not ``runtime_checkable``: on Python 3.11 an attribute-presence isinstance check
+    executes the property getters, and counting steps may build a real data loader.
     """
 
     @property
