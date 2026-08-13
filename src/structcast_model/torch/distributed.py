@@ -18,7 +18,7 @@ from itertools import chain
 from logging import getLogger
 import os
 import re
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import Any, Literal, overload
 
 from structcast.utils.lazy_import import try_import
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
@@ -181,6 +181,14 @@ class DistributedStrategy(Protocol):
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap the models for this strategy and return the wrapped mapping."""
+
+    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+        """Compile *module* where this strategy wants its compile units, and return what to use.
+
+        ``compile_kw`` of ``None`` returns *module* unchanged. Modules are compiled in place, so the
+        returned object is the one handed in; plain callables (the generated flow functions) have no
+        in-place form and come back wrapped.
+        """
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
         """Make every rank's initial weights identical. Must be called on every rank, before wrap."""
@@ -346,6 +354,24 @@ class _StateDictMixin:
         )
 
 
+class _CompileMixin:
+    """Default compilation placement: the model root itself is the compile unit."""
+
+    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+        """Compile in place when *module* is an ``nn.Module``, else wrap with ``torch.compile``.
+
+        In-place compilation (``nn.Module.compile``) keeps the object identity: no ``OptimizedModule``
+        wrapper shifts ``named_modules()`` paths or prefixes checkpoint keys with ``_orig_mod.``. Plain
+        callables (the generated flow functions) have no in-place form, so they keep the wrapper.
+        """
+        if compile_kw is None:
+            return module
+        if isinstance(module, torch.nn.Module):
+            module.compile(**compile_kw)
+            return module
+        return torch.compile(module, **compile_kw)
+
+
 def _shared_meta(state: dict[str, Any] | None) -> dict[str, Any]:
     """Broadcast everything but the model tensors from rank 0 to every rank.
 
@@ -362,7 +388,7 @@ def _shared_meta(state: dict[str, Any] | None) -> dict[str, Any]:
 
 
 @dataclass(kw_only=True)
-class SingleDeviceStrategy(_StateDictMixin):
+class SingleDeviceStrategy(_CompileMixin, _StateDictMixin):
     """Strategy for single-device training: no wrapping, no cross-rank synchronization."""
 
     device: str
@@ -408,7 +434,7 @@ class _MultiRankMixin:
 
 
 @dataclass(kw_only=True)
-class DistributedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
+class DistributedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
     """Strategy wrapping every model in ``DistributedDataParallel``."""
 
     device: str
@@ -440,6 +466,32 @@ def _compile_shard_pattern(pattern: str) -> "re.Pattern[str]":
     return re.compile("".join(parts) + r"\Z")
 
 
+def _matched_in_model(
+    model: torch.nn.Module,
+    patterns: Sequence[str],
+) -> tuple[list[tuple[str, torch.nn.Module]], set[str]]:
+    """Return *model*'s matching ``named_modules()`` entries and the patterns that hit at least one.
+
+    Never raises on a pattern matching nothing: one model matching none of them is normal (a CycleGAN
+    discriminator has no blocks). Only :func:`matched_shard_modules`, which sees every model, can tell
+    a legitimate miss from a typo.
+    """
+    compiled = {p: _compile_shard_pattern(p) for p in patterns}
+    entries: list[tuple[str, torch.nn.Module]] = []
+    hits: set[str] = set()
+    for path, submodule in model.named_modules():
+        stripped = path.removeprefix("_orig_mod.")
+        # The root (or its compile wrapper's inner module) is never a match: wrap shards it
+        # last unconditionally, and a catch-all pattern must not shard it twice.
+        if not stripped or stripped == "_orig_mod":
+            continue
+        matching = {p for p, rx in compiled.items() if rx.match(stripped)}
+        if matching:
+            entries.append((path, submodule))
+            hits |= matching
+    return entries, hits
+
+
 def matched_shard_modules(
     models: Mapping[str, torch.nn.Module],
     patterns: Sequence[str],
@@ -460,22 +512,11 @@ def matched_shard_modules(
             anywhere is a typo; matching nothing in *one* model is normal for multi-model learners
             (a CycleGAN discriminator has no blocks).
     """
-    compiled = {p: _compile_shard_pattern(p) for p in patterns}
     matched: OrderedDict[str, list[tuple[str, torch.nn.Module]]] = OrderedDict()
     unmatched = set(patterns)
     for name, model in models.items():
-        entries = []
-        for path, submodule in model.named_modules():
-            stripped = path.removeprefix("_orig_mod.")
-            # The root (or its compile wrapper's inner module) is never a match: wrap shards it
-            # last unconditionally, and a catch-all pattern must not shard it twice.
-            if not stripped or stripped == "_orig_mod":
-                continue
-            hits = [p for p, rx in compiled.items() if rx.match(stripped)]
-            if hits:
-                entries.append((path, submodule))
-                unmatched -= set(hits)
-        matched[name] = entries
+        matched[name], hits = _matched_in_model(model, patterns)
+        unmatched -= hits
     if unmatched:
         available = [p for m in models.values() for p, _ in m.named_modules() if p][:10]
         raise ValueError(
@@ -506,7 +547,7 @@ def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str]) -> None
 
 
 @dataclass(kw_only=True)
-class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
+class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
     """Strategy sharding every model in place with ``fully_shard`` (FSDP2).
 
     Each model is one communication group by default; ``shard_modules`` splits it into one group per
@@ -579,6 +620,23 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
                     fully_shard(submodule, **kwargs)
         return OrderedDict((n, fully_shard(m, **kwargs)) for n, m in models.items())
 
+    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+        """Compile the sharded submodules in place, so compile units follow the shard boundaries.
+
+        Compiling the root instead would bury the per-block all-gather/reduce-scatter hooks inside one
+        graph (ADR-0004). A module none of the patterns match keeps the default root compile: matching
+        nothing in one model is normal for a multi-model learner, unlike matching nothing anywhere,
+        which :func:`matched_shard_modules` rejects at wrap time.
+        """
+        if compile_kw is None or not self.shard_modules or not isinstance(module, torch.nn.Module):
+            return super().compile(module, compile_kw)
+        matched, _ = _matched_in_model(module, self.shard_modules)
+        if not matched:
+            return super().compile(module, compile_kw)
+        for _, submodule in matched:
+            submodule.compile(**compile_kw)
+        return module
+
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
         """Broadcast rank 0's parameters and buffers; ``fully_shard`` performs no such synchronization."""
         for module in models.values():
@@ -616,9 +674,7 @@ __all__ = [
 ]
 
 
-if not TYPE_CHECKING:
-    import sys
-
-    from structcast.utils.lazy_import import LazySelectedImporter
-
-    sys.modules[__name__] = LazySelectedImporter(__name__, globals())
+# Unlike the package's other modules, this one is NOT replaced by LazySelectedImporter: generated
+# flow functions call sync_gate inside torch.compile'd regions, and dynamo introspects the
+# function's module through sys.modules — the shim raises on dunders (`__class__`) and breaks
+# tracing (InternalTorchDynamoError). A plain module traces cleanly.

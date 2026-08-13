@@ -43,20 +43,24 @@ forward region even though `.backward()` is called outside it. The functions are
 can rebind them compiled (`learner.flow_functions` lists them); cross-segment values thread through
 parameters and returns, derived from the flow's dataflow at generation time.
 
-The CLI composes compilation as `strategy.wrap(compile(model))`: the wrapper stays outermost, so
+The CLI composes compilation as `strategy.wrap(strategy.compile(model))`: the wrapper stays outermost, so
 `isinstance` checks and the sync gate keep seeing real DDP/FSDP2 types, and checkpoint keys are handled by
 the DCP state-dict API, which strips both `module.` and `_orig_mod.` prefixes. The previous model-level
 compile (applied outside the wrapper, into a discarded local) and the step-closure compile are deleted.
 Under distributed execution the flow-function graphs break at wrapper boundaries, and measurement settled
 the follow-up (`docs/references/flow-compile-step-time-h200.md`): compiling the fragments is a net loss
 (+8.9% training, +60% inference step time on DDP 2×H200) while the single-device fusion win is real
-(−14.8% training), so flow functions compile only on a single device. The sync gate is emitted inline in
-the generated script rather than imported — the package's lazy-import shim is opaque to dynamo's tracer.
+(−14.8% training), so flow functions compile only on a single device. Generated steps import the sync gate
+from `structcast_model.torch.distributed`, which for that reason is the one module NOT self-replaced by the
+package's lazy-import shim — the shim raises on dunder lookups and breaks dynamo's tracing of anything that
+calls into the module from a compiled region.
 Per-block compilation and per-block `fully_shard` build on a structural seam the templates already have:
 configs that nest layers via `TYPE`/`CFG` generate real per-block submodule classes. The FSDP2 strategy's
 `shard_modules` names the units — glob patterns over `named_modules()` paths whose `*` never crosses a
 `.`, because fnmatch semantics would match a block's whole subtree and shard every leaf as its own group —
 and its wrap shards matched modules descendants-first with the root last, so the root group holds exactly
-the leftovers. When compilation is on, the CLI compiles the matched submodules in place instead of the
-root: compile-unit boundaries follow the shard boundaries, keeping FSDP2's per-block hooks out of the
-compiled graphs. Unset, each model stays one group and one compile unit, as before.
+the leftovers. Where the compile units sit is the strategy's decision, not the CLI's: `strategy.compile`
+compiles the model root in place by default, and the FSDP2 strategy overrides it to compile the matched
+submodules instead, so compile-unit boundaries follow the shard boundaries and FSDP2's per-block hooks stay
+out of the compiled graphs. The CLI only invokes it. Unset, each model stays one group and one compile
+unit, as before.

@@ -40,7 +40,8 @@ remain compiled.
 
 - Generated flow functions previously imported `sync_gate` through the package's lazy-import
   shim, which `torch.compile`'s tracer cannot introspect (`InternalTorchDynamoError` on
-  `__class__`): flow compilation was broken everywhere until the gate became an inline helper in
-  the generated script.
+  `__class__`): flow compilation was broken everywhere. First worked around with an inline gate;
+  later fixed at the source by exempting `structcast_model.torch.distributed` from the shim, so
+  generated code imports `sync_gate` again (a regression test pins the fullgraph trace).
 - `torch.compile` needs a host C/C++ toolchain at run time (triton builds its driver shim with
   `cc`); the training image now installs `gcc`/`g++`.

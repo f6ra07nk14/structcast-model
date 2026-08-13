@@ -65,6 +65,25 @@ def test_sync_gate_sets_fsdp2_gradient_sync_without_restoring(single_process_glo
     assert calls == [False, True]
 
 
+def test_sync_gate_traces_under_torch_compile_without_graph_breaks() -> None:
+    """Generated flow functions call the package-imported gate inside compiled regions.
+
+    This only works because structcast_model.torch.distributed is exempt from the package's
+    LazySelectedImporter tail: the shim raises on dunder lookups and dynamo's tracer dies on it
+    (InternalTorchDynamoError). Restoring the tail keeps every eager test green and breaks
+    --compile at runtime — this fullgraph trace is the pin.
+    """
+    model = torch.nn.Linear(2, 2)
+
+    def flow(x: torch.Tensor) -> torch.Tensor:
+        with sync_gate(model, armed=True):
+            y = model(x)
+        return y.sum()
+
+    compiled = torch.compile(flow, fullgraph=True, backend="eager")
+    assert torch.isfinite(compiled(torch.randn(3, 2)))
+
+
 # ---------------------------------------------------------------------------
 # SingleDeviceStrategy
 # ---------------------------------------------------------------------------
@@ -116,6 +135,31 @@ def test_single_device_round_trips_models_and_optimizers() -> None:
     assert torch.equal(fresh_models["model"].weight, models["model"].weight)
     assert fresh_optimizer.param_groups[0]["lr"] == 0.125
     assert returned is state
+
+
+def test_default_compile_returns_the_module_when_compilation_is_off() -> None:
+    """`compile_kw` of None is how the CLI says "no --compile"; every strategy must pass through."""
+    module = torch.nn.Linear(4, 2)
+    assert SingleDeviceStrategy(device="cpu").compile(module, None) is module
+
+
+def test_default_compile_compiles_modules_in_place_and_wraps_callables() -> None:
+    """Modules keep their identity; plain callables get the torch.compile wrapper.
+
+    An OptimizedModule wrapper would shift named_modules() paths (which `wrap` matches on) and prefix
+    checkpoint keys with '_orig_mod.'; the generated flow functions have no in-place form.
+    """
+    strategy = SingleDeviceStrategy(device="cpu")
+    module = torch.nn.Linear(4, 2)
+    compiled = strategy.compile(module, {})
+    assert compiled is module
+    assert module._compiled_call_impl is not None  # noqa: SLF001  # the only marker .compile() leaves
+    assert set(compiled.state_dict()) == {"weight", "bias"}
+
+    def flow(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    assert strategy.compile(flow, {}) is not flow
 
 
 class _ProxyOptimizer:
@@ -407,3 +451,41 @@ def test_fsdp2_sync_gate_on_the_root_reaches_the_block_groups(single_process_glo
     with sync_gate(wrapped, armed=False):
         pass
     assert wrapped.block0._get_fsdp_state()._fsdp_param_group.reduce_grads is False
+
+
+def _is_compiled(module: torch.nn.Module) -> bool:
+    """Whether ``.compile()`` ran on *module* itself; the compiled call impl is the only marker it leaves."""
+    return module._compiled_call_impl is not None
+
+
+def test_fsdp2_compile_compiles_the_matched_blocks_and_not_the_root() -> None:
+    """Compile units follow the shard boundaries: a root graph buries the per-block hooks (ADR-0004)."""
+    pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block?"])
+    model = _block_models()["model"]
+    assert strategy.compile(model, {}) is model
+    assert _is_compiled(model.block0)
+    assert _is_compiled(model.block1)
+    assert not _is_compiled(model)
+
+
+def test_fsdp2_compile_without_patterns_compiles_the_root() -> None:
+    """One group, one compile unit: without shard_modules the root is the only boundary there is."""
+    pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu")
+    model = _block_models()["model"]
+    assert strategy.compile(model, {}) is model
+    assert _is_compiled(model)
+    assert not _is_compiled(model.block0)
+
+
+def test_fsdp2_compile_falls_back_to_the_root_when_the_patterns_match_nothing() -> None:
+    """A blockless model (a CycleGAN discriminator) is normal per module, so compile must not raise.
+
+    Only wrap, which sees every model at once, can tell a legitimate miss from a typo'd pattern.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block?"])
+    model = torch.nn.Linear(4, 2)
+    assert strategy.compile(model, {}) is model
+    assert _is_compiled(model)
