@@ -296,6 +296,64 @@ def test_fsdp2_strategy_trains_and_round_trips_across_two_ranks(tmp_path: pathli
     _assert_round_trip(*_spawn(_fsdp2_round_trip_worker, tmp_path))
 
 
+class _BlockModel(torch.nn.Module):
+    """A two-block model, the shape ``shard_modules`` splits into per-block groups."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block0 = torch.nn.Linear(4, 4)
+        self.block1 = torch.nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run both blocks in sequence."""
+        return self.block1(self.block0(x))
+
+
+def _per_block_round_trip_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Round-trip a per-block sharded model: every group must gather into one rank-0 checkpoint."""
+    _init(rank, world_size, init_file)
+    try:
+        torch.manual_seed(0)
+        strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block?"])
+        models = strategy.wrap(OrderedDict(model=_BlockModel()))
+        optimizer = torch.optim.SGD(models["model"].parameters(), lr=0.1, momentum=0.9)
+        _train_one_step(models["model"], optimizer)
+        saved = strategy.state_dict(models, {"opt": optimizer}, {"opt": ["model"]})
+        trained = _full_weight(models["model"].block1)
+
+        torch.manual_seed(7 + rank)
+        fresh = strategy.wrap(OrderedDict(model=_BlockModel()))
+        fresh_optimizer = torch.optim.SGD(fresh["model"].parameters(), lr=0.1, momentum=0.9)
+        before_load = _full_weight(fresh["model"].block1)
+        strategy.load_state_dict(fresh, {"opt": fresh_optimizer}, {"opt": ["model"]}, saved if rank == 0 else None)
+
+        _report(
+            result_dir,
+            rank,
+            {
+                "model_state_empty": saved["models"]["model"] == {},
+                "keys": sorted(saved["models"]["model"]),
+                "trained": trained,
+                "before_load": before_load,
+                "restored": _full_weight(fresh["model"].block1),
+            },
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fsdp2_per_block_sharding_round_trips_across_two_ranks(tmp_path: pathlib.Path) -> None:
+    """Per-block groups must not change the checkpoint: same keys, gathered on rank 0, re-sharded on load."""
+    pytest.importorskip("torch.distributed.fsdp")
+    rank0, rank1 = _spawn(_per_block_round_trip_worker, tmp_path)
+
+    assert rank0["keys"] == ["block0.bias", "block0.weight", "block1.bias", "block1.weight"]
+    _assert_round_trip(rank0, rank1)
+
+
 # ---------------------------------------------------------------------------
 # fp16 gradient scaler under FSDP2
 # ---------------------------------------------------------------------------

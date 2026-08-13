@@ -11,12 +11,13 @@ Every ``state_dict``/``load_state_dict`` implementation routes through
 """
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
 import os
+import re
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from structcast.utils.lazy_import import try_import
@@ -426,9 +427,91 @@ class DistributedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
         )
 
 
+def _compile_shard_pattern(pattern: str) -> "re.Pattern[str]":
+    """Compile a shard_modules glob into a regex whose ``*``/``?`` stay within one path segment."""
+    parts = []
+    for char in pattern:
+        if char == "*":
+            parts.append("[^.]*")
+        elif char == "?":
+            parts.append("[^.]")
+        else:
+            parts.append(re.escape(char))
+    return re.compile("".join(parts) + r"\Z")
+
+
+def matched_shard_modules(
+    models: Mapping[str, torch.nn.Module],
+    patterns: Sequence[str],
+) -> "OrderedDict[str, list[tuple[str, torch.nn.Module]]]":
+    """Return, per model, the ``named_modules()`` entries whose path matches one of *patterns*.
+
+    Patterns are globs whose ``*`` and ``?`` never cross a ``.``: ``backbone.block*`` matches
+    ``backbone.block0`` but not its children (``backbone.block0.layer_norm``, ...). ``fnmatch``
+    semantics, where ``*`` crosses ``.``, would silently match a block's whole subtree and shard
+    every leaf as its own communication group — the opposite of one all-gather per block.
+
+    Entries keep ``named_modules()`` (pre-order DFS) order, which the per-block wrap reverses to
+    shard descendants before ancestors. A leading ``_orig_mod.`` is stripped before matching so the
+    same patterns keep working on a root already wrapped by ``torch.compile``.
+
+    Raises:
+        ValueError: if a pattern matches no module in any of the models. A pattern matching nothing
+            anywhere is a typo; matching nothing in *one* model is normal for multi-model learners
+            (a CycleGAN discriminator has no blocks).
+    """
+    compiled = {p: _compile_shard_pattern(p) for p in patterns}
+    matched: OrderedDict[str, list[tuple[str, torch.nn.Module]]] = OrderedDict()
+    unmatched = set(patterns)
+    for name, model in models.items():
+        entries = []
+        for path, submodule in model.named_modules():
+            stripped = path.removeprefix("_orig_mod.")
+            # The root (or its compile wrapper's inner module) is never a match: wrap shards it
+            # last unconditionally, and a catch-all pattern must not shard it twice.
+            if not stripped or stripped == "_orig_mod":
+                continue
+            hits = [p for p, rx in compiled.items() if rx.match(stripped)]
+            if hits:
+                entries.append((path, submodule))
+                unmatched -= set(hits)
+        matched[name] = entries
+    if unmatched:
+        available = [p for m in models.values() for p, _ in m.named_modules() if p][:10]
+        raise ValueError(
+            f"shard_modules pattern(s) {sorted(unmatched)} matched no module; "
+            f"available module paths include {available}."
+        )
+    return matched
+
+
+def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str]) -> None:
+    """Refuse to shard *model* when a tied parameter would land in two ``fully_shard`` groups.
+
+    Each parameter belongs to the innermost matched module containing it, or to the root group when
+    no matched path contains it. ``fully_shard`` replaces a group's parameters with its own sharded
+    copies and checks nothing, so a tie split across two groups silently becomes two parameters that
+    drift apart. A tie staying inside one group is untouched and fine.
+    """
+    groups: dict[int, tuple[str, str]] = {}
+    for occurrence, parameter in model.named_parameters(remove_duplicate=False):
+        group = max((p for p in paths if occurrence.startswith(f"{p}.")), key=len, default="")
+        owner, first = groups.setdefault(id(parameter), (group, occurrence))
+        if owner != group:
+            raise RuntimeError(
+                f"Tied parameter {first!r} and {occurrence!r} would be sharded into different "
+                f"fully_shard groups ({owner or '<root>'} and {group or '<root>'}); "
+                "shard_modules must keep tied parameters inside one group."
+            )
+
+
 @dataclass(kw_only=True)
 class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
     """Strategy sharding every model in place with ``fully_shard`` (FSDP2).
+
+    Each model is one communication group by default; ``shard_modules`` splits it into one group per
+    matched submodule, so a block's parameters are all-gathered right before it runs and freed right
+    after instead of the whole model being resident for the whole forward.
 
     Requires torch >= 2.6. fp16 learners built under this strategy use the plain
     ``torch.amp.GradScaler``: since torch 2.5 the DTensor dispatcher all-reduces ``found_inf``
@@ -450,6 +533,10 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
     mp_policy: dict[str, str] | None = None
     """Mixed precision policy dtypes by ``MixedPrecisionPolicy`` field name, e.g. ``{"param_dtype": "bfloat16"}``."""
 
+    shard_modules: list[str] | None = None
+    """``fnmatch`` patterns over ``named_modules()`` paths to shard as their own communication
+    groups, e.g. ``["backbone.block*"]``. ``None`` shards each model as a single group."""
+
     grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     _broadcast_on_load = True
@@ -464,7 +551,12 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
             )
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
-        """Shard every model in place with ``fully_shard`` and return the same (now sharded) modules."""
+        """Shard every model in place with ``fully_shard`` and return the same (now sharded) modules.
+
+        With ``shard_modules`` set, the matched submodules are sharded first and the root last: the
+        root's managed-module walk stops at children that are already ``FSDPModule``s, so the root
+        group ends up holding exactly the parameters no matched submodule claimed.
+        """
         if self._mesh is None:
             # Without an explicit mesh, fully_shard follows the accelerator, which reports CUDA on
             # CUDA-enabled builds even when this strategy trains on CPU — the mesh must follow the
@@ -474,6 +566,17 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _StateDictMixin):
         kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
             kwargs["mp_policy"] = MixedPrecisionPolicy(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
+        if self.shard_modules:
+            matched = matched_shard_modules(models, self.shard_modules)
+            # Every model is validated before any is sharded: a tie violation surfacing halfway
+            # would leave the earlier models already irrecoverably sharded.
+            for name, model in models.items():
+                _check_tied_parameters(model, [path for path, _ in matched[name]])
+            for name in models:
+                # Reversed pre-order shards descendants before ancestors; the other order makes an
+                # ancestor claim its whole subtree and re-sharding the descendant then throws.
+                for _, submodule in reversed(matched[name]):
+                    fully_shard(submodule, **kwargs)
         return OrderedDict((n, fully_shard(m, **kwargs)) for n, m in models.items())
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
@@ -508,6 +611,7 @@ __all__ = [
     "FullyShardedDataParallelStrategy",
     "SingleDeviceStrategy",
     "initial_distributed_env",
+    "matched_shard_modules",
     "sync_gate",
 ]
 

@@ -1,6 +1,10 @@
 # Distributed strategy pattern: FSDP2 (fully_shard, torch>=2.6). The pattern is called with
-# device=... and local_rank=...; bind wrap-time knobs here.
+# device=... and local_rank=...; bind wrap-time knobs here. shard_modules takes glob patterns
+# (* and ? never cross a ".") over named_modules() paths and shards every matched submodule as
+# its own communication group (and compiles it as its own graph); unset, each model is sharded
+# as a single group.
 - _obj_
 - _addr_: structcast_model.torch.distributed.FullyShardedDataParallelStrategy
 - _bind_:
     reshard_after_forward: true
+    # shard_modules: ["backbone.block*"]

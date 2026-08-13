@@ -52,4 +52,11 @@ the follow-up (`docs/references/flow-compile-step-time-h200.md`): compiling the 
 (+8.9% training, +60% inference step time on DDP 2×H200) while the single-device fusion win is real
 (−14.8% training), so flow functions compile only on a single device. The sync gate is emitted inline in
 the generated script rather than imported — the package's lazy-import shim is opaque to dynamo's tracer.
-Per-block compilation would need a model-structure seam the builder does not have and stays out of scope.
+Per-block compilation and per-block `fully_shard` build on a structural seam the templates already have:
+configs that nest layers via `TYPE`/`CFG` generate real per-block submodule classes. The FSDP2 strategy's
+`shard_modules` names the units — glob patterns over `named_modules()` paths whose `*` never crosses a
+`.`, because fnmatch semantics would match a block's whole subtree and shard every leaf as its own group —
+and its wrap shards matched modules descendants-first with the root last, so the root group holds exactly
+the leftovers. When compilation is on, the CLI compiles the matched submodules in place instead of the
+root: compile-unit boundaries follow the shard boundaries, keeping FSDP2's per-block hooks out of the
+compiled graphs. Unset, each model stays one group and one compile unit, as before.
