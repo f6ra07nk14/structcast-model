@@ -41,7 +41,6 @@ LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
 _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 
@@ -423,8 +422,7 @@ def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: C
     script = (tmp_path / "learner.py").read_text()
     assert "class Learner" in script
     # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
-    # The two steps are closures bound in `__init__`, so they are attributes rather than methods.
-    for member in ("def update(self", "self.training_step = training_step", "self.inference_step = inference_step"):
+    for member in ("def update(self", "def training_step(self", "def inference_step(self"):
         assert member in script
     assert "def models(self" in script
 
@@ -495,36 +493,6 @@ def test_instantiate_builds_linear_with_args() -> None:
     assert isinstance(result, torch.nn.Linear)
     assert result.in_features == 8
     assert result.out_features == 4
-
-
-# ---------------------------------------------------------------------------
-# _compile_module
-# ---------------------------------------------------------------------------
-
-
-def test_compile_module_returns_module_when_no_kwargs() -> None:
-    """_compile_module returns the module unchanged when compile_kw is None."""
-    module = torch.nn.Linear(4, 2)
-    assert _compile_module(module, None) is module
-
-
-def test_compile_module_compiles_modules_in_place_and_wraps_callables() -> None:
-    """Modules keep their identity; plain callables get the torch.compile wrapper.
-
-    An OptimizedModule wrapper would shift named_modules() paths and prefix checkpoint keys with
-    '_orig_mod.'; callables have no in-place form.
-    """
-    module = torch.nn.Linear(4, 2)
-    compiled = _compile_module(module, {})
-    assert compiled is module
-    assert module._compiled_call_impl is not None  # noqa: SLF001  # the only marker .compile() leaves
-    assert set(compiled.state_dict()) == {"weight", "bias"}
-
-    def flow(x: torch.Tensor) -> torch.Tensor:
-        return x + 1
-
-    wrapped = _compile_module(flow, {})
-    assert wrapped is not flow
 
 
 # ---------------------------------------------------------------------------

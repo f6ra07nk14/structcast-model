@@ -126,7 +126,7 @@ scm torch train \
 What happens:
 
 1. Datasets are instantiated and composed into a `SimpleDataProvider`, which reports `steps_per_epoch` / `validation_steps`; the trainer scans the provider datasets, so every dataset implementing an event protocol joins the loop.
-2. The command builds and initializes the models on the training device, compiles each model and wraps it with the distributed strategy, then constructs the learner on the wrapped models and compiles its generated `_flow_*` functions.
+2. The command builds and initializes the models on the training device, compiles them where the strategy places the units and wraps them, then constructs the learner on the wrapped models and compiles its generated `_flow_*` functions on a single device only.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
 4. `TorchTrainer` is built, then the callbacks are collected from its prefixes: `ProgressBar` (or `Printer` with `--ci`) and the logger on rank 0 only, while the training-state saver and one `TorchBestCriterion` per `-LC`/`-HC` criterion join on every rank — producing their states is a collective — holding a `NullLogger` off rank 0 so only rank 0 writes.
 5. Every participant is routed into its events on first use, and `fit(epochs=...)` runs inside the logger's run context.

@@ -1,7 +1,6 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
 from collections import OrderedDict
-from collections.abc import Callable
 from functools import partial
 import inspect
 from pathlib import Path
@@ -149,21 +148,6 @@ def create_learner(
     builder(parameters=reduce_dict(parameters), classname=classname)(output)
 
 
-def _compile_module(module: Any, compile_kw: dict[str, Any] | None) -> Any:
-    """Compile in place when *module* is an `nn.Module`, else wrap with `torch.compile`.
-
-    In-place compilation (`nn.Module.compile`) keeps the object identity: no `OptimizedModule`
-    wrapper shifts `named_modules()` paths or prefixes checkpoint keys with `_orig_mod.`. Plain
-    callables (the generated flow functions) have no in-place form, so they keep the wrapper.
-    """
-    if compile_kw is None:
-        return module
-    if isinstance(module, torch.nn.Module):
-        module.compile(**compile_kw)
-        return module
-    return torch.compile(module, **compile_kw)
-
-
 def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
     """Instantiate models from a list of name-pattern mappings."""
     res: OrderedDict[str, Any] = OrderedDict()
@@ -248,7 +232,9 @@ def measure_inference_time(
         shapes = torch_trainer.resolve_input_shapes(model, shapes)
         torch_trainer.initial_model(model, shapes)
     print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
-    model = _compile_module(model, instantiator.instantiate(compile_pattern))
+    model = torch_distributed.SingleDeviceStrategy(device=device).compile(
+        model, instantiator.instantiate(compile_pattern)
+    )
     if training_mode:
         model.train()
     else:
@@ -369,7 +355,6 @@ def _assemble_learner(
     resume: str | None,
     strategy: "torch_distributed.DistributedStrategy",
     compile_kw: dict[str, Any] | None,
-    compile_fn: Callable[[Any], Any],
     learner_pattern: Any,
     learner_outputs: list[str] | None,
     device: str,
@@ -392,16 +377,7 @@ def _assemble_learner(
                     model.apply(initializers[model_name])
         if resume is None:
             strategy.sync_initial_weights(models)
-        shard_modules = getattr(strategy, "shard_modules", None)
-        if shard_modules and compile_kw is not None:
-            # Compile units follow the shard boundaries (ADR-0004): compiling the root would bury
-            # the per-block all-gather/reduce-scatter hooks inside one graph. nn.Module.compile
-            # compiles in place, so no OptimizedModule wrapper shifts the paths wrap matches on.
-            for matches in torch_distributed.matched_shard_modules(models, shard_modules).values():
-                for _, submodule in matches:
-                    submodule.compile(**compile_kw)
-        else:
-            models = OrderedDict((n, compile_fn(m)) for n, m in models.items())
+        models = OrderedDict((n, strategy.compile(m, compile_kw)) for n, m in models.items())
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
         # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
@@ -415,14 +391,16 @@ def _assemble_learner(
         else:
             learner = factory(**models)
         learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-        tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
+        tracker = torch_trainer.TorchTracker.from_criteria(
+            learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
+        )
     # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
     # Flow functions compile only on a single device: distributed wrappers graph-break inside the
     # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
     # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
     if hasattr(learner, "flow_functions") and not distributed:
         for flow_name in list(learner.flow_functions):
-            setattr(learner, flow_name, compile_fn(getattr(learner, flow_name)))
+            setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), compile_kw))
     return models, learner, learner_outputs, tracker
 
 
@@ -638,7 +616,6 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
     input_shapes = reduce_dict(shapes)
     initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
     compile_kw = instantiator.instantiate(compile_pattern)
-    compile_fn = partial(_compile_module, compile_kw=compile_kw)
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
     provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
@@ -654,7 +631,6 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
         resume=resume,
         strategy=strategy,
         compile_kw=compile_kw,
-        compile_fn=compile_fn,
         learner_pattern=learner_pattern,
         learner_outputs=learner_outputs,
         device=device,

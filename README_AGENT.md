@@ -218,7 +218,7 @@ Purpose:
 
 Key runtime behavior:
 
-- `torch.compile` is optional and configured via `-c/--compile`; it is applied to each model before the distributed strategy wraps it (so the wrapper stays outermost) and to the learner's generated `_flow_*` functions. Whole wrapped models and step closures are never compiled; `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
+- `torch.compile` is optional and configured via `-c/--compile`; the strategy places the compile units (model root in place by default, matched `shard_modules` blocks under per-block FSDP2), always before wrapping so the wrapper stays outermost. The learner's generated `_flow_*` functions compile on a single device only; the eager step methods, `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 - Mixed precision is owned by the learner (its `MIXED_PRECISION` template keys), not by a CLI flag.
 - The two dataset options are composed into a `SimpleDataProvider` passed as `data=`; `fit()` receives only loop parameters.
 - Callbacks passed to the trainer: `ProgressBar` (or `Printer` under `--ci`) and the logger on rank 0 only; `TrainingStateSaver` and one `TorchBestCriterion` per `-LC`/`-HC` criterion on every rank, since producing their states is a collective — off rank 0 they carry a `NullLogger` and write nothing. Datasets never enter `callbacks`: the trainer scans the provider datasets for event protocols on every rank.
@@ -386,7 +386,7 @@ Utility functions:
 
 1. Datasets are instantiated from YAML or inline StructCast patterns and composed into a `SimpleDataProvider`, which reports the step counts; the trainer scans the provider datasets, so those implementing an event protocol join the loop.
 2. The `train` command instantiates the models on the training device, initializes them with dummy inputs, and applies initializers on the main rank.
-3. Each model is compiled where requested and then wrapped by the distributed strategy; the learner is built with those wrapped models, and its generated `_flow_*` functions are compiled.
+3. Each model is compiled where the strategy places the units and then wrapped by it; the learner is built with those wrapped models, and its generated `_flow_*` functions are compiled on a single device only.
 4. `TorchTracker` is built from the learner's `outputs` (or `--learner-outputs`).
 5. `TorchTrainer` is constructed, then the callbacks are assembled from its prefixes: progress reporting, logger, state saver, best criteria.
 6. Every participant is routed into its events on first use, and `fit()` runs inside the logger's run context.
