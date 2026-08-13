@@ -80,23 +80,25 @@ def test_learner_bfloat16_script_has_no_grad_scaler() -> None:
 def test_learner_script_gates_model_invocations() -> None:
     """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "with _sync_gate(model, __need_update__): cls = model(image)" in script
-    assert "def _sync_gate(module, armed):" in script
-    assert '_restore_requires_grad(model, _requires_grad_defaults["model"])' in script
+    assert "with sync_gate(model, __need_update__): cls = model(image)" in script
+    assert "def _sync_gate(module, armed):" not in script  # the package helper, never an inline copy
+    assert '_restore_requires_grad(model, self._requires_grad_defaults["model"])' in script
+    assert "def _restore_requires_grad(module, defaults):" in script
 
 
-def test_learner_script_binds_steps_as_closures() -> None:
-    """The steps are `__init__` closures bound onto the instance, not methods delegating to them.
+def test_learner_script_defines_steps_as_methods() -> None:
+    """The steps are class-level methods, not closures bound onto the instance in `__init__`.
 
-    The closure captures the models and optimizers directly, so no wrapper method has to thread
-    `need_update` through; the training closure reads it off `self` instead.
+    The bodies rebind the models and optimizers off `self`, so a compiled `_flow_*` function can be
+    swapped on the instance and still be picked up; the training method reads `need_update` off
+    `self` too, so no wrapper has to thread it through.
     """
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "def training_step(image, label, **kwargs):" in script
+    assert "    def training_step(self, image, label, **kwargs):" in script
     assert "__need_update__ = self.need_update" in script
-    assert "@torch.no_grad()\n        def inference_step(image, label, **kwargs):" in script
-    assert "self.training_step = training_step" in script
-    assert "self.inference_step = inference_step" in script
+    assert "    @torch.no_grad()\n    def inference_step(self, image, label, **kwargs):" in script
+    assert "self.training_step = training_step" not in script
+    assert "self.inference_step = inference_step" not in script
     assert "forward_training_step" not in script
     assert "forward_inference_step" not in script
 
@@ -241,7 +243,9 @@ def test_learner_collected_imports_include_torch_and_amp() -> None:
     """Collected imports include torch always, the sync gate always, and torch.amp only for fp16."""
     imports = TorchLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
     assert "torch" in imports
-    assert "nullcontext" in imports["contextlib"]
+    assert "sync_gate" in imports["structcast_model.torch.distributed"]
+    assert "get_decays" in imports["structcast_model.torch.optimizers"]
+    assert "contextlib" not in imports
     assert "torch.amp" not in imports
     fp16_imports = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).collected_imports
     assert "torch.amp" in fp16_imports
@@ -255,7 +259,8 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
     """
     built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     assert "AdamWWithCosine(" in built.scripts[0]
-    assert "structcast_model.torch.optimizers" not in built.collected_imports
+    # The module is imported for `get_decays`, but the file-referenced class must not ride along.
+    assert "AdamWWithCosine" not in built.collected_imports["structcast_model.torch.optimizers"]
     script_path = tmp_path / "learner.py"
     built(script_path)
     code = script_path.read_text(encoding="utf-8")

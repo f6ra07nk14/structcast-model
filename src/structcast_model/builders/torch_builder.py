@@ -3,6 +3,7 @@
 import ast
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from structcast.core.instantiator import ObjectPattern
@@ -80,24 +81,16 @@ class TorchLearnerIntermediate(LearnerIntermediate):
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
-        "contextlib": {"nullcontext"},
+        "structcast_model.torch.optimizers": {"get_decays"},
+        "structcast_model.torch.distributed": {"sync_gate"},
     }
-    """Default imports for PyTorch learners; `nullcontext` backs the inline sync gate."""
+    """Default imports for PyTorch learners; the generated steps and properties call these directly."""
 
     def _with_autocast(self, flow: list[str]) -> list[str]:
         if not (self.mixed_precision_type and flow):
             return flow
         autocast = f"with torch.autocast(device_type, torch.{self.mixed_precision_type}):"
         return [autocast] + [f"{' ' * 4}{L}" for L in flow]
-
-    def _wrap_step_function(self, name: str, flow: list[str], decorator: str = "") -> list[str]:
-        """Wrap the given flow in a step function definition, closing over `self` inside `__init__`."""
-        inputs = self._forward_inputs
-        inputs += ", " if inputs else ""
-        prefix = ([decorator] if decorator else []) + [f"def {name}({inputs}**kwargs):"]
-        body = [f"{' ' * 4}{L}" for L in flow]
-        suffix = [f"{' ' * 4}return {self._forward_outputs}"]
-        return prefix + body + suffix
 
     def _flow_function(self, name: str, params: list[str], body: list[str], returns: list[str]) -> list[str]:
         """Emit one pure flow function plus the self-assignment that makes it rebindable (compilable)."""
@@ -134,21 +127,31 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             if layer in self.models:
                 seen[layer] += 1
                 last_owned = layer in trainable_layers and seen[layer] == info["counts"][layer]
-                line = f"with _sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
+                line = f"with sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
             body.append(line)
         return body
 
     def _get_forward_inference_flow(self) -> list[str]:
-        """Extract the inference flow into a compilable `_flow_inference` function and its caller."""
+        """Get the `__init__` half of the inference flow."""
+        return self._inference_flow_parts[0]
+
+    @cached_property
+    def _inference_flow_parts(self) -> tuple[list[str], list[str]]:
+        """Split inference into the compilable `_flow_inference` definition and the `inference_step` body."""
         info = self._analyze_segment(self.inference_flow)
         params = [n for n in info["external"] if n in self.inputs]
         body = self._with_autocast([line for line, _ in info["lines"]])
         defs = self._flow_function("_flow_inference", params, body, self.outputs)
         call = f"{', '.join(self.outputs)} = self._flow_inference(False{''.join(f', {p}' for p in params)})"
-        return defs + self._wrap_step_function("inference_step", [call], decorator="@torch.no_grad()")
+        return defs, [call]
 
     def _get_forward_training_flow(self) -> list[str]:
-        """Extract per-optimizer flow functions and the eager training step driving them.
+        """Get the `__init__` half of the training flow."""
+        return self._training_flow_parts[0]
+
+    @cached_property
+    def _training_flow_parts(self) -> tuple[list[str], list[str]]:
+        """Split training into the per-optimizer flow definitions and the eager `training_step` body.
 
         Each optimizer segment's pure computation becomes a `_flow_<optimizer>` function (the
         `torch.compile` unit); `train()/eval()`, `requires_grad_` freezing, backward, clipping,
@@ -174,26 +177,13 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         available = set(self.inputs)
         # Freezing restores each owned model's construction-time requires_grad states instead of a
         # blanket True, so submodules the user froze stay frozen across optimizer segments.
-        # The sync gate is emitted inline rather than imported: the package modules sit behind a
-        # lazy-import shim that torch.compile's tracer cannot introspect. It sets the wrapper's
-        # sync flag when called and leaves it in place — DDP reads the flag at forward, FSDP2 at
-        # backward — and the next gate on the same module overwrites it.
-        defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
-        defs: list[str] = [
-            f"_requires_grad_defaults = {{{defaults}}}",
-            "def _restore_requires_grad(module, defaults):",
-            "    for p, d in zip(module.parameters(), defaults):",
-            "        p.requires_grad_(d)",
-            "def _sync_gate(module, armed):",
-            "    if isinstance(module, torch.nn.parallel.DistributedDataParallel):",
-            "        module.require_backward_grad_sync = armed",
-            '    elif hasattr(module, "set_requires_gradient_sync"):',
-            "        module.set_requires_gradient_sync(armed)",
-            "    return nullcontext()",
-        ]
+        defs: list[str] = []
         step: list[str] = []
+        # `others` the step body reads off `self`, so the body lines stay plain local-variable code.
+        used: list[str] = list(self.models)
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
             loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = opt_unit
+            used += [n for n in (optimizer_name, clip_name, mixed_precision_name) if n and n not in used]
             backward_line = (
                 f"{loss}.backward({backward_kwargs})"
                 if mixed_precision_name is None
@@ -209,7 +199,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             )
             step += [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
             step += [
-                f'_restore_requires_grad({m}, _requires_grad_defaults["{m}"])'
+                f'_restore_requires_grad({m}, self._requires_grad_defaults["{m}"])'
                 if m in trainable_layers
                 else f"{m}.requires_grad_(False)"
                 for m in self.models
@@ -236,7 +226,8 @@ class TorchLearnerIntermediate(LearnerIntermediate):
                 step.append(f"{indent}{mixed_precision_name}.update()")
             step.append(f"{indent}{optimizer_name}.zero_grad()")
             available |= set(info["stores"])
-        return defs + self._wrap_step_function("training_step", ["__need_update__ = self.need_update", *step])
+        binds = ["__need_update__ = self.need_update"] + [f"{n} = self.{n}" for n in used]
+        return defs, binds + step
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner."""
@@ -252,7 +243,15 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
+        inputs = self._forward_inputs
+        inputs += ", " if inputs else ""
+        defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         return f"""\
+def _restore_requires_grad(module, defaults):
+    for p, d in zip(module.parameters(), defaults):
+        p.requires_grad_(d)
+
+
 class {self.classname}:
 
     def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
@@ -265,13 +264,21 @@ class {self.classname}:
         {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
         {sep.join(self._forward_training_flow)}
         {sep.join(self._forward_inference_flow)}
-        self.training_step = training_step
-        self.inference_step = inference_step
         {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
+        self._requires_grad_defaults = {{{defaults}}}
         self.need_update = True
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
+
+    def training_step(self, {inputs}**kwargs):
+        {sep.join(self._training_flow_parts[1])}
+        return {self._forward_outputs}
+
+    @torch.no_grad()
+    def inference_step(self, {inputs}**kwargs):
+        {sep.join(self._inference_flow_parts[1])}
+        return {self._forward_outputs}
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
@@ -305,8 +312,6 @@ class {self.classname}:
 
     @property
     def weight_decays(self):
-        from structcast_model.torch.optimizers import get_decays
-
         return get_decays(self.optimizers)
 
     @property

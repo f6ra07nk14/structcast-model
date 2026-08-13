@@ -364,8 +364,8 @@ def test_torch_learner_builder_simple_learner_generates_scripts() -> None:
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "class Learner" in combined
-    assert "self.training_step = training_step" in combined
-    assert "self.inference_step = inference_step" in combined
+    assert "def training_step(self, x, **kwargs):" in combined
+    assert "def inference_step(self, x, **kwargs):" in combined
     assert "optimizer" in combined.lower() or "sgd" in combined.lower()
 
 
