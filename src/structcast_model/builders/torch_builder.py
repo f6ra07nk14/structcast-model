@@ -90,11 +90,11 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         autocast = f"with torch.autocast(device_type, torch.{self.mixed_precision_type}):"
         return [autocast] + [f"{' ' * 4}{L}" for L in flow]
 
-    def _wrap_step_function(self, name: str, flow: list[str], extra_params: str = "") -> list[str]:
-        """Wrap the given flow in a step function definition."""
+    def _wrap_step_function(self, name: str, flow: list[str], decorator: str = "") -> list[str]:
+        """Wrap the given flow in a step function definition, closing over `self` inside `__init__`."""
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
-        prefix = [f"def {name}({extra_params}{inputs}**kwargs):"]
+        prefix = ([decorator] if decorator else []) + [f"def {name}({inputs}**kwargs):"]
         body = [f"{' ' * 4}{L}" for L in flow]
         suffix = [f"{' ' * 4}return {self._forward_outputs}"]
         return prefix + body + suffix
@@ -145,7 +145,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         body = self._with_autocast([line for line, _ in info["lines"]])
         defs = self._flow_function("_flow_inference", params, body, self.outputs)
         call = f"{', '.join(self.outputs)} = self._flow_inference(False{''.join(f', {p}' for p in params)})"
-        return defs + self._wrap_step_function("_inference_step", [call])
+        return defs + self._wrap_step_function("inference_step", [call], decorator="@torch.no_grad()")
 
     def _get_forward_training_flow(self) -> list[str]:
         """Extract per-optimizer flow functions and the eager training step driving them.
@@ -236,7 +236,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
                 step.append(f"{indent}{mixed_precision_name}.update()")
             step.append(f"{indent}{optimizer_name}.zero_grad()")
             available |= set(info["stores"])
-        return defs + self._wrap_step_function("_training_step", step, extra_params="__need_update__, ")
+        return defs + self._wrap_step_function("training_step", ["__need_update__ = self.need_update", *step])
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner."""
@@ -252,8 +252,6 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
-        inputs = self._forward_inputs
-        inputs += ", " if inputs else ""
         return f"""\
 class {self.classname}:
 
@@ -267,8 +265,8 @@ class {self.classname}:
         {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
         {sep.join(self._forward_training_flow)}
         {sep.join(self._forward_inference_flow)}
-        self.forward_training_step = _training_step
-        self.forward_inference_step = _inference_step
+        self.training_step = training_step
+        self.inference_step = inference_step
         {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
         self.need_update = True
@@ -277,13 +275,6 @@ class {self.classname}:
 
     def update(self, step: int) -> bool:
         {sep.join(need_update)}
-
-    def training_step(self, {inputs}**kwargs):
-        return self.forward_training_step(self.need_update, {inputs}**kwargs)
-
-    @torch.no_grad()
-    def inference_step(self, {inputs}**kwargs):
-        return self.forward_inference_step({inputs}**kwargs)
 
     @property
     def models(self):

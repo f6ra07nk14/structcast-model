@@ -85,11 +85,20 @@ def test_learner_script_gates_model_invocations() -> None:
     assert '_restore_requires_grad(model, _requires_grad_defaults["model"])' in script
 
 
-def test_learner_script_defines_training_and_inference_steps() -> None:
-    """Script defines both _training_step and _inference_step functions."""
+def test_learner_script_binds_steps_as_closures() -> None:
+    """The steps are `__init__` closures bound onto the instance, not methods delegating to them.
+
+    The closure captures the models and optimizers directly, so no wrapper method has to thread
+    `need_update` through; the training closure reads it off `self` instead.
+    """
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "def _training_step(" in script
-    assert "def _inference_step(" in script
+    assert "def training_step(image, label, **kwargs):" in script
+    assert "__need_update__ = self.need_update" in script
+    assert "@torch.no_grad()\n        def inference_step(image, label, **kwargs):" in script
+    assert "self.training_step = training_step" in script
+    assert "self.inference_step = inference_step" in script
+    assert "forward_training_step" not in script
+    assert "forward_inference_step" not in script
 
 
 def test_learner_script_exposes_properties() -> None:
