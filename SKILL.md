@@ -193,7 +193,7 @@ What happens:
 4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
 6. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
-7. Generated learners wrap every model call in `sync_gate(model, armed)`, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
+7. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
 
 ## CLI Surface
 
@@ -313,7 +313,7 @@ These live in `examples/torch/data.py` and are referenced from a configuration b
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
 | Distributed environment detection | `initial_distributed_env(device, ...)` | Read `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars, init process group |
-| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, and produce wrapper-free state dicts |
+| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, place the compile units, and produce wrapper-free state dicts |
 | Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
 | Gradient sync gating | `sync_gate(model, armed)` (in generated learners) | Let gradients synchronize only on the owning segment's last model call of an update step |
 

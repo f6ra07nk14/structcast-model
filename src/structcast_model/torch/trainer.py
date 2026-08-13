@@ -194,22 +194,6 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
         if "cuda" in self.device:
             torch.cuda.synchronize()
 
-    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
-        """Perform a training step and update the models.
-
-        Gradient synchronization is gated inside the generated training step, per model invocation,
-        so the trainer runs the step without any surrounding context.
-
-        Args:
-            __inputs__ (Any): The inputs for the training step.
-
-        Returns:
-            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
-                a dictionary of criteria for tracking.
-        """
-        updated = self.learner.update(self.step)
-        return updated, self.learner.training_step(**__inputs__)
-
 
 @dataclass(kw_only=True, slots=True)
 class TorchBestCriterion(BestCriterion[torch.nn.Module]):

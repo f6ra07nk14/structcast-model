@@ -11,6 +11,11 @@ class CausalSelfAttention(Module):
 
     The mask is not materialized: `scaled_dot_product_attention(..., is_causal=True)` applies it
     internally, which keeps the memory cost independent of the sequence length.
+
+    This exists because `torch.nn.MultiheadAttention` cannot do that: its `is_causal` is only a
+    hint and it raises "Need attn_mask if specifying the is_causal hint" without an explicit
+    (sequence x sequence) mask built per forward — which a model configuration cannot express
+    cleanly (mask line, kwargs inputs, and unpacking the `(output, weights)` tuple).
     """
 
     __constants__ = ["embed_dim", "num_heads", "head_dim"]

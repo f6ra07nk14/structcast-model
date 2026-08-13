@@ -27,6 +27,7 @@ cfg/keras/
 examples/torch/
 ├── simple_training.py         # Runnable programmatic training tutorial
 ├── optimizers.py              # Optimizer + scheduler compositions referenced by _file_
+├── corpus.py                  # Tiny Shakespeare corpus + device/rank-aware loader, referenced by _file_
 └── data.py                    # timm dataset/dataloader wrappers and TimmDataProvider, referenced by _file_
 
 src/structcast_model/
@@ -45,6 +46,8 @@ src/structcast_model/
 │   └── utils.py               # CLI argument parsers and reducers
 ├── torch/
 │   ├── trainer.py             # Trainer, tracker, best criterion, training-state saver
+│   ├── distributed.py         # Distributed strategies, sync_gate, compile placement
+│   ├── utils.py               # get_torch_device / get_torch_device_type
 │   ├── logger.py              # Logger protocol shared by the experiment tracking backends
 │   ├── mlflow_logger.py       # MLflowLogger
 │   ├── wandb_logger.py        # WandbLogger
@@ -458,7 +461,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Dataclasses use `@dataclass(kw_only=True, slots=True)`.
 - Lazy import wrappers are used broadly:
   - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
-  - `LazySelectedImporter` for module export surfaces (`__all__`).
+  - `LazySelectedImporter` for module export surfaces (`__all__`) — except `structcast_model.torch.distributed`, deliberately exempt: generated compiled flows call `sync_gate` and the shim breaks dynamo's tracer (see the module tail comment and ADR-0004).
 - Generated code should stay minimal and preserve current public APIs.
 - The `outputs` attribute on a generated learner is significant — the CLI reads it to determine which keys `TorchTracker` should track, falling back to `--learner-outputs`.
 - A method named after a lifecycle event (`on_epoch_end`, `on_update`, …) on any participant is live code: the trainer will call it. Do not add such names for unrelated purposes.

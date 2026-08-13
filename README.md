@@ -429,7 +429,7 @@ Key arguments:
 What the train command does internally:
 
 1. Instantiates the datasets and composes them into a `SimpleDataProvider`, which reports `steps_per_epoch` and `validation_steps`. The trainer scans the provider datasets for event protocols, so a dataset implementing one receives the lifecycle events it defines.
-2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers, then compiles each model and hands it to the distributed strategy, which wraps it. The learner is built from the already-wrapped models.
+2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers on rank 0 and broadcasts the result (`sync_initial_weights`), then compiles each model where the strategy places the units and hands it to the strategy, which wraps it. The learner is built from the already-wrapped models.
 3. Builds a `TorchTracker` from the learner's output names, still inside the device scope so its buffers live on the training device.
 4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step — on a single device only. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
@@ -454,7 +454,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; the trainer scans the provider datasets for event protocols on every rank, so the hook runs everywhere it must.
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — Experiment logging and progress bars run only on rank 0. Checkpoint states are produced on **every** rank, because the strategy's state dict is a collective, and written only by rank 0.
-7. **Gradient sync gating** — Generated learners wrap every model call in `sync_gate(model, armed)`. Gradients synchronize only on the last call of a model owned by the running optimizer segment, on steps that update; every other call runs without synchronization, which covers gradient accumulation.
+7. **Gradient sync gating** — Generated learners precede every model call with a `sync_gate(model, armed)` statement. Gradients synchronize only on the last call of a model owned by the running optimizer segment, on steps that update; every other call runs without synchronization, which covers gradient accumulation.
 8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
 
 ##### Single-Node Multi-GPU

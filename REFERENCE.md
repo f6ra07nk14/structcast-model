@@ -532,7 +532,7 @@ trainer = TorchTrainer(
 history = trainer.fit(epochs=5)
 ```
 
-**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger, strategy)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it, produced through *strategy*. *logger* is `None` on the ranks that write nothing, while the state dicts are still produced on every rank; the CLI appends the returned monitors to its callbacks.
+**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger, strategy)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it, produced through *strategy*. *logger* is a `NullLogger` on the ranks that write nothing, while the state dicts are still produced on every rank; the CLI appends the returned monitors to its callbacks.
 
 **`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it with `--resume`: the model and optimizer state dicts produced by the strategy through `torch.distributed.checkpoint.state_dict` (wrapper-free keys for raw, compiled, DDP, and FSDP2 models alike), the learner's gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact. Producing the states is a collective that runs on every rank; only the ranks holding a logger write them.
 
@@ -541,7 +541,7 @@ saver = TrainingStateSaver(logger=logger, strategy=strategy)
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
-The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, and handed to the learner by name.
+The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, broadcast via `sync_initial_weights`, compiled and wrapped by the strategy, and handed to the learner by name.
 
 ---
 

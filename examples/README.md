@@ -242,7 +242,7 @@ torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train \
     -E Transformer
 ```
 
-The model declares its own `INPUT_SHAPES` (`tokens`, `int64`), so `--shapes/-s` is not needed. To
+The model declares its own `INPUT_SHAPES` (`tokens`, `int64`), so `--shape/-s` is not needed. To
 shard every block as its own communication group, uncomment `shard_modules` in the strategy
 configuration — the patterns are globs over `named_modules()` paths whose `*` and `?` never cross
 a `.`, so `"backbone.block*"` matches the blocks this model generates but not their contents.

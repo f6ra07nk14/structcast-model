@@ -21,8 +21,8 @@ synchronization, checkpoint state production, and checkpoint loading — used to
 `isinstance` branches spread over the CLI, the trainer, and the saver callbacks. They are collapsed into a
 `DistributedStrategy` protocol (`torch/distributed.py`) with three implementations, named in full:
 `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy`. The
-interface is deliberately minimal: `wrap`, `sync_initial_weights`, `state_dict`, `load_state_dict`, and a
-`grad_scaler_creator` attribute. Every member exists because a verified defect required strategy-specific
+interface is deliberately minimal: `wrap`, `sync_initial_weights`, `state_dict`, `load_state_dict`, a
+`grad_scaler_creator` attribute, and — added by ADR-0004 — `compile`, placing the compile units. Every member exists because a verified defect required strategy-specific
 behavior; nothing speculative is included. PyTorch Lightning's `Strategy` hierarchy and MMEngine's
 `_strategy` package are the same shape, independently converged on.
 

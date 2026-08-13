@@ -561,8 +561,9 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
     """Mixed precision policy dtypes by ``MixedPrecisionPolicy`` field name, e.g. ``{"param_dtype": "bfloat16"}``."""
 
     shard_modules: list[str] | None = None
-    """``fnmatch`` patterns over ``named_modules()`` paths to shard as their own communication
-    groups, e.g. ``["backbone.block*"]``. ``None`` shards each model as a single group."""
+    """Glob patterns over ``named_modules()`` paths to shard as their own communication groups,
+    e.g. ``["backbone.block*"]``; ``*`` and ``?`` never cross a ``.``. ``None`` shards each model
+    as a single group."""
 
     grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
