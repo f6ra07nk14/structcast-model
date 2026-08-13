@@ -283,7 +283,7 @@ scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: 
 
 - `-p/--parameter`: override template parameters
 - `-c/--classname`: set the generated class name, default `Model`
-- `--no-structured-output`: force tuple-like return behavior instead of a structured output mapping
+- `--structured-output/--no-structured-output`: force the root model's return type. `scm torch` defaults to the template's `STRUCTURED_OUTPUT` (a plain tuple-like return unless the template sets it); `scm flax` and `scm keras` default to a structured output mapping
 - `-s/--sublayer`: generate a named sublayer from the template instead of the root model
 - `-o/--output`: output file path; if omitted, defaults to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
 
@@ -605,7 +605,6 @@ The `cfg/` directory contains working YAML templates that demonstrate each part 
 # Root model: routes tensors through backbone → pooling → classifier
 INPUTS: [image]
 OUTPUTS: [cls]
-STRUCTURED_OUTPUT: true
 FLOW:
   - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
   - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]

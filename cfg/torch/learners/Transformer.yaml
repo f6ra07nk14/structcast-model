@@ -54,7 +54,7 @@ LEARNERS:
     # "targets", the same sequence shifted by one. Both are flattened over the batch and the time
     # axis, so cross entropy sees one class prediction per position.
     FLOW:
-      - [tokens, {logits: logits}, model]
+      - [tokens, logits, model]
       - [logits, flat_logits, flatten_logits, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 0, end_dim: 1}}]]
       - [targets, flat_targets, flatten_targets, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 0, end_dim: -1}}]]
       - INPUTS: {input: flat_logits, target: flat_targets}
@@ -62,7 +62,7 @@ LEARNERS:
         NAME: cross_entropy_loss
         LAYER: [_obj_, {_addr_: torch.nn.CrossEntropyLoss}, _call_]
     INFERENCE_FLOW:
-      - [tokens, {logits: logits}, model]
+      - [tokens, logits, model]
       - [logits, flat_logits, flatten_logits]
       - [targets, flat_targets, flatten_targets]
       - [{input: flat_logits, target: flat_targets}, ce_loss, cross_entropy_loss]

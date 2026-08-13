@@ -30,7 +30,6 @@ _jinja_yaml_: |-
       tokens: {_SHAPE_: [{{max_seq_len}}], _DTYPE_: int64}
   {% endraw %}
 OUTPUTS: [logits]
-STRUCTURED_OUTPUT: true
 FLOW:
   - _jinja_yaml_: |-
       - _jinja_group_: {{size}}

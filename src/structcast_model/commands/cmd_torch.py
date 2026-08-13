@@ -117,7 +117,13 @@ def create_model(
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Model", "--classname", "-c", help="Name the model class."),
-    structured_output: bool = Option(True, help="Enable structured output for the model."),
+    structured_output: bool | None = Option(
+        None,
+        "--structured-output/--no-structured-output",
+        help="Force dict (structured) output on the root model. By default the configuration's "
+        "STRUCTURED_OUTPUT decides, which is false unless set. Ignored with --sublayer: the "
+        "selected layer's own configuration decides.",
+    ),
     sublayer: str | None = Option(
         None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
     ),
@@ -144,8 +150,18 @@ def create_learner(
 
 
 def _compile_module(module: Any, compile_kw: dict[str, Any] | None) -> Any:
-    """Compile a PyTorch module if compile_kw is provided."""
-    return module if compile_kw is None else torch.compile(module, **compile_kw)
+    """Compile in place when *module* is an `nn.Module`, else wrap with `torch.compile`.
+
+    In-place compilation (`nn.Module.compile`) keeps the object identity: no `OptimizedModule`
+    wrapper shifts `named_modules()` paths or prefixes checkpoint keys with `_orig_mod.`. Plain
+    callables (the generated flow functions) have no in-place form, so they keep the wrapper.
+    """
+    if compile_kw is None:
+        return module
+    if isinstance(module, torch.nn.Module):
+        module.compile(**compile_kw)
+        return module
+    return torch.compile(module, **compile_kw)
 
 
 def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":

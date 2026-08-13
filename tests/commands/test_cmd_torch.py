@@ -335,10 +335,24 @@ def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> 
     assert "class MyNet" in (tmp_path / "my_net.py").read_text()
 
 
-def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model' should default structured_output to True (dict return in root class)."""
+def test_create_model_structured_output_defaults_to_configuration(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model' leaves the return type to the template, which here means a bare tensor.
+
+    The root of the ConvNeXtV2 template sets no STRUCTURED_OUTPUT, so its single `cls` output must
+    stay a plain tensor a loss can consume; only the multi-output Backbone opts into a dict.
+    """
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    script = (tmp_path / "model.py").read_text()
+    assert "return {'feat1'" in script  # the Backbone's own STRUCTURED_OUTPUT is still honored
+    assert "return {'" not in script.rsplit("class Model", 1)[-1]
+
+
+def test_create_model_forced_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model --structured-output' overrides the template and returns a dict from the root."""
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--structured-output", "--output", out])
     assert result.exit_code == 0, result.output
     last_class = (tmp_path / "model.py").read_text().rsplit("class Model", 1)[-1]
     assert "return {'" in last_class
@@ -409,8 +423,10 @@ def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: C
     script = (tmp_path / "learner.py").read_text()
     assert "class Learner" in script
     # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
-    for member in ("def update(self", "def training_step(self", "def inference_step(self", "def models(self"):
+    # The two steps are closures bound in `__init__`, so they are attributes rather than methods.
+    for member in ("def update(self", "self.training_step = training_step", "self.inference_step = inference_step"):
         assert member in script
+    assert "def models(self" in script
 
 
 def test_create_learner_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
@@ -490,6 +506,25 @@ def test_compile_module_returns_module_when_no_kwargs() -> None:
     """_compile_module returns the module unchanged when compile_kw is None."""
     module = torch.nn.Linear(4, 2)
     assert _compile_module(module, None) is module
+
+
+def test_compile_module_compiles_modules_in_place_and_wraps_callables() -> None:
+    """Modules keep their identity; plain callables get the torch.compile wrapper.
+
+    An OptimizedModule wrapper would shift named_modules() paths and prefix checkpoint keys with
+    '_orig_mod.'; callables have no in-place form.
+    """
+    module = torch.nn.Linear(4, 2)
+    compiled = _compile_module(module, {})
+    assert compiled is module
+    assert module._compiled_call_impl is not None  # noqa: SLF001  # the only marker .compile() leaves
+    assert set(compiled.state_dict()) == {"weight", "bias"}
+
+    def flow(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    wrapped = _compile_module(flow, {})
+    assert wrapped is not flow
 
 
 # ---------------------------------------------------------------------------

@@ -141,7 +141,7 @@ OUTPUTS: [feat1, feat2, feat3, feat4]
 | Value             | Behavior                                                                 |
 | ----------------- | ------------------------------------------------------------------------ |
 | `true`            | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
-| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`.                         |
+| `false` (default) | Returns the bare value for a single output, else a tuple in `OUTPUTS` order. |
 
 ```yaml
 STRUCTURED_OUTPUT: true
