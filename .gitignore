@@ -221,3 +221,5 @@ __marimo__/
 # to turn this off: the only switches are the CLI's --no-lockfile flag and the
 # application-scoped "dev.containers.lockfile" VS Code user setting.
 .devcontainer/devcontainer-lock.json
+# Downloaded example datasets (the corpus loader in examples/torch/corpus.py fetches into data/)
+data/
