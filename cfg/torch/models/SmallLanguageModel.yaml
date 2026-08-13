@@ -1,0 +1,114 @@
+PARAMETERS:
+  DEFAULT:
+    size: tiny
+  SHARED:
+    # "vocab_size", "max_seq_len" and "dropout" are shared instead of default parameters: the flows
+    # below select a size group with "_jinja_group_", and a group sees its own parameters merged
+    # with the shared ones, never the default ones. Overriding them on the command line therefore
+    # means overriding them on the selected size group, e.g. -p "tiny: {vocab_size: 100}".
+    vocab_size: 65 # the character vocabulary of Tiny Shakespeare
+    # Only the length of the "INPUT_SHAPES" dummy forward: the rotary position embedding below
+    # derives its angles from the sequence length of the actual input, so the model has no position
+    # table and no length it cannot run.
+    max_seq_len: 256
+    dropout: 0.0
+    norm_eps: 1.0e-5
+    mlp_ratio: 4
+    rope_base: 10000.0 # the standard RoPE frequency base
+  # model size parameters
+  tiny:
+    dim: 256
+    heads: 4
+    depth: 4
+  small:
+    dim: 512
+    heads: 8
+    depth: 8
+IMPORTS: {}
+INPUTS: [tokens]
+_jinja_yaml_: |-
+  _jinja_group_: {{size}}
+  {% raw %}
+  _jinja_yaml_: |-
+    INPUT_SHAPES:
+      tokens: {_SHAPE_: [{{max_seq_len}}], _DTYPE_: int64}
+  {% endraw %}
+OUTPUTS: [logits]
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [tokens, feature, token_embedding, [_obj_, {_addr_: torch.nn.Embedding}, {_call_: {num_embeddings: {{vocab_size}}, embedding_dim: {{dim}}}}]]
+          - [feature, feature, [_obj_, {_addr_: torch.nn.Dropout}, {_call_: {p: {{dropout}}}}]]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+          - [feature, logits, head, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{vocab_size}}, bias: false}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dropout: {{dropout}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+      - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - ["eval: inp + attended", residual]
+      - [residual, _, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.GELU}, _call_]]
+      - [_, _, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}}}]]
+      - [_, projected, [_obj_, {_addr_: torch.nn.Dropout}, {_call_: {p: {{dropout}}}}]]
+      - ["eval: residual + projected", out]
+CausalSelfAttention:
+  # Causal self-attention with rotary position embedding, defined entirely here: two "torch.nn.Linear"
+  # projections plus flow lines for the head split, the rotation and the fused attention kernel.
+  # There is no attention-weight dropout: "scaled_dot_product_attention" would need "dropout_p" toggled
+  # by "self.training", which a generated forward cannot consult. Small language models train attention
+  # dropout at 0 anyway; the dropouts that matter sit in the MLP and residual paths of "Block", where
+  # "torch.nn.Dropout" handles the train/eval switch itself.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    {% set head_dim = dim // heads %}
+    {% set half_dim = head_dim // 2 %}
+    FLOW:
+      # (batch, seq, dim) -> (batch, seq, 3 * dim), split back into three (batch, seq, dim) tensors.
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}}}]]
+      - INPUTS: qkv
+        OUTPUTS: [query, key, value]
+        NAME: split_qkv
+        LAYER: [_obj_, {_addr_: structcast_model.torch.layers.Split}, {_call_: {split_size_or_sections: {{dim}}, dim: -1}}]
+      # (batch, seq, dim) -> (batch, seq, heads, {{head_dim}}) -> (batch, heads, seq, {{head_dim}}).
+      # One instance of each shape layer serves all three tensors, since neither holds any state.
+      - [query, query, split_heads, [_obj_, {_addr_: torch.nn.Unflatten}, {_call_: {dim: -1, unflattened_size: [{{heads}}, {{head_dim}}]}}]]
+      - [key, key, split_heads]
+      - [value, value, split_heads]
+      - [query, query, heads_first, [_obj_, {_addr_: structcast_model.torch.layers.Permute}, {_call_: {dims: [2, 1, 3]}}]]
+      - [key, key, heads_first]
+      - [value, value, heads_first]
+      # Rotary position embedding: angles for the actual sequence length, shared by every head as
+      # (1, 1, seq, {{head_dim}}), so nothing here is bound to a maximum length.
+      - ["eval: torch.arange(inp.shape[1], device=inp.device, dtype=torch.float32)", positions]
+      - ["eval: {{rope_base}} ** (-torch.arange(0, {{head_dim}}, 2, device=inp.device, dtype=torch.float32) / {{head_dim}})", inv_freq]
+      - ["eval: positions[:, None] * inv_freq", freqs]
+      - ["eval: torch.cat((freqs, freqs), dim=-1)", angles]
+      - ["eval: angles.cos()[None, None].to(query.dtype)", cos]
+      - ["eval: angles.sin()[None, None].to(query.dtype)", sin]
+      # Rotate the query and the key by their position: "x * cos + rotate_half(x) * sin".
+      - ["eval: query * cos + torch.cat((-query[..., {{half_dim}}:], query[..., :{{half_dim}}]), dim=-1) * sin", query]
+      - ["eval: key * cos + torch.cat((-key[..., {{half_dim}}:], key[..., :{{half_dim}}]), dim=-1) * sin", key]
+      # "is_causal=True" masks the future inside the kernel, so no (seq x seq) mask is materialized.
+      - ["eval: torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=True)", attended]
+      # (batch, heads, seq, {{head_dim}}) -> (batch, seq, heads, {{head_dim}}) -> (batch, seq, dim).
+      - [attended, attended, heads_first]
+      - [attended, attended, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 2}}]]
+      - [attended, out, out_proj, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}}}]]

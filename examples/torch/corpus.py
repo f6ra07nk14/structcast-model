@@ -15,7 +15,7 @@ _obj_:
 
 Every item is `{"tokens": ..., "targets": ...}`, collation stacks those into
 `[batch, block_size]` tensors, and the trainer passes them to the learner as keyword arguments --
-which is why the keys match the inputs of `cfg/torch/learners/Transformer.yaml`.
+which is why the keys match the inputs of `cfg/torch/learners/SmallLanguageModel.yaml`.
 """
 
 from collections.abc import Iterator

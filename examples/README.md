@@ -200,22 +200,30 @@ dictionary, so a resumed run keeps its schedule.
 `OptimizerWithNativeScheduler` in the same file does the same for `torch.optim.lr_scheduler`
 schedules, which count in epochs and therefore only need `on_epoch_end`.
 
-## A decoder-only transformer on Tiny Shakespeare
+## A small language model on Tiny Shakespeare
 
-[`cfg/torch/models/Transformer.yaml`](../cfg/torch/models/Transformer.yaml) is a GPT-style language
-model: token and learned positional embeddings, a `backbone` of pre-LN blocks named `block0` …
+[`cfg/torch/models/SmallLanguageModel.yaml`](../cfg/torch/models/SmallLanguageModel.yaml) is a
+GPT-style language model: a token embedding, a `backbone` of pre-LN blocks named `block0` …
 `blockN-1`, a final layer normalization and a linear head over the vocabulary. Its blocks are
 therefore addressable as `backbone.block*`, which is what the per-block sharding of
 [`cfg/torch/strategies/fsdp2.yaml`](../cfg/torch/strategies/fsdp2.yaml) matches on.
 
+Causal self-attention is not a package layer but a `CausalSelfAttention` section of that
+configuration: two `torch.nn.Linear` projections around flow lines that split the fused qkv output
+(`Split`), reshape it into heads (`torch.nn.Unflatten` and `Permute`), and call
+`torch.nn.functional.scaled_dot_product_attention(..., is_causal=True)`, whose kernel applies the
+causal mask without materializing one. Positions come from a rotary embedding computed in the same
+section from the sequence length of the actual input, so there is no learned position table and no
+length the model cannot run — `max_seq_len` only sizes the `INPUT_SHAPES` dummy forward.
+
 ```bash
 # 1. The model: -p "DEFAULT: {size: small}" picks the larger preset, and the vocabulary and the
 #    sequence length are parameters of the size group, e.g. -p "tiny: {vocab_size: 100}".
-scm torch create model cfg/torch/models/Transformer.yaml -o model.py
+scm torch create model cfg/torch/models/SmallLanguageModel.yaml -o model.py
 
 # 2. The learner: next-token cross entropy over the flattened logits and targets, with a native
 #    torch.optim.AdamW -- FSDP2's checkpoint path refuses scheduler proxies like AdamWWithCosine
-scm torch create learner cfg/torch/learners/Transformer.yaml -o learner.py
+scm torch create learner cfg/torch/learners/SmallLanguageModel.yaml -o learner.py
 ```
 
 [`torch/corpus.py`](torch/corpus.py) supplies the data: `TinyShakespeare` downloads the corpus once
@@ -239,7 +247,7 @@ torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train \
     -LC val_ce_loss \
     -SC val_ce_loss \
     --logger mlflow \
-    -E Transformer
+    -E SmallLanguageModel
 ```
 
 The model declares its own `INPUT_SHAPES` (`tokens`, `int64`), so `--shape/-s` is not needed. To
