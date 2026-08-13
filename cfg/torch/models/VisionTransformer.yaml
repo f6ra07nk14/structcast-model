@@ -1,0 +1,150 @@
+# ViT-B/16, laid out to match `timm.create_model("vit_base_patch16_224")` module for module: with the
+# timm state dict transplanted into it this configuration reproduces timm's logits to ~1e-6
+# (see `tests/builders/test_vision_transformer.py`).
+# The class token is a `torch.nn.Embedding(1, dim)` read at index 0 -- the DSL has no free parameter
+# outside a layer, but a one-row embedding table is the same parameter, and its weight maps 1:1 onto
+# timm's `cls_token`. The position table likewise maps onto `pos_embed` squeezed, and it covers
+# {{(image_size // patch_size) ** 2 + 1}} positions because timm adds it after the class token is
+# prepended (`no_embed_class=False`).
+# The root emits a bare "cls" tensor, exactly like "ConvNeXtV2.yaml", so both models train through
+# "cfg/torch/learners/ImageClassifier.yaml" unchanged.
+PARAMETERS:
+  DEFAULT:
+    size: base
+  SHARED:
+    # As in "SmallLanguageModel.yaml" these are shared instead of default parameters: the flows below
+    # select a size group with "_jinja_group_", and a group sees its own parameters merged with the
+    # shared ones, never the default ones. Overriding them on the command line therefore means
+    # overriding them on the selected size group, e.g. -p "base: {num_classes: 10}".
+    patch_size: 16
+    image_size: 224
+    num_classes: 1000
+    mlp_ratio: 4
+    # Linearly ramped over the blocks, as in "ConvNeXtV2.yaml"; a single stage needs no cumulative
+    # depths, so the ramp is just "drop_path_rate * i / (depth - 1)". timm's own
+    # "vit_base_patch16_224" defaults to 0.0; 0.1 is the usual supervised ImageNet recipe.
+    drop_path_rate: 0.1
+    norm_eps: 1.0e-6
+  # model size parameters
+  base:
+    dim: 768
+    heads: 12
+    depth: 12
+IMPORTS: {}
+INPUTS: [image]
+_jinja_yaml_: |-
+  INPUT_SHAPES:
+    image: {_SHAPE_: [3, {{image_size}}, {{image_size}}], _DTYPE_: float32}
+OUTPUTS: [cls]
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          # (batch, 3, {{image_size}}, {{image_size}}) -> (batch, {{dim}}, {{image_size // patch_size}}, {{image_size // patch_size}})
+          # -> (batch, {{dim}}, {{(image_size // patch_size) ** 2}}) -> (batch, {{(image_size // patch_size) ** 2}}, {{dim}}),
+          # i.e. timm's "patch_embed": the same convolution, flatten and transpose.
+          - INPUTS: image
+            OUTPUTS: feature
+            NAME: patchify
+            LAYER:
+              - _obj_
+              - _addr_: torch.nn.Conv2d
+              - _call_: {in_channels: 3, out_channels: {{dim}}, kernel_size: {{patch_size}}, stride: {{patch_size}}}
+          - [feature, feature, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 2}}]]
+          - [feature, feature, [_obj_, {_addr_: structcast_model.torch.layers.Permute}, {_call_: {dims: [2, 1]}}]]
+          # The class token, read out of a one-row embedding table at index 0 for every batch element:
+          # the same tensor timm expands from "cls_token", prepended before the position table is added.
+          - ["eval: torch.zeros(feature.shape[0], 1, device=feature.device, dtype=torch.long)", class_index]
+          - INPUTS: class_index
+            OUTPUTS: class_token
+            NAME: cls_token_embedding
+            LAYER: [_obj_, {_addr_: torch.nn.Embedding}, {_call_: {num_embeddings: 1, embedding_dim: {{dim}}}}]
+          - INPUTS: [[class_token, feature]]
+            OUTPUTS: feature
+            NAME: concat_class_token
+            LAYER: [_obj_, {_addr_: structcast_model.torch.layers.Concatenate}, {_call_: {dim: 1}}]
+          # A learned position table, unlike the rotary embedding of "SmallLanguageModel.yaml": the
+          # patch grid is fixed by "image_size" and "patch_size", so there is nothing to extrapolate.
+          - ["eval: torch.arange(feature.shape[1], device=feature.device)", index]
+          - INPUTS: index
+            OUTPUTS: position
+            NAME: position_embedding
+            LAYER:
+              - _obj_
+              - _addr_: torch.nn.Embedding
+              - _call_: {num_embeddings: {{(image_size // patch_size) ** 2 + 1}}, embedding_dim: {{dim}}}
+          - ["eval: feature + position", feature]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+          # timm normalizes the whole sequence and only then reads the class token, so the two cannot
+          # be swapped.
+          - ["eval: feature[:, 0]", pooled]
+          - [pooled, cls, head, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{num_classes}}}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1)}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  # timm's "Block": pre-norm attention and pre-norm MLP, each on a residual branch. "LayerScale" is
+  # left out because "vit_base_patch16_224" sets "init_values=None", which makes it an identity.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+      - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - [attended, attended, drop_path_attention, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: inp + attended", residual]
+      - [residual, _, [_obj_, {_addr_: torch.nn.LayerNorm}, {_call_: {normalized_shape: {{dim}}, eps: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.GELU}, _call_]]
+      - [_, _, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}}}]]
+      - [_, projected, drop_path_mlp, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: residual + projected", out]
+SelfAttention:
+  # The bidirectional twin of the "CausalSelfAttention" section of "SmallLanguageModel.yaml": same two
+  # "torch.nn.Linear" projections and the same head-split flow lines, without the rotary embedding
+  # (the position table in the root carries order) and with "is_causal=False", since an image patch
+  # may read every other patch.
+  # Splitting the fused projection into three (batch, tokens, dim) tensors and unflattening each into
+  # (heads, {{dim // heads}}) reproduces timm's "reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)": the
+  # fused output is laid out as q, k, v each of "dim" contiguous features, heads-major within each.
+  # There is no attention-weight dropout: "scaled_dot_product_attention" would need "dropout_p"
+  # toggled by "self.training", which a generated forward cannot consult. ViT regularizes through
+  # "DropPath" on the residual branches instead, and timm's own attention dropout defaults to 0.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    {% set head_dim = dim // heads %}
+    FLOW:
+      # (batch, tokens, dim) -> (batch, tokens, 3 * dim), split back into three (batch, tokens, dim) tensors.
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}}}]]
+      - INPUTS: qkv
+        OUTPUTS: [query, key, value]
+        NAME: split_qkv
+        LAYER: [_obj_, {_addr_: structcast_model.torch.layers.Split}, {_call_: {split_size_or_sections: {{dim}}, dim: -1}}]
+      # (batch, tokens, dim) -> (batch, tokens, heads, {{head_dim}}) -> (batch, heads, tokens, {{head_dim}}).
+      # One instance of each shape layer serves all three tensors, since neither holds any state.
+      - [query, query, split_heads, [_obj_, {_addr_: torch.nn.Unflatten}, {_call_: {dim: -1, unflattened_size: [{{heads}}, {{head_dim}}]}}]]
+      - [key, key, split_heads]
+      - [value, value, split_heads]
+      - [query, query, heads_first, [_obj_, {_addr_: structcast_model.torch.layers.Permute}, {_call_: {dims: [2, 1, 3]}}]]
+      - [key, key, heads_first]
+      - [value, value, heads_first]
+      # "is_causal=False": attention is bidirectional, every patch attends to every patch.
+      - ["eval: torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=False)", attended]
+      # (batch, heads, tokens, {{head_dim}}) -> (batch, tokens, heads, {{head_dim}}) -> (batch, tokens, dim).
+      - [attended, attended, heads_first]
+      - [attended, attended, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 2}}]]
+      - [attended, out, out_proj, [_obj_, {_addr_: torch.nn.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}}}]]
+DropPath:
+  _jinja_yaml_: |-
+    FLOW: [[inp, out, [_obj_, {_addr_: timm.layers.DropPath}, {_call_: {drop_prob: {{drop_prob}}}}]]]
+  INFERENCE_FLOW: [[inp, out]]
