@@ -1,6 +1,7 @@
 """PyTorch related commands for the StructCast Model CLI application."""
 
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import partial
 import inspect
 from pathlib import Path
@@ -333,8 +334,148 @@ def call_calflops(
     print(f"Parameters: {params}")
 
 
+def _resolve_strategy(
+    strategy_pattern: Any, device: str, local_rank: int, distributed: bool
+) -> "torch_distributed.DistributedStrategy":
+    """Resolve the run's strategy: an explicit pattern wins, then DDP when distributed, else single-device."""
+    if strategy_pattern is not None:
+        return instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
+    if distributed:
+        return torch_distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
+    return torch_distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
+
+
+def _assemble_learner(
+    *,
+    model_patterns: list[dict],
+    input_shapes: dict[str, Any],
+    initializers: dict[str, Any],
+    resume: str | None,
+    strategy: "torch_distributed.DistributedStrategy",
+    compile_kw: dict[str, Any] | None,
+    compile_fn: Callable[[Any], Any],
+    learner_pattern: Any,
+    learner_outputs: list[str] | None,
+    device: str,
+    distributed: bool,
+    is_main: bool,
+) -> tuple["OrderedDict[str, torch.nn.Module]", Any, list[str], Any]:
+    """Instantiate, initialize, compile and wrap the models, then build the learner and its tracker."""
+    # Everything below runs on the training device: the models, and the tracker buffers, which are
+    # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
+    # CPU buffers.
+    with torch.device(device):
+        models = _instantiate_models(model_patterns)
+        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
+        torch_trainer.initial_model(models, input_shapes)
+        # A resumed run loads its weights later, which would overwrite whatever the initializers and
+        # the initial-weight broadcast produce here.
+        if is_main and resume is None:
+            for model_name, model in models.items():
+                if model_name in initializers:
+                    model.apply(initializers[model_name])
+        if resume is None:
+            strategy.sync_initial_weights(models)
+        shard_modules = getattr(strategy, "shard_modules", None)
+        if shard_modules and compile_kw is not None:
+            # Compile units follow the shard boundaries (ADR-0004): compiling the root would bury
+            # the per-block all-gather/reduce-scatter hooks inside one graph. nn.Module.compile
+            # compiles in place, so no OptimizedModule wrapper shifts the paths wrap matches on.
+            for matches in torch_distributed.matched_shard_modules(models, shard_modules).values():
+                for _, submodule in matches:
+                    submodule.compile(**compile_kw)
+        else:
+            models = OrderedDict((n, compile_fn(m)) for n, m in models.items())
+        models = strategy.wrap(models)
+        factory = instantiate_object(learner_pattern)
+        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
+        # its models as **kwargs would otherwise record the creator as one more model.
+        try:
+            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
+        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
+            takes_scaler_creator = False
+        if takes_scaler_creator:
+            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
+        else:
+            learner = factory(**models)
+        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
+        tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
+    # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
+    # Flow functions compile only on a single device: distributed wrappers graph-break inside the
+    # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
+    # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
+    if hasattr(learner, "flow_functions") and not distributed:
+        for flow_name in list(learner.flow_functions):
+            setattr(learner, flow_name, compile_fn(getattr(learner, flow_name)))
+    return models, learner, learner_outputs, tracker
+
+
+def _restore_training_state(
+    resume: str,
+    strategy: "torch_distributed.DistributedStrategy",
+    models: "OrderedDict[str, torch.nn.Module]",
+    learner: Any,
+    start_epoch: int,
+    is_main: bool,
+) -> int:
+    """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch."""
+    raw_state = _fetch_training_state(resume) if is_main else None
+    state = strategy.load_state_dict(
+        models, getattr(learner, "optimizers", {}), getattr(learner, "optimizer_models", None), raw_state
+    )
+    for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
+        if state.get("grad_scalers", {}).get(scaler_name):
+            scaler.load_state_dict(state["grad_scalers"][scaler_name])
+    resumed_epoch = state["meta"]["epoch"] + 1
+    if start_epoch != 1 and is_main:
+        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+    return resumed_epoch
+
+
+def _build_callbacks(
+    *,
+    trainer: Any,
+    provider: SimpleDataProvider,
+    strategy: "torch_distributed.DistributedStrategy",
+    learner_outputs: list[str],
+    higher_criteria: list[str],
+    lower_criteria: list[str],
+    save_criteria: list[str],
+    logger_name: str,
+    experiment: str,
+    ci: bool,
+    is_main: bool,
+) -> torch_logger.Logger:
+    """Build the run's logger and install it and the saver/best/display callbacks on the trainer."""
+    if is_main:
+        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
+        logger: torch_logger.Logger = logger_type(experiment=experiment)
+    else:
+        logger = torch_logger.NullLogger()
+    # The saver and the best-criterion monitors run collectives, so they are built on every rank;
+    # only rank 0 holds a real logger and writes anything. See ADR-0005.
+    saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
+    bests = torch_trainer.TorchBestCriterion.from_criteria(
+        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
+    )
+    display: list[Any] = []
+    if is_main:
+        display.append(
+            Printer()
+            if ci
+            else ProgressBar(
+                steps_per_epoch=provider.steps_per_epoch,
+                validation_steps=provider.validation_steps,
+                training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
+                validation_criteria=[f"{trainer.validation_prefix}{n}" for n in learner_outputs],
+            )
+        )
+    trainer.callbacks = [*display, logger, saver, *bests]
+    return logger
+
+
 @app.command()
-def train(  # noqa: PLR0912,PLR0913,PLR0915
+def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help="The object patterns used to instantiate models. "
@@ -476,16 +617,12 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     torch.manual_seed(seed + global_rank)
     np.random.seed(seed + global_rank)
     random.seed(seed + global_rank)
-    if strategy_pattern is not None:
-        strategy = instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
-    elif distributed:
-        strategy = torch_distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
-    else:
-        strategy = torch_distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
+    strategy = _resolve_strategy(strategy_pattern, device, local_rank, distributed)
     is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
     initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
-    compile_fn = partial(_compile_module, compile_kw=instantiator.instantiate(compile_pattern))
+    compile_kw = instantiator.instantiate(compile_pattern)
+    compile_fn = partial(_compile_module, compile_kw=compile_kw)
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
     provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
@@ -494,81 +631,37 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
     if is_main:
         print(f"Training dataset size: {provider.steps_per_epoch} steps.")
         print(f"Validation dataset size: {provider.validation_steps} steps.")
-    # Everything below runs on the training device: the models, and the tracker buffers, which are
-    # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
-    # CPU buffers.
-    with torch.device(device):
-        models = _instantiate_models(model_patterns)
-        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
-        torch_trainer.initial_model(models, input_shapes)
-        # A resumed run loads its weights below, which would overwrite whatever the initializers and
-        # the initial-weight broadcast produce here.
-        if is_main and resume is None:
-            for model_name, model in models.items():
-                if model_name in initializers:
-                    model.apply(initializers[model_name])
-        if resume is None:
-            strategy.sync_initial_weights(models)
-        models = OrderedDict((n, compile_fn(m)) for n, m in models.items())
-        models = strategy.wrap(models)
-        factory = instantiate_object(learner_pattern)
-        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
-        # its models as **kwargs would otherwise record the creator as one more model.
-        try:
-            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
-        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
-            takes_scaler_creator = False
-        if takes_scaler_creator:
-            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
-        else:
-            learner = factory(**models)
-        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-        tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
-    # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
-    # Flow functions compile only on a single device: distributed wrappers graph-break inside the
-    # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
-    # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
-    if hasattr(learner, "flow_functions") and not distributed:
-        for flow_name in list(learner.flow_functions):
-            setattr(learner, flow_name, compile_fn(getattr(learner, flow_name)))
+    models, learner, learner_outputs, tracker = _assemble_learner(
+        model_patterns=model_patterns,
+        input_shapes=input_shapes,
+        initializers=initializers,
+        resume=resume,
+        strategy=strategy,
+        compile_kw=compile_kw,
+        compile_fn=compile_fn,
+        learner_pattern=learner_pattern,
+        learner_outputs=learner_outputs,
+        device=device,
+        distributed=distributed,
+        is_main=is_main,
+    )
     if resume is not None:
-        raw_state = _fetch_training_state(resume) if is_main else None
-        state = strategy.load_state_dict(
-            models, getattr(learner, "optimizers", {}), getattr(learner, "optimizer_models", None), raw_state
-        )
-        for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
-            if state.get("grad_scalers", {}).get(scaler_name):
-                scaler.load_state_dict(state["grad_scalers"][scaler_name])
-        resumed_epoch = state["meta"]["epoch"] + 1
-        if start_epoch != 1 and is_main:
-            print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
-        start_epoch = resumed_epoch
+        start_epoch = _restore_training_state(resume, strategy, models, learner, start_epoch, is_main)
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
-    if is_main:
-        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
-        logger: torch_logger.Logger = logger_type(experiment=experiment)
-    else:
-        logger = torch_logger.NullLogger()
-    # The saver and the best-criterion monitors run collectives, so they are built on every rank;
-    # only rank 0 holds a real logger and writes anything. See ADR-0005.
-    saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
-    bests = torch_trainer.TorchBestCriterion.from_criteria(
-        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
+    logger = _build_callbacks(
+        trainer=trainer,
+        provider=provider,
+        strategy=strategy,
+        learner_outputs=learner_outputs,
+        higher_criteria=higher_criteria,
+        lower_criteria=lower_criteria,
+        save_criteria=save_criteria,
+        logger_name=logger_name,
+        experiment=experiment,
+        ci=ci,
+        is_main=is_main,
     )
-    display: list[Any] = []
-    if is_main:
-        display.append(
-            Printer()
-            if ci
-            else ProgressBar(
-                steps_per_epoch=provider.steps_per_epoch,
-                validation_steps=provider.validation_steps,
-                training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
-                validation_criteria=[f"{trainer.validation_prefix}{n}" for n in learner_outputs],
-            )
-        )
-    trainer.callbacks = [*display, logger, saver, *bests]
     arguments = {
         **reduce_dict(log_arguments),
         "models": model_patterns,
