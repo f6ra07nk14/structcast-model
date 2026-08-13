@@ -47,6 +47,9 @@ The CLI composes compilation as `strategy.wrap(compile(model))`: the wrapper sta
 `isinstance` checks and the sync gate keep seeing real DDP/FSDP2 types, and checkpoint keys are handled by
 the DCP state-dict API, which strips both `module.` and `_orig_mod.` prefixes. The previous model-level
 compile (applied outside the wrapper, into a discarded local) and the step-closure compile are deleted.
-Under distributed execution the flow-function graphs break at wrapper boundaries; whether keeping the flow
-fragments compiled there is worth it is left to a measured follow-up, as is per-block compilation, which
-would need a model-structure seam the builder does not have.
+Under distributed execution the flow-function graphs break at wrapper boundaries, and measurement settled
+the follow-up (`docs/references/flow-compile-step-time-h200.md`): compiling the fragments is a net loss
+(+8.9% training, +60% inference step time on DDP 2×H200) while the single-device fusion win is real
+(−14.8% training), so flow functions compile only on a single device. The sync gate is emitted inline in
+the generated script rather than imported — the package's lazy-import shim is opaque to dynamo's tracer.
+Per-block compilation would need a model-structure seam the builder does not have and stays out of scope.

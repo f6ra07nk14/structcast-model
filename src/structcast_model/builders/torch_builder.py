@@ -80,9 +80,9 @@ class TorchLearnerIntermediate(LearnerIntermediate):
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
-        "structcast_model.torch.distributed": {"sync_gate"},
+        "contextlib": {"nullcontext"},
     }
-    """Default imports for PyTorch learners; `sync_gate` gates gradient sync per model invocation."""
+    """Default imports for PyTorch learners; `nullcontext` backs the inline sync gate."""
 
     def _with_autocast(self, flow: list[str]) -> list[str]:
         if not (self.mixed_precision_type and flow):
@@ -134,7 +134,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             if layer in self.models:
                 seen[layer] += 1
                 last_owned = layer in trainable_layers and seen[layer] == info["counts"][layer]
-                line = f"with sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
+                line = f"with _sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
             body.append(line)
         return body
 
@@ -174,12 +174,22 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         available = set(self.inputs)
         # Freezing restores each owned model's construction-time requires_grad states instead of a
         # blanket True, so submodules the user froze stay frozen across optimizer segments.
+        # The sync gate is emitted inline rather than imported: the package modules sit behind a
+        # lazy-import shim that torch.compile's tracer cannot introspect. It sets the wrapper's
+        # sync flag when called and leaves it in place — DDP reads the flag at forward, FSDP2 at
+        # backward — and the next gate on the same module overwrites it.
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         defs: list[str] = [
             f"_requires_grad_defaults = {{{defaults}}}",
             "def _restore_requires_grad(module, defaults):",
             "    for p, d in zip(module.parameters(), defaults):",
             "        p.requires_grad_(d)",
+            "def _sync_gate(module, armed):",
+            "    if isinstance(module, torch.nn.parallel.DistributedDataParallel):",
+            "        module.require_backward_grad_sync = armed",
+            '    elif hasattr(module, "set_requires_gradient_sync"):',
+            "        module.set_requires_gradient_sync(armed)",
+            "    return nullcontext()",
         ]
         step: list[str] = []
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):

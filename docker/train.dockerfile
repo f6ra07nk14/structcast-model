@@ -22,6 +22,12 @@
 ARG PY_VERSION=3.12
 FROM ghcr.io/astral-sh/uv:python${PY_VERSION}-bookworm-slim
 
+# torch.compile needs a host C/C++ toolchain at run time: triton builds its CUDA driver shim and
+# inductor its wrapper modules with cc, even though the wheels themselves are binary.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
 ENV HOME=/app
 WORKDIR /app
 ENV UV_CACHE_DIR=/app/.cache/uv

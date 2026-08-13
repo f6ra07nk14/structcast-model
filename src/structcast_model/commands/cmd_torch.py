@@ -525,7 +525,10 @@ def train(  # noqa: PLR0912,PLR0913,PLR0915
         learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
         tracker = torch_trainer.TorchTracker.from_criteria(learner_outputs, compile_fn, distributed)
     # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
-    if hasattr(learner, "flow_functions"):
+    # Flow functions compile only on a single device: distributed wrappers graph-break inside the
+    # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
+    # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
+    if hasattr(learner, "flow_functions") and not distributed:
         for flow_name in list(learner.flow_functions):
             setattr(learner, flow_name, compile_fn(getattr(learner, flow_name)))
     if resume is not None:

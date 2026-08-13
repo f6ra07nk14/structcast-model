@@ -80,7 +80,8 @@ def test_learner_bfloat16_script_has_no_grad_scaler() -> None:
 def test_learner_script_gates_model_invocations() -> None:
     """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "with sync_gate(model, __need_update__): cls = model(image)" in script
+    assert "with _sync_gate(model, __need_update__): cls = model(image)" in script
+    assert "def _sync_gate(module, armed):" in script
     assert '_restore_requires_grad(model, _requires_grad_defaults["model"])' in script
 
 
@@ -231,7 +232,7 @@ def test_learner_collected_imports_include_torch_and_amp() -> None:
     """Collected imports include torch always, the sync gate always, and torch.amp only for fp16."""
     imports = TorchLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
     assert "torch" in imports
-    assert "sync_gate" in imports["structcast_model.torch.distributed"]
+    assert "nullcontext" in imports["contextlib"]
     assert "torch.amp" not in imports
     fp16_imports = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).collected_imports
     assert "torch.amp" in fp16_imports
