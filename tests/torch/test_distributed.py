@@ -20,33 +20,30 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def test_sync_gate_is_a_null_context_for_plain_modules() -> None:
-    """Plain modules have no gradient sync to gate, so the gate must be a no-op either way."""
+def test_sync_gate_is_a_no_op_for_plain_modules() -> None:
+    """Plain modules have no gradient sync to gate, so the gate must leave them untouched."""
     model = torch.nn.Linear(2, 2)
-    with sync_gate(model, armed=True):
-        pass
-    with sync_gate(model, armed=False):
-        assert not hasattr(model, "require_backward_grad_sync")
+    sync_gate(model, armed=True)
+    sync_gate(model, armed=False)
+    assert not hasattr(model, "require_backward_grad_sync")
 
 
 def test_sync_gate_sets_the_ddp_flag_and_leaves_it_for_the_next_gate(single_process_gloo: None) -> None:
-    """The gate sets the sync flag on entry and must NOT restore it on exit.
+    """The gate sets the sync flag and nothing restores it afterwards.
 
-    FSDP2 reads its flag at backward time, which happens after the gated forward exits; a
-    forward-scoped restore would re-enable gradient sync before any backward ran. The next gate on
-    the same module overwrites the flag instead.
+    FSDP2 reads its flag at backward time, after the gated invocation; any restore in between
+    would re-enable gradient sync before the backward ran. The next gate on the same module
+    overwrites the flag instead.
     """
     ddp = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(2, 2))
-    with sync_gate(ddp, armed=False):
-        assert ddp.require_backward_grad_sync is False
+    sync_gate(ddp, armed=False)
     assert ddp.require_backward_grad_sync is False
-    with sync_gate(ddp, armed=True):
-        assert ddp.require_backward_grad_sync is True
+    sync_gate(ddp, armed=True)
     assert ddp.require_backward_grad_sync is True
 
 
-def test_sync_gate_sets_fsdp2_gradient_sync_without_restoring(single_process_gloo: None) -> None:
-    """The FSDP2 branch must route through set_requires_gradient_sync and leave the flag in place."""
+def test_sync_gate_sets_fsdp2_gradient_sync(single_process_gloo: None) -> None:
+    """The FSDP2 branch must route through set_requires_gradient_sync, once per gate."""
     fsdp = pytest.importorskip("torch.distributed.fsdp")
     model = fsdp.fully_shard(torch.nn.Linear(2, 2))
     calls: list[bool] = []
@@ -57,11 +54,9 @@ def test_sync_gate_sets_fsdp2_gradient_sync_without_restoring(single_process_glo
         original(value, **kwargs)
 
     model.set_requires_gradient_sync = _recording
-    with sync_gate(model, armed=False):
-        assert calls == [False]
+    sync_gate(model, armed=False)
     assert calls == [False]
-    with sync_gate(model, armed=True):
-        pass
+    sync_gate(model, armed=True)
     assert calls == [False, True]
 
 
@@ -76,9 +71,8 @@ def test_sync_gate_traces_under_torch_compile_without_graph_breaks() -> None:
     model = torch.nn.Linear(2, 2)
 
     def flow(x: torch.Tensor) -> torch.Tensor:
-        with sync_gate(model, armed=True):
-            y = model(x)
-        return y.sum()
+        sync_gate(model, armed=True)
+        return model(x).sum()
 
     compiled = torch.compile(flow, fullgraph=True, backend="eager")
     assert torch.isfinite(compiled(torch.randn(3, 2)))
@@ -448,8 +442,7 @@ def test_fsdp2_sync_gate_on_the_root_reaches_the_block_groups(single_process_glo
     pytest.importorskip("torch.distributed.fsdp")
     strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block?"])
     wrapped = strategy.wrap(_block_models())["model"]
-    with sync_gate(wrapped, armed=False):
-        pass
+    sync_gate(wrapped, armed=False)
     assert wrapped.block0._get_fsdp_state()._fsdp_param_group.reduce_grads is False
 
 

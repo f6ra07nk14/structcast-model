@@ -12,7 +12,6 @@ Every ``state_dict``/``load_state_dict`` implementation routes through
 
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
@@ -130,38 +129,25 @@ def _strip_wrapper_prefixes(state: dict[str, Any]) -> dict[str, Any]:
     return {_clean(k): v for k, v in state.items()}
 
 
-def sync_gate(module: Any, armed: bool) -> AbstractContextManager[None]:
-    """Return a context deciding whether *module*'s next backward participates in gradient sync.
+def sync_gate(module: Any, armed: bool) -> None:
+    """Arm or disarm *module*'s next gradient synchronization; a no-op for plain modules.
 
-    Generated training steps wrap every model invocation in this gate. ``armed`` is computed at
-    code-generation time as "the model is owned by the current optimizer segment AND this is its
-    last invocation in the segment", multiplied at runtime by the update-step flag, so gradient
-    all-reduce (DDP) or reduce-scatter (FSDP2) fires exactly once per update, on the final backward.
-    Plain modules get a null context, keeping single-device flow functions fully traceable.
+    Generated training steps call this immediately before every model invocation. ``armed`` is
+    computed at code-generation time as "the model is owned by the current optimizer segment AND
+    this is its last invocation in the segment", multiplied at runtime by the update-step flag, so
+    gradient all-reduce (DDP) or reduce-scatter (FSDP2) fires exactly once per update, on the
+    final backward.
 
-    Entering the gate SETS the wrapper's sync flag and exiting leaves it in place: DDP reads its
-    flag when the forward prepares the reducer, but FSDP2 reads its flag at backward time — a
-    forward-scoped restore would re-enable reduce-scatter before any backward ran. The next gate
-    on the same module overwrites the flag, so no restore is needed.
+    The flag is deliberately left in place rather than scoped: DDP reads it when the forward
+    prepares the reducer, but FSDP2 reads it at backward time, after the gated invocation — any
+    restore in between would re-enable reduce-scatter before the backward ran. The next gate on
+    the same module overwrites the flag, so nothing ever needs restoring. On plain modules both
+    branches are false, keeping single-device flow functions fully traceable.
     """
     if isinstance(module, torch.nn.parallel.DistributedDataParallel):
-        return _SetOnEnter(lambda: setattr(module, "require_backward_grad_sync", armed))
-    if _fsdp_imports.is_successful and isinstance(module, FSDPModule):
-        return _SetOnEnter(lambda: module.set_requires_gradient_sync(armed))
-    return nullcontext()
-
-
-class _SetOnEnter(AbstractContextManager[None]):
-    """Context manager applying a wrapper-flag update on entry and leaving it in place on exit."""
-
-    def __init__(self, apply: Callable[[], Any]) -> None:
-        self._apply = apply
-
-    def __enter__(self) -> None:
-        self._apply()
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        return None
+        module.require_backward_grad_sync = armed
+    elif _fsdp_imports.is_successful and isinstance(module, FSDPModule):
+        module.set_requires_gradient_sync(armed)
 
 
 @runtime_checkable

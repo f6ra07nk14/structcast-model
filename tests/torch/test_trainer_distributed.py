@@ -66,13 +66,13 @@ def _sync_gate_worker(rank: int, world_size: int, init_file: str, result_dir: st
         x = torch.tensor([[1.0, 0.0]]) if rank == 0 else torch.tensor([[0.0, 1.0]])
         target = torch.tensor([[1.0]]) if rank == 0 else torch.tensor([[2.0]])
 
-        with sync_gate(ddp, False):
-            out = ddp(x)
+        sync_gate(ddp, False)
+        out = ddp(x)
         ((out - target) ** 2).sum().backward()
         unarmed = model.weight.grad.detach().clone()
 
-        with sync_gate(ddp, True):
-            out = ddp(x)
+        sync_gate(ddp, True)
+        out = ddp(x)
         ((out - target) ** 2).sum().backward()
         armed = model.weight.grad.detach().clone()
 
@@ -111,15 +111,15 @@ def _fsdp2_sync_gate_worker(rank: int, world_size: int, init_file: str, result_d
         x = torch.tensor([[1.0, 0.0]]) if rank == 0 else torch.tensor([[0.0, 1.0]])
         target = torch.tensor([[1.0]]) if rank == 0 else torch.tensor([[2.0]])
 
-        with sync_gate(wrapped, False):
-            out = wrapped(x)
+        sync_gate(wrapped, False)
+        out = wrapped(x)
         ((out - target) ** 2).sum().backward()
         # With sync deferred, no reduce-scatter ran, so the sharded parameter has no gradient yet;
         # the accumulating gradients live on the unsharded parameters until the armed backward.
         unarmed_grad_missing = wrapped.weight.grad is None
 
-        with sync_gate(wrapped, True):
-            out = wrapped(x)
+        sync_gate(wrapped, True)
+        out = wrapped(x)
         ((out - target) ** 2).sum().backward()
         grad = wrapped.weight.grad
         armed = grad.full_tensor().detach().clone() if hasattr(grad, "full_tensor") else grad.detach().clone()

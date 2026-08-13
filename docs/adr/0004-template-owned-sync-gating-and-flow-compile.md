@@ -14,13 +14,16 @@ the reducer arms on every call. A trainer-level context (`TorchTrainer.no_sync`)
 cannot express this, so it is deleted rather than kept alongside the finer mechanism: two owners of the
 same DDP flag, split across layers, is the exact pathology that made the original no_sync dead code.
 
-Generated steps wrap every model invocation in `sync_gate(model, armed)` (from
+Generated steps precede every model invocation with a `sync_gate(model, armed)` statement (from
 `structcast_model.torch.distributed`, which generated code may import — precedent: generated learners
-already import `get_decays`). The arming rule is computed at code-generation time:
+already import `get_decays`). The gate is a plain setter, not a context manager: the wrapper flag it
+sets is only ever consumed later (DDP at the forward's reducer setup, FSDP2 at backward) and the next
+gate on the same module overwrites it, so there is nothing to scope or restore. The arming rule is
+computed at code-generation time:
 `armed = model owned by the current optimizer segment AND last invocation of that model in the segment`,
 multiplied at runtime by `__need_update__`, which also subsumes gradient-accumulation gating — StyleGAN2-ADA's
-`ddp_sync` discipline, generated instead of hand-written. Single-device models get `nullcontext`, keeping
-the gate free and traceable.
+`ddp_sync` discipline, generated instead of hand-written. On single-device models both wrapper branches
+are false, keeping the gate free and traceable.
 
 ## Optimizer segments freeze the models they do not own
 

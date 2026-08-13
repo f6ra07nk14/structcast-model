@@ -120,14 +120,14 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         return {"lines": lines, "external": external, "stores": stores, "counts": counts}
 
     def _gated_body(self, info: dict[str, Any], trainable_layers: list[str]) -> list[str]:
-        """Wrap each model invocation in a sync gate, arming only a model's last owned call."""
+        """Precede each model invocation with a sync gate, arming only a model's last owned call."""
         body: list[str] = []
         seen: dict[str, int] = defaultdict(int)
         for line, layer in info["lines"]:
             if layer in self.models:
                 seen[layer] += 1
                 last_owned = layer in trainable_layers and seen[layer] == info["counts"][layer]
-                line = f"with sync_gate({layer}, {'__need_update__' if last_owned else 'False'}): {line}"
+                body.append(f"sync_gate({layer}, {'__need_update__' if last_owned else 'False'})")
             body.append(line)
         return body
 

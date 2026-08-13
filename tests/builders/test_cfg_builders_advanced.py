@@ -80,7 +80,8 @@ def test_learner_bfloat16_script_has_no_grad_scaler() -> None:
 def test_learner_script_gates_model_invocations() -> None:
     """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "with sync_gate(model, __need_update__): cls = model(image)" in script
+    assert "sync_gate(model, __need_update__)" in script
+    assert script.index("sync_gate(model, __need_update__)") < script.index("cls = model(image)")
     assert "def _sync_gate(module, armed):" not in script  # the package helper, never an inline copy
     assert '_restore_requires_grad(model, self._requires_grad_defaults["model"])' in script
     assert "def _restore_requires_grad(module, defaults):" in script
