@@ -6,7 +6,7 @@ runs on 8×H200 (driver 595.71.05, container `docker/train.dockerfile`, torch 2.
 Global batch size is held constant across strategies; the single-device arm reaches it with
 `accumulate_gradients`.
 
-MLflow store: `/Coretronic3610/2/frankkang/structcast-validation/mlflow.db`, experiments
+MLflow store: `<data-root>/structcast-validation/mlflow.db`, experiments
 `StratCmp-*`.
 
 ## Language model — WikiText-103 (final)
@@ -34,7 +34,7 @@ all nine runs, which is the direct check that sharding does not perturb optimize
 Supervised classification (full image, no masking, CE head), global batch 512, 90 epochs,
 constant lr 1e-3, `weight_decay` 0.05 / 0.0, `torch.compile` on. Distributed arms use 4 ranks ×
 128; single-device arms use 512 directly. Data staged on local NVMe
-(`/raid/frankkang/imagenet-1k`, 172 G). Experiments are prefixed `StratCmpC-`.
+(`<nvme-root>/imagenet-1k`, 172 G). Experiments are prefixed `StratCmpC-`.
 
 An earlier pass of the same matrix ran without compilation; those `StratCmp-` runs are kept as an
 uncompiled reference, and two of them finished:
