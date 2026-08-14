@@ -36,13 +36,29 @@ constant lr 1e-3, `weight_decay` 0.05 / 0.0, `torch.compile` on. Distributed arm
 128; single-device arms use 512 directly. Data staged on local NVMe
 (`<nvme-root>/imagenet-1k`, 172 G). Experiments are prefixed `StratCmpC-`.
 
-An earlier pass of the same matrix ran without compilation; those `StratCmp-` runs are kept as an
-uncompiled reference, and two of them finished:
+ViT-B, all three strategies at 90 epochs:
 
-| model | strategy | val_ce_loss | val_acc1 | val_acc5 |
-| --- | --- | --- | --- | --- |
-| ViT-B (uncompiled) | DDP ×4 | 1.5064 | 0.6497 | 0.8573 |
-| ViT-B (uncompiled) | FSDP2 per-block ×4 | — | 0.6454 | 0.8559 |
+| strategy | ce_loss | val_ce_loss | val_acc1 | val_acc5 | min/epoch |
+| --- | --- | --- | --- | --- | --- |
+| single | 1.3845 | 1.5516 | 0.6404 | 0.8509 | 7.37 |
+| DDP ×4 | 1.3687 | 1.5352 | 0.6431 | 0.8533 | 2.77 |
+| FSDP2 per-block ×4 | 1.3496 | 1.5432 | 0.6414 | 0.8534 | 3.71 |
+
+Top-1 spans 0.27 pp across the three, val_ce_loss 0.016, top-5 0.25 pp — smaller than the spread
+between two runs of one strategy (next section). **No strategy costs measurable accuracy** at a
+fixed global batch of 512. The ordering within that span carries no signal and should not be read.
+
+What does differ is cost. DDP is 2.66× faster per epoch than single-device, short of the ideal
+4× on four GPUs; measured separately on this host, the smaller per-GPU batch accounts for 3.7%
+(3474 img/s at 128 versus 3606 at 512), gradient all-reduce for about 10% at two ranks
+(3133 img/s per rank against 3474 for the same per-rank batch), and the remainder is host-side
+JPEG decode, since the four-rank run demands 7910 img/s against the single run's 2925 while
+sharing the host with other jobs. FSDP2 costs a further 33% over DDP and buys memory this model
+does not need — ViT-B has 86M parameters, so per-block sharding only pays once a model no longer
+fits.
+
+An earlier pass of the same matrix ran without compilation; those `StratCmp-` runs are kept as an
+uncompiled reference (ViT-B DDP 0.6497, FSDP2 0.6454).
 
 The vision matrix runs one seed per configuration, so unlike the language model it carries no
 error bar: a small cross-strategy gap such as the 0.43 pp above cannot be separated from
