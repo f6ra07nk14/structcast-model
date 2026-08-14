@@ -32,24 +32,51 @@ all nine runs, which is the direct check that sharding does not perturb optimize
 ## Vision — ImageNet-1K (in progress)
 
 Supervised classification (full image, no masking, CE head), global batch 512, 90 epochs,
-constant lr 1e-3, `weight_decay` 0.05 / 0.0. Distributed arms use 4 ranks × 128; single-device
-arms use 512 directly. Data staged on local NVMe (`/raid/frankkang/imagenet-1k`, 172 G).
+constant lr 1e-3, `weight_decay` 0.05 / 0.0, `torch.compile` on. Distributed arms use 4 ranks ×
+128; single-device arms use 512 directly. Data staged on local NVMe
+(`/raid/frankkang/imagenet-1k`, 172 G). Experiments are prefixed `StratCmpC-`.
 
-| model | strategy | epochs | val_ce_loss | val_acc1 | val_acc5 |
-| --- | --- | --- | --- | --- | --- |
-| ViT-B | DDP ×4 | 90/90 | 1.5064 | 0.6497 | 0.8573 |
-| ViT-B | FSDP2 per-block ×4 | 90/90 | — | 0.6454 | 0.8559 |
-| ViT-B | single | running | — | — | — |
-| ConvNeXt V2-B | DDP ×4 | running | — | — | — |
-| ConvNeXt V2-B | FSDP2 per-block ×4 | queued | — | — | — |
-| ConvNeXt V2-B | single | running | — | — | — |
+An earlier pass of the same matrix ran without compilation; those `StratCmp-` runs are kept as an
+uncompiled reference, and two of them finished:
 
-Two extra single-device ViT-B seeds (43, 44) are running to give the vision side the same error
-bar the language model has: the 0.43 pp DDP-vs-FSDP2 gap is not interpretable without one.
+| model | strategy | val_ce_loss | val_acc1 | val_acc5 |
+| --- | --- | --- | --- | --- |
+| ViT-B (uncompiled) | DDP ×4 | 1.5064 | 0.6497 | 0.8573 |
+| ViT-B (uncompiled) | FSDP2 per-block ×4 | — | 0.6454 | 0.8559 |
+
+Two extra single-device ViT-B seeds (43, 44) run alongside, to give the vision side the same
+error bar the language model has: the 0.43 pp DDP-vs-FSDP2 gap above is not interpretable
+without one.
 
 There is no scheduler in `cfg/torch/learners/ImageClassifier.yaml`, so ~65% top-1 is the expected
 level for a constant-lr run, well below the ~81% a full timm recipe reaches. The comparison
 target is cross-strategy behaviour, not absolute accuracy.
+
+### Why ConvNeXt V2-B costs 4× ViT-B per epoch
+
+Uncompiled, ConvNeXt V2-B ran 34.0 min/epoch against ViT-B's 8.6 at the same global batch. It is
+not memory format — forcing `channels_last` changes nothing (240.9 → 239.7 ms/step at batch 64),
+because cuDNN already picks NHWC internally (`dgrad2d_c1_k1_nhwc_specialized` in the profile).
+It is not FLOPs either: ConvNeXt V2-B has fewer than ViT-B (15.4 vs 17.6 GFLOPs).
+
+`torch.profiler` attributes ConvNeXt V2-B's CUDA time roughly as 67% elementwise kernels, 7%
+reduce, 6.5% layer_norm, 6% conv dgrad/wgrad, 2.5% tensor-core GEMM. The model is
+memory-bandwidth bound: each of its 36 blocks walks the whole activation tensor about ten times
+(depthwise 7×7 conv → permute → LayerNorm → Linear → GELU → GRN → Linear → permute → DropPath →
+residual), on activations larger than ViT's token tensors, while ViT-B has 12 blocks whose cost
+sits in four large GEMMs.
+
+Compilation fuses exactly those chains, which is why it pays off so asymmetrically:
+
+| model | `compile=False` | `compile=True` | speedup |
+| --- | --- | --- | --- |
+| ConvNeXtV2-B | 241.4 ms/step | 90.7 ms/step | 2.66× |
+| ViT-B | 55.0 ms/step | 43.0 ms/step | 1.28× |
+
+Measured at batch 64 on a GPU concurrently running another job, so absolute values carry
+contention; both arms saw the same contention, so the ratios hold. Compilation is the reason the
+matrix was relaunched — a convolutional model built from these blocks should not be trained
+uncompiled.
 
 ## Implementation error found by these runs
 
