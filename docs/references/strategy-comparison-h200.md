@@ -44,9 +44,10 @@ uncompiled reference, and two of them finished:
 | ViT-B (uncompiled) | DDP ×4 | 1.5064 | 0.6497 | 0.8573 |
 | ViT-B (uncompiled) | FSDP2 per-block ×4 | — | 0.6454 | 0.8559 |
 
-Two extra single-device ViT-B seeds (43, 44) run alongside, to give the vision side the same
-error bar the language model has: the 0.43 pp DDP-vs-FSDP2 gap above is not interpretable
-without one.
+The vision matrix runs one seed per configuration, so unlike the language model it carries no
+error bar: a small cross-strategy gap such as the 0.43 pp above cannot be separated from
+run-to-run noise from the vision runs alone. The language-model grid is the available reference
+for how large that noise is.
 
 There is no scheduler in `cfg/torch/learners/ImageClassifier.yaml`, so ~65% top-1 is the expected
 level for a constant-lr run, well below the ~81% a full timm recipe reaches. The comparison
