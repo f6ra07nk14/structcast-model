@@ -46,8 +46,31 @@ uncompiled reference, and two of them finished:
 
 The vision matrix runs one seed per configuration, so unlike the language model it carries no
 error bar: a small cross-strategy gap such as the 0.43 pp above cannot be separated from
-run-to-run noise from the vision runs alone. The language-model grid is the available reference
-for how large that noise is.
+run-to-run noise from the vision runs alone.
+
+### Run-to-run spread is large early and small late
+
+Two single-device ViT-B runs with identical code, configuration, seed, and data — verified by
+`md5sum` on the generated model, learner, and loader, and by identical logged parameters — reached
+**35.05% and 43.65% top-1 at epoch 10**. The recipe has no warmup and holds lr at 1e-3, so early
+training is chaotic and bf16 with non-deterministic reductions is enough to separate two runs.
+The same pair of runs agreed to four decimals on the epoch-1 training loss in one comparison and
+differed by 0.038 in another, so the spread itself is not stable.
+
+The practical consequences:
+
+- Mid-training cross-strategy comparisons are meaningless here. An epoch-10 gap of several points
+  says nothing about the strategy.
+- The spread shrinks as training proceeds: the uncompiled arms sat at 59.58 / 59.03 / 59.74 by
+  epoch 30 and 64.97 / 64.54 at epoch 90.
+- Only final-epoch numbers are usable, and even those carry noise this matrix cannot quantify
+  without replicates.
+
+This also settles a false lead. An apparent 9 pp single-device regression under `torch.compile`
+did not reproduce: with the flow-function compile at `cmd_torch.py:401` disabled the run reached
+43.96%, and with it enabled 43.65%, both matching the uncompiled baseline. ConvNeXt V2-B is
+numerically unaffected by compilation as well (epoch-10 top-1 0.668063 uncompiled vs 0.668058
+compiled). Compilation changes speed, not what these models learn.
 
 There is no scheduler in `cfg/torch/learners/ImageClassifier.yaml`, so ~65% top-1 is the expected
 level for a constant-lr run, well below the ~81% a full timm recipe reaches. The comparison
