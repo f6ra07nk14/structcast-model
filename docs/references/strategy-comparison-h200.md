@@ -88,9 +88,24 @@ did not reproduce: with the flow-function compile at `cmd_torch.py:401` disabled
 numerically unaffected by compilation as well (epoch-10 top-1 0.668063 uncompiled vs 0.668058
 compiled). Compilation changes speed, not what these models learn.
 
-There is no scheduler in `cfg/torch/learners/ImageClassifier.yaml`, so ~65% top-1 is the expected
-level for a constant-lr run, well below the ~81% a full timm recipe reaches. The comparison
-target is cross-strategy behaviour, not absolute accuracy.
+### Recipe
+
+The commands set only `input_size`, `is_training`, `batch_size`, `num_workers`, and
+`image_dtype`, so the augmentation is whatever `examples/torch/data.py` defaults to: random
+resized crop (scale 0.08–1.0, ratio 3/4–4/3), horizontal flip at 0.5, colour jitter 0.4, bicubic
+interpolation, ImageNet mean/std. Everything else is off — no AutoAugment or RandAugment, no
+random erasing, no mixup or cutmix, no label smoothing, no augmentation repeats. Validation is
+resize plus centre crop at `crop_pct` 0.875.
+
+There is also no scheduler in `cfg/torch/learners/ImageClassifier.yaml`: lr is held at 1e-3 for
+all 90 epochs with no warmup.
+
+That is a 2016-era baseline recipe, not the ConvNeXt or DeiT one (RandAugment, mixup 0.8,
+cutmix 1.0, label smoothing 0.1, random erasing 0.25, stochastic depth, cosine schedule with
+warmup). It is why top-1 lands near 64% rather than the ~81–84% those papers report, and it is
+also why early training is unstable enough to produce the spread documented below. None of this
+affects the comparison — all arms share one loader and one learner — but the numbers are not
+model-quality figures.
 
 ### Why ConvNeXt V2-B costs 4× ViT-B per epoch
 
