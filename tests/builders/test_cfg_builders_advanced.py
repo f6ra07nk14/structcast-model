@@ -138,13 +138,25 @@ def test_learner_accumulate_gradients_stored() -> None:
 
 
 def test_learner_accumulate_gradients_script_patterns() -> None:
-    """Script contains loss division, need_update guard, and modular update."""
+    """Script scales only the backward pass, keeps the need_update guard and modular update."""
     params = {"DEFAULT": {"accumulate_gradients": 4}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
-    assert "ce_loss = ce_loss / 4" in script
+    assert "(ce_loss / 4).backward()" in script
     assert "if __need_update__:" in script
     assert "self.need_update = (step + 1) % 4 == 0" in script
     assert "return self.need_update" in script
+
+
+def test_learner_accumulate_gradients_reports_unscaled_loss() -> None:
+    """The tracked loss must not be rebound to the accumulation-scaled value.
+
+    Reporting ``loss / accumulate_gradients`` makes training curves incomparable between an
+    accumulating run and an equivalent multi-device run at the same global batch size.
+    """
+    params = {"DEFAULT": {"accumulate_gradients": 4}}
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
+    assert "ce_loss = ce_loss / 4" not in script
+    assert "return {'ce_loss': ce_loss," in script
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +200,8 @@ def test_learner_mp_scale_backward_with_accumulation() -> None:
     """With accumulation loss is divided and backward uses scaler."""
     params = {"DEFAULT": {**FP16, "accumulate_gradients": 2}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
-    assert "ce_loss = ce_loss / 2" in script
-    assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
+    assert "ce_loss = ce_loss / 2" not in script
+    assert "optimizer_grad_scaler.scale((ce_loss / 2)).backward()" in script
     assert "optimizer_grad_scaler.step(optimizer)" in script
     assert "optimizer_grad_scaler.update()" in script
 
@@ -284,8 +296,7 @@ def test_learner_full_combo_accumulate_clip_mp() -> None:
     assert built.accumulate_gradients == 4
     assert "optimizer" in built.optimizers
     assert "optimizer_grad_scaler" in built.mixed_precision_scales
-    assert "ce_loss = ce_loss / 4" in script
-    assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
+    assert "optimizer_grad_scaler.scale((ce_loss / 4)).backward()" in script
     assert "optimizer_grad_scaler.unscale_(optimizer)" in script
     assert "dispatch_clip_grad" in script
     assert "if __need_update__:" in script

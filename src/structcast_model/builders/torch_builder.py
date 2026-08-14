@@ -184,10 +184,12 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
             loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = opt_unit
             used += [n for n in (optimizer_name, clip_name, mixed_precision_name) if n and n not in used]
+            # Scale inside the backward expression so the reported loss keeps its unscaled value.
+            scaled = f"({loss} / {self.accumulate_gradients})" if self.accumulate_gradients else loss
             backward_line = (
-                f"{loss}.backward({backward_kwargs})"
+                f"{scaled}.backward({backward_kwargs})"
                 if mixed_precision_name is None
-                else f"{mixed_precision_name}.scale({loss}).backward({backward_kwargs})"
+                else f"{mixed_precision_name}.scale({scaled}).backward({backward_kwargs})"
             )
             params = [n for n in info["external"] if n in available]
             needed = {loss} | set(self.outputs) | _statement_names(backward_line)[0]
@@ -206,8 +208,6 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             ]
             arguments = "__need_update__" + "".join(f", {p}" for p in params)
             step.append(f"{', '.join(returns)} = self.{function_name}({arguments})")
-            if self.accumulate_gradients:
-                step.append(f"{loss} = {loss} / {self.accumulate_gradients}")
             step.append(backward_line)
             if self.accumulate_gradients:
                 step.append("if __need_update__:")
