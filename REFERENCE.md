@@ -213,21 +213,23 @@ LEARNERS:
   [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: 40, kernel_size: 4, stride: 4}}]
   ```
 
-- **`UserLayer` dict** — references a sublayer defined elsewhere in the same file (via `TYPE`) or in an external file (via `CFG`):
+- **`UserLayer` dict** — references a sublayer defined in the same file (via `TYPE`), the root template of an external file (via `CFG`), or a sublayer defined inside an external file (via both):
 
   ```yaml
   {TYPE: Backbone}
   {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}
-  {CFG: cfg/torch/models/my_sublayer.yaml, TYPE: MySublayer}
+  {CFG: cfg/torch/models/my_model.yaml}
+  {CFG: cfg/torch/models/my_model.yaml, TYPE: MySublayer}
   ```
 
 #### `TYPE`, `PARAM`, and `CFG`
 
-These three keys form the `UserLayer` dict that activates a named sublayer:
+These three keys form the `UserLayer` dict that activates a sublayer. At least one of `TYPE` or `CFG` must be
+present:
 
-- **`TYPE`** (`str`): Name of a sublayer defined as a top-level key in the same YAML file (e.g., `Backbone`, `Block`, `Stem`). The code generator expands it into a nested `nn.Module` subclass.
+- **`TYPE`** (`str`): Name of a sublayer defined as a top-level key — resolved in the same YAML file, or inside the `CFG` file when `CFG` is also set (e.g., `Backbone`, `Block`, `Stem`). A dotted path (e.g., `Block.Norm`) selects a sublayer nested inside another sublayer. The code generator expands it into a nested `nn.Module` subclass.
 - **`PARAM`** (`PARAMETERS` dict): Template variable overrides passed when rendering the sublayer. Uses the same `DEFAULT` / `SHARED` / named-group structure as the top-level `PARAMETERS` block.
-- **`CFG`** (file path): Path to an external YAML file that defines the sublayer. Allows sublayer reuse across multiple model templates. When `CFG` is set, `TYPE` selects the sublayer name within that file.
+- **`CFG`** (file path): Path to an external YAML file. Allows reuse across multiple model templates. On its own it embeds that file's root template as the sublayer; combined with `TYPE` it selects a sublayer defined inside that file instead.
 
 ```yaml
 # References Backbone sublayer defined in the same file, no parameter overrides
@@ -235,6 +237,9 @@ These three keys form the `UserLayer` dict that activates a named sublayer:
 
 # References Block sublayer with per-instance parameter overrides
 - [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}]
+
+# Embeds the root template of an external file as the sublayer, no TYPE needed
+- [image, feature, backbone, {CFG: cfg/torch/models/my_model.yaml}]
 ```
 
 ---
