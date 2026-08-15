@@ -3,11 +3,15 @@
 Does the choice of `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, or
 `FullyShardedDataParallelStrategy` (per-block) change what a model learns? Full-length training
 runs on 8×H200 (driver 595.71.05, container `docker/train.dockerfile`, torch 2.11.0+cu130).
-Global batch size is held constant across strategies; the single-device arm reaches it with
-`accumulate_gradients`.
+Global batch size is held constant across strategies: the language-model single-device arm reaches
+it with `accumulate_gradients: 4`, the vision single-device arms take the full batch directly.
 
-MLflow store: `<data-root>/structcast-validation/mlflow.db`, experiments
-`StratCmp-*`.
+**Answer: no.** Across two vision architectures and one language model, every cross-strategy
+spread is smaller than the spread between two runs of the same strategy. The strategies differ in
+throughput and memory, not in what the model learns.
+
+MLflow store: `<data-root>/structcast-validation/mlflow.db`, experiments `StratCmp-*` (uncompiled
+vision pass and the language model) and `StratCmpC-*` (the vision matrix).
 
 ## Language model — WikiText-103 (final)
 
@@ -29,33 +33,49 @@ The spread within a single strategy (up to 0.052) exceeds the spread between str
 `optimizer` (learning rate) and both `optimizer_group*_weight_decay` series are identical across
 all nine runs, which is the direct check that sharding does not perturb optimizer state.
 
-## Vision — ImageNet-1K (in progress)
+## Vision — ImageNet-1K (final)
 
 Supervised classification (full image, no masking, CE head), global batch 512, 90 epochs,
 constant lr 1e-3, `weight_decay` 0.05 / 0.0, `torch.compile` on. Distributed arms use 4 ranks ×
 128; single-device arms use 512 directly. Data staged on local NVMe
 (`<nvme-root>/imagenet-1k`, 172 G). Experiments are prefixed `StratCmpC-`.
 
-ViT-B, all three strategies at 90 epochs:
+Both models, all three strategies, 90 epochs:
 
-| strategy | ce_loss | val_ce_loss | val_acc1 | val_acc5 | min/epoch |
-| --- | --- | --- | --- | --- | --- |
-| single | 1.3845 | 1.5516 | 0.6404 | 0.8509 | 7.37 |
-| DDP ×4 | 1.3687 | 1.5352 | 0.6431 | 0.8533 | 2.77 |
-| FSDP2 per-block ×4 | 1.3496 | 1.5432 | 0.6414 | 0.8534 | 3.71 |
+| model | strategy | ce_loss | val_ce_loss | val_acc1 | val_acc5 | min/epoch |
+| --- | --- | --- | --- | --- | --- | --- |
+| ViT-B | single | 1.3845 | 1.5516 | 0.6404 | 0.8509 | 7.30 |
+| ViT-B | DDP ×4 | 1.3687 | 1.5352 | 0.6431 | 0.8533 | 2.77 |
+| ViT-B | FSDP2 per-block ×4 | 1.3496 | 1.5432 | 0.6414 | 0.8534 | 3.74 |
+| ConvNeXt V2-B | single | 0.9292 | 1.1511 | 0.7284 | 0.9093 | 14.02 |
+| ConvNeXt V2-B | DDP ×4 | 0.9350 | 1.1433 | 0.7279 | 0.9102 | 4.22 |
+| ConvNeXt V2-B | FSDP2 per-block ×4 | 0.9340 | 1.1576 | 0.7269 | 0.9082 | 7.75 |
 
-Top-1 spans 0.27 pp across the three, val_ce_loss 0.016, top-5 0.25 pp — smaller than the spread
-between two runs of one strategy (next section). **No strategy costs measurable accuracy** at a
-fixed global batch of 512. The ordering within that span carries no signal and should not be read.
+Top-1 spans **0.27 pp** across the ViT-B arms and **0.15 pp** across the ConvNeXt V2-B arms;
+val_ce_loss spans 0.016 and 0.014. Both are smaller than the spread between two runs of one
+strategy (next section), so **no strategy costs measurable accuracy** at a fixed global batch of
+512, on either architecture. The ordering inside those spans carries no signal and should not be
+read — the single-device arm happens to lead on ConvNeXt and trail on ViT.
 
-What does differ is cost. DDP is 2.66× faster per epoch than single-device, short of the ideal
-4× on four GPUs; measured separately on this host, the smaller per-GPU batch accounts for 3.7%
-(3474 img/s at 128 versus 3606 at 512), gradient all-reduce for about 10% at two ranks
-(3133 img/s per rank against 3474 for the same per-rank batch), and the remainder is host-side
-JPEG decode, since the four-rank run demands 7910 img/s against the single run's 2925 while
-sharing the host with other jobs. FSDP2 costs a further 33% over DDP and buys memory this model
-does not need — ViT-B has 86M parameters, so per-block sharding only pays once a model no longer
-fits.
+What does differ is cost, and it is architecture-dependent:
+
+| | ViT-B | ConvNeXt V2-B |
+| --- | --- | --- |
+| DDP speedup over single | 2.64× | 3.32× |
+| FSDP2 penalty over DDP | +35% | +84% |
+
+DDP falls short of the ideal 4× on four GPUs. Measured separately on this host for ViT-B, the
+smaller per-GPU batch accounts for 3.7% (3474 img/s at 128 versus 3606 at 512), gradient
+all-reduce for about 10% at two ranks (3133 img/s per rank against 3474 at the same per-rank
+batch), and the rest is host-side JPEG decode: the four-rank run demands 7910 img/s against the
+single run's 2925, while sharing the host with other jobs. ConvNeXt V2-B scales better precisely
+because it is slower per image, so the same data pipeline covers a larger share of its step.
+
+The FSDP2 penalty tracks block count rather than parameter count: ConvNeXt V2-B has 36 sharded
+blocks against ViT-B's 12, so it pays three times as many all-gather / reduce-scatter rounds per
+step. Removing the other jobs from the host barely moved it (7.75 average, 7.06 best), which
+places the cost in communication rather than contention. Neither model needs the memory that buys
+— ViT-B is 86M parameters — so per-block sharding only pays once a model no longer fits.
 
 An earlier pass of the same matrix ran without compilation; those `StratCmp-` runs are kept as an
 uncompiled reference (ViT-B DDP 0.6497, FSDP2 0.6454).
