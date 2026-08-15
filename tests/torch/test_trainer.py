@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import logging
 from typing import Any
 
@@ -41,6 +42,19 @@ class _LossModule(Module):
 
     def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
         return {"loss": torch.tensor(0.5)}
+
+
+@dataclass(kw_only=True)
+class _InfoWithModels(BaseInfo[torch.nn.Module]):
+    """Info carrying models without a trainer, for callbacks tested outside a training loop."""
+
+    named_models: dict[str, torch.nn.Module] = field(default_factory=dict)
+    """The models the property hands out."""
+
+    @property
+    def models(self) -> dict[str, torch.nn.Module]:
+        """Return the models this info was built with."""
+        return self.named_models
 
 
 class _StubLearner:
@@ -546,7 +560,7 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     )
     trainer.epoch, trainer.step, trainer.update = 3, 7, 2
     recorder = _RecordingLogger()
-    TrainingStateSaver(logger=recorder, strategy=SingleDeviceStrategy(device="cpu")).on_epoch_end(trainer, model=model)
+    TrainingStateSaver(logger=recorder, strategy=SingleDeviceStrategy(device="cpu")).on_epoch_end(trainer)
     states, name = recorder.states[0]
     assert name == "training_state"
     assert "weight" in states["models"]["model"]
@@ -581,7 +595,7 @@ def test_training_state_saver_produces_state_on_null_logger_ranks() -> None:
         data=SimpleDataProvider(training_dataset=[]),
     )
     strategy = _RecordingStrategy()
-    TrainingStateSaver(logger=NullLogger(), strategy=strategy).on_epoch_end(trainer, model=model)
+    TrainingStateSaver(logger=NullLogger(), strategy=strategy).on_epoch_end(trainer)
     assert strategy.calls == [{"model": model}]
 
 
@@ -622,10 +636,10 @@ def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
     """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
     logger = _BestRecordingLogger()
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger, SingleDeviceStrategy(device="cpu"))
-    info = BaseInfo()
+    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
-    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    monitor.on_epoch_end(info)
     assert logger.metrics == [("best_val_loss", 0.3, 1)]
     assert logger.states == []
 
@@ -637,10 +651,10 @@ def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: lis
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], save_criteria, logger, SingleDeviceStrategy(device="cpu")
     )
-    info = BaseInfo()
+    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
-    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    monitor.on_epoch_end(info)
     assert logger.states == expected
 
 
@@ -650,13 +664,13 @@ def test_from_criteria_does_not_save_a_stale_best() -> None:
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], ["val_loss"], logger, SingleDeviceStrategy(device="cpu")
     )
-    info = BaseInfo()
+    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
-    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    monitor.on_epoch_end(info)
     info.epoch, info.step = 2, 9
     info.history[2] = {"val_loss": 0.9}
-    monitor.on_epoch_end(info, model=torch.nn.Linear(4, 2))
+    monitor.on_epoch_end(info)
     assert logger.states == ["best_val_loss"]
 
 
@@ -670,9 +684,9 @@ def test_from_criteria_saves_the_states_the_strategy_produced() -> None:
     strategy = _RecordingStrategy()
     model = torch.nn.Linear(4, 2)
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger, strategy)
-    info = BaseInfo()
+    info = _InfoWithModels(named_models={"model": model})
     info.epoch, info.step = 1, 5
     info.history[1] = {"val_loss": 0.3}
-    monitor.on_epoch_end(info, model=model)
+    monitor.on_epoch_end(info)
     assert strategy.calls == [{"model": model}]
     assert logger.payloads == [{"gathered": True}]

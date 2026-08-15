@@ -26,13 +26,13 @@ from structcast_model.base_trainer import BaseInfo
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
 from structcast_model.torch.trainer import TorchTrainer
-from tests import ASSETS_DIR
+from tests import CFG_DIR, FIXTURES_DIR
 import torch
 import torch.distributed as dist
 
-LINEAR_CFG = str(ASSETS_DIR / "cfg" / "torch" / "Linear.yaml")
-MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
-LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
+LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "torch" / "Linear.yaml")
+MODEL_CFG = str(CFG_DIR / "torch" / "models" / "ConvNeXtV2.yaml")
+LEARNER_CFG = str(CFG_DIR / "torch" / "learners" / "ConvNeXtV2.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
@@ -662,7 +662,7 @@ class _EpochAwareDataset(list[dict[str, torch.Tensor]]):
         super().__init__(batches)
         self.epochs: list[int] = []
 
-    def on_epoch_begin(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_begin(self, info: BaseInfo) -> None:
         """Record the epoch the trainer is starting."""
         self.epochs.append(info.epoch)
 

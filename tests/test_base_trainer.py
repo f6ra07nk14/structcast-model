@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from functools import partial
 from math import inf
 from typing import Any, Literal
@@ -110,6 +111,19 @@ def test_simple_data_provider_counts_steps_from_its_datasets() -> None:
     assert provider.validation_steps == 1
 
 
+def test_simple_data_provider_caches_the_step_counts_after_the_first_read() -> None:
+    """The counts are per-run constants read several times per run (print, progress bar, log_params).
+
+    Recounting a dataset without __len__ re-iterates it, so a one-shot iterable would be consumed by
+    the first read and report 0 on the second.
+    """
+    provider = SimpleDataProvider(training_dataset=iter([{"x": 1}, {"x": 2}]), validation_dataset=iter([{"x": 3}]))
+    assert provider.steps_per_epoch == 2
+    assert provider.steps_per_epoch == 2
+    assert provider.validation_steps == 1
+    assert provider.validation_steps == 1
+
+
 def test_simple_data_provider_satisfies_the_data_provider_protocol() -> None:
     """Widening the protocol must not orphan the package's own provider.
 
@@ -154,6 +168,20 @@ def test_base_info_logs_raises_key_error_for_unknown_epoch() -> None:
         info.logs(99)
 
 
+def test_base_info_holds_no_models() -> None:
+    """A bare info carries no models, so callbacks driven outside a trainer still read the property."""
+    assert BaseInfo().models == {}
+
+
+def test_trainer_models_read_the_learner_live() -> None:
+    """The trainer keeps no snapshot: a callback sees whatever the learner owns at that moment."""
+    learner = _FakeLearner()
+    trainer = _make_trainer(learner=learner)
+    assert trainer.models == {"model": "the-model"}
+    learner.named_models = {"model": "replaced"}
+    assert trainer.models == {"model": "replaced"}
+
+
 # ---------------------------------------------------------------------------
 # Test collaborators
 # ---------------------------------------------------------------------------
@@ -173,11 +201,12 @@ class _FakeLearner:
         self._inference_loss = inference_loss
         self.optimizers = dict(optimizers) if optimizers is not None else {}
         self.learning_rates = {"lr": 0.1}
+        self.named_models: dict[str, Any] = {"model": "the-model"}
 
     @property
     def models(self) -> dict[str, Any]:
-        """Return the named models handed to every callback."""
-        return {"model": "the-model"}
+        """Return the named models every callback reads off the info."""
+        return self.named_models
 
     def update(self, step: int) -> bool:
         """Report whether this step ends an update."""
@@ -218,7 +247,7 @@ class _Recorder:
         for event in events:
             setattr(self, event, partial(self._record, event))
 
-    def _record(self, event: str, info: BaseInfo, **models: Any) -> None:
+    def _record(self, event: str, info: BaseInfo) -> None:
         """Append ``label:event`` to the shared log."""
         self.log.append(f"{self.label}:{event}")
 
@@ -240,7 +269,7 @@ class _RecordingProvider:
         self.steps_per_epoch = 1
         self.validation_steps = 0
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Record that the data provider received the event."""
         self.log.append("data:on_epoch_end")
 
@@ -251,7 +280,7 @@ class _EpochEndOnly:
     def __init__(self, log: list[str]) -> None:
         self.log = log
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Record the epoch that just finished."""
         self.log.append(f"epoch_end:{info.epoch}")
 
@@ -274,6 +303,19 @@ def _make_trainer(
         training_prefix=training_prefix,
         validation_prefix=validation_prefix,
     )
+
+
+@dataclass(kw_only=True)
+class _InfoWithModels(BaseInfo[Any]):
+    """Info carrying models without a trainer, for callbacks tested outside a training loop."""
+
+    named_models: dict[str, Any] = field(default_factory=dict)
+    """The models the property hands out."""
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return the models this info was built with."""
+        return self.named_models
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +356,9 @@ def test_callbacks_receive_info_and_models() -> None:
     received: list[tuple[Any, dict[str, Any]]] = []
 
     class _Capture:
-        def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
-            """Capture the arguments passed by the trainer."""
-            received.append((info, models))
+        def on_epoch_end(self, info: BaseInfo) -> None:
+            """Capture the info passed by the trainer, and the models it exposes."""
+            received.append((info, info.models))
 
     trainer = _make_trainer(data=SimpleDataProvider(training_dataset=[{"x": 1}]), callbacks=[_Capture()])
     trainer.fit(epochs=1)
@@ -334,7 +376,7 @@ def test_explicit_callback_matching_no_event_warns(caplog: pytest.LogCaptureFixt
     """A typo'd hook name (on_epoch_ended) would die silently, so dead explicit callbacks must warn."""
 
     class Typoed:
-        def on_epoch_ended(self, info: Any, **models: Any) -> None:
+        def on_epoch_ended(self, info: Any) -> None:
             raise AssertionError("never called")
 
     with caplog.at_level("WARNING", logger="structcast_model.base_trainer"):
@@ -383,7 +425,7 @@ def test_provider_datasets_are_scanned_for_events_before_the_callbacks() -> None
     log: list[str] = []
 
     class _EventfulDataset(list[dict[str, Any]]):
-        def on_epoch_begin(self, info: BaseInfo, **models: Any) -> None:
+        def on_epoch_begin(self, info: BaseInfo) -> None:
             """Record that the trainer reached this dataset."""
             log.append("dataset:on_epoch_begin")
 
@@ -646,19 +688,19 @@ class _BestRecorder:
     def __init__(self) -> None:
         self.seen: list[tuple[int, float, dict[str, Any]]] = []
 
-    def on_best(self, info: BaseInfo, best: BestCriterion[Any], **models: Any) -> None:
-        """Record the epoch, the best value, and the models."""
-        self.seen.append((info.epoch, best.value, models))
+    def on_best(self, info: BaseInfo, best: BestCriterion[Any]) -> None:
+        """Record the epoch, the best value, and the models the info carries."""
+        self.seen.append((info.epoch, best.value, info.models))
 
 
 def test_best_criterion_on_best_receives_info_best_and_models() -> None:
     """on_best participants get the criterion itself, so they can log or save by its value/step."""
     recorder = _BestRecorder()
     criterion = BestCriterion(target="loss", callbacks=[recorder])
-    info = BaseInfo()
+    info = _InfoWithModels(named_models={"model": "the-model"})
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
-    criterion.on_epoch_end(info, model="the-model")
+    criterion.on_epoch_end(info)
     assert recorder.seen == [(1, 0.5, {"model": "the-model"})]
 
 

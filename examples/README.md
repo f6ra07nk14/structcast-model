@@ -37,7 +37,7 @@ The keys of each dictionary become the keyword arguments of the learner's steps:
 `SimpleLearner` is the object the redesign asks you to write per model. It implements the `Learner`
 protocol — nothing is subclassed, nothing is registered:
 
-- **`models`** — the models by name. The trainer passes them as keyword arguments to every callback.
+- **`models`** — the models by name. Every callback reads them from `info.models`.
 - **`update(step)`** — whether this step applied the optimizers. Returning `True` on every step means
   "one step, one update"; a learner accumulating gradients over N batches returns `True` only every
   N-th step, and the trainer fires `on_update` that often.

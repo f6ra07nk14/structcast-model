@@ -43,7 +43,8 @@ _Avoid_: logger
 
 **Logger**:
 Records a training run to an experiment-tracking service (MLflow, wandb): parameters, metrics, artifacts, and
-model state.
+model state. Also retrieves a saved training state to resume from — each logger accepts only references to its
+own service, or a local path.
 _Avoid_: tracker
 
 **Best criterion**:

@@ -51,6 +51,40 @@ def test_mlflow_logger_stores_dicts_states_and_files_as_artifacts(mlflow_store: 
     assert {"arguments.yaml", "config.yaml", "training_state"} <= names
 
 
+def test_mlflow_logger_fetches_a_training_state_from_a_run_uri(mlflow_store: Any) -> None:
+    """--resume names the run that produced the state, so the logger must read back its own URI."""
+    with MLflowLogger(experiment="phase-two") as logger:
+        run_id = mlflow_store.active_run().info.run_id
+        logger.log_state_dict({"weight": torch.zeros(2)}, "training_state")
+    state = MLflowLogger(experiment="phase-two").fetch_training_state(f"runs:/{run_id}/training_state")
+    assert state["weight"].tolist() == [0.0, 0.0]
+
+
+def test_mlflow_logger_fetches_a_training_state_from_a_local_path(tmp_path: Path) -> None:
+    """A state copied out of the tracker must still resume, so a plain path stays a valid reference."""
+    path = tmp_path / "state_dict.pth"
+    torch.save({"weight": torch.ones(2)}, path)
+    assert MLflowLogger(experiment="phase-two").fetch_training_state(str(path))["weight"].tolist() == [1.0, 1.0]
+
+
+def test_mlflow_logger_rejects_an_artifact_directory_holding_no_state(mlflow_store: Any) -> None:
+    """A directory artifact that never held a state file must fail loudly, not hand torch.load a directory."""
+    with MLflowLogger(experiment="phase-two") as logger:
+        run_id = mlflow_store.active_run().info.run_id
+        logger.log_dict({"a": 1}, "state_dir/config.json")
+    with pytest.raises(ValueError, match='No "'):
+        MLflowLogger(experiment="phase-two").fetch_training_state(f"runs:/{run_id}/state_dir")
+
+
+@pytest.mark.parametrize(
+    ("reference", "local"), [("missing.pth", True), ("wandb://entity/project/run/state.pt", False)]
+)
+def test_mlflow_logger_rejects_a_reference_it_cannot_resolve(tmp_path: Path, reference: str, local: bool) -> None:
+    """A logger only knows its own scheme, so a foreign reference must fail naming the MLflow form."""
+    with pytest.raises(ValueError, match="runs:/"):
+        MLflowLogger(experiment="phase-two").fetch_training_state(str(tmp_path / reference) if local else reference)
+
+
 def test_mlflow_logger_satisfies_the_logger_protocol() -> None:
     """The CLI picks a backend by name, so a member missing from one of them breaks that choice."""
     assert isinstance(MLflowLogger(experiment="phase-two"), Logger)

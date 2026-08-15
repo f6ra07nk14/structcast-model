@@ -5,7 +5,6 @@ from functools import partial
 import inspect
 from pathlib import Path
 import random
-from tempfile import TemporaryDirectory
 from time import time
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -28,11 +27,9 @@ from structcast_model.commands.utils import (
 
 if TYPE_CHECKING:
     import calflops
-    import mlflow
     import numpy as np
     import ptflops
     from structcast.core import instantiator
-    import wandb
 
     from structcast_model.builders import torch_builder
     from structcast_model.torch import (
@@ -47,10 +44,8 @@ else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     calflops = LazyModuleImporter("calflops")
-    mlflow = LazyModuleImporter("mlflow")
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
-    wandb = LazyModuleImporter("wandb")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
     torch_distributed = LazyModuleImporter("structcast_model.torch.distributed")
@@ -169,39 +164,6 @@ def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> li
         f'Module "{name}" does not have an "outputs" attribute. '
         f'Please provide default outputs using the "--{name}-outputs" option.'
     )
-
-
-def _fetch_training_state(reference: str) -> dict[str, Any]:
-    """Load a saved training state from a local path, an MLflow `runs:/` URI, or a `wandb://` reference.
-
-    Args:
-        reference (str): The training state location: a local path, `runs:/<run_id>/<artifact>`, or
-            `wandb://<entity>/<project>/<run_id>/<file>`.
-
-    Returns:
-        dict[str, Any]: The loaded training state.
-
-    Raises:
-        ValueError: If a downloaded MLflow artifact directory holds no state file.
-    """
-    if reference.startswith("runs:/"):
-        path = Path(mlflow.artifacts.download_artifacts(artifact_uri=reference))
-        if path.is_dir():
-            # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
-            states = sorted(path.glob("*.pth"))
-            if not states:
-                raise ValueError(f'No "*.pth" training state found in the downloaded MLflow artifact "{path}".')
-            path = states[0]
-    elif reference.startswith("wandb://"):
-        entity, project, run_id, filename = reference.removeprefix("wandb://").split("/", 3)
-        with TemporaryDirectory() as directory:
-            wandb.Api().run(f"{entity}/{project}/{run_id}").file(filename).download(root=directory, replace=True)
-            # The download is deleted with the temporary directory, so it is read inside the block.
-            return torch.load(Path(directory) / filename, map_location="cpu", weights_only=True)
-    else:
-        path = Path(reference)
-    # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
-    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 @app.command(name="time")
@@ -405,15 +367,21 @@ def _assemble_learner(
 
 
 def _restore_training_state(
+    *,
     resume: str,
     strategy: "torch_distributed.DistributedStrategy",
     models: "OrderedDict[str, torch.nn.Module]",
     learner: Any,
     start_epoch: int,
     is_main: bool,
+    logger: "torch_logger.Logger",
 ) -> int:
-    """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch."""
-    raw_state = _fetch_training_state(resume) if is_main else None
+    """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch.
+
+    The logger owns the reference format, and only rank 0 holds a real one: the `NullLogger` ranks
+    fetch nothing and take the state from the strategy's broadcast.
+    """
+    raw_state = logger.fetch_training_state(resume)
     state = strategy.load_state_dict(
         models, getattr(learner, "optimizers", {}), getattr(learner, "optimizer_models", None), raw_state
     )
@@ -435,17 +403,11 @@ def _build_callbacks(
     higher_criteria: list[str],
     lower_criteria: list[str],
     save_criteria: list[str],
-    logger_name: str,
-    experiment: str,
+    logger: "torch_logger.Logger",
     ci: bool,
     is_main: bool,
-) -> torch_logger.Logger:
-    """Build the run's logger and install it and the saver/best/display callbacks on the trainer."""
-    if is_main:
-        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
-        logger: torch_logger.Logger = logger_type(experiment=experiment)
-    else:
-        logger = torch_logger.NullLogger()
+) -> None:
+    """Install the logger and the saver/best/display callbacks on the trainer."""
     # The saver and the best-criterion monitors run collectives, so they are built on every rank;
     # only rank 0 holds a real logger and writes anything. See ADR-0005.
     saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
@@ -465,7 +427,6 @@ def _build_callbacks(
             )
         )
     trainer.callbacks = [*display, logger, saver, *bests]
-    return logger
 
 
 @app.command()
@@ -520,9 +481,10 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
     resume: str | None = Option(
         None,
         "--resume",
-        help="Training state to resume from: a local path, an MLflow 'runs:/<run_id>/<artifact>' URI, "
-        "or 'wandb://<entity>/<project>/<run_id>/<file>'. "
-        "Restores models, optimizers, grad scalers, and continues from the saved epoch.",
+        help="Training state to resume from, in a form the active --logger understands: a local path always "
+        "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
+        "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
+        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch.",
     ),
     training_dataset_pattern: Any = Option(
         ...,
@@ -637,11 +599,26 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
         distributed=distributed,
         is_main=is_main,
     )
+    # Built before the resume, which fetches the state through it. Only the experiment name is stored
+    # here: the run itself starts in __enter__.
+    if is_main:
+        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
+        logger: torch_logger.Logger = logger_type(experiment=experiment)
+    else:
+        logger = torch_logger.NullLogger()
     if resume is not None:
-        start_epoch = _restore_training_state(resume, strategy, models, learner, start_epoch, is_main)
+        start_epoch = _restore_training_state(
+            resume=resume,
+            strategy=strategy,
+            models=models,
+            learner=learner,
+            start_epoch=start_epoch,
+            is_main=is_main,
+            logger=logger,
+        )
     trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
-    logger = _build_callbacks(
+    _build_callbacks(
         trainer=trainer,
         provider=provider,
         strategy=strategy,
@@ -649,8 +626,7 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
         higher_criteria=higher_criteria,
         lower_criteria=lower_criteria,
         save_criteria=save_criteria,
-        logger_name=logger_name,
-        experiment=experiment,
+        logger=logger,
         ci=ci,
         is_main=is_main,
     )

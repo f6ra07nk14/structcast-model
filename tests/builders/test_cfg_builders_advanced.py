@@ -5,12 +5,20 @@ from pathlib import Path
 import pytest
 
 from structcast_model.builders.torch_builder import TorchLearnerBuilder
-from tests import ASSETS_DIR
+from structcast_model.utils.base import load_any
+from tests import CFG_DIR
 
-LEARNER_YAML = ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml"
+LEARNER_YAML = CFG_DIR / "torch" / "learners" / "ConvNeXtV2.yaml"
 
-FP16 = {"use_grad_scaler": True, "mixed_precision_type": "float16"}
-"""Parameters selecting the float16 + gradient-scaler configuration."""
+
+def fp16_builder() -> TorchLearnerBuilder:
+    """Build the learner in the float16 + gradient-scaler configuration.
+
+    The template fixes the mixed-precision keys at its root instead of exposing them as template
+    variables, so fp16 is selected by overriding those keys on the loaded config.
+    """
+    raw = {**load_any(LEARNER_YAML), "MIXED_PRECISION": True, "MIXED_PRECISION_TYPE": "float16"}
+    return TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +50,7 @@ def test_learner_default_mixed_precision_type() -> None:
 
 def test_learner_float16_builds_a_grad_scaler() -> None:
     """float16 gradients underflow without scaling, so fp16 configs must build a scaler."""
-    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16})
+    built = fp16_builder()()
     assert built.mixed_precision_type == "float16"
     assert built.mixed_precision_scales == ["optimizer_grad_scaler"]
 
@@ -66,7 +74,7 @@ def test_learner_script_contains_autocast() -> None:
 
 def test_learner_script_contains_grad_scaler() -> None:
     """fp16 scripts build the scaler through the injectable creator, on the training device."""
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).scripts[0]
+    script = fp16_builder()().scripts[0]
     assert "__grad_scaler_creator__=torch.amp.GradScaler" in script
     assert "__grad_scaler_creator__(device=device_type" in script
 
@@ -170,8 +178,7 @@ def test_learner_clip_grad_norm_in_script() -> None:
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" in script
     assert "unscale_" not in script  # bf16 default has no scaler to unscale
-    fp16_params = {"DEFAULT": {**FP16, "clip_grad_norm": 2.0}}
-    fp16_script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=fp16_params).scripts[0]
+    fp16_script = fp16_builder()(parameters={"DEFAULT": {"clip_grad_norm": 2.0}}).scripts[0]
     assert "optimizer_grad_scaler.unscale_(optimizer)" in fp16_script
 
 
@@ -190,16 +197,16 @@ def test_learner_no_clip_when_null() -> None:
 
 def test_learner_mp_scale_backward_without_accumulation() -> None:
     """Without accumulation the scaler.scale().backward() has no division."""
-    params = {"DEFAULT": {**FP16, "accumulate_gradients": None}}
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
+    params = {"DEFAULT": {"accumulate_gradients": None}}
+    script = fp16_builder()(parameters=params).scripts[0]
     assert "optimizer_grad_scaler.scale(ce_loss).backward()" in script
     assert "ce_loss = ce_loss /" not in script
 
 
 def test_learner_mp_scale_backward_with_accumulation() -> None:
     """With accumulation loss is divided and backward uses scaler."""
-    params = {"DEFAULT": {**FP16, "accumulate_gradients": 2}}
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
+    params = {"DEFAULT": {"accumulate_gradients": 2}}
+    script = fp16_builder()(parameters=params).scripts[0]
     assert "ce_loss = ce_loss / 2" not in script
     assert "optimizer_grad_scaler.scale((ce_loss / 2)).backward()" in script
     assert "optimizer_grad_scaler.step(optimizer)" in script
@@ -260,7 +267,7 @@ def test_learner_collected_imports_include_torch_and_amp() -> None:
     assert "get_decays" in imports["structcast_model.torch.optimizers"]
     assert "contextlib" not in imports
     assert "torch.amp" not in imports
-    fp16_imports = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"DEFAULT": FP16}).collected_imports
+    fp16_imports = fp16_builder()().collected_imports
     assert "torch.amp" in fp16_imports
 
 
@@ -289,8 +296,8 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
 
 def test_learner_full_combo_accumulate_clip_mp() -> None:
     """Combine accumulation, clipping, and mixed precision in one build."""
-    params = {"DEFAULT": {**FP16, "accumulate_gradients": 4, "clip_grad_norm": 2.0, "layer_decay_type": "single"}}
-    built = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params, classname="FullCombo")
+    params = {"DEFAULT": {"accumulate_gradients": 4, "clip_grad_norm": 2.0, "layer_decay_type": "single"}}
+    built = fp16_builder()(parameters=params, classname="FullCombo")
     script = built.scripts[0]
     assert built.classname == "FullCombo"
     assert built.accumulate_gradients == 4

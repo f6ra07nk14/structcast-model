@@ -65,11 +65,11 @@ class AdamWWithCosine:
             raise AttributeError(name)
         return getattr(self.optimizer, name)
 
-    def on_update(self, info: Any, **models: Any) -> None:
+    def on_update(self, info: Any) -> None:
         """Advance a per-update schedule."""
         self.scheduler.step_update(info.update, info.logs().get(self.criterion))
 
-    def on_epoch_end(self, info: Any, **models: Any) -> None:
+    def on_epoch_end(self, info: Any) -> None:
         """Advance a per-epoch schedule."""
         self.scheduler.step(info.epoch, info.logs().get(self.criterion))
 
@@ -121,7 +121,7 @@ class OptimizerWithNativeScheduler:
             raise AttributeError(name)
         return getattr(self.optimizer, name)
 
-    def on_epoch_end(self, info: Any, **models: Any) -> None:
+    def on_epoch_end(self, info: Any) -> None:
         """Advance the schedule, which native schedulers count in epochs."""
         self.scheduler.step()
 

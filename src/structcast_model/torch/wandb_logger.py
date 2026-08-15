@@ -3,13 +3,14 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.base import dump_yaml
 from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.logger import Logger, _epoch_metrics
+from structcast_model.torch.logger import Logger, _epoch_metrics, _local_training_state
 import torch
 
 with try_import() as _imports:
@@ -60,7 +61,29 @@ class WandbLogger(Logger):
         """Save a state dictionary into the run directory."""
         torch.save(dict(states), Path(wandb.run.dir) / f"{name}.pt")
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def fetch_training_state(self, reference: str) -> dict[str, Any]:
+        """Load a saved training state from a `wandb://` reference or a local path.
+
+        Args:
+            reference (str): The training state location: `wandb://<entity>/<project>/<run_id>/<file>`
+                or a local path.
+
+        Returns:
+            dict[str, Any]: The loaded training state.
+
+        Raises:
+            ValueError: If the reference is neither a `wandb://` reference nor an existing local path.
+        """
+        if reference.startswith("wandb://"):
+            entity, project, run_id, filename = reference.removeprefix("wandb://").split("/", 3)
+            with TemporaryDirectory() as directory:
+                wandb.Api().run(f"{entity}/{project}/{run_id}").file(filename).download(root=directory, replace=True)
+                # The download is deleted with the temporary directory, so it is read inside the block.
+                # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
+                return torch.load(Path(directory) / filename, map_location="cpu", weights_only=True)
+        return _local_training_state(reference, 'a "wandb://<entity>/<project>/<run_id>/<file>" reference')
+
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""
         self.log_metrics(_epoch_metrics(info), step=info.epoch)
 

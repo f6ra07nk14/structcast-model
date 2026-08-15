@@ -6,7 +6,7 @@ from structcast_model.builders.flax_builder import (
     FlaxBuilder,
     FlaxLayerIntermediate,
 )
-from tests import ASSETS_DIR
+from tests import CFG_DIR
 
 
 def test_flax_layer_intermediate_generates_call_method_without_inference_flow() -> None:
@@ -167,7 +167,7 @@ def test_flax_builder_eval_rngs_renders_in_init() -> None:
 def test_flax_builder_cfg_convnext_builds_expected_topology() -> None:
     """Build Flax ConvNeXt model from cfg and check key topology outputs."""
     parameters = {"DEFAULT": {"backbone": "tiny", "num_classes": 10}}
-    builder = FlaxBuilder.from_path(ASSETS_DIR / "cfg" / "flax" / "ConvNeXtV2.yaml")
+    builder = FlaxBuilder.from_path(CFG_DIR / "flax" / "models" / "ConvNeXtV2.yaml")
     built = builder(parameters=parameters, classname="ConvNeXtFlaxTiny")
     assert built.classname == "ConvNeXtFlaxTiny"
     assert built.structured_output is True
@@ -182,7 +182,7 @@ def test_flax_builder_cfg_convnext_builds_expected_topology() -> None:
 def test_flax_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> None:
     """Build Backbone sublayer from Flax ConvNeXt cfg."""
     parameters = {"DEFAULT": {"backbone": backbone}}
-    builder = FlaxBuilder.from_path(ASSETS_DIR / "cfg" / "flax" / "ConvNeXtV2.yaml")
+    builder = FlaxBuilder.from_path(CFG_DIR / "flax" / "models" / "ConvNeXtV2.yaml")
     built = builder(parameters=parameters, classname="Backbone", user_defined_layer="Backbone")
     assert built.classname == "Backbone"
     assert built.structured_output is True

@@ -6,7 +6,7 @@ from structcast_model.builders.keras_builder import (
     KerasBuilder,
     KerasLayerIntermediate,
 )
-from tests import ASSETS_DIR
+from tests import CFG_DIR
 
 
 def test_keras_layer_intermediate_generates_call_method_without_inference_flow() -> None:
@@ -124,7 +124,7 @@ def test_keras_builder_structured_output_returns_dict() -> None:
 def test_keras_builder_cfg_convnext_builds_expected_topology() -> None:
     """Build Keras ConvNeXt model from cfg and check key topology outputs."""
     parameters = {"DEFAULT": {"backbone": "tiny", "num_classes": 10}}
-    builder = KerasBuilder.from_path(ASSETS_DIR / "cfg" / "keras" / "ConvNeXtV2.yaml")
+    builder = KerasBuilder.from_path(CFG_DIR / "keras" / "models" / "ConvNeXtV2.yaml")
     built = builder(parameters=parameters, classname="ConvNeXtKerasTiny")
     assert built.classname == "ConvNeXtKerasTiny"
     assert built.structured_output is True
@@ -139,7 +139,7 @@ def test_keras_builder_cfg_convnext_builds_expected_topology() -> None:
 def test_keras_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> None:
     """Build Backbone sublayer from Keras ConvNeXt cfg."""
     parameters = {"DEFAULT": {"backbone": backbone}}
-    builder = KerasBuilder.from_path(ASSETS_DIR / "cfg" / "keras" / "ConvNeXtV2.yaml")
+    builder = KerasBuilder.from_path(CFG_DIR / "keras" / "models" / "ConvNeXtV2.yaml")
     built = builder(parameters=parameters, classname="Backbone", user_defined_layer="Backbone")
     assert built.classname == "Backbone"
     assert built.structured_output is True
