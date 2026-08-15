@@ -39,6 +39,7 @@ class _StubLearner:
 
     models: dict[str, Any] = {}
     optimizers: dict[str, Any] = {}
+    optimizer_models: dict[str, list[str]] = {}
     learning_rates: dict[str, float] = {}
 
     def update(self, step: int) -> bool:

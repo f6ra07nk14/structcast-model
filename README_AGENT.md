@@ -173,7 +173,7 @@ The generated learner class supports:
 - Automatic train/eval mode switching per entry
 - Gradient accumulation, AMP scaler logic, and gradient clipping
 
-It implements the `Learner` protocol (the `models`, `optimizers`, and `learning_rates` properties plus `update`, `training_step`, `inference_step`) and additionally exposes `grad_scalers`, `weight_decays`, `param_group_names`, `inputs`, and `outputs`.
+It implements the `Learner` protocol (the `models`, `optimizers`, `optimizer_models`, and `learning_rates` properties plus `update`, `training_step`, `inference_step`) and additionally exposes `grad_scalers`, `weight_decays`, `param_group_names`, `inputs`, and `outputs`.
 
 ### `scm torch ptflops` and `scm torch calflops`
 

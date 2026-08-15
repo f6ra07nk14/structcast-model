@@ -65,6 +65,14 @@ class Learner(Protocol, Generic[ModelT]):
         """The optimizers by name; members implementing event protocols are routed by the trainer."""
 
     @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """The names of the models each optimizer updates (optimizer name -> model names).
+
+        Used by checkpointing to pair sharded optimizer state with its modules; empty when the
+        pairing is not declared.
+        """
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The current learning rate of each optimizer, for display and logging."""
 

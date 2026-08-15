@@ -158,6 +158,11 @@ class SimpleLearner:
         return {"optimizer": self._optimizer}
 
     @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """Declare no pairing; these runs do not exercise sharded optimizer state."""
+        return {}
+
+    @property
     def grad_scalers(self) -> dict[str, Any]:
         """Return empty grad scalers dict."""
         return {}
@@ -202,6 +207,11 @@ class GradientLearner:
     @property
     def optimizers(self) -> dict[str, Any]:
         """Return no optimizers: the run reads gradients, it never applies them."""
+        return {}
+
+    @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """Return no pairing, there being no optimizer."""
         return {}
 
     @property

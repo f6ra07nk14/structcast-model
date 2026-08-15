@@ -262,9 +262,7 @@ class TrainingStateSaver:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
         # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
-        states = self.strategy.state_dict(
-            dict(info.models), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
-        )
+        states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
         states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}

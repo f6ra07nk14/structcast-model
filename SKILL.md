@@ -72,7 +72,7 @@ Losses and metrics are declared inline in the learner's `FLOW`, so there is no s
 scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 ```
 
-The generated class implements the `Learner` protocol: `models`, `update(step)`, `training_step(**inputs)`, `inference_step(**inputs)`, plus `optimizers`, `grad_scalers`, `learning_rates`, `weight_decays`, `param_group_names`, and `outputs`.
+The generated class implements the `Learner` protocol: `models`, `update(step)`, `training_step(**inputs)`, `inference_step(**inputs)`, plus `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`, `weight_decays`, `param_group_names`, and `outputs`.
 
 Optimizer + scheduler combinations are not package API: they are referenced by file path, as in `examples/torch/optimizers.py` (`AdamWWithCosine`, `OptimizerWithNativeScheduler`). The package provides `create_opt` for the optimizer itself.
 

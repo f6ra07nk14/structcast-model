@@ -404,11 +404,12 @@ LEARNERS:
 **`Learner`** — The object that owns the models and defines how they learn. Members:
 
 - `models` (property) — `dict[str, ModelT]` of the models to train, where `ModelT` is the model type the trainer is specialized to (`torch.nn.Module` for `TorchTrainer`); the trainer exposes them to every event as `info.models`.
+- `optimizer_models` (property) — `dict[str, list[str]]` naming the models each optimizer updates (optimizer name -> model names); checkpointing uses it to pair sharded optimizer state with its modules, and an empty mapping means the pairing is not declared.
 - `update(step) -> bool` — whether the given training step applied the optimizers. `False` means gradients are still accumulating.
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
 
-Two required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer) and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
+Three required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer), `optimizer_models` (read whenever checkpointing saves or restores optimizer state, as described above), and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
 
 **`DataProvider`** — Supplies the datasets of a whole run and their step counts: a `training_dataset` property, a `validation_dataset` property that may be `None` to skip validation, and `steps_per_epoch` / `validation_steps` properties (`validation_steps` is `0` without a validation dataset). Each dataset may be a dataset or a zero-argument callable returning one, and the dataset properties must return the same object on every read: the trainer reads them for the event-protocol scan and again in `fit()`. Both datasets are scanned against every event protocol, so a validation dataset implementing training-phase hooks receives those events too — guard on the split inside the hook, as `TimmDataLoaderWrapper` does.
 

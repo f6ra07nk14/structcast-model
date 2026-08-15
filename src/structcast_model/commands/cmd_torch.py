@@ -382,9 +382,7 @@ def _restore_training_state(
     fetch nothing and take the state from the strategy's broadcast.
     """
     raw_state = logger.fetch_training_state(resume)
-    state = strategy.load_state_dict(
-        models, getattr(learner, "optimizers", {}), getattr(learner, "optimizer_models", None), raw_state
-    )
+    state = strategy.load_state_dict(models, learner.optimizers, learner.optimizer_models, raw_state)
     for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
         if state.get("grad_scalers", {}).get(scaler_name):
             scaler.load_state_dict(state["grad_scalers"][scaler_name])

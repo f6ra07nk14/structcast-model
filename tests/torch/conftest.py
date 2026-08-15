@@ -22,6 +22,11 @@ class _LearningRateLearner:
         return {}
 
     @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """No pairing, there being no optimizer."""
+        return {}
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The rate the finished epoch is logged with."""
         return {"lr": 0.1}

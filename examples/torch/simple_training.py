@@ -56,9 +56,9 @@ class SimpleLearner:
     """A hand-written learner: it owns the model and the optimizer and defines both steps.
 
     This is the object the redesign asks you to customize per model. It implements the `Learner`
-    protocol -- the `models`, `optimizers`, and `learning_rates` properties plus `update`,
-    `training_step`, and `inference_step`. Extra methods named after a lifecycle event, such as
-    `on_epoch_end` below, are picked up by the trainer automatically.
+    protocol -- the `models`, `optimizers`, `optimizer_models`, and `learning_rates` properties
+    plus `update`, `training_step`, and `inference_step`. Extra methods named after a lifecycle
+    event, such as `on_epoch_end` below, are picked up by the trainer automatically.
     """
 
     def __init__(self, model: torch.nn.Module, learning_rate: float = 0.1) -> None:
@@ -86,6 +86,11 @@ class SimpleLearner:
     def optimizers(self) -> dict[str, torch.optim.Optimizer]:
         """The optimizers by name: the trainer scans them for event protocols right after the learner."""
         return {"optimizer": self.optimizer}
+
+    @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """The models each optimizer updates, so checkpointing can key its state by parameter names."""
+        return {"optimizer": ["model"]}
 
     @property
     def learning_rates(self) -> dict[str, float]:

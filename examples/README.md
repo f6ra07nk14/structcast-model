@@ -48,10 +48,12 @@ The optimizer lives on the learner, together with its schedule. `SimpleLearner` 
 `on_epoch_end`, which advances the schedule after each epoch. The trainer finds that method by
 checking the learner against the `OnEpochEnd` protocol, so no registration call is needed.
 
-Two more properties are required by the protocol: `optimizers` (the CLI saves their state between
-epochs, and the trainer scans them for event protocols as well) and `learning_rates` (printed next
-to the criteria by `Printer` and logged by the loggers). Optional extras — `grad_scalers`,
-`weight_decays`, `param_group_names` — are read by the toolkit when present.
+Three more properties are required by the protocol: `optimizers` (the CLI saves their state between
+epochs, and the trainer scans them for event protocols as well), `optimizer_models` (which models
+each optimizer updates — `{"optimizer": ["model"]}` here — so checkpointing can pair optimizer state
+with those models), and `learning_rates` (printed next to the criteria by `Printer` and logged by the
+loggers). Optional extras — `grad_scalers`, `weight_decays`, `param_group_names` — are read by the
+toolkit when present.
 
 ### The tracker
 
@@ -123,8 +125,8 @@ scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs
 ```
 
 `learner.py` holds a `Learner` class with exactly the members the tutorial writes by hand — `models`,
-`update`, `training_step`, `inference_step`, plus `optimizers`, `grad_scalers`, `learning_rates`,
-`weight_decays`, and `param_group_names`.
+`update`, `training_step`, `inference_step`, plus `optimizers`, `optimizer_models`, `grad_scalers`,
+`learning_rates`, `weight_decays`, and `param_group_names`.
 
 Then render the dataset configurations and train:
 

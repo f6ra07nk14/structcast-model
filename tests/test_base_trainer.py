@@ -200,6 +200,7 @@ class _FakeLearner:
         self._should_update = should_update
         self._inference_loss = inference_loss
         self.optimizers = dict(optimizers) if optimizers is not None else {}
+        self.optimizer_models: dict[str, list[str]] = {}
         self.learning_rates = {"lr": 0.1}
         self.named_models: dict[str, Any] = {"model": "the-model"}
 
