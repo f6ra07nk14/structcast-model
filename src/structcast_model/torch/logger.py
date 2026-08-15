@@ -1,11 +1,13 @@
 """Shared interface of the loggers recording a training run to an experiment tracking service."""
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from typing_extensions import Protocol, runtime_checkable
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer
+import torch
 
 
 @runtime_checkable
@@ -39,6 +41,9 @@ class Logger(Protocol):
 
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
         """Log a state dictionary under the given artifact name."""
+
+    def fetch_training_state(self, reference: str) -> dict[str, Any] | None:
+        """Fetch the training state the reference points to; None when the logger records nothing."""
 
     def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
         """Log the criteria and learning rates of the finished epoch."""
@@ -78,6 +83,9 @@ class NullLogger(Logger):
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
         """Discard the state dictionary."""
 
+    def fetch_training_state(self, reference: str) -> None:
+        """Fetch nothing: the non-main ranks receive the state through the strategy broadcast."""
+
     def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
         """React to nothing."""
 
@@ -95,9 +103,20 @@ def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
     return {**learner.learning_rates, **getattr(learner, "weight_decays", {}), **info.logs()}
 
 
-# `_epoch_metrics` is listed because the LazySelectedImporter tail below only exposes the names in
-# `__all__`, and the two logger backends import it from here.
-__all__ = ["Logger", "NullLogger", "_epoch_metrics"]
+def _local_training_state(reference: str, expected_form: str) -> dict[str, Any]:
+    """Load a training state from an existing local path, naming the logger's accepted forms otherwise."""
+    path = Path(reference)
+    if not path.exists():
+        raise ValueError(
+            f'Cannot fetch a training state from "{reference}": expected {expected_form} or an existing local path.'
+        )
+    # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+# `_epoch_metrics` and `_local_training_state` are listed because the LazySelectedImporter tail below
+# only exposes the names in `__all__`, and the two logger backends import them from here.
+__all__ = ["Logger", "NullLogger", "_epoch_metrics", "_local_training_state"]
 
 
 if not TYPE_CHECKING:

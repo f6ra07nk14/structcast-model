@@ -2,12 +2,14 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.logger import Logger, _epoch_metrics
+from structcast_model.torch.logger import Logger, _epoch_metrics, _local_training_state
+import torch
 
 with try_import() as _imports:
     import mlflow
@@ -63,6 +65,31 @@ class MLflowLogger(Logger):
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
         """Log a state dictionary under the given artifact name."""
         mlflow.pytorch.log_state_dict(dict(states), name)
+
+    def fetch_training_state(self, reference: str) -> dict[str, Any]:
+        """Load a saved training state from an MLflow `runs:/` URI or a local path.
+
+        Args:
+            reference (str): The training state location: `runs:/<run_id>/<artifact>` or a local path.
+
+        Returns:
+            dict[str, Any]: The loaded training state.
+
+        Raises:
+            ValueError: If the reference is neither a `runs:/` URI nor an existing local path, or if
+                a downloaded artifact directory holds no state file.
+        """
+        if reference.startswith("runs:/"):
+            path = Path(mlflow.artifacts.download_artifacts(artifact_uri=reference))
+            if path.is_dir():
+                # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
+                states = sorted(path.glob("*.pth"))
+                if not states:
+                    raise ValueError(f'No "*.pth" training state found in the downloaded MLflow artifact "{path}".')
+                path = states[0]
+            # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
+            return torch.load(path, map_location="cpu", weights_only=True)
+        return _local_training_state(reference, 'a "runs:/<run_id>/<artifact>" URI')
 
     def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
         """Log the criteria and learning rates of the finished epoch."""

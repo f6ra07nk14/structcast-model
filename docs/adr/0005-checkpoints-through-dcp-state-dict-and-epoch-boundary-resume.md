@@ -42,8 +42,10 @@ collective-safe producer, not an interrupt handler.
 `torch.load`s the artifact, then `strategy.load_state_dict` distributes it: model tensors travel through
 `set_model_state_dict(broadcast_from_rank0=True)`, while optimizer states and metadata are object-broadcast
 to every rank first — the broadcast option cannot infer a device from stateless optimizers (plain SGD), for
-which only hyperparameters are restored. Gradient-scaler states and the loop counters come from the same
-artifact; the run continues at `meta.epoch + 1`, overriding `--start-epoch` with a warning. Initializers and
-the initial-weight broadcast are skipped on resume since the loaded state overwrites them. Sampler and
-dataloader positions are not saved, so resume is exact only at epoch boundaries; step-exact resume would
-need RNG and sampler state in `meta` and is out of scope.
+which only hyperparameters are restored. (Amended: fetching now goes through the active logger's
+`fetch_training_state`, so the reference must match `--logger` and cross-service resume is not supported.)
+Gradient-scaler states and the loop counters come from the same artifact; the run continues at
+`meta.epoch + 1`, overriding `--start-epoch` with a warning. Initializers and the initial-weight broadcast
+are skipped on resume since the loaded state overwrites them. Sampler and dataloader positions are not
+saved, so resume is exact only at epoch boundaries; step-exact resume would need RNG and sampler state in
+`meta` and is out of scope.

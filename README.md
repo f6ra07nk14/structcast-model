@@ -424,7 +424,7 @@ Key arguments:
 - `-A/--log-artifacts`: files to store as run artifacts
 - `--trainer`: StructCast pattern for a `TorchTrainer` replacement, when the default loop is not enough
 - `--strategy`: StructCast pattern for the `DistributedStrategy`; it is called with the resolved `device` and `local_rank`. Defaults to `DistributedDataParallelStrategy` when a distributed environment is detected, and `SingleDeviceStrategy` otherwise
-- `--resume`: training state to restore before the loop starts — a local path, a `runs:/<run_id>/<artifact>` MLflow URI, or a `wandb://entity/project/run/file` URI. Models, optimizers, and gradient scalers are restored and training continues from the saved epoch (`--start-epoch` is overridden, with a warning)
+- `--resume`: training state to restore before the loop starts; the reference is resolved by the active `--logger`, so a local path always works, a `runs:/<run_id>/<artifact>` MLflow URI requires `--logger mlflow`, and a `wandb://<entity>/<project>/<run_id>/<file>` reference requires `--logger wandb` — resuming across services is not supported. Models, optimizers, and gradient scalers are restored and training continues from the saved epoch (`--start-epoch` is overridden, with a warning)
 
 What the train command does internally:
 
