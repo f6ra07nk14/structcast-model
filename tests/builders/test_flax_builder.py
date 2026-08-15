@@ -77,6 +77,22 @@ def test_flax_layer_intermediate_uses_inputs_outputs_attributes() -> None:
     assert "self.outputs = ['cls']" in script
 
 
+def test_flax_layer_intermediate_emits_input_shapes_literal() -> None:
+    """Emit the declared input shapes as a literal so the built model can create its own dummy inputs."""
+    script = FlaxLayerIntermediate(
+        classname="Unit",
+        imports={},
+        inputs=["image"],
+        input_shapes={"image": (3, 224, 224)},
+        outputs=["cls"],
+        layers={},
+        flow=[("image", "cls", None)],
+        inference_flow=[],
+        structured_output=False,
+    )._get_layer_script("Unit", [])
+    assert "self.input_shapes = {'image': (3, 224, 224)}" in script
+
+
 def test_flax_builder_builds_intermediate_and_scripts() -> None:
     """Build a minimal Flax nnx model and render Python script content."""
     raw = {

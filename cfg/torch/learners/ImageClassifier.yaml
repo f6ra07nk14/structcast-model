@@ -1,0 +1,95 @@
+# Supervised image classification for any model whose root reads "image" and emits a bare "cls"
+# tensor, i.e. both "cfg/torch/models/VisionTransformer.yaml" and "cfg/torch/models/ConvNeXtV2.yaml".
+# One learner for both keeps a strategy comparison honest: SingleDevice, DDP and FSDP2 runs differ
+# only in the strategy configuration.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "MIXED_PRECISION" enables gradient scaling ("torch.amp.GradScaler"), which only applies to
+# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: bfloat16
+# "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
+# specify the number of steps to accumulate gradients before updating parameters.
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+# "LEARNERS" can be set to a learner configuration or a list of learner configurations
+# to specify how the models are trained.
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    NAME: optimizer
+    # A native torch.optim.AdamW (via create_opt's native engine), not a scheduler proxy like
+    # AdamWWithCosine: FSDP2's DCP checkpoint path refuses optimizers that are not real
+    # torch.optim.Optimizer instances, and this learner is the per-block FSDP2 example.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_opt
+      - _bind_:
+          opt: torch.optim.AdamW
+          betas: [0.9, 0.999]
+          weight_decay_regexes: []
+          # Biases and norm scales are already exempt because "create_opt" never decays a parameter
+          # with at most one dimension; the regexes name them anyway and, more importantly, add the
+          # two-dimensional class-token and position tables of the Vision Transformer, which that
+          # rule would decay -- timm keeps "cls_token" and "pos_embed" out of weight decay too.
+          # "norm" covers "layer_norm" in both models and the "global_response_norm" of ConvNeXt V2.
+          no_weight_decay_regexes:
+            - ^(?:\w+\.)*bias$
+            - ^(?:\w+\.)*\w*norm\w*(?:\.\w+)*$
+            - ^(?:\w+\.)*\w*embedding\w*(?:\.\w+)*$
+          _jinja_yaml_: |-
+            lr: {{lr}}
+            weight_decay: {{weight_decay}}
+    _jinja_yaml_: |-
+      {% if clip_grad_norm is none %}
+      CLIP: null
+      {% else %}
+      CLIP:
+        - _obj_
+        - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+      {% endif %}
+    EXTRA: {}
+    FLOW:
+      - [image, cls, model]
+      - INPUTS: {input: cls, target: label}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: torch.nn.CrossEntropyLoss}, _call_]
+      - INPUTS: {y_true: label, y_pred: cls}
+        OUTPUTS: acc1
+        NAME: accuracy
+        LAYER:
+          - _obj_
+          - _addr_: torch.no_grad
+          - _call_
+          - _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_categorical_accuracy}]]
+      - INPUTS: {y_true: label, y_pred: cls, k: 5}
+        OUTPUTS: acc5
+        NAME: top_5_accuracy
+        LAYER:
+          - _obj_
+          - _addr_: torch.no_grad
+          - _call_
+          - _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_top_k_categorical_accuracy}]]
+    INFERENCE_FLOW:
+      - [image, cls, model]
+      - [{input: cls, target: label}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: cls}, acc1, accuracy]
+      - [{y_true: label, y_pred: cls, k: 5}, acc5, top_5_accuracy]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

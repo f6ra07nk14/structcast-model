@@ -1,24 +1,25 @@
 """API-level tests for base builder utilities."""
 
 from collections import defaultdict
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import ModuleType
 from typing import TypeAlias
 
 import pytest
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SpecIntermediate
-from structcast.utils.security import configure_security
 
 from structcast_model.builders.base_builder import (
-    BaseBackwardBuilder,
+    BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
     resolve_getter,
     resolve_object,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
-from structcast_model.builders.torch_builder import TorchBackwardBuilder, TorchLayerIntermediate
+from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from tests import ASSETS_DIR
 
 
@@ -125,6 +126,52 @@ def test_base_model_builder_from_path_and_user_defined_entry() -> None:
     assert sublayer.outputs == ["feat1", "feat2", "feat3", "feat4"]
 
 
+def _import_module(module_path: Path) -> ModuleType:
+    """Import the generated module from its file path."""
+    spec = spec_from_file_location(module_path.stem, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_builder_emits_input_shapes_onto_the_generated_model(tmp_path: Path) -> None:
+    """The declared INPUT_SHAPES survive as a literal, so a built model knows its own inputs without a --shape flag."""
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "INPUT_SHAPES": {"x": [3, 224, 224], "tokens": {"_SHAPE_": [512], "_DTYPE_": "int64"}},
+        "FLOW": [["x", "y", {"_obj_": [["_addr_", "torch.nn.LazyLinear"], ["_call_", {"out_features": 2}]]}]],
+    }
+    expected = {"x": (3, 224, 224), "tokens": {"_SHAPE_": (512,), "_DTYPE_": "int64"}}
+    built = TorchBuilder(raw=raw)(classname="TinyNet")
+    assert built.input_shapes == expected
+    module_path = tmp_path / "tiny_net.py"
+    built(module_path)
+    assert _import_module(module_path).TinyNet().input_shapes == expected
+
+
+def test_builder_deduplicates_sublayers_sharing_input_shapes(tmp_path: Path) -> None:
+    """Identical sub-layers still collapse into a single class now that input_shapes takes part in their hash."""
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["z"],
+        "FLOW": [["x", "y", "first", {"TYPE": "Unit"}], ["y", "z", "second", {"TYPE": "Unit"}]],
+        "Unit": {
+            "INPUTS": ["a"],
+            "OUTPUTS": ["b"],
+            "FLOW": [["a", "b", {"_obj_": [["_addr_", "torch.nn.LazyLinear"], ["_call_", {"out_features": 2}]]}]],
+        },
+    }
+    built = TorchBuilder(raw=raw)(classname="TinyNet")
+    module_path = tmp_path / "tiny_net.py"
+    built(module_path)
+    assert module_path.read_text(encoding="utf-8").count("class Unit(") == 1
+    model = _import_module(module_path).TinyNet()
+    assert model.first is not model.second
+
+
 def test_layer_intermediate_default_methods_raise_not_implemented() -> None:
     """Default abstract-style methods raise in base intermediate types."""
     inter = LayerIntermediate(
@@ -186,12 +233,8 @@ def test_base_model_builder_get_sublayer_cfg_with_type(tmp_path: Path) -> None:
     )
     builder = BaseModelBuilder(raw={"FLOW": []})
     cfg_unit = UserLayer.model_validate({"CFG": cfg_path, "TYPE": "Backbone"})
-    try:
-        configure_security(working_dir_check=False)
-        subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
-        assert subclassname.endswith("Backbone")
-    finally:
-        configure_security()
+    subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
+    assert subclassname.endswith("Backbone")
 
 
 def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
@@ -208,11 +251,11 @@ def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
         BaseModelBuilder(raw=raw_bad)()
 
 
-def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
-    """Reject duplicate backward names and optimizer names."""
+def test_base_learner_builder_duplicate_name_and_optimizer_raise() -> None:
+    """Reject duplicate learner names and optimizer names."""
     opt = {"_obj_": [["_addr_", "torch.optim.SGD"]]}
-    duplicate_backward = {
-        "BACKWARDS": [
+    duplicate_learner = {
+        "LEARNERS": [
             {
                 "NAME": "main",
                 "LOSS": "loss_a",
@@ -230,17 +273,17 @@ def test_base_backward_builder_duplicate_name_and_optimizer_raise() -> None:
         ],
     }
     with pytest.raises(SpecError, match='Duplicate variable name "main" for optimizer'):
-        TorchBackwardBuilder(raw=duplicate_backward)()
+        TorchLearnerBuilder(raw=duplicate_learner)()
 
 
-def test_base_backward_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
-    """Base backward builder logs a warning for mixed precision and returns None."""
+def test_base_learner_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Base learner builder logs a warning for mixed precision and returns None."""
 
-    class _NoMixedPrecisionBuilder(BaseBackwardBuilder):
+    class _NoMixedPrecisionBuilder(BaseLearnerBuilder):
         pass
 
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -301,14 +344,14 @@ def test_resolve_object_with_list_literal_in_call() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TorchBackwardBuilder — full backward build with flow
+# TorchLearnerBuilder — full learner build with flow
 # ---------------------------------------------------------------------------
 
 
-def test_torch_backward_builder_simple_backward_generates_scripts() -> None:
-    """Building a simple backward configuration produces scripts with training/inference steps."""
+def test_torch_learner_builder_simple_learner_generates_scripts() -> None:
+    """Building a simple learner configuration produces scripts with training/inference steps."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -317,19 +360,19 @@ def test_torch_backward_builder_simple_backward_generates_scripts() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
-    assert "class Backward" in combined
-    assert "_training_step" in combined
-    assert "_inference_step" in combined
+    assert "class Learner" in combined
+    assert "def training_step(self, x, **kwargs):" in combined
+    assert "def inference_step(self, x, **kwargs):" in combined
     assert "optimizer" in combined.lower() or "sgd" in combined.lower()
 
 
-def test_torch_backward_builder_with_mixed_precision() -> None:
+def test_torch_learner_builder_with_mixed_precision() -> None:
     """Building with mixed precision generates GradScaler code."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -340,17 +383,17 @@ def test_torch_backward_builder_with_mixed_precision() -> None:
         "MIXED_PRECISION": True,
         "MIXED_PRECISION_TYPE": "float16",
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "GradScaler" in combined
     assert "autocast" in combined
 
 
-def test_torch_backward_builder_with_clip_gradient() -> None:
+def test_torch_learner_builder_with_clip_gradient() -> None:
     """Building with CLIP generates a gradient clipping call."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -365,16 +408,16 @@ def test_torch_backward_builder_with_clip_gradient() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "dispatch_clip_grad" in combined
 
 
-def test_torch_backward_builder_with_accumulate_gradients() -> None:
+def test_torch_learner_builder_with_accumulate_gradients() -> None:
     """Building with ACCUMULATE_GRADIENTS generates conditional update logic."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -384,16 +427,16 @@ def test_torch_backward_builder_with_accumulate_gradients() -> None:
         ],
         "ACCUMULATE_GRADIENTS": 4,
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "need_update" in combined.lower() or "__need_update__" in combined
 
 
-def test_torch_backward_builder_with_extra_kwargs() -> None:
-    """EXTRA dict in backward generates kwargs in the backward call."""
+def test_torch_learner_builder_with_extra_kwargs() -> None:
+    """EXTRA dict in a learner generates kwargs in the backward call."""
     raw = {
-        "BACKWARDS": [
+        "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
@@ -403,7 +446,7 @@ def test_torch_backward_builder_with_extra_kwargs() -> None:
             },
         ],
     }
-    intermediate = TorchBackwardBuilder(raw=raw)()
+    intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
     assert "retain_graph" in combined

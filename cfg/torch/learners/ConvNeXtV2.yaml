@@ -23,14 +23,9 @@ PARAMETERS:
   large: {depths: [3, 3, 27, 3], group: 3}
   huge: {depths: [3, 3, 27, 3], group: 3}
 IMPORTS: {}
-# "MIXED_PRECISION" can be set to a boolean or a dictionary of keyword arguments for
-# configuring Torch's automatic mixed precision ("torch.amp.GradScaler").
-MIXED_PRECISION:
-  init_scale: "eval: 2.0**16"
-  growth_factor: 2.0
-  backoff_factor: 0.5
-  growth_interval: 2000
-  enabled: True
+# "MIXED_PRECISION" enables gradient scaling ("torch.amp.GradScaler"), which only applies to
+# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler.
+MIXED_PRECISION: false
 MIXED_PRECISION_TYPE: bfloat16
 # "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
 # specify the number of steps to accumulate gradients before updating parameters.
@@ -40,16 +35,17 @@ _jinja_yaml_: |-
   {% else %}
   ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
   {% endif %}
-# "BACKWARDS" can be set to a backwards configuration or a list of backwards configurations
-# to specify the backward pass(es) to perform during training.
+# "LEARNERS" can be set to a learner configuration or a list of learner configurations
+# to specify how the models are trained.
 OUTPUTS: [ce_loss, acc1, acc5]
-BACKWARDS:
+LEARNERS:
   - LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
     NAME: optimizer
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: AdamWWithCosine
+        _file_: examples/torch/optimizers.py
       - _bind_:
           optimizer_kwargs:
             opt: adamw
@@ -109,7 +105,7 @@ BACKWARDS:
               {{ "Invalid layer_decay_type: {}".format(layer_decay_type) | raise_error }}
               {% endif %}
           scheduler_kwargs:
-            name: cosine
+            sched: cosine
             min_lr: 1.0e-6
             warmup_lr: 1.0e-5
             warmup_prefix: false
@@ -159,7 +155,7 @@ BACKWARDS:
       - [{y_true: label, y_pred: cls, k: 5}, acc5, top_5_accuracy]
 # "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
 # to specify the losses and models to be used during training.
-# These will be automatically aggregated from the "BACKWARDS" configurations,
+# These will be automatically aggregated from the "LEARNERS" configurations,
 # but can also be manually specified here if needed.
 LOSSES: []
 MODELS: []

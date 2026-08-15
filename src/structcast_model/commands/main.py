@@ -73,3 +73,8 @@ if not TYPE_CHECKING:
     from structcast.utils.lazy_import import LazySelectedImporter
 
     sys.modules[__name__] = LazySelectedImporter(__name__, globals())
+
+if __name__ == "__main__":
+    # `python -m structcast_model.commands.main` (the documented torchrun launch) imports this
+    # module as __main__, which the lazy-import tail does not dispatch to the Typer app.
+    app()

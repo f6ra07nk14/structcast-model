@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -12,10 +13,10 @@ from structcast_model.flax.trainer import create_jax_inputs, get_jax_device, get
 
 
 def test_create_jax_inputs_from_int_tuple_returns_array() -> None:
-    """A tuple of ints produces a float32 JAX array with batch dimension 1."""
+    """A tuple of ints produces a bfloat16 JAX array with batch dimension 1, bfloat16 being the default dtype."""
     result = create_jax_inputs((3, 4))
     assert result.shape == (1, 3, 4)
-    assert result.dtype == jnp.float32
+    assert result.dtype == jnp.bfloat16
 
 
 def test_create_jax_inputs_from_list_returns_list() -> None:
@@ -44,6 +45,25 @@ def test_create_jax_inputs_custom_batch_size() -> None:
     """Custom batch_size is prepended to the shape."""
     result = create_jax_inputs((5,), batch_size=4)
     assert result.shape == (4, 5)
+
+
+def test_create_jax_inputs_int_dtype_falls_back_to_zeros_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """An integer dtype without an initializer falls back to zeros, because random floats cannot be integers.
+
+    The fallback is a guess about the caller's intent, so it must be reported.
+    JAX truncates `int64` to `int32` unless `jax_enable_x64` is set, so only the kind of the dtype is asserted.
+    """
+    with caplog.at_level(logging.WARNING):
+        result = create_jax_inputs({"_SHAPE_": [5], "_DTYPE_": "int64"})
+    assert jnp.issubdtype(result.dtype, jnp.integer)
+    assert jnp.array_equal(result, jnp.zeros((1, 5), dtype=result.dtype))
+    assert "Falling back to zeros" in caplog.text
+
+
+def test_create_jax_inputs_honours_explicit_initializer() -> None:
+    """An explicit `_INIT_` address replaces the dtype-based default initializer."""
+    result = create_jax_inputs({"_SHAPE_": [4], "_INIT_": "jax.numpy.ones"})
+    assert jnp.array_equal(result, jnp.ones((1, 4), dtype=jnp.bfloat16))
 
 
 # ---------------------------------------------------------------------------

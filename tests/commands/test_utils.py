@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pydantic
 import pytest
-from structcast.utils.security import register_dir, unregister_dir
+from structcast.utils.base import register_dir, unregister_dir
 
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
@@ -115,6 +115,31 @@ def test_tensor_shape_parser_scalar_raises() -> None:
     """A scalar value (not a sequence or mapping) raises a ValueError."""
     with pytest.raises((ValueError, pydantic.ValidationError)):
         tensor_shape_parser("image: not_a_shape")
+
+
+def test_tensor_shape_parser_explicit_dtype() -> None:
+    """The explicit form keeps a non-default dtype, so the CLI can request integer inputs."""
+    assert tensor_shape_parser("tokens: {_SHAPE_: [512], _DTYPE_: int64}") == {
+        "tokens": {"_SHAPE_": (512,), "_DTYPE_": "int64"}
+    }
+
+
+def test_tensor_shape_parser_explicit_init() -> None:
+    """The explicit form keeps the initializer address, so the CLI can override the default initializer."""
+    assert tensor_shape_parser("mask: {_SHAPE_: [8], _INIT_: torch.ones}") == {
+        "mask": {"_SHAPE_": (8,), "_INIT_": "torch.ones"}
+    }
+
+
+def test_tensor_shape_parser_explicit_defaults_collapse() -> None:
+    """The explicit form collapses to the compact form when dtype and initializer are the defaults."""
+    assert tensor_shape_parser("image: {_SHAPE_: [3, 224, 224], _DTYPE_: bfloat16}") == {"image": (3, 224, 224)}
+
+
+def test_tensor_shape_parser_unsupported_dtype_raises() -> None:
+    """A dtype outside the supported set is rejected instead of reaching the framework."""
+    with pytest.raises(pydantic.ValidationError, match="_DTYPE_"):
+        tensor_shape_parser("image: {_SHAPE_: [4], _DTYPE_: float64}")
 
 
 # ---------------------------------------------------------------------------

@@ -10,117 +10,42 @@ Model code generation is available for all three frameworks. Training workflow g
   - [Table of Contents](#table-of-contents)
   - [What This Project Does](#what-this-project-does)
   - [Installation](#installation)
-      - [PyTorch](#pytorch)
-      - [JAX / Flax](#jax--flax)
-      - [TensorFlow](#tensorflow)
-      - [Keras (multi-backend)](#keras-multi-backend)
-      - [Bundles](#bundles)
-      - [Tools](#tools)
   - [Project Structure](#project-structure)
   - [Core Workflow](#core-workflow)
   - [StructCast Pattern Basics](#structcast-pattern-basics)
+  - [Quick Start](#quick-start)
   - [Command Guide](#command-guide)
     - [1. Format Templates](#1-format-templates)
     - [2. Generate a Model Class](#2-generate-a-model-class)
-      - [PyTorch](#pytorch-1)
-      - [Flax](#flax)
-      - [Keras](#keras)
-      - [Common options](#common-options)
-    - [3. Generate Loss, Metric, and Backward Classes](#3-generate-loss-metric-and-backward-classes)
+    - [3. Generate a Learner Class](#3-generate-a-learner-class)
     - [4. Inspect FLOPs and Parameters](#4-inspect-flops-and-parameters)
     - [5. Measure Inference Time](#5-measure-inference-time)
-      - [PyTorch](#pytorch-2)
-      - [Flax](#flax-1)
-      - [Keras](#keras-1)
     - [6. Train a Generated Model](#6-train-a-generated-model)
-  - [Distributed Training with `torchrun`](#distributed-training-with-torchrun)
-    - [How It Works](#how-it-works)
-    - [Single-Node Multi-GPU](#single-node-multi-gpu)
-    - [Multi-Node Training](#multi-node-training)
-    - [Dataset Configuration](#dataset-configuration)
-    - [Distributed Training Notes](#distributed-training-notes)
+      - [Distributed Training with `torchrun`](#distributed-training-with-torchrun)
+        - [How It Works](#how-it-works)
+        - [Single-Node Multi-GPU](#single-node-multi-gpu)
+        - [Multi-Node Training](#multi-node-training)
+        - [Dataset Configuration](#dataset-configuration)
+        - [Distributed Training Notes](#distributed-training-notes)
+  - [Training Loop Anatomy](#training-loop-anatomy)
   - [Configuration Examples](#configuration-examples)
-    - [PyTorch](#pytorch-3)
-      - [`cfg/torch/models/ConvNeXtV2.yaml`](#cfgtorchmodelsconvnextv2yaml)
-      - [`cfg/torch/backwards/ConvNeXtV2.yaml`](#cfgtorchbackwardsconvnextv2yaml)
-      - [`cfg/torch/backwards/CycleGAN.yaml`](#cfgtorchbackwardscycleganyaml)
-      - [`cfg/torch/models/CycleGAN_generator.yaml` and `CycleGAN_discriminator.yaml`](#cfgtorchmodelscyclegan_generatoryaml-and-cyclegan_discriminatoryaml)
-      - [`cfg/torch/datasets/default_timm.yaml`](#cfgtorchdatasetsdefault_timmyaml)
-    - [Flax](#flax-2)
-      - [`cfg/flax/models/ConvNeXtV2.yaml`](#cfgflaxmodelsconvnextv2yaml)
-    - [Keras](#keras-2)
-      - [`cfg/keras/models/ConvNeXtV2.yaml`](#cfgkerasmodelsconvnextv2yaml)
-  - [Schema Reference](#schema-reference)
-    - [Template Parameters](#template-parameters)
-      - [`PARAMETERS`](#parameters)
-      - [`DEFAULT`](#default)
-      - [`SHARED`](#shared)
-      - [Named groups](#named-groups)
-      - [`_jinja_yaml_`](#_jinja_yaml_)
-      - [`_jinja_group_`](#_jinja_group_)
-    - [Model Template Schema](#model-template-schema)
-      - [`IMPORTS`](#imports)
-      - [`INPUTS`](#inputs)
-      - [`OUTPUTS`](#outputs)
-      - [`STRUCTURED_OUTPUT`](#structured_output)
-      - [`FLOW` and `INFERENCE_FLOW`](#flow-and-inference_flow)
-      - [`FLOW` entry format](#flow-entry-format)
-      - [`NAME`](#name)
-      - [`LAYER`](#layer)
-      - [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)
-    - [Backward Template Schema](#backward-template-schema)
-      - [`IMPORTS`](#imports-1)
-      - [`INPUTS` and `OUTPUTS`](#inputs-and-outputs)
-      - [`MIXED_PRECISION`](#mixed_precision)
-      - [`MIXED_PRECISION_TYPE`](#mixed_precision_type)
-      - [`ACCUMULATE_GRADIENTS`](#accumulate_gradients)
-      - [`BACKWARDS`](#backwards)
-      - [`LOSSES` and `TRAINABLE_LAYERS`](#losses-and-trainable_layers)
-      - [`BACKWARDS` entry keys](#backwards-entry-keys)
-  - [API Reference: `base_trainer.py`](#api-reference-base_trainerpy)
-    - [Utility functions](#utility-functions)
-      - [`get_dataset(dataset)`](#get_datasetdataset)
-      - [`get_dataset_size(dataset)`](#get_dataset_sizedataset)
-      - [`invoke_callback(callbacks, info, *args, **models)`](#invoke_callbackcallbacks-info-args-models)
-    - [Protocols](#protocols)
-      - [`Forward`](#forward)
-      - [`Backward`](#backward)
-      - [`Callback` and `BestCallback`](#callback-and-bestcallback)
-    - [State and callbacks](#state-and-callbacks)
-      - [`BaseInfo`](#baseinfo)
-      - [`Callbacks`](#callbacks)
-      - [`GLOBAL_CALLBACKS`](#global_callbacks)
-    - [Core classes](#core-classes)
-      - [`BaseTrainer`](#basetrainer)
-      - [`BestCriterion`](#bestcriterion)
-  - [API Reference: `trainer.py`](#api-reference-trainerpy)
-    - [Utility functions](#utility-functions-1)
-      - [`create_torch_inputs(shape)`](#create_torch_inputsshape)
-      - [`get_torch_device(device=None)`](#get_torch_devicedevicenone)
-      - [`initial_model(model, shapes=None, compile_fn=None)`](#initial_modelmodel-shapesnone-compile_fnnone)
-      - [`get_autocast(mixed_precision_type, device)`](#get_autocastmixed_precision_type-device)
-    - [Step objects](#step-objects)
-      - [`TrainingStep`](#trainingstep)
-      - [`ValidationStep`](#validationstep)
-    - [Tracking and orchestration](#tracking-and-orchestration)
-      - [`TorchTracker`](#torchtracker)
-      - [`TorchTrainer`](#torchtrainer)
-    - [timm integrations](#timm-integrations)
-      - [`TimmDatasetWrapper`](#timmdatasetwrapper)
-      - [`TimmDataLoaderWrapper`](#timmdataloaderwrapper)
-  - [Minimal End-to-End Example](#minimal-end-to-end-example)
+    - [PyTorch](#pytorch)
+    - [Flax](#flax)
+    - [Keras](#keras)
   - [Development](#development)
   - [Migration Notes](#migration-notes)
+    - [Upgrading from v1.x](#upgrading-from-v1x)
   - [Roadmap](#roadmap)
 
 ## What This Project Does
 
 - **Generate model code** — Produce PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html), Flax [`nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html), and Keras [`Layer`](https://keras.io/api/layers/base_layer/) classes from YAML layer templates.
-- **Generate training code** — Produce backward-pass, optimizer, and scheduler orchestration classes from YAML templates (PyTorch only).
+- **Generate training code** — Produce learner classes — the object owning the models, the optimizers, and the training and inference steps — from YAML templates (PyTorch only).
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
-- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) experiment logging.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) or [Weights & Biases](https://docs.wandb.ai/) experiment logging.
+- **Train programmatically** — Use the same trainer directly from Python, without any YAML. See [`examples/`](examples/) for a runnable tutorial.
 
 ## Installation
 
@@ -130,65 +55,59 @@ StructCast-Model is installed with [uv](https://docs.astral.sh/uv/) and exposes 
 uv sync --extra torch-cu130 --extra mlflow --extra flops
 ```
 
-Each extra installs a group of optional dependencies. Pick the extras that match your target framework and accelerator.
+Each extra installs a group of optional dependencies. Pick the extras that match your target framework and accelerator. [Keras](https://keras.io/) is multi-backend and runs on top of JAX, PyTorch, or TensorFlow.
 
-#### PyTorch
+| Category   | Extra           | What it provides                                                               |
+| ---------- | --------------- | ------------------------------------------------------------------------------ |
+| PyTorch    | `torch-cpu`     | PyTorch and torchvision (CPU only)                                             |
+|            | `torch-cu130`   | PyTorch and torchvision with CUDA 13.0 support                                 |
+| JAX / Flax | `jax-cpu`       | JAX and Flax (CPU only)                                                        |
+| Keras      | `keras-jax-cpu` | Keras with JAX (CPU)                                                           |
+| Bundles    | `all-cpu`       | JAX + Flax, PyTorch + torchvision + timm, TensorFlow, and Keras — all CPU-only |
+|            | `all-cuda`      | Same as `all-cpu` but with CUDA acceleration for every backend                 |
+| Tools      | `flops`         | Both `ptflops` and `calflops` for complexity inspection                        |
+|            | `mlflow`        | MLflow experiment tracking for `scm torch train --logger mlflow`               |
+|            | `wandb`         | Weights & Biases tracking for `scm torch train --logger wandb`                 |
 
-| Extra         | What it provides                               |
-| ------------- | ---------------------------------------------- |
-| `torch-cpu`   | PyTorch and torchvision (CPU only)             |
-| `torch-cu118` | PyTorch and torchvision with CUDA 11.8 support |
-| `torch-cu126` | PyTorch and torchvision with CUDA 12.6 support |
-| `torch-cu128` | PyTorch and torchvision with CUDA 12.8 support |
-| `torch-cu130` | PyTorch and torchvision with CUDA 13.0 support |
+<details>
+<summary><strong>All available extras</strong></summary>
 
-#### JAX / Flax
+| Category   | Extra               | What it provides                                                               |
+| ---------- | ------------------- | ------------------------------------------------------------------------------ |
+| PyTorch    | `torch-cpu`         | PyTorch and torchvision (CPU only)                                             |
+|            | `torch-cu118`       | PyTorch and torchvision with CUDA 11.8 support                                 |
+|            | `torch-cu126`       | PyTorch and torchvision with CUDA 12.6 support                                 |
+|            | `torch-cu128`       | PyTorch and torchvision with CUDA 12.8 support                                 |
+|            | `torch-cu130`       | PyTorch and torchvision with CUDA 13.0 support                                 |
+| JAX / Flax | `jax-cpu`           | JAX and Flax (CPU only)                                                        |
+|            | `jax-cu12`          | JAX and Flax with CUDA 12 support                                              |
+|            | `jax-cu13`          | JAX and Flax with CUDA 13 support                                              |
+| TensorFlow | `tf-cpu`            | TensorFlow (CPU only)                                                          |
+|            | `tf-cu12`           | TensorFlow with CUDA 12 support                                                |
+| Keras      | `keras-jax-cpu`     | Keras with JAX (CPU)                                                           |
+|            | `keras-jax-cu12`    | Keras with JAX (CUDA 12)                                                       |
+|            | `keras-jax-cu13`    | Keras with JAX (CUDA 13)                                                       |
+|            | `keras-torch-cpu`   | Keras with PyTorch (CPU)                                                       |
+|            | `keras-torch-cu118` | Keras with PyTorch (CUDA 11.8)                                                 |
+|            | `keras-torch-cu126` | Keras with PyTorch (CUDA 12.6)                                                 |
+|            | `keras-torch-cu128` | Keras with PyTorch (CUDA 12.8)                                                 |
+|            | `keras-torch-cu130` | Keras with PyTorch (CUDA 13.0)                                                 |
+|            | `keras-tf-cpu`      | Keras with TensorFlow (CPU)                                                    |
+|            | `keras-tf-cu12`     | Keras with TensorFlow (CUDA 12)                                                |
+| Bundles    | `all-cpu`           | JAX + Flax, PyTorch + torchvision + timm, TensorFlow, and Keras — all CPU-only |
+|            | `all-cuda`          | Same as `all-cpu` but with CUDA acceleration for every backend                 |
+| Tools      | `ptflops`           | `ptflops` for model complexity inspection                                      |
+|            | `calflops`          | `calflops` and Transformers for complexity inspection                          |
+|            | `flops`             | Both `ptflops` and `calflops`                                                  |
+|            | `mlflow`            | MLflow experiment tracking for `scm torch train --logger mlflow`               |
+|            | `wandb`             | Weights & Biases tracking for `scm torch train --logger wandb`                 |
 
-| Extra      | What it provides                                                                                     |
-| ---------- | ---------------------------------------------------------------------------------------------------- |
-| `jax-cpu`  | [JAX](https://docs.jax.dev/en/latest/) and [Flax](https://flax.readthedocs.io/en/stable/) (CPU only) |
-| `jax-cu12` | JAX and Flax with CUDA 12 support                                                                    |
-| `jax-cu13` | JAX and Flax with CUDA 13 support                                                                    |
+> - [**ptflops**](https://github.com/sovrasov/flops-counter.pytorch): a popular FLOPs and parameter counting library for PyTorch models. It provides detailed breakdowns of computational complexity per layer and supports custom layer definitions through a registration mechanism. StructCast-Model uses `ptflops` to analyze generated PyTorch models and report their FLOPs and parameter counts.
+> - [**calflops**](https://github.com/MrYxJ/calculate-flops.pytorch): a FLOPs and parameter counting library for PyTorch models, similar to `ptflops`.
+> - [**MLflow**](https://mlflow.org/): an open-source platform for managing the ML lifecycle, including experimentation, reproducibility, and deployment. StructCast-Model integrates with MLflow to log training metrics, model checkpoints, and configuration artifacts from `scm torch train`.
+> - [**Weights & Biases**](https://wandb.ai/): a hosted experiment tracking service. It is the alternative backend of `scm torch train`, selected with `--logger wandb`, and receives the same metrics, artifacts, and state dictionaries as the MLflow backend.
 
-#### TensorFlow
-
-| Extra     | What it provides                |
-| --------- | ------------------------------- |
-| `tf-cpu`  | TensorFlow (CPU only)           |
-| `tf-cu12` | TensorFlow with CUDA 12 support |
-
-#### Keras (multi-backend)
-
-[Keras](https://keras.io/) runs on top of JAX, PyTorch, or TensorFlow. Choose the extra that matches your preferred backend:
-
-| Extra               | Backend + accelerator           |
-| ------------------- | ------------------------------- |
-| `keras-jax-cpu`     | Keras with JAX (CPU)            |
-| `keras-jax-cu12`    | Keras with JAX (CUDA 12)        |
-| `keras-jax-cu13`    | Keras with JAX (CUDA 13)        |
-| `keras-torch-cpu`   | Keras with PyTorch (CPU)        |
-| `keras-torch-cu118` | Keras with PyTorch (CUDA 11.8)  |
-| `keras-torch-cu126` | Keras with PyTorch (CUDA 12.6)  |
-| `keras-torch-cu128` | Keras with PyTorch (CUDA 12.8)  |
-| `keras-torch-cu130` | Keras with PyTorch (CUDA 13.0)  |
-| `keras-tf-cpu`      | Keras with TensorFlow (CPU)     |
-| `keras-tf-cu12`     | Keras with TensorFlow (CUDA 12) |
-
-#### Bundles
-
-| Extra      | What it provides                                                               |
-| ---------- | ------------------------------------------------------------------------------ |
-| `all-cpu`  | JAX + Flax, PyTorch + torchvision + timm, TensorFlow, and Keras — all CPU-only |
-| `all-cuda` | Same as `all-cpu` but with CUDA acceleration for every backend                 |
-
-#### Tools
-
-| Extra      | What it provides                                                                                                |
-| ---------- | --------------------------------------------------------------------------------------------------------------- |
-| `ptflops`  | [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) for model complexity inspection                  |
-| `calflops` | [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) and Transformers for model complexity inspection |
-| `flops`    | Both `ptflops` and `calflops`                                                                                   |
-| `mlflow`   | [MLflow](https://mlflow.org/) experiment tracking for `scm torch train`                                         |
+</details>
 
 Omit any extra you do not need. For example, `uv sync --extra torch-cu130` is sufficient if you only want to generate and train PyTorch models without FLOPs analysis or MLflow logging. To work with all three model frameworks on CPU:
 
@@ -202,16 +121,15 @@ uv sync --extra all-cpu
 structcast-model/
 ├── cfg/
 │   ├── torch/
-│   │   ├── backwards/     # backward, optimizer, scheduler templates
-│   │   ├── datasets/      # reusable dataset/dataloader templates
-│   │   ├── losses/        # loss module templates
-│   │   ├── metrics/       # metric module templates
+│   │   ├── learners/      # learner, optimizer, loss, and metric templates
 │   │   ├── models/        # model architecture templates
-│   │   └── others/        # misc templates (e.g. for `torch.compile` options)
+│   │   └── others/        # dataset, compile options, and other templates
 │   ├── flax/
 │   │   └── models/        # Flax model architecture templates
 │   └── keras/
 │       └── models/        # Keras model architecture templates
+├── examples/
+│   └── torch/         # runnable training tutorial and optimizer compositions
 ├── src/structcast_model/
 │   ├── builders/      # generic and framework-specific code generators
 │   ├── commands/      # Typer CLI entry points
@@ -226,16 +144,15 @@ structcast-model/
 
 The main package areas are:
 
-| Directory    | Purpose                                                                                                                               |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `builders/`  | Converts validated YAML templates into intermediate representations, then renders Python source code for PyTorch, Flax, and Keras.    |
-| `commands/`  | Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)) with `torch`, `flax`, and `keras` sub-commands.               |
-| `torch/`     | Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers. |
-| `flax/`      | Flax-specific layers (e.g. `GlobalResponseNorm`) and JAX inference helpers.                                                           |
-| `keras/`     | Keras-specific layers (e.g. `GlobalResponseNormalization`) and backend-agnostic inference helpers.                                    |
-| `cfg/torch/` | Declarative source of truth: YAML templates for PyTorch models, backward logic, datasets, and runtime presets.                        |
-| `cfg/flax/`  | YAML templates for Flax model architectures.                                                                                          |
-| `cfg/keras/` | YAML templates for Keras model architectures.                                                                                         |
+- **`builders/`** — Converts validated YAML templates into intermediate representations, then renders Python source code for PyTorch, Flax, and Keras.
+- **`commands/`** — Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)) with `torch`, `flax`, and `keras` sub-commands.
+- **`torch/`** — Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers.
+- **`flax/`** — Flax-specific layers (e.g. `GlobalResponseNorm`) and JAX inference helpers.
+- **`keras/`** — Keras-specific layers (e.g. `GlobalResponseNormalization`) and backend-agnostic inference helpers.
+- **`cfg/torch/`** — Declarative source of truth: YAML templates for PyTorch models, learners, datasets, and runtime presets.
+- **`examples/torch/`** — Runnable example code: a programmatic training tutorial, and optimizer + scheduler compositions that templates reference by file path.
+- **`cfg/flax/`** — YAML templates for Flax model architectures.
+- **`cfg/keras/`** — YAML templates for Keras model architectures.
 
 ## Core Workflow
 
@@ -243,10 +160,10 @@ The repository follows a repeatable workflow:
 
 1. **Write or reuse** YAML templates under `cfg/[torch/flax/keras]/`.
 2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
-3. **Generate** Python source files for the model (and, for PyTorch, loss, metric, and backward logic) using `scm [torch/flax/keras] create`.
+3. **Generate** Python source files for the model (and, for PyTorch, the learner) using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
 5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
-6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, losses, metrics, optimizer logic, AMP, and MLflow.
+6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, the learner, AMP, and the experiment logger.
 
 ```text
 YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
@@ -255,7 +172,7 @@ StructCast patterns  <--------------------------------------------------------+
        |
        v
 scm [torch/flax/keras] time  --->  Inference benchmarks
-scm torch train              --->  MLflow logs + model checkpoints
+scm torch train              --->  MLflow / wandb logs + model checkpoints
 ```
 
 ## StructCast Pattern Basics
@@ -284,18 +201,63 @@ This pattern does the following:
 
 This pattern is the bridge between generated source files and runtime commands like `ptflops`, `calflops`, and `train`. For full documentation on StructCast patterns, see the [StructCast README](https://github.com/f6ra07nk14/structcast).
 
+## Quick Start
+
+The following commands generate a ConvNeXtV2 model along with its learner and dataset configurations, then launch a training run on CIFAR-100.
+
+```bash
+# 1. Install
+uv sync --extra torch-cu130 --extra mlflow --extra flops
+
+# 2. Generate the model and the learner classes
+scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
+
+# 3. Render dataset configurations from templates
+scm format cfg/torch/others/default_timm.yaml \
+    -o dataset_train.yaml \
+    -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
+
+scm format cfg/torch/others/default_timm.yaml \
+    -o dataset_valid.yaml \
+    -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
+
+# 4. Train
+scm torch train \
+    'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
+    -s 'image: [3, 224, 224]' \
+    -d cuda \
+    -L '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
+    -c cfg/torch/others/compile_default.yaml \
+    -e 5 \
+    --training-dataset dataset_train.yaml \
+    -V dataset_valid.yaml \
+    -f 1 \
+    -LC ce_loss \
+    -LC val_ce_loss \
+    -HC acc1 \
+    -HC val_acc1 \
+    -HC acc5 \
+    -HC val_acc5 \
+    -SC val_acc1 \
+    --matmul-precision high \
+    -E Test
+```
+
+Each step is explained in detail under [Command Guide](#command-guide). To see the same training run built in plain Python instead of YAML, start from [`examples/`](examples/) and run `uv run python examples/torch/simple_training.py`.
+
 ## Command Guide
 
 ### 1. Format Templates
 
-Use `scm format` to render a parameterized YAML template (such as [`cfg/torch/datasets/default_timm.yaml`](cfg/torch/datasets/default_timm.yaml)) into a concrete configuration file.
+Use `scm format` to render a parameterized YAML template (such as [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml)) into a concrete configuration file.
 
 ```bash
-scm format cfg/torch/datasets/default_timm.yaml \
+scm format cfg/torch/others/default_timm.yaml \
     -o dataset_train.yaml \
     -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 
-scm format cfg/torch/datasets/default_timm.yaml \
+scm format cfg/torch/others/default_timm.yaml \
     -o dataset_valid.yaml \
     -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 ```
@@ -309,11 +271,7 @@ What this does:
 
 ### 2. Generate a Model Class
 
-Each framework has its own `create model` command that reads a YAML layer template and generates a framework-native module.
-
-#### PyTorch
-
-Generate a PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html) from a YAML layer template (such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml)).
+Each framework has its own `create model` command that reads a YAML layer template and generates a framework-native module. The examples below use PyTorch; Flax and Keras share the same interface with minor differences noted afterward.
 
 ```bash
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml
@@ -321,64 +279,46 @@ scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: 
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o torch_model.py
 ```
 
-#### Flax
-
-Generate a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) from a YAML layer template (such as [`cfg/flax/models/ConvNeXtV2.yaml`](cfg/flax/models/ConvNeXtV2.yaml)).
-
-```bash
-scm flax create model cfg/flax/models/ConvNeXtV2.yaml
-scm flax create model cfg/flax/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
-scm flax create model cfg/flax/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o flax_model.py
-```
-
-#### Keras
-
-Generate a [Keras `Layer`](https://keras.io/api/layers/base_layer/) from a YAML layer template (such as [`cfg/keras/models/ConvNeXtV2.yaml`](cfg/keras/models/ConvNeXtV2.yaml)).
-
-```bash
-scm keras create model cfg/keras/models/ConvNeXtV2.yaml
-scm keras create model cfg/keras/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}'
-scm keras create model cfg/keras/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: atto}' -o keras_model.py
-```
-
-#### Common options
-
-All three commands share the same options:
+**Common options** — All three framework commands share the same options:
 
 - `-p/--parameter`: override template parameters
 - `-c/--classname`: set the generated class name, default `Model`
-- `--no-structured-output`: force tuple-like return behavior instead of a structured output mapping
+- `--structured-output/--no-structured-output`: force the root model's return type. `scm torch` defaults to the template's `STRUCTURED_OUTPUT` (a plain tuple-like return unless the template sets it); `scm flax` and `scm keras` default to a structured output mapping
 - `-s/--sublayer`: generate a named sublayer from the template instead of the root model
 - `-o/--output`: output file path; if omitted, defaults to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
 
 The ConvNeXtV2 template uses Jinja parameter groups to switch between backbone variants such as `atto`, `femto`, `tiny`, and `base`.
 
-### 3. Generate Loss, Metric, and Backward Classes
+> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Templates live under `cfg/flax/models/` and `cfg/keras/models/` respectively. Flax generates [`nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) classes; Keras generates [`Layer`](https://keras.io/api/layers/base_layer/) classes. Both use channel-last tensor layout (*H × W × C*) instead of PyTorch's channel-first (*C × H × W*).
 
-Losses and metrics use the same `scm torch create model` command because they are also layer graphs.
+### 3. Generate a Learner Class
+
+The learner is the object that owns the models and defines how they learn: when an update happens, how a training step runs, and how an inference step runs. Losses and metrics are part of it — they are declared inline in the learner's flow, so there is no separate loss or metric command.
 
 ```bash
-scm torch create model cfg/torch/losses/cls.yaml -c Loss -o loss.py
-scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
-scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
+scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
 ```
 
-The `scm torch create backward` command turns a backward template into a class that manages:
+Options: `-p/--parameter` overrides template parameters, `-c/--classname` sets the generated class name (default `Learner`), and `-o/--output` sets the output path.
 
-- a training-time execution graph (`FLOW`) and an inference-time execution graph (`INFERENCE_FLOW`) per backward entry
+The generated class manages:
+
+- a training-time execution graph (`FLOW`) and an inference-time execution graph (`INFERENCE_FLOW`) per learner entry
 - inline layer instantiation (loss layers, metric layers, and arbitrary modules can be defined directly in the flow)
-- one or more backward entries, each with its own optimizer and trainable layers — enabling multi-optimizer training (e.g., GAN generator + discriminator)
-- optimizer construction via StructCast patterns
+- one or more `LEARNERS` entries, each with its own optimizer and trainable layers — enabling multi-optimizer training (e.g., GAN generator + discriminator)
+- optimizer construction via StructCast patterns, including file-addressed optimizer + scheduler compositions such as [`examples/torch/optimizers.py`](examples/torch/optimizers.py)
 - optional gradient scaler creation (`MIXED_PRECISION`)
 - optional gradient clipping (`CLIP`)
 - optional gradient accumulation (`ACCUMULATE_GRADIENTS`)
 - optimizer stepping, zeroing, and automatic train/eval mode switching
 - learning-rate and parameter-group inspection helpers
 
-For example, a CycleGAN backward template defines three backward entries — one for the generator pair and one for each discriminator — each with its own flow, optimizer, and trainable layers:
+The result implements the `Learner` protocol — the `models`, `optimizers`, and `learning_rates` properties plus `update`, `training_step`, and `inference_step` — and the optional `grad_scalers`, `weight_decays`, and `param_group_names` properties the toolkit reads when present (the loggers merge `learning_rates` and `weight_decays` into the epoch metrics). Any object with those members can be trained, generated or hand-written; see [`examples/torch/simple_training.py`](examples/torch/simple_training.py).
+
+For example, a CycleGAN learner template defines three `LEARNERS` entries — one for the generator pair and one for each discriminator — each with its own flow, optimizer, and trainable layers:
 
 ```bash
-scm torch create backward cfg/torch/backwards/CycleGAN.yaml -o backward.py
+scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 ```
 
 ### 4. Inspect FLOPs and Parameters
@@ -416,7 +356,7 @@ Use `scm [torch/flax/keras] time` to benchmark the average forward-pass latency 
 | `-t/--times`       | Number of timed iterations (default: 10)                          |
 | `-b/--batch-size`  | Batch size for dummy inputs (default: 1)                          |
 
-#### PyTorch
+**PyTorch** example:
 
 ```bash
 scm torch create model cfg/torch/models/ConvNeXtV2.yaml \
@@ -431,42 +371,7 @@ scm torch time \
 
 PyTorch-specific option: `--matmul-precision` (`highest`, `high`, `medium`) controls [`torch.set_float32_matmul_precision`](https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html).
 
-#### Flax
-
-```bash
-scm flax create model cfg/flax/models/ConvNeXtV2.yaml \
-    -p 'DEFAULT: {backbone: atto}' -o flax_model.py
-
-scm flax time \
-    '[_obj_, {_addr_: model.Model, _file_: flax_model.py}, {_call_: {rngs: [_obj_, _addr_: flax.nnx.Rngs, _call_: {params: 0, dropout: 1}]}}]' \
-    -s 'image: [224, 224, 3]' \
-    -c true \
-    -d gpu:0
-```
-
-Flax-specific option: `--training-mode-kwargs` lets you override the keyword arguments passed to [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) when `--training-mode` is set (e.g. `'{deterministic: false, use_running_average: false}'`).
-
-> **Note:** Flax uses channel-last tensor layout. The shape `'image: [224, 224, 3]'` corresponds to *H × W × C*.
-
-#### Keras
-
-```bash
-scm keras create model cfg/keras/models/ConvNeXtV2.yaml \
-    -p 'DEFAULT: {backbone: atto}' -o keras_model.py
-
-# Keras with JAX backend may need NVIDIA shared libraries on the path
-export LD_LIBRARY_PATH=$(find .venv -name "*.so*" | grep nvidia | xargs dirname | sort -u | paste -d ":" -s -)
-
-scm keras time \
-    '[_obj_, {_addr_: model.Model, _file_: keras_model.py}, _call_]' \
-    -s 'image: [224, 224, 3]' \
-    -c true \
-    -d gpu:0
-```
-
-Compilation for Keras uses [`keras.Model.compile`](https://keras.io/api/models/model_training_apis/#compile-method). The `--compile/-c` option accepts `true`/`false`, a YAML file path, or an inline dict of keyword arguments.
-
-> **Note:** Keras also uses channel-last layout by default. The shape `'image: [224, 224, 3]'` corresponds to *H × W × C*.
+> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Both use channel-last shapes (e.g., `'image: [224, 224, 3]'`). Flax additionally accepts `--training-mode-kwargs` to override keyword arguments for [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html). Keras compilation uses [`keras.Model.compile`](https://keras.io/api/models/model_training_apis/#compile-method). When using the Keras JAX backend on GPU, you may need to set `LD_LIBRARY_PATH` to include NVIDIA shared libraries from your virtual environment.
 
 ### 6. Train a Generated Model
 
@@ -477,12 +382,10 @@ scm torch train \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+    -L '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
     -c cfg/torch/others/compile_default.yaml \
     -e 5 \
-    -T dataset_train.yaml \
+    --training-dataset dataset_train.yaml \
     -V dataset_valid.yaml \
     -f 1 \
     -LC ce_loss \
@@ -493,11 +396,10 @@ scm torch train \
     -HC val_acc5 \
     -SC val_acc1 \
     --matmul-precision high \
+    --logger mlflow \
     -E Test \
     -A model.py \
-    -A loss.py \
-    -A metric.py \
-    -A backward.py \
+    -A learner.py \
     -A cfg/torch/others/compile_default.yaml \
     -A dataset_train.yaml \
     -A dataset_valid.yaml
@@ -508,49 +410,54 @@ Key arguments:
 - positional model patterns: one or more named model definitions
 - `-s/--shape`: dummy input shapes used for model initialization
 - `-d/--device`: `cpu` or `cuda`
-- `-L/--loss`: StructCast pattern for the loss module
-- `-M/--metric`: StructCast pattern for the metric module
-- `-B/--backward`: StructCast pattern for the backward class
+- `-L/--learner`: StructCast pattern for the learner class; it is called with the instantiated models as keyword arguments
+- `-LO/--learner-outputs`: criterion names to track, when the learner exposes no `outputs` attribute
 - `-c/--compile`: boolean, YAML file, or inline dict for `torch.compile`
-- `-T/--training-dataset`: training dataset pattern or rendered dataset YAML
-- `-V/--validation-dataset`: validation dataset pattern or rendered dataset YAML
+- `--training-dataset`: training dataset pattern or rendered dataset YAML
+- `-V/--validation-dataset`: validation dataset pattern or rendered dataset YAML; omit it to skip validation
+- `-f/--validation-frequency`: run validation every N epochs
 - `-LC/--lower-criterion`: criteria where lower is better
 - `-HC/--higher-criterion`: criteria where higher is better
 - `-SC/--save-criterion`: criteria that should trigger best-model saving
-- `-E/--experiment`: MLflow experiment name
-- `-A/--log-artifacts`: artifacts to store in MLflow
+- `--logger`: experiment tracking service, `mlflow` (default) or `wandb`
+- `-E/--experiment`: experiment name passed to the logger
+- `-A/--log-artifacts`: files to store as run artifacts
+- `--trainer`: StructCast pattern for a `TorchTrainer` replacement, when the default loop is not enough
+- `--strategy`: StructCast pattern for the `DistributedStrategy`; it is called with the resolved `device` and `local_rank`. Defaults to `DistributedDataParallelStrategy` when a distributed environment is detected, and `SingleDeviceStrategy` otherwise
+- `--resume`: training state to restore before the loop starts — a local path, a `runs:/<run_id>/<artifact>` MLflow URI, or a `wandb://entity/project/run/file` URI. Models, optimizers, and gradient scalers are restored and training continues from the saved epoch (`--start-epoch` is overridden, with a warning)
 
 What the train command does internally:
 
-1. Instantiates datasets and determines their lengths.
-2. Initializes models with optional dummy-input forward passes.
-3. Instantiates loss, metric, backward, and compile objects.
-4. Builds a `TorchTracker` from the declared output names.
-5. Creates a `TorchTrainer` with training and validation step objects.
-6. Logs metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints to MLflow.
+1. Instantiates the datasets and composes them into a `SimpleDataProvider`, which reports `steps_per_epoch` and `validation_steps`. The trainer scans the provider datasets for event protocols, so a dataset implementing one receives the lifecycle events it defines.
+2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers on rank 0 and broadcasts the result (`sync_initial_weights`), then compiles each model where the strategy places the units and hands it to the strategy, which wraps it. The learner is built from the already-wrapped models.
+3. Builds a `TorchTracker` from the learner's output names, still inside the device scope so its buffers live on the training device.
+4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step — on a single device only. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
+5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
+6. Collects the callbacks from the trainer's prefixes: a `ProgressBar` (or a `Printer` under `--ci`) and the logger on rank 0 only, plus a training-state saver and one `TorchBestCriterion` per monitored criterion on every rank — producing their states is a collective, and off rank 0 they hold a `NullLogger` and write nothing. They join the trainer's events on first use, and the resulting routing is printed.
+7. Runs `fit()` inside the logger's run context, recording metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints.
 
-## Distributed Training with `torchrun`
+#### Distributed Training with `torchrun`
 
 `scm torch train` supports multi-GPU and multi-node [distributed data parallel (DDP)](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) training out of the box via [`torchrun`](https://docs.pytorch.org/docs/stable/elastic/run.html). No changes to your generated code, YAML templates, or dataset configurations are required — the same `scm torch train` command works for both single-GPU and distributed training.
 
 > **⚠️ SyncBatchNorm Warning**
 >
-> When using multi-GPU training with `DistributedDataParallel`, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training with DDP, consider applying [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) to the model **before** wrapping it with `DistributedDataParallel`. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
+> When using multi-GPU training, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training distributed, apply [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) **at model construction time**, since the CLI wraps the models with the distributed strategy right after the initializers run. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
 
-### How It Works
+##### How It Works
 
 When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT` are set automatically. `scm torch train` detects these and enables distributed mode:
 
 1. **Process group initialization** — The NCCL backend is initialized via [`torch.distributed.init_process_group`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group).
 2. **Per-rank device assignment** — Each process is assigned to `cuda:<LOCAL_RANK>`.
-3. **DDP model wrapping** — All models are wrapped with [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
-4. **Distributed data loading** — `TimmDataLoaderWrapper` automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. The sampler's `set_epoch()` is called each epoch for proper shuffling.
+3. **Strategy model wrapping** — Every model is wrapped by the selected `DistributedStrategy` before the learner is built. The default in a distributed environment is [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html); `SingleDeviceStrategy` and `FullyShardedDataParallelStrategy` ([FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), requires `torch>=2.6`) are selectable through `--strategy`.
+4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; the trainer scans the provider datasets for event protocols on every rank, so the hook runs everywhere it must.
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
-6. **Rank-0 logging** — MLflow logging, progress bars, and checkpoint saving are performed only on rank 0.
-7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
+6. **Rank-0 logging** — Experiment logging and progress bars run only on rank 0. Checkpoint states are produced on **every** rank, because the strategy's state dict is a collective, and written only by rank 0.
+7. **Gradient sync gating** — Generated learners precede every model call with a `sync_gate(model, armed)` statement. Gradients synchronize only on the last call of a model owned by the running optimizer segment, on steps that update; every other call runs without synchronization, which covers gradient accumulation.
 8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
 
-### Single-Node Multi-GPU
+##### Single-Node Multi-GPU
 
 To train on all GPUs of a single machine, prefix your `scm torch train` command with `torchrun`:
 
@@ -562,12 +469,10 @@ torchrun --nproc_per_node=gpu \
     'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
     -s 'image: [3, 224, 224]' \
     -d cuda \
-    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
+    -L '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
     -c cfg/torch/others/compile_default.yaml \
     -e 5 \
-    -T dataset_train.yaml \
+    --training-dataset dataset_train.yaml \
     -V dataset_valid.yaml \
     -f 1 \
     -LC ce_loss -LC val_ce_loss \
@@ -588,7 +493,7 @@ torchrun --nproc_per_node=4 \
 
 > **Note:** `torchrun` launches the training script as a Python module (`-m structcast_model.commands.main`) rather than through the `scm` entry point. This is because `torchrun` requires a module or script path, not a console script wrapper.
 
-### Multi-Node Training
+##### Multi-Node Training
 
 For training across multiple machines, provide the node topology to `torchrun` on each node:
 
@@ -628,127 +533,95 @@ This creates 8 total processes (4 GPUs × 2 nodes) training with DDP.
 
 `scm torch train` distributed-related options:
 
-| Option           | Description                                                                                               |
-| ---------------- | --------------------------------------------------------------------------------------------------------- |
-| `--dist-backend` | Distributed backend (`nccl`, `gloo`). Auto-selected if omitted. Also settable via `DIST_BACKEND` env var. |
-| `--dist-url`     | URL for distributed setup. Defaults to `env://`. Also settable via `DIST_URL` env var.                    |
-| `--ci`           | Disables `tqdm` progress bars — useful in cluster job logs.                                               |
+| Option           | Description                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| `--dist-backend` | Distributed backend (`nccl`, `gloo`). Auto-selected if omitted. Env var: `DIST_BACKEND`. |
+| `--dist-url`     | URL for distributed setup. Defaults to `env://`. Env var: `DIST_URL`.                    |
+| `--ci`           | Disables `tqdm` progress bars — useful in cluster job logs.                              |
 
-### Dataset Configuration
+##### Dataset Configuration
 
-Dataset YAML files do **not** need per-rank customization. A single `device: cuda` value in the dataset configuration works for all ranks — `TimmDataLoaderWrapper` internally resolves it to the correct `cuda:<LOCAL_RANK>` device for each process.
+Dataset YAML files do **not** need per-rank customization. A single `device: cuda` value in the dataset configuration works for all ranks — the example `TimmDataLoaderWrapper` internally resolves it to the correct `cuda:<LOCAL_RANK>` device for each process.
 
 ```bash
 # The same dataset YAML works for single-GPU and distributed training
-scm format cfg/torch/datasets/default_timm.yaml \
+scm format cfg/torch/others/default_timm.yaml \
     -o dataset_train.yaml \
     -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
 ```
 
 > **Tip:** The `batch_size` in the dataset template is the **per-GPU** batch size. With 4 GPUs and `batch_size: 32`, the effective global batch size is 128.
 
-### Distributed Training Notes
+##### Distributed Training Notes
 
 - **Seed reproducibility** — Each rank's random seed is offset by `global_rank` to ensure different data augmentation across processes while remaining reproducible.
-- **Learning rate scaling** — When scaling to multiple GPUs, consider adjusting the learning rate. A common practice is [linear scaling](https://arxiv.org/abs/1706.02677): multiply the base learning rate by the number of GPUs. This must be configured in the backward template or optimizer settings — `scm torch train` does not scale the learning rate automatically.
-- **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#6-train-a-generated-model) for details.
-- **`torch.compile` and DDP** — When both `--compile` and DDP are active, `torch.compile` is applied **before** DDP wrapping.
-- **Checkpoint saving** — Only rank 0 saves checkpoints and logs to MLflow. When resuming from a checkpoint in a distributed setting, all ranks load the same checkpoint.
+- **Learning rate scaling** — When scaling to multiple GPUs, consider adjusting the learning rate. A common practice is [linear scaling](https://arxiv.org/abs/1706.02677): multiply the base learning rate by the number of GPUs. This must be configured in the learner template or optimizer settings — `scm torch train` does not scale the learning rate automatically.
+- **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#distributed-training-with-torchrun) for details.
+- **`torch.compile` and the strategy** — with `--compile`, the strategy decides where its compile units sit: the model root in place by default, the matched `shard_modules` blocks under per-block FSDP2 — always **before** wrapping, so the strategy wrapper stays outermost. The learner's generated `_flow_*` functions compile on a single device only (distributed wrappers graph-break inside them); the eager step methods are never compiled.
+- **Checkpoint saving** — State dicts are produced through [`torch.distributed.checkpoint.state_dict`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html), so the keys are wrapper-free for raw, compiled, DDP, and FSDP2 models alike. Producing them is a collective that runs on every rank; only rank 0 writes them to the experiment tracking service. `--resume` loads the same training state on all ranks.
+
+## Training Loop Anatomy
+
+Whether it is built by the CLI or by hand, a training run is the same five objects handed to a trainer at construction:
+
+| Object           | Responsibility                                                                                     | Ready-made pieces                                            |
+| ---------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| **Learner**      | Owns the models; decides when to update and how a training and an inference step run                | `scm torch create learner`                                    |
+| **Tracker**      | Turns the criteria of each step into the values recorded for the epoch                             | `TorchTracker` (averages, and reduces across ranks)           |
+| **DataProvider** | Supplies the datasets and their step counts (`steps_per_epoch`, `validation_steps`) for the run    | `SimpleDataProvider`                                          |
+| **Callbacks**    | React to lifecycle events                                                                          | `ProgressBar`, `Printer`, `BestCriterion`                     |
+| **Logger**       | Owns the run on an experiment tracking service and logs the epoch metrics                          | `MLflowLogger`, `WandbLogger`                                 |
+
+```python
+trainer = TorchTrainer(
+    device="cpu",
+    learner=learner,
+    tracker=tracker,
+    data=SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset),
+    callbacks=[Printer(), BestCriterion(target="val_loss", mode="min")],
+)
+trainer.fit(epochs=3)
+```
+
+There is no registration call and no global registry. Every participant — the learner, the learner's `optimizers`, the tracker, the data provider and its datasets, then the `callbacks` in the order given — is scanned once on first use — the first dispatched event; `describe()` only previews the routing — and is routed into each lifecycle event whose protocol it implements:
+
+`on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`.
+
+An object joins an event simply by defining the matching method; `trainer.describe()` shows the resulting routing. This is how an optimizer + scheduler composition steps its schedule, how `TorchTracker` resets its averages between training and validation, and how a logger records epoch metrics — all through the same mechanism.
+
+Datasets arrive at construction through the data provider, so `fit(epochs, start_epoch, validation_frequency)` takes loop parameters only. `train(dataset)` and `evaluate(dataset)` remain available for a single pass over a dataset.
+
+For a complete, commented program built from these pieces, see [`examples/`](examples/).
 
 ## Configuration Examples
 
-The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow. Templates are organized by framework under `cfg/torch/`, `cfg/flax/`, and `cfg/keras/`.
+The `cfg/` directory contains working YAML templates that demonstrate each part of the workflow. Templates are organized by framework under `cfg/torch/`, `cfg/flax/`, and `cfg/keras/`. For schema details on every key used below, see [REFERENCE.md](REFERENCE.md).
 
 ### PyTorch
 
-#### `cfg/torch/models/ConvNeXtV2.yaml`
+**[`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml)** — Demonstrates the model-building style used throughout the project. The root model defines the top-level execution flow, and sublayer keys (`Backbone`, `Block`, etc.) define reusable nested modules:
 
-Demonstrates the model-building style used throughout the project:
+```yaml
+# Root model: routes tensors through backbone → pooling → classifier
+INPUTS: [image]
+OUTPUTS: [cls]
+FLOW:
+  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
+  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
+  - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
+  - # ... LayerNorm (Jinja-expanded from backbone dims) ...
+  - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 1000}}]]
+```
 
-- parameter groups for multiple backbone sizes
-- nested user-defined layers such as `Backbone`, `Stem`, `DownSample`, and `Block`
-- Jinja-driven layer expansion
-- separate training and inference flow support
-- structured outputs such as `{cls: torch.tensor(...), ...}`
-
-#### `cfg/torch/backwards/ConvNeXtV2.yaml`
-
-Demonstrates how backward logic is configured declaratively for a single-optimizer workflow:
-
-- `MIXED_PRECISION` for `torch.amp.GradScaler`
-- `MIXED_PRECISION_TYPE` for autocast dtype
-- `ACCUMULATE_GRADIENTS` for delayed optimizer updates
-- single `BACKWARDS` entry with `FLOW` containing model forward pass, loss, and metric computation inline
-- separate `INFERENCE_FLOW` for evaluation without gradient tracking
-- optimizer creation through `structcast_model.torch.optimizers.create_with_scheduler`
-- optional gradient clipping via `timm.utils.clip_grad.dispatch_clip_grad`
-
-#### `cfg/torch/backwards/CycleGAN.yaml`
-
-Demonstrates multi-optimizer backward logic for GAN-style training:
-
-- three `BACKWARDS` entries: one for the generator pair (`G_AB`, `G_BA`) and one for each discriminator (`D_A`, `D_B`)
-- each entry defines its own `FLOW` with inline loss layers (`L1Loss`, `MSELoss`) and computed expressions
-- each entry has a dedicated `OPTIMIZER` with independent learning-rate scheduler
-- `TRAINABLE_LAYERS` specifies which models each optimizer manages
-- the generated backward class automatically handles train/eval mode switching per backward entry
-- `OUTPUTS` aggregates all tracked values (generator loss, GAN loss, cycle loss, identity loss, discriminator losses)
-
-#### `cfg/torch/models/CycleGAN_generator.yaml` and `CycleGAN_discriminator.yaml`
-
-Pair of model templates for the CycleGAN architecture:
-
-- **Generator** — uses `ResidualBlock`, `DownBlock`, and `UpBlock` sublayers with reflection padding, instance normalization, and Jinja-driven residual block expansion (`n_residual_blocks` parameter)
-- **Discriminator** — uses a `DiscriminatorBlock` sublayer with conditional instance normalization controlled by a `normalize` parameter
-- both templates use `LazyConv2d` for automatic input channel inference
-
-#### `cfg/torch/datasets/default_timm.yaml`
-
-Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern. Covers:
-
-- timm dataset construction
-- timm dataloader construction
-- device and prefetch settings
-- mixup and cutmix options
-- train or validation split generation from one template
-
-### Flax
-
-#### `cfg/flax/models/ConvNeXtV2.yaml`
-
-Generates a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) equivalent of the PyTorch ConvNeXtV2 model. The template mirrors the same parameter groups (`atto` through `huge`) and uses [`GlobalResponseNorm`](src/structcast_model/flax/layers/grn.py) as a custom Flax layer. Key differences from the PyTorch variant:
-
-- uses channel-last tensor layout (*H × W × C*)
-- constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization
-- `__call__` propagates a `training` flag to sub-modules
-
-### Keras
-
-#### `cfg/keras/models/ConvNeXtV2.yaml`
-
-Generates a [Keras `Layer`](https://keras.io/api/layers/base_layer/) equivalent of the ConvNeXtV2 model. Shares the same backbone parameter groups and uses [`GlobalResponseNormalization`](src/structcast_model/keras/layers/grn.py) as a custom Keras layer. Key differences:
-
-- uses channel-last tensor layout (*H × W × C*)
-- follows the Keras `call(self, ..., *, training=None, **kwargs)` convention
-- runs on any [Keras backend](https://keras.io/getting_started/#configuring-your-backend) (JAX, PyTorch, or TensorFlow)
-
-## Schema Reference
-
-All configuration templates under `cfg/` follow a shared schema that controls how YAML files are parsed, rendered, and validated by the code generators. This section explains every top-level key and sub-key that appears in these templates.
-
-### Template Parameters
-
-Every YAML template may begin with an optional top-level `PARAMETERS` block that declares named sets of values consumed by the Jinja rendering engine.
-
-#### `PARAMETERS`
-
-The top-level container for all template variable groups. Any key nested inside `PARAMETERS` (other than `DEFAULT` and `SHARED`) is treated as a named group that can be selected at render time.
+Parameter groups define multiple backbone sizes, and Jinja rendering expands blocks based on `depths` and `dims`:
 
 ```yaml
 PARAMETERS:
   DEFAULT:
     backbone: atto
   SHARED:
+    stem_kernel_size: 4
+    kernel_size: 7
     drop_path_rate: 0.0
     num_classes: 1000
   atto:
@@ -757,249 +630,34 @@ PARAMETERS:
   femto:
     dims: [48, 96, 192, 384]
     depths: [2, 2, 6, 2]
+  # ... tiny, small, base, large, huge ...
 ```
 
-#### `DEFAULT`
-
-Defines the default template variables. These values are active when no named group is selected and can be overridden at the command line with `-p 'DEFAULT: {key: value}'`.
+The `Block` sublayer shows how a single convolutional block is defined with depthwise convolution, normalization, MLP expansion, GRN, and residual addition:
 
 ```yaml
-DEFAULT:
-  backbone: atto
-  epochs: 300
-  lr: 4.0e-3
-```
-
-#### `SHARED`
-
-Defines variables that are merged into **every** named group (including `DEFAULT`). Use `SHARED` for constants that apply to all backbone or variant choices.
-
-```yaml
-SHARED:
-  stem_kernel_size: 4
-  kernel_size: 7
-  norm_eps: 1.0e-6
-```
-
-#### Named groups
-
-Any key in `PARAMETERS` that is not `DEFAULT` or `SHARED` is a named parameter group — for example `atto`, `femto`, `tiny`, or `base`. A named group is activated via `_jinja_group_` and its variables (merged with `SHARED`) replace the template variables for that rendering scope.
-
-```yaml
-atto:
-  dims: [40, 80, 160, 320]
-  depths: [2, 2, 6, 2]
-femto:
-  dims: [48, 96, 192, 384]
-  depths: [2, 2, 6, 2]
-```
-
-#### `_jinja_yaml_`
-
-Embeds an inline Jinja template that is rendered and merged back into the surrounding YAML. The rendered result must itself be valid YAML. `_jinja_yaml_` blocks are evaluated with the currently active template variables and can emit any number of sibling YAML keys or list entries.
-
-```yaml
-_jinja_yaml_: |-
-  {% if accumulate_gradients is none %}
-  ACCUMULATE_GRADIENTS: null
-  {% else %}
-  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
-  {% endif %}
-```
-
-Inside a `_jinja_yaml_` block you can also use standard Jinja control structures (`{% for %}`, `{% if %}`, `{% set %}`, etc.) as well as the custom filter `cumsum` (provided by `structcast_model.builders.jinja_filters`).
-
-#### `_jinja_group_`
-
-Selects a named parameter group from `PARAMETERS`, merging its values (together with `SHARED`) into the template variable scope for the enclosing block. `_jinja_group_` must appear alongside a `_jinja_yaml_` sibling that consumes the newly activated variables.
-
-```yaml
-- _jinja_group_: {{backbone}}
+Block:
+  OUTPUTS: [out]
   _jinja_yaml_: |-
-    - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{num_classes}}}}]]
+    FLOW:
+      - INPUTS: inp
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - _addr_: torch.nn.LazyConv2d
+          - _call_: {out_channels: {{fout}}, kernel_size: {{kernel_size}}, groups: {{fout}}, padding: "eval: {{kernel_size}} // 2"}
+      - [_, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelLast}, _call_]]
+      - [_, _, [_obj_, {_addr_: timm.layers.LayerNorm}, {_call_: {num_channels: {{fout}}, eps: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: "eval: {{fout}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: "timm.layers.{{activation}}"}, {_call_: {inplace: true}}]]
+      - [_, _, [_obj_, {_addr_: timm.layers.grn.GlobalResponseNorm}, {_call_: {dim: "eval: {{fout}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: {{fout}}}}]]
+      - [_, _, [_obj_, {_addr_: structcast_model.torch.layers.ToChannelFirst}, _call_]]
+      - [_, feat, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: inp + feat", out, null]
 ```
 
-When `backbone` resolves to `atto`, the `atto` group from `PARAMETERS` (merged with `SHARED`) becomes the local variable scope for the inner `_jinja_yaml_` block.
-
----
-
-### Model Template Schema
-
-The following keys appear in model configuration files such as [`cfg/torch/models/ConvNeXtV2.yaml`](cfg/torch/models/ConvNeXtV2.yaml). Each top-level key that is not `PARAMETERS` or a Jinja directive defines either the **root model** (using the reserved keys below) or a **named sublayer** (an arbitrary key whose value follows the same schema).
-
-#### `IMPORTS`
-
-Additional Python imports to inject at the top of the generated file. Accepts a dict mapping module names to lists of names to import, or an empty dict `{}` when no extra imports are needed.
-
-```yaml
-IMPORTS: {}
-# or
-IMPORTS:
-  torch.nn: [Module, Linear]
-  my_package.utils: null  # imports the entire module
-```
-
-#### `INPUTS`
-
-Ordered list of tensor names that the generated `forward()` method accepts as keyword arguments. These names correspond to the first element of each `FLOW` entry and to the keys in the `inputs` dict passed at runtime.
-
-```yaml
-INPUTS: [image]
-```
-
-#### `OUTPUTS`
-
-Ordered list of tensor names produced by the generated `forward()` method. When `STRUCTURED_OUTPUT` is `true`, these names become the keys of the returned dict; otherwise, they determine the order of the returned tuple.
-
-```yaml
-OUTPUTS: [cls]
-# or, for a multi-output model:
-OUTPUTS: [feat1, feat2, feat3, feat4]
-```
-
-#### `STRUCTURED_OUTPUT`
-
-Controls the return type of the generated `forward()` method.
-
-| Value             | Behavior                                                                 |
-| ----------------- | ------------------------------------------------------------------------ |
-| `true`            | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
-| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`.                         |
-
-```yaml
-STRUCTURED_OUTPUT: true
-```
-
-#### `FLOW` and `INFERENCE_FLOW`
-
-`FLOW` is the training-time execution graph: an ordered list of `LayerBehavior` entries (see [`FLOW` entry format](#flow-entry-format) below) that describes how tensors are routed through the model's submodules.
-
-`INFERENCE_FLOW` is an optional alternative graph used only during inference — for example, to skip `DropPath` or other training-only layers. When `INFERENCE_FLOW` is absent, inference uses `FLOW` unchanged. Both fields must produce the same `INPUTS` and `OUTPUTS`.
-
-```yaml
-FLOW:
-  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
-  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
-  - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 1000}}]]
-
-# DropPath sublayer uses a simpler inference path
-DropPath:
-  FLOW: [[inp, out, [_obj_, {_addr_: timm.layers.DropPath}, {_call_: {drop_prob: 0.1}}]]]
-  INFERENCE_FLOW: [[inp, out]]
-```
-
-#### `FLOW` entry format
-
-Each entry in `FLOW` or `INFERENCE_FLOW` is a `LayerBehavior` — a list of 2 to 4 elements:
-
-```
-[INPUTS, OUTPUTS]
-[INPUTS, OUTPUTS, NAME_or_LAYER]
-[INPUTS, OUTPUTS, NAME, LAYER]
-```
-
-| Position | Field     | Description                                                                                                                                                                                                                                                              |
-| -------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0        | `INPUTS`  | Input variable name(s) for this step. A plain string (`image`, `feat1`) reads a named tensor from the current scope. Use `_` to pass the previous step's output forward. A nested list `[[a, b]]` collects tensors from multiple sources (e.g., for residual additions). |
-| 1        | `OUTPUTS` | Output variable name(s) produced by this step. Use `_` for intermediate values that need not be named. A dict `{alias: real_name}` renames the output in the current scope.                                                                                              |
-| 2        | `NAME`    | (optional) A unique identifier for the generated submodule attribute. Auto-generated when omitted. Must be a valid Python identifier.                                                                                                                                    |
-| 2 or 3   | `LAYER`   | (optional) The layer definition — either a StructCast `ObjectPattern` (e.g., `[_obj_, {_addr_: torch.nn.ReLU}, _call_]`) or a `UserLayer` dict (see [`TYPE`, `PARAM`, and `CFG`](#type-param-and-cfg)).                                                                  |
-
-```yaml
-FLOW:
-  - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
-  - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]
-  - [_, _, [_obj_, {_addr_: torch.nn.Flatten}, _call_]]
-  - [_, cls, head, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 1000}}]]
-```
-
-#### `NAME`
-
-`NAME` appears in two contexts:
-
-1. **As the third element of a `FLOW` entry** — sets the Python attribute name of the generated submodule (e.g., `"block0"`, `"head"`). Must be a valid Python identifier.
-2. **As a key in a `BACKWARDS` entry** — sets the generated attribute name for that backward pass and its optimizer.
-
-```yaml
-# In FLOW:
-- [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40}}}]
-
-# In BACKWARDS:
-BACKWARDS:
-  - NAME: optimizer
-    LOSS: ce_loss
-    TRAINABLE_LAYERS: [model]
-    OPTIMIZER: [_obj_, ...]
-```
-
-#### `LAYER`
-
-The fourth (or third) element of a `FLOW` entry. Defines how the submodule for this step is constructed. Two forms are accepted:
-
-- **StructCast `ObjectPattern`** — an `[_obj_, ...]` list that constructs a standard PyTorch module:
-
-  ```yaml
-  [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: 40, kernel_size: 4, stride: 4}}]
-  ```
-
-- **`UserLayer` dict** — references a sublayer defined elsewhere in the same file (via `TYPE`) or in an external file (via `CFG`):
-
-  ```yaml
-  {TYPE: Backbone}
-  {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}
-  {CFG: cfg/torch/models/my_sublayer.yaml, TYPE: MySublayer}
-  ```
-
-#### `TYPE`, `PARAM`, and `CFG`
-
-These three keys form the `UserLayer` dict that activates a named sublayer:
-
-| Key     | Type              | Description                                                                                                                                                                           |
-| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TYPE`  | `str`             | Name of a sublayer defined as a top-level key in the same YAML file (e.g., `Backbone`, `Block`, `Stem`). The code generator expands it into a nested `nn.Module` subclass.            |
-| `PARAM` | `PARAMETERS` dict | Template variable overrides passed when rendering the sublayer. Uses the same `DEFAULT` / `SHARED` / named-group structure as the top-level `PARAMETERS` block.                       |
-| `CFG`   | file path         | Path to an external YAML file that defines the sublayer. Allows sublayer reuse across multiple model templates. When `CFG` is set, `TYPE` selects the sublayer name within that file. |
-
-```yaml
-# References Backbone sublayer defined in the same file, no parameter overrides
-- [image, {feature: feat4}, backbone, {TYPE: Backbone}]
-
-# References Block sublayer with per-instance parameter overrides
-- [feat1, feat1, "block0", {TYPE: Block, PARAM: {DEFAULT: {fout: 40, drop_path: 0.0}}}]
-```
-
----
-
-### Backward Template Schema
-
-The following keys appear in backward configuration files such as [`cfg/torch/backwards/ConvNeXtV2.yaml`](cfg/torch/backwards/ConvNeXtV2.yaml) and [`cfg/torch/backwards/CycleGAN.yaml`](cfg/torch/backwards/CycleGAN.yaml).
-
-#### `IMPORTS`
-
-Same format as in the model schema. Injects additional Python imports into the generated backward file.
-
-```yaml
-IMPORTS: {}
-```
-
-#### `INPUTS` and `OUTPUTS`
-
-`INPUTS` lists the tensor names the generated backward class expects as keyword arguments during training and inference. `OUTPUTS` lists the tensor names produced by the backward flow. Both default to `[]`, which instructs the code generator to infer them automatically from the `BACKWARDS` entries' `FLOW` definitions.
-
-```yaml
-INPUTS: []                # auto-inferred from BACKWARDS[*].FLOW
-OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
-```
-
-#### `MIXED_PRECISION`
-
-Controls `torch.amp.GradScaler` for automatic mixed-precision training.
-
-| Value             | Behavior                                                                                |
-| ----------------- | --------------------------------------------------------------------------------------- |
-| `false` (default) | AMP disabled; no `GradScaler` is created.                                               |
-| `true`            | AMP enabled with default `GradScaler` settings.                                         |
-| `dict`            | AMP enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler(...)`. |
+**[`cfg/torch/learners/ConvNeXtV2.yaml`](cfg/torch/learners/ConvNeXtV2.yaml)** — Demonstrates a single-optimizer learner with mixed precision, gradient accumulation, cosine LR scheduling, and inline loss/metric definitions in the flow. The optimizer is a file-addressed composition from [`examples/torch/optimizers.py`](examples/torch/optimizers.py): the package builds optimizers (`create_opt`), while optimizer + scheduler combinations are example code you can copy and adapt:
 
 ```yaml
 MIXED_PRECISION:
@@ -1008,375 +666,75 @@ MIXED_PRECISION:
   backoff_factor: 0.5
   growth_interval: 2000
   enabled: True
-```
-
-#### `MIXED_PRECISION_TYPE`
-
-The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Has no effect when `MIXED_PRECISION` is `false`.
-
-```yaml
 MIXED_PRECISION_TYPE: bfloat16
-```
-
-#### `ACCUMULATE_GRADIENTS`
-
-The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches.
-
-```yaml
-ACCUMULATE_GRADIENTS: null   # disabled
-ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
-```
-
-#### `BACKWARDS`
-
-An ordered list of `BackwardBehavior` entries. Each entry defines one backward pass — i.e., one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
-
-During code generation, each entry's trainable layers are automatically set to training mode before its flow executes, and set back to eval mode after the optimizer step.
-
-```yaml
-# Single-optimizer example (classification)
-BACKWARDS:
-  - NAME: optimizer
-    LOSS: ce_loss
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
-    OPTIMIZER: [_obj_, ...]
-    CLIP: null
-    EXTRA: {}
-    FLOW:
-      - [image, cls, model]
-      - [{target: label, input: cls}, ce_loss, cross_entropy_loss, [_obj_, ...]]
-    INFERENCE_FLOW:
-      - [image, cls, model]
-      - [{target: label, input: cls}, ce_loss, cross_entropy_loss]
-
-# Multi-optimizer example (GAN)
-BACKWARDS:
-  - NAME: optimizer_G
-    LOSS: loss_G
-    TRAINABLE_LAYERS: [G_AB, G_BA]
-    OPTIMIZER: [_obj_, ...]
-    FLOW: [...]          # generator forward + loss computation
-    INFERENCE_FLOW: [...] # inference-only flow
-  - NAME: optimizer_D_A
-    LOSS: loss_D_A
-    TRAINABLE_LAYERS: [D_A]
-    OPTIMIZER: [_obj_, ...]
-    FLOW: [...]          # discriminator A forward + loss computation
-  - NAME: optimizer_D_B
-    LOSS: loss_D_B
-    TRAINABLE_LAYERS: [D_B]
-    OPTIMIZER: [_obj_, ...]
-    FLOW: [...]          # discriminator B forward + loss computation
-```
-
-#### `LOSSES` and `TRAINABLE_LAYERS`
-
-Both fields default to `[]`, which instructs the code generator to infer their values automatically from the `BACKWARDS` entries.
-
-| Key                | Type        | Description                                                                                                                                                                 |
-| ------------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOSSES`           | `list[str]` | Explicit list of loss key names that the generated backward class tracks. Auto-inferred from `BACKWARDS[*].LOSS` when left as `[]`.                                         |
-| `TRAINABLE_LAYERS` | `list[str]` | Explicit list of trainable model names the generated backward class expects as constructor arguments. Auto-inferred from `BACKWARDS[*].TRAINABLE_LAYERS` when left as `[]`. |
-
-```yaml
-LOSSES: []           # auto-inferred
-TRAINABLE_LAYERS: [] # auto-inferred
-```
-
-#### `BACKWARDS` entry keys
-
-Each entry in `BACKWARDS` is a `BackwardBehavior` with the following fields:
-
-| Key                | Type                         | Description                                                                                                                                                                                                                                           |
-| ------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NAME`             | `str`                        | Optional identifier for this backward pass. Used as the generated attribute name for the optimizer. Must be a valid Python identifier.                                                                                                                |
-| `LOSS`             | `str`                        | The loss key (produced by the `FLOW`) that this backward pass differentiates.                                                                                                                                                                         |
-| `TRAINABLE_LAYERS` | `list[str]`                  | Model names whose parameters this optimizer manages. Each value must match a model passed to the backward class constructor.                                                                                                                          |
-| `FLOW`             | `list`                       | Training-time execution graph for this backward entry. Uses the same entry format as model `FLOW` (see [`FLOW` entry format](#flow-entry-format)), plus support for `"eval: ..."` expressions and inline layer instantiation via StructCast patterns. |
-| `INFERENCE_FLOW`   | `list`                       | Optional inference-time execution graph. When absent, `FLOW` is used for inference as well.                                                                                                                                                           |
-| `OPTIMIZER`        | StructCast pattern           | A StructCast `ObjectPattern` that constructs the optimizer (and optionally its learning-rate scheduler). Commonly uses `structcast_model.torch.optimizers.create_with_scheduler` with `_bind_` to pass `optimizer_kwargs` and `scheduler_kwargs`.     |
-| `CLIP`             | StructCast pattern or `null` | Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `TRAINABLE_LAYERS`. Set to `null` to disable gradient clipping.                                 |
-| `EXTRA`            | `dict`                       | Extra keyword arguments forwarded to the backward/optimizer logic. Default is `{}`.                                                                                                                                                                   |
-
-```yaml
-BACKWARDS:
-  - NAME: optimizer
-    LOSS: ce_loss
-    TRAINABLE_LAYERS: [model]
+    NAME: optimizer
     OPTIMIZER:
       - _obj_
-      - _addr_: structcast_model.torch.optimizers.create_with_scheduler
+      - _addr_: AdamWWithCosine
+        _file_: examples/torch/optimizers.py
       - _bind_:
-          optimizer_kwargs:
-            opt: adamw
-            lr: 4.0e-3
-            weight_decay: 0.001
-          scheduler_kwargs:
-            name: cosine
-            num_epochs: 300
-    CLIP:
-      - _obj_
-      - _addr_: timm.utils.clip_grad.dispatch_clip_grad
-      - _bind_: {value: 1.0, mode: norm, norm_type: 2.0}
-    EXTRA: {}
+          optimizer_kwargs: {opt: adamw, lr: 4.0e-3, weight_decay: 0.001}
+          scheduler_kwargs: {sched: cosine, num_epochs: 300, criterion: ce_loss}
     FLOW:
       - [image, cls, model]
       - [{target: label, input: cls}, ce_loss, cross_entropy_loss, [_obj_, _addr_: torch.nn.CrossEntropyLoss, _call_]]
-    INFERENCE_FLOW:
-      - [image, cls, model]
-      - [{target: label, input: cls}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: cls}, acc1, accuracy, [_obj_, _addr_: torch.no_grad, _call_, _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_categorical_accuracy}]]]]
+      - [{y_true: label, y_pred: cls, k: 5}, acc5, top_5_accuracy, [_obj_, _addr_: torch.no_grad, _call_, _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_top_k_categorical_accuracy}]]]]
 ```
 
----
+**[`cfg/torch/learners/CycleGAN.yaml`](cfg/torch/learners/CycleGAN.yaml)** — Demonstrates a multi-optimizer learner for GAN-style training with three `LEARNERS` entries (generator pair + two discriminators), each with its own flow, optimizer, and trainable layers.
 
-## API Reference: `base_trainer.py`
+**`cfg/torch/models/CycleGAN_generator.yaml` and `CycleGAN_discriminator.yaml`** — Pair of model templates for the CycleGAN architecture:
 
-[`src/structcast_model/base_trainer.py`](src/structcast_model/base_trainer.py) provides the framework-agnostic training loop, state management, and callback system. Concrete trainers such as `TorchTrainer` build on top of these abstractions.
+- **Generator** — uses `ResidualBlock`, `DownBlock`, and `UpBlock` sublayers with reflection padding, instance normalization, and Jinja-driven residual block expansion (`n_residual_blocks` parameter)
+- **Discriminator** — uses a `DiscriminatorBlock` sublayer with conditional instance normalization controlled by a `normalize` parameter
+- both templates use `LazyConv2d` for automatic input channel inference
 
-### Utility functions
+**[`cfg/torch/others/default_timm.yaml`](cfg/torch/others/default_timm.yaml)** — Formats directly into a `TimmDataLoaderWrapper.model_validate(...)` pattern, loading the wrapper from the example file [`examples/torch/data.py`](examples/torch/data.py) by path. The template covers timm dataset and dataloader construction, device and prefetch settings, mixup/cutmix configuration, and train/validation split generation — all from a single parameterized template:
 
-#### `get_dataset(dataset)`
-
-Resolves a `DatasetLike` or a zero-argument callable into an actual iterable. This allows lazy dataset construction.
-
-#### `get_dataset_size(dataset)`
-
-Returns the number of batches. Uses `__len__` when available, otherwise iterates to count.
-
-#### `invoke_callback(callbacks, info, *args, **models)`
-
-Iterates over a callback list and calls each entry with `info` and keyword model arguments.
-
-### Protocols
-
-#### `Forward`
-
-Called once per batch during training or validation. Accepts an `inputs` dictionary and keyword model arguments; returns a `dict[str, Any]` of named outputs and criteria.
-
-#### `Backward`
-
-Called once per training step. Receives the step index and criterion keyword arguments; returns `True` when the optimizer has stepped, `False` when gradients are being accumulated.
-
-#### `Callback` and `BestCallback`
-
-Lifecycle hooks called with `(info: BaseInfo, **models)`. `BestCallback` additionally receives `target: str` and `best: float` arguments.
-
-### State and callbacks
-
-#### `BaseInfo`
-
-Dataclass holding mutable training state:
-
-- `step` — total training steps taken
-- `update` — optimizer update count
-- `epoch` — current epoch number
-- `history` — per-epoch log dictionaries
-- `logs(epoch=None)` — returns the log dict for the current (or given) epoch
-
-#### `Callbacks`
-
-Dataclass holding callback lists for each lifecycle hook:
-
-- `on_update` — after each optimizer update
-- `on_training_begin` / `on_training_end`
-- `on_training_step_begin` / `on_training_step_end`
-- `on_validation_begin` / `on_validation_end`
-- `on_validation_step_begin` / `on_validation_step_end`
-- `on_epoch_begin` / `on_epoch_end`
-
-When `add_global_callbacks=True` (the default), entries from `GLOBAL_CALLBACKS` are copied into each list at construction time.
-
-#### `GLOBAL_CALLBACKS`
-
-A shared `Callbacks[Any]` instance. Callbacks registered here are automatically picked up by every newly created trainer.
-
-### Core classes
-
-#### `BaseTrainer`
-
-The main training loop driver. Inherits both `BaseInfo` and `Callbacks`.
-
-Required fields: `training_step` (`Forward`), `backward` (`Backward`), `tracker` (callable returning `dict[str, float]`).
-
-Optional fields: `validation_step`, `training_prefix` (default `""`), `validation_prefix` (default `"val_"`).
-
-Key methods:
-
-- `train(dataset, **models)` — runs one training epoch, returns the final step logs
-- `evaluate(dataset, **models)` — runs one validation epoch, returns the final step logs
-- `fit(epochs, training_dataset, validation_dataset=None, start_epoch=1, validation_frequency=1, **models)` — runs the full loop and returns the complete history dict
-- `sync()` — optional synchronization hook, no-op by default (overridden in `TorchTrainer`)
-
-```python
-trainer = MyTrainer(
-    training_step=my_forward,
-    backward=my_backward,
-    tracker=my_tracker,
-    validation_step=my_val_forward,
-)
-history = trainer.fit(
-    epochs=10,
-    training_dataset=train_loader,
-    validation_dataset=val_loader,
-    model=model,
-)
+```yaml
+_obj_:
+  - _addr_: TimmDataLoaderWrapper
+    _file_: examples/torch/data.py
+  - _attr_: model_validate
+  - - _call_
+    - spec: {image: "0", label: "1"}
+      dataset:
+        input_img_mode: RGB
+        _jinja_yaml_: |-
+          batch_size: {{batch_size}}
+          name: {{dataset}}
+          root: {{dataset_dir}}
+          is_training: {{training}}
+          split: {{"train" if training else "validation"}}
+          # ...
+      use_prefetcher: true
+      mixup_alpha: 0.0
+      cutmix_alpha: 0.0
+      # ...
 ```
 
-#### `BestCriterion`
+### Flax
 
-A callable that monitors a log key and fires `on_best` callbacks whenever a new best is found. Attach it to `on_epoch_end` or `on_validation_end`.
+**[`cfg/flax/models/ConvNeXtV2.yaml`](cfg/flax/models/ConvNeXtV2.yaml)** — Generates a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) equivalent of the PyTorch ConvNeXtV2 model. The template mirrors the same parameter groups (`atto` through `huge`) and uses [`GlobalResponseNorm`](src/structcast_model/flax/layers/grn.py) as a custom Flax layer. Key differences from the PyTorch variant:
 
-```python
-checkpoint = BestCriterion(
-    target="val_acc1",
-    mode="max",
-    on_best=[save_checkpoint],
-)
-trainer.on_epoch_end.append(checkpoint)
-```
+- uses channel-last tensor layout (*H × W × C*)
+- constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization
+- `__call__` propagates a `training` flag to sub-modules
+- layer APIs differ (e.g., `flax.nnx.Conv` instead of `torch.nn.LazyConv2d`)
 
-Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `on_best` (list of `BestCallback`).
+### Keras
 
-## API Reference: `trainer.py`
+**[`cfg/keras/models/ConvNeXtV2.yaml`](cfg/keras/models/ConvNeXtV2.yaml)** — Generates a [Keras `Layer`](https://keras.io/api/layers/base_layer/) equivalent of the ConvNeXtV2 model. Shares the same backbone parameter groups and uses [`GlobalResponseNormalization`](src/structcast_model/keras/layers/grn.py) as a custom Keras layer. Key differences:
 
-[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer.
-
-### Utility functions
-
-#### `create_torch_inputs(shape)`
-
-Creates dummy `float32` tensors from tuple, list, or dict shape descriptions. Used for model initialization and FLOPs inspection.
-
-#### `get_torch_device(device=None)`
-
-Returns the runtime device. Selects `cuda` when available and requested, otherwise falls back to `cpu`.
-
-#### `initial_model(model, shapes=None, compile_fn=None)`
-
-Walks a module or nested module structure, optionally builds dummy inputs, runs a forward pass, and applies a compile function to each module. Returns:
-
-```python
-(initialized_model, inputs, outputs)
-```
-
-#### `get_autocast(mixed_precision_type, device)`
-
-Returns a context manager for automatic mixed precision:
-
-- `contextlib.suppress` when AMP is disabled.
-- A configured `torch.autocast(...)` partial when AMP is enabled.
-
-### Step objects
-
-#### `TrainingStep`
-
-`TrainingStep` chains one or more models, updates a shared output dictionary, computes losses, and optionally computes metrics.
-
-```python
-step = TrainingStep(
-    models=["model"],
-    losses=loss_module,
-    metrics=metric_module,
-    autocast=get_autocast("bfloat16", "cuda"),
-)
-criteria = step({"image": image, "label": label}, model=model)
-```
-
-#### `ValidationStep`
-
-Same interface as `TrainingStep`, but always executes under `torch.no_grad()`.
-
-### Tracking and orchestration
-
-#### `TorchTracker`
-
-Wraps `CriteriaTracker` instances for losses and metrics, resets them through global callbacks, and returns float-valued logs suitable for history storage and MLflow logging.
-
-```python
-tracker = TorchTracker.from_criteria(["ce_loss"], ["acc1", "acc5"])
-logs = tracker(ce_loss=loss_tensor, acc1=acc1_tensor, acc5=acc5_tensor)
-```
-
-#### `TorchTrainer`
-
-`TorchTrainer` extends the generic `BaseTrainer` with PyTorch-specific synchronization.
-
-```python
-trainer = TorchTrainer(
-    device="cuda",
-    training_step=TrainingStep(models=["model"], losses=loss_module, metrics=metric_module),
-    validation_step=ValidationStep(models=["model"], losses=loss_module, metrics=metric_module),
-    backward=backward,
-    tracker=tracker,
-)
-
-history = trainer.fit(
-    epochs=5,
-    training_dataset=train_loader,
-    validation_dataset=valid_loader,
-    model=model,
-)
-```
-
-### timm integrations
-
-#### `TimmDatasetWrapper`
-
-Holds validated dataset configuration and lazily calls `timm.data.create_dataset(...)`.
-
-#### `TimmDataLoaderWrapper`
-
-Builds a timm dataloader with support for:
-
-- Prefetching
-- Channels-last memory format conversion
-- Mixup and cutmix data augmentation
-- Train/validation-specific augmentation settings
-- Distributed device initialization
-- Optional `FlexSpec` output remapping
-
-The dataset template at `cfg/torch/datasets/default_timm.yaml` formats into this wrapper.
-
-## Minimal End-to-End Example
-
-```bash
-uv sync --extra torch-cu130 --extra mlflow --extra flops
-
-scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
-scm torch create model cfg/torch/losses/cls.yaml -c Loss -o loss.py
-scm torch create model cfg/torch/metrics/topk.yaml -c Metric -o metric.py
-scm torch create backward cfg/torch/backwards/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o backward.py
-
-scm format cfg/torch/datasets/default_timm.yaml \
-    -o dataset_train.yaml \
-    -p 'DEFAULT: {training: true, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, label_smoothing: 0.1, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
-
-scm format cfg/torch/datasets/default_timm.yaml \
-    -o dataset_valid.yaml \
-    -p 'DEFAULT: {training: false, epochs: 5, batch_size: 32, dataset: torch/cifar100, num_classes: 100, input_size: [3, 224, 224], image_dtype: bfloat16, download: true}'
-
-scm torch train \
-    'model: [_obj_, {_addr_: model.Model, _file_: model.py}, _call_]' \
-    -s 'image: [3, 224, 224]' \
-    -d cuda \
-    -L '[_obj_, {_addr_: loss.Loss, _file_: loss.py}, _call_]' \
-    -M '[_obj_, {_addr_: metric.Metric, _file_: metric.py}, _call_]' \
-    -B '[_obj_, {_addr_: backward.Backward, _file_: backward.py}]' \
-    -c cfg/torch/others/compile_default.yaml \
-    -e 5 \
-    -T dataset_train.yaml \
-    -V dataset_valid.yaml \
-    -f 1 \
-    -LC ce_loss \
-    -LC val_ce_loss \
-    -HC acc1 \
-    -HC val_acc1 \
-    -HC acc5 \
-    -HC val_acc5 \
-    -SC val_acc1 \
-    --matmul-precision high \
-    -E Test
-```
+- uses channel-last tensor layout (*H × W × C*)
+- follows the Keras `call(self, ..., *, training=None, **kwargs)` convention
+- runs on any [Keras backend](https://keras.io/getting_started/#configuring-your-backend) (JAX, PyTorch, or TensorFlow)
+- uses `keras.layers.Add` for residual connections instead of `"eval: inp + feat"` expressions
 
 ## Development
 
@@ -1423,13 +781,24 @@ The repository includes tests for:
 
 ## Migration Notes
 
+### Upgrading to v2.x
+
+The training loop was redesigned around protocol-routed callbacks. The rationale is recorded in [`docs/adr/0002-protocol-routed-training-loop.md`](docs/adr/0002-protocol-routed-training-loop.md); the vocabulary in [`CONTEXT.md`](CONTEXT.md). There are no compatibility aliases:
+
+- **`Backward` is now `Learner`** — The rename cascades through the runtime, the CLI (`scm torch create learner`, `--learner/-L`), the builder and schema names (`LEARNERS`, `LearnerBehavior`, `UserDefinedLearner`), and the template directory (`cfg/torch/learners/`).
+- **Callbacks are routed by protocol** — The `GLOBAL_CALLBACKS` registry, the `callbacks_session` context manager, and `NamedCallbackList.register()` are gone. Pass participants to the trainer as `callbacks=[...]`; each one joins the events whose `on_*` method it defines. Ad-hoc lambdas become small callback classes — `ProgressBar` and `Printer` ship with the package.
+- **Datasets are given at construction** — `fit()` no longer takes datasets. Build a `DataProvider` (`SimpleDataProvider`, or your own object with `training_dataset`, `validation_dataset`, `steps_per_epoch`, and `validation_steps` — the dataset properties must return the same object on every read, since the trainer reads them for the event scan and again in `fit()`) and pass it as `data=`. The trainer also scans the provider datasets for event protocols, so a dataset with an `on_*` hook (e.g. a distributed sampler wrapper) takes part in the loop without being passed as a callback. `fit()` keeps `epochs`, `start_epoch`, and `validation_frequency`; `train(dataset)` and `evaluate(dataset)` are unchanged.
+- **`create_with_scheduler` is removed** — The package keeps `create_opt` (regex weight-decay and layer-decay grouping over `torch.optim` and timm engines). Optimizer + scheduler combinations move to example code referenced by file path; `AdamWWithCosine` (timm schedules) and `OptimizerWithNativeScheduler` (per-epoch native schedules) in [`examples/torch/optimizers.py`](examples/torch/optimizers.py) cover the cosine and per-epoch native cases and also keep the schedule in their `state_dict`; metric-driven (`ReduceLROnPlateau`), per-update, and composite schedules need a wrapper of their own modeled on these.
+- **Loggers own the run** — `MLflowLogger` (`structcast_model.torch.mlflow_logger`) and `WandbLogger` (`structcast_model.torch.wandb_logger`) are context managers that start and end the run and log epoch metrics; both follow the `Logger` protocol in `structcast_model.torch.logger`. Select the backend with `--logger mlflow|wandb`.
+- **Trackers reset themselves** — `TorchTracker` clears its averages from `on_training_begin` and `on_validation_begin`; the explicit `reset()` call in the loop is gone.
+
 ### Upgrading from v1.x
 
-The following breaking changes were introduced by the backward-template restructure for multi-optimizer GAN training support:
+The following breaking changes were introduced by the learner-template restructure for multi-optimizer GAN training support:
 
 - **EMA support removed** — `TimmEmaWrapper`, the `cfg/torch/others/ema.yaml` configuration, and all `InferenceWrapper`-based EMA integration in `cmd_torch.py` and `torch/trainer.py` have been removed. If your training workflow relied on built-in EMA, you will need to manage EMA externally.
-- **Backward template schema restructured** — The `BACKWARDS` key now expects a list of `BackwardBehavior` entries (each with its own `NAME`, `LOSS`, `TRAINABLE_LAYERS`, `OPTIMIZER`, `FLOW`, and optional `INFERENCE_FLOW`). Previous single-optimizer backward configurations must be wrapped in a single-entry list.
-- **`trainer.fit()` signature simplified** — Unused model arguments were removed from the `fit()` method. Update any custom callers accordingly.
+- **Learner template schema restructured** — The `LEARNERS` key expects a list of `LearnerBehavior` entries (each with its own `NAME`, `LOSS`, `TRAINABLE_LAYERS`, `OPTIMIZER`, `FLOW`, and optional `INFERENCE_FLOW`). Previous single-optimizer configurations must be wrapped in a single-entry list.
+- **Separate loss and metric templates removed** — Losses and metrics are declared inline in the learner's flow, so `scm torch train` no longer takes `--loss` or `--metric`.
 
 ## Roadmap
 

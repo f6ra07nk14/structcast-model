@@ -60,6 +60,7 @@ class {class_name}(keras.layers.Layer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.input_names = {self.inputs}
+        self.input_shapes = {self.input_shapes}
         self.output_names = {self.outputs}
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 

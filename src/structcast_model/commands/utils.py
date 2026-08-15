@@ -8,12 +8,14 @@ if TYPE_CHECKING:
     import pydantic
     from structcast.core import instantiator
 
+    from structcast_model.builders import schema
     from structcast_model.utils import base
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
     pydantic = LazyModuleImporter("pydantic")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
+    schema = LazyModuleImporter("structcast_model.builders.schema")
     base = LazyModuleImporter("structcast_model.utils.base")
 
 
@@ -88,29 +90,25 @@ def bool_or_path_or_dict_parser(value: str) -> dict[str, Any] | None:
 def tensor_shape_parser(value: str) -> dict[str, Any]:
     """Parse a YAML string into a dictionary of tensor shapes.
 
-    The input string can be a YAML representation of a dictionary, where the values can be tuples, lists,
-    or dictionaries representing tensor shapes.
-    For example: `{image: [224, 224, 3], metadata: {feature1: 10, feature2: 5}}`.
+    The input string is a YAML representation of a dictionary mapping input names to tensor specifications,
+    validated through `structcast_model.builders.schema.TensorSpecTree`. A specification is either the compact
+    form, which is a plain shape, or the explicit form, which is a mapping with the `_SHAPE_` key and the
+    optional `_DTYPE_` and `_INIT_` keys. Specifications can be nested in dictionaries and lists.
+    For example: `{image: [224, 224, 3], tokens: {_SHAPE_: [512], _DTYPE_: int64},
+    metadata: {feature1: [10], feature2: [5]}}`.
 
     Args:
         value (str): The YAML string to parse.
 
     Returns:
-        dict[str, Any]: The parsed dictionary of tensor shapes.
+        dict[str, Any]: The parsed dictionary of tensor shapes, dumped back to plain Python data.
+            A specification with default dtype and no initializer collapses to a shape tuple,
+            while any other specification stays a mapping keyed by `_SHAPE_`, `_DTYPE_` and `_INIT_`.
     """
-
-    def _check(shape: Any) -> Any:
-        try:
-            return pydantic.TypeAdapter(tuple[int, ...]).validate_python(shape)
-        except pydantic.ValidationError:
-            pass
-        if isinstance(shape, dict):
-            return {k: _check(v) for k, v in shape.items()}
-        if isinstance(shape, (list, tuple)):
-            return [_check(v) for v in shape]
-        raise ValueError(f"Invalid tensor shape: {shape}")
-
-    return _check(pydantic.TypeAdapter(dict[str, Any]).validate_python(load_yaml_from_string(value))) if value else {}
+    if not value:
+        return {}
+    adapter = pydantic.TypeAdapter(dict[str, schema.TensorSpecTree])
+    return adapter.dump_python(adapter.validate_python(load_yaml_from_string(value)))
 
 
 def instantiate_object(raw: Any) -> Any:

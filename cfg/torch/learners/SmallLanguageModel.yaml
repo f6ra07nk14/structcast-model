@@ -1,0 +1,74 @@
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.1
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "MIXED_PRECISION" enables gradient scaling ("torch.amp.GradScaler"), which only applies to
+# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: bfloat16
+# "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
+# specify the number of steps to accumulate gradients before updating parameters.
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+# "LEARNERS" can be set to a learner configuration or a list of learner configurations
+# to specify how the models are trained.
+OUTPUTS: [ce_loss]
+LEARNERS:
+  - LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    NAME: optimizer
+    # A native torch.optim.AdamW (via create_opt's native engine), not a scheduler proxy like
+    # AdamWWithCosine: FSDP2's DCP checkpoint path refuses optimizers that are not real
+    # torch.optim.Optimizer instances, and this learner is the per-block FSDP2 example.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_opt
+      - _bind_:
+          opt: torch.optim.AdamW
+          betas: [0.9, 0.95]
+          weight_decay_regexes: []
+          no_weight_decay_regexes:
+            - ^(?:\w+\.)*bias*$
+            - ^(?:\w+\.)*\w*(?:layer_norm|embedding)\w*(?:\.\w+)*$
+          _jinja_yaml_: |-
+            lr: {{lr}}
+            weight_decay: {{weight_decay}}
+    _jinja_yaml_: |-
+      {% if clip_grad_norm is none %}
+      CLIP: null
+      {% else %}
+      CLIP:
+        - _obj_
+        - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+      {% endif %}
+    EXTRA: {}
+    # Next-token prediction: the model reads "tokens" and the loss compares its logits against
+    # "targets", the same sequence shifted by one. Both are flattened over the batch and the time
+    # axis, so cross entropy sees one class prediction per position.
+    FLOW:
+      - [tokens, logits, model]
+      - [logits, flat_logits, flatten_logits, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 0, end_dim: 1}}]]
+      - [targets, flat_targets, flatten_targets, [_obj_, {_addr_: torch.nn.Flatten}, {_call_: {start_dim: 0, end_dim: -1}}]]
+      - INPUTS: {input: flat_logits, target: flat_targets}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: torch.nn.CrossEntropyLoss}, _call_]
+    INFERENCE_FLOW:
+      - [tokens, logits, model]
+      - [logits, flat_logits, flatten_logits]
+      - [targets, flat_targets, flatten_targets]
+      - [{input: flat_logits, target: flat_targets}, ce_loss, cross_entropy_loss]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

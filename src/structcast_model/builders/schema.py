@@ -3,9 +3,10 @@
 from collections.abc import Sequence
 from functools import cached_property
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar
 
 from pydantic import (
+    AfterValidator,
     Field,
     FilePath,
     PositiveInt,
@@ -24,6 +25,7 @@ from structcast.core.specifier import SPEC_CONSTANT, FlexSpec, SpecIntermediate,
 from structcast.core.template import ALIAS_ALL, Parameters as BaseParameters, configure_jinja, extend_structure
 from structcast.utils.base import check_elements
 from structcast.utils.types import PathLike
+from typing_extensions import TypeAliasType
 
 from structcast_model.builders import jinja_filters
 from structcast_model.utils.base import load_any, unique
@@ -219,6 +221,88 @@ def _validate_imports(data: Any) -> Any:
     return data
 
 
+DTypeName = Literal["bfloat16", "float16", "float32", "int32", "int64"]
+"""Supported element types of an input tensor."""
+
+
+class TensorSpec(Serializable):
+    """Tensor specification: shape, dtype and optional initializer address.
+
+    A tensor can be written in the compact form, which is a plain shape (`[3, 224, 224]`),
+    or in the explicit form, which is a mapping with the `_SHAPE_` key
+    (`{_SHAPE_: [512], _DTYPE_: int64, _INIT_: torch.zeros}`).
+    """
+
+    SHAPE: tuple[int, ...] = Field(alias="_SHAPE_")
+    """Shape of the tensor, excluding the batch dimension."""
+
+    DTYPE: DTypeName = Field("bfloat16", alias="_DTYPE_")
+    """Element type of the tensor."""
+
+    INIT: str | None = Field(None, alias="_INIT_")
+    """Address of the callable creating the dummy tensor, e.g. `torch.zeros`.
+
+    If not specified, the initializer is chosen from `DTYPE` by the framework creating the dummy inputs.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, raw: Any) -> Any:
+        """Expand the compact shape form into the explicit mapping form.
+
+        Anything else is returned unchanged, so that pydantic reports a `ValidationError`
+        instead of an exception escaping the surrounding `TensorSpecTree` union.
+        """
+        if isinstance(raw, (list, tuple)):
+            return {"_SHAPE_": raw}
+        return raw
+
+    @model_serializer(mode="wrap")
+    def _serialize_model(self, handler: SerializerFunctionWrapHandler) -> tuple[int, ...] | dict[str, Any]:
+        """Serialize the model, collapsing to the compact shape form when only the shape is specified."""
+        default_dtype = self.DTYPE == TensorSpec.model_fields["DTYPE"].default
+        if default_dtype and self.INIT is None:
+            return self.SHAPE
+        res: dict[str, Any] = {"_SHAPE_": self.SHAPE}
+        if not default_dtype:
+            res["_DTYPE_"] = self.DTYPE
+        if self.INIT is not None:
+            res["_INIT_"] = self.INIT
+        return res
+
+
+def _validate_no_marker_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Reject nested dictionaries using the reserved tensor specification marker keys.
+
+    A mapping with the `_SHAPE_` key only reaches the nested dictionary branch of `TensorSpecTree`
+    when it failed to validate as an explicit `TensorSpec`, so accepting it would silently
+    reinterpret a malformed explicit form as a nested input named `_SHAPE_`.
+    """
+    if markers := {"_SHAPE_", "_DTYPE_", "_INIT_"} & data.keys():
+        raise ValueError(f"Invalid explicit tensor specification with marker keys: {sorted(markers)}")
+    return data
+
+
+if TYPE_CHECKING:
+    # mypy resolves the recursion only in this implicit alias form, while pydantic builds a recursive schema
+    # only from `TypeAliasType`, so the two forms of the same alias are kept side by side.
+    TensorSpecTree = Annotated[
+        TensorSpec | dict[str, "TensorSpecTree"] | list["TensorSpecTree"],
+        Field(union_mode="left_to_right"),
+    ]
+    """A `TensorSpec`, or a dictionary or list nesting more of them."""
+else:
+    TensorSpecTree = TypeAliasType(
+        "TensorSpecTree",
+        Annotated[
+            TensorSpec
+            | Annotated[dict[str, "TensorSpecTree"], AfterValidator(_validate_no_marker_keys)]
+            | list["TensorSpecTree"],
+            Field(union_mode="left_to_right"),
+        ],
+    )
+
+
 class UserDefinedLayer(Serializable):
     """User defined layer configuration."""
 
@@ -231,6 +315,13 @@ class UserDefinedLayer(Serializable):
 
     INPUTS: list[str] = Field(default_factory=list)
     """Inputs of the layer."""
+
+    INPUT_SHAPES: dict[str, TensorSpecTree] = Field(default_factory=dict)
+    """Shapes of the inputs of the layer, where the keys are input names.
+
+    Each value is a `TensorSpec` written in the compact or the explicit form,
+    or a dictionary or list nesting more of them.
+    """
 
     OUTPUTS: list[str] = Field(default_factory=list)
     """Outputs of the layer."""
@@ -281,8 +372,8 @@ class UserDefinedLayer(Serializable):
         return self
 
 
-class BackwardBehavior(Serializable):
-    """Backward behavior configuration."""
+class LearnerBehavior(Serializable):
+    """Learner behavior configuration."""
 
     LOSS: str
     """The target loss to optimize."""
@@ -300,14 +391,14 @@ class BackwardBehavior(Serializable):
     """The name of the optimizer class or an instance of the optimizer."""
 
     NAME: str | None = None
-    """The name of the backward layer class or an instance of the backward layer."""
+    """The name of the learner class or an instance of the learner."""
 
     CLIP: ObjectPattern | None = None
     """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
     or a pattern to instantiate the gradient clipping configuration."""
 
     EXTRA: dict[str, Any] = Field(default_factory=dict)
-    """Extra fields for the backward behavior,
+    """Extra fields for the learner behavior,
     which will be passed to the optimizer or the backward process in general."""
 
     @field_validator("TRAINABLE_LAYERS", mode="before")
@@ -331,11 +422,11 @@ class BackwardBehavior(Serializable):
         return data
 
 
-class UserDefinedBackward(Serializable):
-    """User defined backward configuration."""
+class UserDefinedLearner(Serializable):
+    """User defined learner configuration."""
 
     IMPORTS: dict[str, set[str | None]] = Field(default_factory=dict)
-    """Imports required for the backward behavior,
+    """Imports required for the learner behavior,
     where the keys are module names and the values are sets of imported names from the corresponding modules.
 
     The imported names can be `None`, which indicates that the entire module is imported.
@@ -351,10 +442,10 @@ class UserDefinedBackward(Serializable):
     """Losses to optimize."""
 
     TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
-    """Trainable layer names required for the backward behavior."""
+    """Trainable layer names required for the learner behavior."""
 
-    BACKWARDS: list[BackwardBehavior] = Field(default_factory=list, min_length=1)
-    """Backward behavior configuration."""
+    LEARNERS: list[LearnerBehavior] = Field(default_factory=list, min_length=1)
+    """Learner behavior configuration."""
 
     MIXED_PRECISION: bool | dict[str, Any] = False
     """Whether to use mixed precision during backward pass.
@@ -376,8 +467,8 @@ class UserDefinedBackward(Serializable):
         return _validate_imports(data)
 
     def _validate_trainable_layers(self) -> None:
-        """Validate that the trainable layers exist in the backwards."""
-        layers = unique([L for b in self.BACKWARDS for L in b.TRAINABLE_LAYERS])
+        """Validate that the trainable layers exist in the learners."""
+        layers = unique([L for b in self.LEARNERS for L in b.TRAINABLE_LAYERS])
         if not self.TRAINABLE_LAYERS:
             self.TRAINABLE_LAYERS.extend(layers)
         if unknown := set(self.TRAINABLE_LAYERS) - set(layers):
@@ -386,16 +477,21 @@ class UserDefinedBackward(Serializable):
             raise SpecError(f"Missing trainable layers found: {missing}.")
 
     def _validate_mixed_precision(self) -> None:
-        """Validate the mixed precision configuration."""
-        if isinstance(self.MIXED_PRECISION, bool) and not self.MIXED_PRECISION:
-            if self.MIXED_PRECISION_TYPE is not None:
-                raise SpecError("MIXED_PRECISION_TYPE must be None when MIXED_PRECISION is False.")
-        elif self.MIXED_PRECISION is None:
-            raise SpecError("MIXED_PRECISION must be a boolean or a dictionary when MIXED_PRECISION_TYPE is not None.")
+        """Validate the mixed precision configuration.
+
+        MIXED_PRECISION enables gradient scaling, which only counteracts float16 underflow;
+        MIXED_PRECISION_TYPE alone configures autocast and is valid without a scaler.
+        """
+        enabled = bool(self.MIXED_PRECISION) if isinstance(self.MIXED_PRECISION, bool) else True
+        if enabled and self.MIXED_PRECISION_TYPE != "float16":
+            raise SpecError(
+                "MIXED_PRECISION enables gradient scaling, which only applies to float16: set "
+                "MIXED_PRECISION_TYPE: float16, or disable MIXED_PRECISION (bfloat16 autocast needs no scaler)."
+            )
 
     @model_validator(mode="after")
-    def _validate_user_defined_backward(self) -> Self:
-        """Validate the user-defined backward configuration."""
+    def _validate_user_defined_learner(self) -> Self:
+        """Validate the user-defined learner configuration."""
         self._validate_mixed_precision()
         self._validate_trainable_layers()
         train_inputs: list[str] = []
@@ -403,18 +499,18 @@ class UserDefinedBackward(Serializable):
         losses: list[str] = []
         infer_inputs: list[str] = []
         infer_outputs: list[str] = []
-        for backward in self.BACKWARDS:
-            backward_inputs, backward_outputs = resolve_flow(backward.FLOW, existing_values=train_outputs)
-            train_inputs += backward_inputs
-            train_outputs += backward_outputs
-            if backward.LOSS not in train_outputs:
-                msg = f'Loss "{backward.LOSS}" must be in the outputs of the backward flow but got: {train_outputs}.'
+        for learner in self.LEARNERS:
+            learner_inputs, learner_outputs = resolve_flow(learner.FLOW, existing_values=train_outputs)
+            train_inputs += learner_inputs
+            train_outputs += learner_outputs
+            if learner.LOSS not in train_outputs:
+                msg = f'Loss "{learner.LOSS}" must be in the outputs of the learner flow but got: {train_outputs}.'
                 raise SpecError(msg)
-            losses.append(backward.LOSS)
-            flow = backward.INFERENCE_FLOW or backward.FLOW
-            backward_inputs, backward_outputs = resolve_flow(flow, existing_values=infer_outputs)
-            infer_inputs += backward_inputs
-            infer_outputs += backward_outputs
+            losses.append(learner.LOSS)
+            flow = learner.INFERENCE_FLOW or learner.FLOW
+            learner_inputs, learner_outputs = resolve_flow(flow, existing_values=infer_outputs)
+            infer_inputs += learner_inputs
+            infer_outputs += learner_outputs
         train_inputs, train_outputs, losses = unique(train_inputs), unique(train_outputs), unique(losses)
         if not self.INPUTS:
             self.INPUTS.extend(train_inputs)
@@ -511,22 +607,25 @@ class TemplateLayer(Template[UserDefinedLayer]):
     target_type: ClassVar[type[UserDefinedLayer]] = UserDefinedLayer
 
 
-class TemplateBackward(Template[UserDefinedBackward]):
-    """Template for user-defined backwards."""
+class TemplateLearner(Template[UserDefinedLearner]):
+    """Template for user-defined learners."""
 
-    target_type: ClassVar[type[UserDefinedBackward]] = UserDefinedBackward
+    target_type: ClassVar[type[UserDefinedLearner]] = UserDefinedLearner
 
 
 __all__ = [
     "SPEC_EVAL",
-    "BackwardBehavior",
+    "DTypeName",
     "LayerBehavior",
+    "LearnerBehavior",
     "Parameters",
     "Template",
-    "TemplateBackward",
     "TemplateLayer",
-    "UserDefinedBackward",
+    "TemplateLearner",
+    "TensorSpec",
+    "TensorSpecTree",
     "UserDefinedLayer",
+    "UserDefinedLearner",
     "UserLayer",
     "resolve_flow",
     "resolve_inputs",
