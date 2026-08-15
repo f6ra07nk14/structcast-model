@@ -13,9 +13,8 @@ from structcast_model.builders.base_builder import (
     BaseModelBuilder,
     LayerIntermediate,
     LearnerIntermediate,
-    resolve_getter,
-    resolve_object,
 )
+from structcast_model.builders.utils import resolve_getter, resolve_object
 
 
 def _statement_names(line: str) -> tuple[set[str], set[str]]:

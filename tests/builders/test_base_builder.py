@@ -15,11 +15,10 @@ from structcast_model.builders.base_builder import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
-    resolve_getter,
-    resolve_object,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
 from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
+from structcast_model.builders.utils import resolve_getter, resolve_object
 from tests import ASSETS_DIR
 
 
@@ -459,8 +458,8 @@ def test_torch_learner_builder_with_extra_kwargs() -> None:
 
 def test_intermediate_get_scripts_raises_not_implemented() -> None:
     """_Intermediate._get_scripts must be overridden; calling it bare raises."""
-    # LazySelectedImporter only exposes __all__; get _Intermediate via function globals.
-    _Intermediate: TypeAlias = resolve_object.__globals__["_Intermediate"]
+    # LazySelectedImporter only exposes __all__; get _Intermediate via its public subclass.
+    _Intermediate: TypeAlias = LayerIntermediate.__bases__[0]
 
     class _BareIntermediate(_Intermediate):
         """Subclass that does NOT override _get_scripts."""
