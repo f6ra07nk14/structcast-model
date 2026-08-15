@@ -79,7 +79,7 @@ class SimpleLearner:
 
     @property
     def models(self) -> dict[str, torch.nn.Module]:
-        """The models to train, by name. The trainer passes them to every callback as keywords."""
+        """The models to train, by name. The trainer exposes them to every callback as `info.models`."""
         return {"model": self.model}
 
     @property
@@ -145,15 +145,14 @@ class SimpleLearner:
         """Return the fraction of correctly classified rows of the batch."""
         return (self.model(x).argmax(dim=1) == y).to(torch.float32).mean()
 
-    def on_epoch_end(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Advance the learning-rate schedule once the epoch is over.
 
         The trainer found this method by checking the learner against the `OnEpochEnd` protocol --
         no registration call, no global registry.
 
         Args:
-            info: The trainer itself, exposing `epoch`, `step`, `update`, and `logs()`.
-            **models: The models of the learner, by name.
+            info: The trainer itself, exposing `epoch`, `step`, `update`, `logs()`, and `models`.
         """
         self.scheduler.step()
 

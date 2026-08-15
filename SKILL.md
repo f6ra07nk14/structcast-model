@@ -369,7 +369,7 @@ See the [StructCast README](https://github.com/f6ra07nk14/structcast) for full p
 
 Callback wiring rule: a trainer receives its participants at construction (`learner`, `tracker`, `data`, `callbacks`) and, on first use (the first dispatched event; `describe()` only previews), routes each into every event whose `runtime_checkable` protocol it implements — scan order learner, the learner's `optimizers`, tracker, data provider, its `training_dataset` and `validation_dataset`, then `callbacks` in order, never registering the same object twice for one event. There is no global registry and no `register()` method; `trainer.describe()` reports the resulting table.
 
-The eleven events: `on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`. Every handler takes `(info: BaseInfo, **models)`, where `info` is the trainer.
+The eleven events: `on_update`, `on_training_begin`, `on_training_end`, `on_training_step_begin`, `on_training_step_end`, `on_validation_begin`, `on_validation_end`, `on_validation_step_begin`, `on_validation_step_end`, `on_epoch_begin`, `on_epoch_end`. Every handler takes `(info: BaseInfo)`, where `info` is the trainer; the models are read from `info.models`.
 
 Use this layer when the task is about callback ordering, history storage, epoch/step/update semantics, or best-model tracking independent of the torch-specific wrapper.
 

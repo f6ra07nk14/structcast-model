@@ -662,7 +662,7 @@ class _EpochAwareDataset(list[dict[str, torch.Tensor]]):
         super().__init__(batches)
         self.epochs: list[int] = []
 
-    def on_epoch_begin(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_begin(self, info: BaseInfo) -> None:
         """Record the epoch the trainer is starting."""
         self.epochs.append(info.epoch)
 

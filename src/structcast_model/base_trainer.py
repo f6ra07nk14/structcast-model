@@ -22,7 +22,7 @@ else:
 
 logger = getLogger(__name__)
 
-ModelT_contra = TypeVar("ModelT_contra", contravariant=True)
+ModelT = TypeVar("ModelT")
 
 DatasetLike: TypeAlias = Iterable[dict[str, Any]]
 """Dataset-like object."""
@@ -49,7 +49,7 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
 
 
 @runtime_checkable
-class Learner(Protocol):
+class Learner(Protocol, Generic[ModelT]):
     """Protocol for the object that owns the models and defines how they learn.
 
     A learner decides when an update should happen, how a training step runs, and how an
@@ -57,7 +57,7 @@ class Learner(Protocol):
     """
 
     @property
-    def models(self) -> dict[str, Any]:
+    def models(self) -> dict[str, ModelT]:
         """The models to train."""
 
     @property
@@ -148,7 +148,7 @@ class SimpleDataProvider:
 
 
 @dataclass(kw_only=True)
-class BaseInfo:
+class BaseInfo(Generic[ModelT]):
     """Base information for building a model."""
 
     step: int = 0
@@ -162,6 +162,11 @@ class BaseInfo:
 
     history: dict[int, dict[str, Any]] = field(default_factory=dict)
     """History of training and validation logs."""
+
+    @property
+    def models(self) -> dict[str, ModelT]:
+        """The models by name; a bare info holds none, a trainer delegates to its learner."""
+        return {}
 
     def logs(self, epoch: int | None = None) -> dict[str, Any]:
         """Get the log for the given epoch."""
@@ -189,90 +194,90 @@ EVENTS: tuple[str, ...] = (
 
 
 @runtime_checkable
-class OnUpdate(Protocol, Generic[ModelT_contra]):
+class OnUpdate(Protocol, Generic[ModelT]):
     """Protocol for objects reacting after each update."""
 
-    def on_update(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_update(self, info: "BaseInfo[ModelT]") -> None:
         """React to the models having just been updated."""
 
 
 @runtime_checkable
-class OnTrainingBegin(Protocol, Generic[ModelT_contra]):
+class OnTrainingBegin(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the beginning of training."""
 
-    def on_training_begin(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_training_begin(self, info: "BaseInfo[ModelT]") -> None:
         """React to training being about to start."""
 
 
 @runtime_checkable
-class OnTrainingEnd(Protocol, Generic[ModelT_contra]):
+class OnTrainingEnd(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the end of training."""
 
-    def on_training_end(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_training_end(self, info: "BaseInfo[ModelT]") -> None:
         """React to training having finished."""
 
 
 @runtime_checkable
-class OnTrainingStepBegin(Protocol, Generic[ModelT_contra]):
+class OnTrainingStepBegin(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the beginning of each training step."""
 
-    def on_training_step_begin(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_training_step_begin(self, info: "BaseInfo[ModelT]") -> None:
         """React to a training step being about to start."""
 
 
 @runtime_checkable
-class OnTrainingStepEnd(Protocol, Generic[ModelT_contra]):
+class OnTrainingStepEnd(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the end of each training step."""
 
-    def on_training_step_end(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_training_step_end(self, info: "BaseInfo[ModelT]") -> None:
         """React to a training step having finished."""
 
 
 @runtime_checkable
-class OnValidationBegin(Protocol, Generic[ModelT_contra]):
+class OnValidationBegin(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the beginning of validation."""
 
-    def on_validation_begin(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_validation_begin(self, info: "BaseInfo[ModelT]") -> None:
         """React to validation being about to start."""
 
 
 @runtime_checkable
-class OnValidationEnd(Protocol, Generic[ModelT_contra]):
+class OnValidationEnd(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the end of validation."""
 
-    def on_validation_end(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_validation_end(self, info: "BaseInfo[ModelT]") -> None:
         """React to validation having finished."""
 
 
 @runtime_checkable
-class OnValidationStepBegin(Protocol, Generic[ModelT_contra]):
+class OnValidationStepBegin(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the beginning of each validation step."""
 
-    def on_validation_step_begin(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_validation_step_begin(self, info: "BaseInfo[ModelT]") -> None:
         """React to a validation step being about to start."""
 
 
 @runtime_checkable
-class OnValidationStepEnd(Protocol, Generic[ModelT_contra]):
+class OnValidationStepEnd(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the end of each validation step."""
 
-    def on_validation_step_end(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_validation_step_end(self, info: "BaseInfo[ModelT]") -> None:
         """React to a validation step having finished."""
 
 
 @runtime_checkable
-class OnEpochBegin(Protocol, Generic[ModelT_contra]):
+class OnEpochBegin(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the beginning of each epoch."""
 
-    def on_epoch_begin(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_epoch_begin(self, info: "BaseInfo[ModelT]") -> None:
         """React to an epoch being about to start."""
 
 
 @runtime_checkable
-class OnEpochEnd(Protocol, Generic[ModelT_contra]):
+class OnEpochEnd(Protocol, Generic[ModelT]):
     """Protocol for objects reacting at the end of each epoch."""
 
-    def on_epoch_end(self, info: "BaseInfo", **models: ModelT_contra) -> None:
+    def on_epoch_end(self, info: "BaseInfo[ModelT]") -> None:
         """React to an epoch having finished."""
 
 
@@ -293,7 +298,7 @@ EVENT_PROTOCOLS: Mapping[str, type] = {
 
 
 @dataclass(kw_only=True)
-class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
+class BaseTrainer(BaseInfo[ModelT]):
     """Base trainer for training a model.
 
     Every participant given to the trainer -- the learner, its optimizers, the tracker, the data
@@ -301,7 +306,7 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
     first dispatched event) and routed into the lifecycle events whose protocol it implements.
     """
 
-    learner: Learner
+    learner: Learner[ModelT]
     """The learner owning the models and the step definitions."""
 
     tracker: Callable[..., dict[str, float]]
@@ -326,6 +331,11 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
 
     def __post_init__(self) -> None:
         """Extension hook kept for subclasses; the participant scan runs lazily via ``_scan``."""
+
+    @property
+    def models(self) -> dict[str, ModelT]:
+        """The learner's models, read on every access rather than snapshotted."""
+        return self.learner.models
 
     def _routed_events(self) -> dict[str, list[tuple[str, Callable[..., None]]]]:
         """Return event name to participants, scanning the current candidates.
@@ -381,12 +391,12 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
         events = self._events or self._routed_events()
         return {event: [name for name, _ in registered] for event, registered in events.items() if registered}
 
-    def _dispatch(self, event: str, **models: Any) -> None:
-        """Call every callback registered for *event* with this trainer and the models."""
+    def _dispatch(self, event: str) -> None:
+        """Call every callback registered for *event* with this trainer as the info."""
         if not self._events:
             self._scan()
         for _, callback in self._events[event]:
-            callback(self, **models)
+            callback(self)
 
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
@@ -413,12 +423,11 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
         Returns:
             Mapping[str, Any]: The logs from training, which may include metrics and other information.
         """
-        models = self.learner.models
-        self._dispatch("on_training_begin", **models)
+        self._dispatch("on_training_begin")
         elapsed_time = 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
             self.step += 1
-            self._dispatch("on_training_step_begin", **models)
+            self._dispatch("on_training_step_begin")
             elapsed_time -= time()
             updated, criteria = self.update_models(inputs)
             logs = self.tracker(**criteria)
@@ -430,9 +439,9 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
             self.logs().update(logs)
             if updated:
                 self.update += 1
-                self._dispatch("on_update", **models)
-            self._dispatch("on_training_step_end", **models)
-        self._dispatch("on_training_end", **models)
+                self._dispatch("on_update")
+            self._dispatch("on_training_step_end")
+        self._dispatch("on_training_end")
         return logs
 
     def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
@@ -445,11 +454,10 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
         Returns:
             Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
         """
-        models = self.learner.models
-        self._dispatch("on_validation_begin", **models)
+        self._dispatch("on_validation_begin")
         elapsed_time = 0.0
         for index, data in enumerate(get_dataset(dataset), start=1):
-            self._dispatch("on_validation_step_begin", **models)
+            self._dispatch("on_validation_step_begin")
             elapsed_time -= time()
             logs = self.tracker(**self.learner.inference_step(**data))
             self.sync()
@@ -458,8 +466,8 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
             if self.validation_prefix:
                 logs = {f"{self.validation_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
-            self._dispatch("on_validation_step_end", **models)
-        self._dispatch("on_validation_end", **models)
+            self._dispatch("on_validation_step_end")
+        self._dispatch("on_validation_end")
         return logs
 
     def fit(
@@ -486,27 +494,26 @@ class BaseTrainer(BaseInfo, Generic[ModelT_contra]):
             raise ValueError(f"Start epoch must be less than or equal to epochs: {start_epoch} > {epochs}")
         training_dataset = self.data.training_dataset
         validation_dataset = self.data.validation_dataset
-        models = self.learner.models
         for epoch in range(start_epoch, epochs + 1):
             self.epoch = epoch
-            self._dispatch("on_epoch_begin", **models)
+            self._dispatch("on_epoch_begin")
             self.train(training_dataset)
             if validation_dataset is not None and epoch % validation_frequency == 0:
                 self.evaluate(validation_dataset)
-            self._dispatch("on_epoch_end", **models)
+            self._dispatch("on_epoch_end")
         return self.history
 
 
 @runtime_checkable
-class OnBest(Protocol, Generic[ModelT_contra]):
+class OnBest(Protocol, Generic[ModelT]):
     """Protocol for participants notified after a monitored criterion has been checked."""
 
-    def on_best(self, info: BaseInfo, best: "BestCriterion[Any]", **models: ModelT_contra) -> None:
+    def on_best(self, info: BaseInfo[ModelT], best: "BestCriterion[ModelT]") -> None:
         """React to the check of *best* for the current epoch."""
 
 
 @dataclass(kw_only=True, slots=True)
-class BestCriterion(Generic[ModelT_contra]):
+class BestCriterion(Generic[ModelT]):
     """Callback to track the best criterion during training or validation."""
 
     target: str
@@ -515,7 +522,7 @@ class BestCriterion(Generic[ModelT_contra]):
     mode: Literal["min", "max"] = "min"
     """The mode to monitor the criterion. Either 'min' or 'max'."""
 
-    callbacks: list[OnBest[ModelT_contra]] = field(default_factory=list)
+    callbacks: list[OnBest[ModelT]] = field(default_factory=list)
     """Participants notified whenever the target was produced, the way a trainer routes events:
     each implements the ``OnBest`` protocol and receives this criterion alongside the info.
 
@@ -541,7 +548,7 @@ class BestCriterion(Generic[ModelT_contra]):
         """Get the best criterion value found."""
         return self._best
 
-    def on_epoch_end(self, info: BaseInfo, **models: ModelT_contra) -> None:
+    def on_epoch_end(self, info: BaseInfo[ModelT]) -> None:
         """Check and update the best criterion."""
         current: float | None = info.logs().get(self.target, None)
         if current is not None:
@@ -549,7 +556,7 @@ class BestCriterion(Generic[ModelT_contra]):
                 self._step = info.step
                 self._best = current
             for callback in self.callbacks:
-                callback.on_best(info, self, **models)
+                callback.on_best(info, self)
 
 
 def _format_criteria(info: BaseInfo) -> str:
@@ -590,33 +597,33 @@ class ProgressBar:
         logs = info.logs()
         self.bar.set_postfix({key: logs[key] for key in criteria if key in logs})
 
-    def on_training_begin(self, info: BaseInfo, **models: Any) -> None:
+    def on_training_begin(self, info: BaseInfo) -> None:
         """Restart the bar for the training steps of a new epoch."""
         self.bar.reset(total=self.steps_per_epoch)
 
-    def on_training_step_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_training_step_end(self, info: BaseInfo) -> None:
         """Advance the bar by one training step."""
         self.bar.update(1)
         self._set_postfix(info, self.training_criteria)
 
-    def on_training_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_training_end(self, info: BaseInfo) -> None:
         """Flush the bar after the last training step."""
         self.bar.refresh()
 
-    def on_validation_begin(self, info: BaseInfo, **models: Any) -> None:
+    def on_validation_begin(self, info: BaseInfo) -> None:
         """Restart the bar for the validation steps of the current epoch."""
         self.bar.reset(total=self.validation_steps)
 
-    def on_validation_step_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_validation_step_end(self, info: BaseInfo) -> None:
         """Advance the bar by one validation step."""
         self.bar.update(1)
         self._set_postfix(info, self.validation_criteria)
 
-    def on_validation_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_validation_end(self, info: BaseInfo) -> None:
         """Flush the bar after the last validation step."""
         self.bar.refresh()
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Write the criteria of the finished epoch above the bar."""
         self.bar.write(_format_criteria(info))
 
@@ -625,7 +632,7 @@ class ProgressBar:
 class Printer:
     """Callback printing the criteria of each epoch, for environments without a terminal."""
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Print the criteria of the finished epoch."""
         print(_format_criteria(info))
 

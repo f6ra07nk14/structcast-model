@@ -398,7 +398,7 @@ LEARNERS:
 
 **`Learner`** — The object that owns the models and defines how they learn. Members:
 
-- `models` (property) — `dict[str, Any]` of the models to train; the trainer passes them to every event as keyword arguments.
+- `models` (property) — `dict[str, ModelT]` of the models to train, where `ModelT` is the model type the trainer is specialized to (`torch.nn.Module` for `TorchTrainer`); the trainer exposes them to every event as `info.models`.
 - `update(step) -> bool` — whether the given training step applied the optimizers. `False` means gradients are still accumulating.
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
@@ -407,7 +407,7 @@ Two required members are also read elsewhere in the toolkit: `optimizers` (a map
 
 **`DataProvider`** — Supplies the datasets of a whole run and their step counts: a `training_dataset` property, a `validation_dataset` property that may be `None` to skip validation, and `steps_per_epoch` / `validation_steps` properties (`validation_steps` is `0` without a validation dataset). Each dataset may be a dataset or a zero-argument callable returning one, and the dataset properties must return the same object on every read: the trainer reads them for the event-protocol scan and again in `fit()`. Both datasets are scanned against every event protocol, so a validation dataset implementing training-phase hooks receives those events too — guard on the split inside the hook, as `TimmDataLoaderWrapper` does.
 
-**`OnBest`** — Protocol for the participants of `BestCriterion.on_best`, mirroring how the trainer routes events: an object with an `on_best(info: BaseInfo, best: BestCriterion, **models)` method.
+**`OnBest`** — Protocol for the participants of `BestCriterion.on_best`, mirroring how the trainer routes events: an object with an `on_best(info: BaseInfo, best: BestCriterion)` method.
 
 ### Event protocols
 
@@ -422,7 +422,7 @@ Two required members are also read elsewhere in the toolkit: `optimizers` (a map
 | `on_validation_step_begin` / `on_validation_step_end` | `OnValidationStepBegin` / `OnValidationStepEnd` | around each validation step                |
 | `on_epoch_begin` / `on_epoch_end`                  | `OnEpochBegin` / `OnEpochEnd`                   | around a whole epoch, validation included     |
 
-Every handler has the signature `(info: BaseInfo, **models) -> None`, where `info` is the trainer itself. An object joins an event by defining the matching method — there is no registration call and no global registry. Because the protocols are `runtime_checkable`, only the method name is checked, not its signature.
+Every handler has the signature `(info: BaseInfo) -> None`, where `info` is the trainer itself, so the models are read from `info.models`. An object joins an event by defining the matching method — there is no registration call and no global registry. Because the protocols are `runtime_checkable`, only the method name is checked, not its signature.
 
 ### State and callbacks
 
@@ -433,6 +433,7 @@ Every handler has the signature `(info: BaseInfo, **models) -> None`, where `inf
 - `epoch` — current epoch number
 - `history` — per-epoch log dictionaries
 - `logs(epoch=None)` — returns the log dict for the current (or given) epoch
+- `models` (property) — the models by name; empty on a bare info, delegated to the learner by `BaseTrainer`
 
 **`SimpleDataProvider`** — Dataclass implementing `DataProvider` over an already-built training dataset and an optional validation dataset.
 
@@ -477,7 +478,7 @@ history = trainer.fit(epochs=10)
 
 ```python
 class SaveCheckpoint:
-    def on_best(self, info: BaseInfo, best: BestCriterion, **models) -> None:
+    def on_best(self, info: BaseInfo, best: BestCriterion) -> None:
         ...  # log or save by best.value / best.step
 
 checkpoint = BestCriterion(target="val_acc1", mode="max", callbacks=[SaveCheckpoint()])

@@ -91,7 +91,7 @@ class MLflowLogger(Logger):
             return torch.load(path, map_location="cpu", weights_only=True)
         return _local_training_state(reference, 'a "runs:/<run_id>/<artifact>" URI')
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""
         self.log_metrics(_epoch_metrics(info), step=info.epoch)
 

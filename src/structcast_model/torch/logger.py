@@ -45,7 +45,7 @@ class Logger(Protocol):
     def fetch_training_state(self, reference: str) -> dict[str, Any] | None:
         """Fetch the training state the reference points to; None when the logger records nothing."""
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""
 
 
@@ -86,7 +86,7 @@ class NullLogger(Logger):
     def fetch_training_state(self, reference: str) -> None:
         """Fetch nothing: the non-main ranks receive the state through the strategy broadcast."""
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """React to nothing."""
 
 

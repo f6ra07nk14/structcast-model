@@ -372,7 +372,7 @@ class TimmDataLoaderWrapper(WithExtra):
             return (FastCollateMixup if self.use_prefetcher else Mixup)(**self.mixup_kwargs)
         raise ValueError("Mixup is not active, cannot create mixup function.")
 
-    def on_training_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+    def on_training_begin(self, info: BaseInfo) -> None:
         """Disable mixup once the configured epoch is reached.
 
         Safe to call on every training begin: it is a no-op unless this is a training split whose
@@ -394,7 +394,7 @@ class TimmDataLoaderWrapper(WithExtra):
             dataset = AugMixDataset(dataset, num_splits=self.num_aug_splits)
         return dataset
 
-    def on_epoch_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+    def on_epoch_begin(self, info: BaseInfo) -> None:
         """Tell the dataset or the distributed sampler which epoch is starting, so shuffling varies.
 
         Safe to call on every epoch begin: it is a no-op unless this is a training split whose

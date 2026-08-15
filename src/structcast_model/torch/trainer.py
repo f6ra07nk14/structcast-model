@@ -138,11 +138,11 @@ class TorchTracker:
     distributed: bool = field(default_factory=torch.distributed.is_initialized)
     """Whether the tracker is being used in a distributed training environment."""
 
-    def on_training_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+    def on_training_begin(self, info: BaseInfo) -> None:
         """Reset the tracker so an epoch's training averages start empty."""
         self.tracker.reset()
 
-    def on_validation_begin(self, info: BaseInfo, **models: torch.nn.Module) -> None:
+    def on_validation_begin(self, info: BaseInfo) -> None:
         """Reset the tracker so validation averages do not carry training values."""
         self.tracker.reset()
 
@@ -238,14 +238,14 @@ class _BestLogger:
     strategy: DistributedStrategy
     """The strategy producing the model states to save."""
 
-    def on_best(self, info: BaseInfo, best: BestCriterion[torch.nn.Module], **models: torch.nn.Module) -> None:
-        """Log the best value, and save the states of *models* when this epoch reached it."""
+    def on_best(self, info: BaseInfo[torch.nn.Module], best: BestCriterion[torch.nn.Module]) -> None:
+        """Log the best value, and save the states of the info's models when this epoch reached it."""
         name = f"best_{best.target}"
         self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
             # Producing the states is a collective, so every rank must reach it. That the ranks agree
             # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
-            self.logger.log_state_dict(self.strategy.state_dict(dict(models))["models"], name)
+            self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -258,12 +258,12 @@ class TrainingStateSaver:
     strategy: DistributedStrategy
     """The strategy producing the model and optimizer states to save."""
 
-    def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo[torch.nn.Module]) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
         # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
         states = self.strategy.state_dict(
-            dict(kwargs), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
+            dict(info.models), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
         )
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}

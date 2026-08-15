@@ -83,7 +83,7 @@ class WandbLogger(Logger):
                 return torch.load(Path(directory) / filename, map_location="cpu", weights_only=True)
         return _local_training_state(reference, 'a "wandb://<entity>/<project>/<run_id>/<file>" reference')
 
-    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+    def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""
         self.log_metrics(_epoch_metrics(info), step=info.epoch)
 
