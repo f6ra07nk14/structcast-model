@@ -1,6 +1,6 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus PyTorch training workflows — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and DistributedDataParallel (DDP).
+description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus PyTorch training workflows — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and the distributed strategies (DistributedDataParallel (DDP) or FSDP2).
 ---
 
 # StructCast-Model
@@ -126,9 +126,9 @@ scm torch train \
 What happens:
 
 1. Datasets are instantiated and composed into a `SimpleDataProvider`, which reports `steps_per_epoch` / `validation_steps`; the trainer scans the provider datasets, so every dataset implementing an event protocol joins the loop.
-2. The command builds the models and the learner on the training device, initializing and compiling them.
+2. The command builds and initializes the models on the training device, compiles them where the strategy places the units and wraps them, then constructs the learner on the wrapped models and compiles its generated `_flow_*` functions on a single device only.
 3. `TorchTracker` is built from the learner's `outputs` (or `-LO/--learner-outputs`).
-4. `TorchTrainer` is built, then the callbacks are collected on rank 0 from its prefixes: `ProgressBar` (or `Printer` with `--ci`), the logger, the training-state saver, and one `TorchBestCriterion` per `-LC`/`-HC` criterion.
+4. `TorchTrainer` is built, then the callbacks are collected from its prefixes: `ProgressBar` (or `Printer` with `--ci`) and the logger on rank 0 only, while the training-state saver and one `TorchBestCriterion` per `-LC`/`-HC` criterion join on every rank — producing their states is a collective — holding a `NullLogger` off rank 0 so only rank 0 writes.
 5. Every participant is routed into its events on first use, and `fit(epochs=...)` runs inside the logger's run context.
 
 ### Workflow 6: Measure Inference Time
@@ -189,11 +189,11 @@ What happens:
 
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
-3. Each model is wrapped with `DistributedDataParallel`.
+3. The selected `DistributedStrategy` wraps every model before the learner is constructed — `DistributedDataParallelStrategy` by default in a distributed environment, `SingleDeviceStrategy` or `FullyShardedDataParallelStrategy` (FSDP2) via `--strategy`.
 4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
 5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
-6. Experiment logging and checkpoints are gated to rank 0 only.
-7. DDP gradient sync is skipped during gradient accumulation steps.
+6. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
+7. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
 
 ## CLI Surface
 
@@ -291,9 +291,9 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
-| Save the training state | `TrainingStateSaver(logger=...)` | Save models, optimizers, gradient scalers, and loop counters each epoch |
+| Save the training state | `TrainingStateSaver(logger=..., strategy=...)` | Save models, optimizers, gradient scalers, and loop counters each epoch |
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Average criteria per pass, reset on training/validation begin, reduce across ranks |
-| Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization and DDP `no_sync` |
+| Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization; gradient sync is gated inside the generated training step |
 | Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion; `.from_criteria(...)` builds the CLI's wired monitors |
 | Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment=...)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
@@ -313,9 +313,9 @@ These live in `examples/torch/data.py` and are referenced from a configuration b
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
 | Distributed environment detection | `initial_distributed_env(device, ...)` | Read `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars, init process group |
-| DDP model wrapping | `DistributedDataParallel` (via `cmd_torch.py`) | Wrap models for multi-GPU gradient synchronization |
+| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, place the compile units, and produce wrapper-free state dicts |
 | Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
-| Gradient sync optimization | `TorchTrainer.no_sync()` | Skip DDP gradient sync during accumulation steps |
+| Gradient sync gating | `sync_gate(model, armed)` (in generated learners) | Let gradients synchronize only on the owning segment's last model call of an update step |
 
 ## Config and Pattern Vocabulary
 

@@ -7,8 +7,9 @@ import sys
 from typing import Any
 
 import pytest
-import torch.distributed as dist
 from typer.testing import CliRunner
+
+import torch.distributed as dist
 
 WANDB_LOGGER = "structcast_model.torch.wandb_logger"
 

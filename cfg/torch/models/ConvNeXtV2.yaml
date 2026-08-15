@@ -40,7 +40,6 @@ PARAMETERS:
 IMPORTS: {}
 INPUTS: [image]
 OUTPUTS: [cls]
-STRUCTURED_OUTPUT: true
 FLOW:
   - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
   - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]

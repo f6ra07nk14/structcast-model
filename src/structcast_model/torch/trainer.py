@@ -1,20 +1,20 @@
 """Trainer for PyTorch models."""
 
-from collections.abc import Callable, Collection, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Callable, Collection, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from logging import getLogger
-import os
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 
 from pydantic import TypeAdapter, ValidationError
-from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.torch.distributed import DistributedStrategy, initial_distributed_env
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 from structcast_model.torch.logger import Logger
 from structcast_model.torch.types import Tensor, TensorInitializer
+from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
 
@@ -65,25 +65,6 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     return [create_torch_inputs(v, batch_size=batch_size) for v in node]
 
 
-def get_torch_device(device: str | None = None) -> str:
-    """Get the device to run the model on."""
-    if device is None:
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if "cpu" in device:
-        return device
-    if "cuda" in device:
-        if torch.cuda.is_available():
-            return device
-        logger.warning("CUDA is not available. Using CPU instead.")
-        return "cpu"
-    raise ValueError(f'Only "cpu" and "cuda" (with optional rank suffix) are supported. Got invalid device: {device}')
-
-
-def get_torch_device_type(device: str | None = None) -> str:
-    """Get the device type (cpu or cuda) from the device string."""
-    return get_torch_device(device).split(":")[0]
-
-
 def _low_precision_dtype(inputs: Any) -> Any:
     """Return the first `float16` or `bfloat16` element type found in the inputs, or `None` if there is none."""
     if isinstance(inputs, torch.Tensor):
@@ -112,70 +93,6 @@ def autocast_inputs(inputs: Any, device_type: str) -> AbstractContextManager[Any
     """
     dtype = _low_precision_dtype(inputs)
     return nullcontext() if dtype is None else torch.autocast(device_type, dtype=dtype)
-
-
-@overload
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: Literal[True] = True,
-) -> dict[str, Any]: ...
-
-
-@overload
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: Literal[False] = False,
-) -> tuple[str, int, int, int, bool]: ...
-
-
-def initial_distributed_env(
-    device: str | None = None,
-    dist_backend: str | None = None,
-    dist_url: str | None = None,
-    *,
-    return_dict: bool = True,
-) -> dict[str, Any] | tuple[str, int, int, int, bool]:
-    """Initialize the distributed environment.
-
-    Args:
-        device (str | None): The device to run the model on, e.g., 'cuda' or 'cpu'.
-        dist_backend (str | None): The backend to use for distributed training.
-            If None, the backend will be automatically selected based on the device.
-        dist_url (str | None): The URL to use for distributed training initialization.
-            If None, the URL will be automatically generated based on the environment.
-        return_dict (bool): Whether to return the result as a dictionary.
-
-    Returns:
-        If return_dict is False, returns a tuple of (device, global_rank, local_rank, world_size, distributed).
-        If return_dict is True, returns a dictionary with device, global_rank, local_rank, world_size, distributed keys.
-    """
-    if is_distributed_env() and torch.distributed.is_initialized():
-        if "SLURM_PROCID" in os.environ:
-            local_rank, global_rank, world_size = world_info_from_env()
-        else:
-            local_rank, _, _ = world_info_from_env()
-            world_size = torch.distributed.get_world_size()
-            global_rank = torch.distributed.get_rank()
-        device_type = get_torch_device_type(device)
-        result = {
-            "device": f"{device_type}:{local_rank}" if device_type != "cpu" else "cpu",
-            "global_rank": global_rank,
-            "local_rank": local_rank,
-            "world_size": world_size,
-            "distributed": True,
-        }
-    else:
-        device = get_torch_device(device)
-        result = init_distributed_device_so(device=device, dist_backend=dist_backend, dist_url=dist_url)
-    if return_dict:
-        return result
-    return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
 
 
 def initial_model(model: Any, shapes: dict[str, Any] | None = None) -> tuple[Any, Any]:
@@ -277,40 +194,6 @@ class TorchTrainer(BaseTrainer[torch.nn.Module]):
         if "cuda" in self.device:
             torch.cuda.synchronize()
 
-    @contextmanager
-    def no_sync(self, __updated__: bool) -> Generator[None, None, None]:
-        """Context manager to disable gradient synchronizations for DistributedDataParallel models when not updating.
-
-        Args:
-            __updated__ (bool): Whether the model is being updated.
-        """
-        if __updated__:
-            yield
-        else:
-            models, old_values = self.learner.models, {}
-            try:
-                for name, model in models.items():
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                        old_values[name] = model.require_backward_grad_sync
-                        model.require_backward_grad_sync = False
-                yield
-            finally:
-                for name, value in old_values.items():
-                    models[name].require_backward_grad_sync = value
-
-    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
-        """Perform a training step and update the models.
-
-        Args:
-            __inputs__ (Any): The inputs for the training step.
-
-        Returns:
-            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
-                a dictionary of criteria for tracking.
-        """
-        with self.no_sync(updated := self.learner.update(self.step)):
-            return updated, self.learner.training_step(**__inputs__)
-
 
 @dataclass(kw_only=True, slots=True)
 class TorchBestCriterion(BestCriterion[torch.nn.Module]):
@@ -323,19 +206,21 @@ class TorchBestCriterion(BestCriterion[torch.nn.Module]):
         lower_criteria: Sequence[str],
         save_criteria: Collection[str],
         logger: Logger,
+        strategy: DistributedStrategy,
     ) -> list[Self]:
         """Build one monitor per criterion, each logging its best value through *logger*.
 
-        Criteria named in *save_criteria* also save the model states that reached the best value.
+        Criteria named in *save_criteria* also save the model states that reached the best value,
+        produced through *strategy*. Ranks that write nothing pass a :class:`NullLogger`.
         """
         monitors: list[Self] = []
         for target in higher_criteria:
             best = cls(target=target, mode="max")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         for target in lower_criteria:
             best = cls(target=target, mode="min")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         return monitors
 
@@ -345,27 +230,22 @@ class _BestLogger:
     """Log the best value of a criterion, and save the models that reached it when asked to."""
 
     logger: Logger
-    """The logger the best values and model states are written through."""
+    """The logger the best values and model states are written through; a NullLogger on non-writing ranks."""
 
     save: bool
     """Whether to also save the model states that reached the best value."""
+
+    strategy: DistributedStrategy
+    """The strategy producing the model states to save."""
 
     def on_best(self, info: BaseInfo, best: BestCriterion[torch.nn.Module], **models: torch.nn.Module) -> None:
         """Log the best value, and save the states of *models* when this epoch reached it."""
         name = f"best_{best.target}"
         self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
-            self.logger.log_state_dict(_get_state_dict(_unwrap_ddp(models)), name)
-
-
-def _get_state_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to state dict for all given modules."""
-    return {n: m.state_dict() for n, m in kwargs.items()}
-
-
-def _unwrap_ddp(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a mapping of name to module for all given modules, unwrapping DistributedDataParallel if necessary."""
-    return {n: m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m for n, m in kwargs.items()}
+            # Producing the states is a collective, so every rank must reach it. That the ranks agree
+            # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
+            self.logger.log_state_dict(self.strategy.state_dict(dict(models))["models"], name)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -373,30 +253,30 @@ class TrainingStateSaver:
     """Callback saving models, optimizers, grad scalers, and loop counters through a logger."""
 
     logger: Logger
-    """The logger the training-state artifacts are written through."""
+    """The logger the training-state artifacts are written through; a NullLogger on non-writing ranks."""
+
+    strategy: DistributedStrategy
+    """The strategy producing the model and optimizer states to save."""
 
     def on_epoch_end(self, info: BaseInfo, **kwargs: Any) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
-        states: dict[str, Any] = {
-            "models": _get_state_dict(_unwrap_ddp(kwargs)),
-            "optimizers": _get_state_dict(getattr(learner, "optimizers", {})),
-            "grad_scalers": _get_state_dict(getattr(learner, "grad_scalers", {})),
-            "meta": {"epoch": info.epoch, "step": info.step, "update": info.update},
-        }
+        # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
+        states = self.strategy.state_dict(
+            dict(kwargs), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
+        )
+        states.setdefault("optimizers", {})
+        states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
+        states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
         self.logger.log_state_dict(states, "training_state")
 
 
-# `_get_state_dict` and `_unwrap_ddp` are listed because the LazySelectedImporter tail below only
-# exposes the names in `__all__`, and the unit tests import them directly.
 __all__ = [
     "CriteriaTracker",
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
     "TrainingStateSaver",
-    "_get_state_dict",
-    "_unwrap_ddp",
     "autocast_inputs",
     "create_torch_inputs",
     "get_torch_device",

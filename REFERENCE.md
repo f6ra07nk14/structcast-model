@@ -141,7 +141,7 @@ OUTPUTS: [feat1, feat2, feat3, feat4]
 | Value             | Behavior                                                                 |
 | ----------------- | ------------------------------------------------------------------------ |
 | `true`            | Returns `{"cls": tensor, ...}` — a dict keyed by the names in `OUTPUTS`. |
-| `false` (default) | Returns a plain tuple in the order of `OUTPUTS`.                         |
+| `false` (default) | Returns the bare value for a single output, else a tuple in `OUTPUTS` order. |
 
 ```yaml
 STRUCTURED_OUTPUT: true
@@ -256,13 +256,13 @@ INPUTS: []                # auto-inferred from LEARNERS[*].FLOW
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
-**`MIXED_PRECISION`** — Controls `torch.amp.GradScaler` for automatic mixed-precision training.
+**`MIXED_PRECISION`** — Controls gradient scaling, which only counteracts float16 underflow. The scaler is built through the learner's injectable `__grad_scaler_creator__` argument, which defaults to `torch.amp.GradScaler` and is called with the training `device`.
 
-| Value             | Behavior                                                                                |
-| ----------------- | --------------------------------------------------------------------------------------- |
-| `false` (default) | AMP disabled; no `GradScaler` is created.                                               |
-| `true`            | AMP enabled with default `GradScaler` settings.                                         |
-| `dict`            | AMP enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler(...)`. |
+| Value             | Behavior                                                                                                                                     |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default) | No `GradScaler` is created. Autocast still runs when `MIXED_PRECISION_TYPE` is set — this is the bfloat16 path, which needs no scaler.        |
+| `true`            | Gradient scaling enabled with default `GradScaler` settings; requires `MIXED_PRECISION_TYPE: float16`.                                        |
+| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to the scaler creator. Requires `MIXED_PRECISION_TYPE: float16`.         |
 
 ```yaml
 MIXED_PRECISION:
@@ -273,7 +273,7 @@ MIXED_PRECISION:
   enabled: True
 ```
 
-**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. Must be omitted when `MIXED_PRECISION` is `false`; setting both raises a `SpecError` at build time.
+**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. It is valid on its own — `MIXED_PRECISION: false` with `MIXED_PRECISION_TYPE: bfloat16` is autocast without a scaler. Enabling `MIXED_PRECISION` with anything other than `float16` raises a `SpecError` at build time, because gradient scaling only applies to float16.
 
 ```yaml
 MIXED_PRECISION_TYPE: bfloat16
@@ -460,7 +460,7 @@ Key methods:
 - `train(dataset)` — runs one training pass, returns the final step logs
 - `evaluate(dataset)` — runs one validation pass, returns the final step logs
 - `fit(epochs, start_epoch=1, validation_frequency=1)` — runs the full loop over the data provider's datasets and returns the complete history dict
-- `update_models(inputs)` — performs one training step, returning `(updated, criteria)`; overridden in `TorchTrainer` to disable DDP gradient synchronization while accumulating
+- `update_models(inputs)` — performs one training step, returning `(updated, criteria)`; gradient synchronization is gated inside the generated training step, not here
 - `sync()` — optional synchronization hook, no-op by default (overridden in `TorchTrainer`)
 
 ```python
@@ -490,7 +490,7 @@ Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `callbacks
 
 ## API Reference: `trainer.py`
 
-[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer.
+[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer. The `DistributedStrategy` implementations it saves states through live in [`src/structcast_model/torch/distributed.py`](src/structcast_model/torch/distributed.py) — `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, and `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) — together with `sync_gate(model, armed)`, the per-call gradient-synchronization gate the generated learners use.
 
 ### Utility functions
 
@@ -515,7 +515,7 @@ tracker = TorchTracker.from_criteria(["ce_loss", "acc1", "acc5"])
 logs = tracker(ce_loss=loss_tensor, acc1=acc1_tensor, acc5=acc5_tensor)
 ```
 
-**`TorchTrainer`** — Extends `BaseTrainer` with a `device` field, CUDA synchronization, and `no_sync`, which suppresses `DistributedDataParallel` gradient synchronization on steps that do not update.
+**`TorchTrainer`** — Extends `BaseTrainer` with a `device` field and CUDA synchronization. It adds no gradient-synchronization context: generated learners gate synchronization per model call with `sync_gate`, so the trainer runs the step as-is.
 
 ```python
 data = SimpleDataProvider(training_dataset=train_loader, validation_dataset=valid_loader)
@@ -532,16 +532,16 @@ trainer = TorchTrainer(
 history = trainer.fit(epochs=5)
 ```
 
-**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it; the CLI appends the returned monitors to its callbacks.
+**`TorchBestCriterion`** — `BestCriterion` specialized to `torch.nn.Module` models. `TorchBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger, strategy)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it, produced through *strategy*. *logger* is a `NullLogger` on the ranks that write nothing, while the state dicts are still produced on every rank; the CLI appends the returned monitors to its callbacks.
 
-**`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it: the model state dicts (unwrapping `DistributedDataParallel`), the learner's optimizer and gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact.
+**`TrainingStateSaver`** — Callback saving the full training state of each finished epoch through a logger, so a run can be resumed from it with `--resume`: the model and optimizer state dicts produced by the strategy through `torch.distributed.checkpoint.state_dict` (wrapper-free keys for raw, compiled, DDP, and FSDP2 models alike), the learner's gradient scaler state dicts, and the epoch/step/update counters, written as the `training_state` artifact. Producing the states is a collective that runs on every rank; only the ranks holding a logger write them.
 
 ```python
-saver = TrainingStateSaver(logger=logger)
+saver = TrainingStateSaver(logger=logger, strategy=strategy)
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
-The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, and handed to the learner by name.
+The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, broadcast via `sync_initial_weights`, compiled and wrapped by the strategy, and handed to the learner by name.
 
 ---
 

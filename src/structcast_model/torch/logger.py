@@ -44,6 +44,44 @@ class Logger(Protocol):
         """Log the criteria and learning rates of the finished epoch."""
 
 
+class NullLogger(Logger):
+    """Logger that records nothing.
+
+    The write-side null object for ranks that must run the collective checkpoint production but
+    own no experiment-tracking run (every rank except rank 0): callbacks call it unconditionally
+    and only the ranks holding a real logger persist anything. Test fakes subclass it and override
+    the one method they observe, satisfying the full protocol without ceremony.
+    """
+
+    def __enter__(self) -> "Logger":
+        """Start nothing and hand back the logger, mirroring a real run's context shape."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """End nothing."""
+
+    def log_params(self, params: Mapping[str, Any]) -> None:
+        """Discard the run parameters."""
+
+    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+        """Discard the dictionary."""
+
+    def log_artifact(self, path: str) -> None:
+        """Discard the artifact."""
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        """Discard the metric value."""
+
+    def log_metrics(self, metrics: Mapping[str, float], step: int) -> None:
+        """Discard the metric values."""
+
+    def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
+        """Discard the state dictionary."""
+
+    def on_epoch_end(self, info: BaseInfo, **models: Any) -> None:
+        """React to nothing."""
+
+
 def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
     """Merge the learner's learning rates and decay values into the criteria of the current epoch.
 
@@ -59,7 +97,7 @@ def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
 
 # `_epoch_metrics` is listed because the LazySelectedImporter tail below only exposes the names in
 # `__all__`, and the two logger backends import it from here.
-__all__ = ["Logger", "_epoch_metrics"]
+__all__ = ["Logger", "NullLogger", "_epoch_metrics"]
 
 
 if not TYPE_CHECKING:

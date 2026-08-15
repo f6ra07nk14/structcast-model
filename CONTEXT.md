@@ -50,6 +50,17 @@ _Avoid_: tracker
 Monitors one criterion for its best value seen so far and notifies its on-best participants after every epoch
 that produced the criterion.
 
+**Distributed strategy**:
+The replaceable unit that decides how models are wrapped, gradient-synchronized, weight-initialized across
+ranks, compiled (where the compile units sit), and turned into checkpointable state. Exactly one strategy
+is active per training run; single-device training uses a strategy too, not a special case.
+_Avoid_: dist_fn, wrapper function, backend
+
+**Training state**:
+The checkpoint artifact produced at epoch end — model weights, optimizer states, gradient-scaler states, and
+progress metadata — sufficient to resume a training run at an epoch boundary.
+_Avoid_: checkpoint dict, snapshot
+
 ### Data
 
 **Dataset**:

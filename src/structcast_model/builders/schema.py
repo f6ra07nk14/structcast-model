@@ -477,12 +477,17 @@ class UserDefinedLearner(Serializable):
             raise SpecError(f"Missing trainable layers found: {missing}.")
 
     def _validate_mixed_precision(self) -> None:
-        """Validate the mixed precision configuration."""
-        if isinstance(self.MIXED_PRECISION, bool) and not self.MIXED_PRECISION:
-            if self.MIXED_PRECISION_TYPE is not None:
-                raise SpecError("MIXED_PRECISION_TYPE must be None when MIXED_PRECISION is False.")
-        elif self.MIXED_PRECISION is None:
-            raise SpecError("MIXED_PRECISION must be a boolean or a dictionary when MIXED_PRECISION_TYPE is not None.")
+        """Validate the mixed precision configuration.
+
+        MIXED_PRECISION enables gradient scaling, which only counteracts float16 underflow;
+        MIXED_PRECISION_TYPE alone configures autocast and is valid without a scaler.
+        """
+        enabled = bool(self.MIXED_PRECISION) if isinstance(self.MIXED_PRECISION, bool) else True
+        if enabled and self.MIXED_PRECISION_TYPE != "float16":
+            raise SpecError(
+                "MIXED_PRECISION enables gradient scaling, which only applies to float16: set "
+                "MIXED_PRECISION_TYPE: float16, or disable MIXED_PRECISION (bfloat16 autocast needs no scaler)."
+            )
 
     @model_validator(mode="after")
     def _validate_user_defined_learner(self) -> Self:

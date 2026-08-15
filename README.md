@@ -283,7 +283,7 @@ scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: 
 
 - `-p/--parameter`: override template parameters
 - `-c/--classname`: set the generated class name, default `Model`
-- `--no-structured-output`: force tuple-like return behavior instead of a structured output mapping
+- `--structured-output/--no-structured-output`: force the root model's return type. `scm torch` defaults to the template's `STRUCTURED_OUTPUT` (a plain tuple-like return unless the template sets it); `scm flax` and `scm keras` default to a structured output mapping
 - `-s/--sublayer`: generate a named sublayer from the template instead of the root model
 - `-o/--output`: output file path; if omitted, defaults to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
 
@@ -423,15 +423,17 @@ Key arguments:
 - `-E/--experiment`: experiment name passed to the logger
 - `-A/--log-artifacts`: files to store as run artifacts
 - `--trainer`: StructCast pattern for a `TorchTrainer` replacement, when the default loop is not enough
+- `--strategy`: StructCast pattern for the `DistributedStrategy`; it is called with the resolved `device` and `local_rank`. Defaults to `DistributedDataParallelStrategy` when a distributed environment is detected, and `SingleDeviceStrategy` otherwise
+- `--resume`: training state to restore before the loop starts — a local path, a `runs:/<run_id>/<artifact>` MLflow URI, or a `wandb://entity/project/run/file` URI. Models, optimizers, and gradient scalers are restored and training continues from the saved epoch (`--start-epoch` is overridden, with a warning)
 
 What the train command does internally:
 
 1. Instantiates the datasets and composes them into a `SimpleDataProvider`, which reports `steps_per_epoch` and `validation_steps`. The trainer scans the provider datasets for event protocols, so a dataset implementing one receives the lifecycle events it defines.
-2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers, and builds the learner from the models.
+2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers on rank 0 and broadcasts the result (`sync_initial_weights`), then compiles each model where the strategy places the units and hands it to the strategy, which wraps it. The learner is built from the already-wrapped models.
 3. Builds a `TorchTracker` from the learner's output names, still inside the device scope so its buffers live on the training device.
-4. Wraps the models in `DistributedDataParallel` when the run is distributed, and compiles the models and the learner's step functions.
+4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step — on a single device only. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
 5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
-6. Collects the callbacks — on rank 0 only — a `ProgressBar` (or a `Printer` under `--ci`) labeled with the trainer's prefixes, the logger, a training-state saver, and one `TorchBestCriterion` per monitored criterion; they join the trainer's events on first use, and the resulting routing is printed.
+6. Collects the callbacks from the trainer's prefixes: a `ProgressBar` (or a `Printer` under `--ci`) and the logger on rank 0 only, plus a training-state saver and one `TorchBestCriterion` per monitored criterion on every rank — producing their states is a collective, and off rank 0 they hold a `NullLogger` and write nothing. They join the trainer's events on first use, and the resulting routing is printed.
 7. Runs `fit()` inside the logger's run context, recording metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints.
 
 #### Distributed Training with `torchrun`
@@ -440,7 +442,7 @@ What the train command does internally:
 
 > **⚠️ SyncBatchNorm Warning**
 >
-> When using multi-GPU training with `DistributedDataParallel`, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training with DDP, consider applying [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) to the model **before** wrapping it with `DistributedDataParallel`. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
+> When using multi-GPU training, `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). Standard `BatchNorm` computes statistics per-GPU, which can cause inconsistent behavior across ranks — especially with small per-GPU batch sizes. If your model contains `BatchNorm` layers and you are training distributed, apply [`torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm.convert_sync_batchnorm) **at model construction time**, since the CLI wraps the models with the distributed strategy right after the initializers run. This conversion must happen in user code or in the model definition; the CLI will not perform it for you.
 
 ##### How It Works
 
@@ -448,11 +450,11 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 
 1. **Process group initialization** — The NCCL backend is initialized via [`torch.distributed.init_process_group`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group).
 2. **Per-rank device assignment** — Each process is assigned to `cuda:<LOCAL_RANK>`.
-3. **DDP model wrapping** — All models are wrapped with [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
+3. **Strategy model wrapping** — Every model is wrapped by the selected `DistributedStrategy` before the learner is built. The default in a distributed environment is [`DistributedDataParallel`](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html); `SingleDeviceStrategy` and `FullyShardedDataParallelStrategy` ([FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), requires `torch>=2.6`) are selectable through `--strategy`.
 4. **Distributed data loading** — The example [`TimmDataLoaderWrapper`](examples/torch/data.py) automatically creates a [`DistributedSampler`](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler) when a distributed environment is detected. Per-epoch reshuffling additionally needs the sampler's `set_epoch()`, which the wrapper issues from its own `on_epoch_begin`; the trainer scans the provider datasets for event protocols on every rank, so the hook runs everywhere it must.
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
-6. **Rank-0 logging** — Experiment logging, progress bars, and checkpoint saving are performed only on rank 0.
-7. **Gradient sync optimization** — During gradient accumulation steps, DDP gradient synchronization is disabled to reduce communication overhead.
+6. **Rank-0 logging** — Experiment logging and progress bars run only on rank 0. Checkpoint states are produced on **every** rank, because the strategy's state dict is a collective, and written only by rank 0.
+7. **Gradient sync gating** — Generated learners precede every model call with a `sync_gate(model, armed)` statement. Gradients synchronize only on the last call of a model owned by the running optimizer segment, on steps that update; every other call runs without synchronization, which covers gradient accumulation.
 8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
 
 ##### Single-Node Multi-GPU
@@ -555,8 +557,8 @@ scm format cfg/torch/others/default_timm.yaml \
 - **Seed reproducibility** — Each rank's random seed is offset by `global_rank` to ensure different data augmentation across processes while remaining reproducible.
 - **Learning rate scaling** — When scaling to multiple GPUs, consider adjusting the learning rate. A common practice is [linear scaling](https://arxiv.org/abs/1706.02677): multiply the base learning rate by the number of GPUs. This must be configured in the learner template or optimizer settings — `scm torch train` does not scale the learning rate automatically.
 - **SyncBatchNorm** — `scm torch train` does **not** automatically convert `BatchNorm` layers to [`SyncBatchNorm`](https://docs.pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html). If your model uses `BatchNorm` and you are training with DDP, consider applying `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition. See the [SyncBatchNorm warning](#distributed-training-with-torchrun) for details.
-- **`torch.compile` and DDP** — When both `--compile` and DDP are active, `torch.compile` is applied **before** DDP wrapping.
-- **Checkpoint saving** — Only rank 0 saves checkpoints and logs to the experiment tracking service. When resuming from a checkpoint in a distributed setting, all ranks load the same checkpoint.
+- **`torch.compile` and the strategy** — with `--compile`, the strategy decides where its compile units sit: the model root in place by default, the matched `shard_modules` blocks under per-block FSDP2 — always **before** wrapping, so the strategy wrapper stays outermost. The learner's generated `_flow_*` functions compile on a single device only (distributed wrappers graph-break inside them); the eager step methods are never compiled.
+- **Checkpoint saving** — State dicts are produced through [`torch.distributed.checkpoint.state_dict`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html), so the keys are wrapper-free for raw, compiled, DDP, and FSDP2 models alike. Producing them is a collective that runs on every rank; only rank 0 writes them to the experiment tracking service. `--resume` loads the same training state on all ranks.
 
 ## Training Loop Anatomy
 
@@ -603,7 +605,6 @@ The `cfg/` directory contains working YAML templates that demonstrate each part 
 # Root model: routes tensors through backbone → pooling → classifier
 INPUTS: [image]
 OUTPUTS: [cls]
-STRUCTURED_OUTPUT: true
 FLOW:
   - [image, {feature: feat4}, backbone, {TYPE: Backbone}]
   - [feature, _, [_obj_, {_addr_: torch.nn.AdaptiveAvgPool2d}, {_call_: {output_size: 1}}]]

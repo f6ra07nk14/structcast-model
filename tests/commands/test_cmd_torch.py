@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from datetime import timedelta
 from functools import partial
+import json
 import os
 import pathlib
 import traceback
@@ -15,7 +17,6 @@ from typing import Any
 import mlflow
 from mlflow.tracking import MlflowClient
 import pytest
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode_stack
 from typer import Typer
@@ -24,9 +25,10 @@ from typer.testing import CliRunner
 from structcast_model.base_trainer import BaseInfo
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import TorchTrainer, _get_state_dict, _unwrap_ddp
+from structcast_model.torch.trainer import TorchTrainer
 from tests import ASSETS_DIR
 import torch
+import torch.distributed as dist
 
 LINEAR_CFG = str(ASSETS_DIR / "cfg" / "torch" / "Linear.yaml")
 MODEL_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
@@ -39,7 +41,6 @@ LEARNER_CFG = str(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2Learner.yaml")
 _CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_compile_module = _CMD_GLOBALS["_compile_module"]
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 
@@ -91,6 +92,22 @@ class SimpleModel(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
         """Forward pass."""
         return {"logits": self.fc(x)}
+
+
+class ZeroLinear(torch.nn.Linear):
+    """A `Linear(2 -> 1)` starting at zero, so a rank's gradient is decided by its batch alone.
+
+    Public so that object patterns can address it.
+    """
+
+    def __init__(self) -> None:
+        """Create the layer without a bias and zero its weight."""
+        super().__init__(2, 1, bias=False)
+        torch.nn.init.zeros_(self.weight)
+
+    def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Forward pass, taking the input under the name the datasets and the shapes use."""
+        return super().forward(x)
 
 
 class _SimpleLoss(torch.nn.Module):
@@ -163,6 +180,51 @@ class LearnerWithoutOutputs(SimpleLearner):
     outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
 
 
+class GradientLearner:
+    """Learner running one squared-error step and dumping the gradient it produced to disk.
+
+    The command builds the learner with the models the strategy wrapped, so the gradient read here
+    is whatever that wrapper leaves behind: under DDP, the average over the ranks. Nothing zeroes
+    the gradients and there is no optimizer, so a one-step run leaves exactly that value.
+    """
+
+    outputs: list[str] = ["loss"]
+
+    def __init__(self, **models: torch.nn.Module) -> None:
+        """Keep the models the command built."""
+        self._models = models
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return models."""
+        return self._models
+
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """Return no optimizers: the run reads gradients, it never applies them."""
+        return {}
+
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        """Return no learning rates, there being no optimizer."""
+        return {}
+
+    def update(self, step: int) -> bool:
+        """Always signal update."""
+        return True
+
+    def training_step(self, x: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """Run one step and write the model's gradient, right after the backward, to `GRADIENT_DIR`."""
+        model = self._models["model"]
+        loss = ((model(x) - target) ** 2).sum()
+        loss.backward()
+        gradient = next(model.parameters()).grad
+        assert gradient is not None, "the backward pass left no gradient on the model parameters"
+        path = pathlib.Path(os.environ["GRADIENT_DIR"], f"grad_{os.environ['RANK']}.json")
+        path.write_text(json.dumps(gradient.flatten().tolist()))
+        return {"loss": loss.detach()}
+
+
 def _make_training_dataset() -> list[dict[str, torch.Tensor]]:
     """Create a minimal training dataset (list of batches)."""
     return [{"x": torch.randn(4, 4), "target": torch.randint(0, 2, (4,))} for _ in range(3)]
@@ -189,6 +251,9 @@ def _address(name: str) -> str:
 
 MODEL_PATTERN: list[Any] = ["_obj_", {"_addr_": _address("SimpleModel")}, "_call_"]
 """Object pattern building one `SimpleModel`."""
+
+ZERO_MODEL_PATTERN: list[Any] = ["_obj_", {"_addr_": _address("ZeroLinear")}, "_call_"]
+"""Object pattern building one `ZeroLinear`."""
 
 
 def _learner_pattern(classname: str = "SimpleLearner") -> list[Any]:
@@ -269,10 +334,24 @@ def test_create_model_passes_classname(tmp_path: Any, cli_runner: CliRunner) -> 
     assert "class MyNet" in (tmp_path / "my_net.py").read_text()
 
 
-def test_create_model_structured_output_default_true(tmp_path: Any, cli_runner: CliRunner) -> None:
-    """'create model' should default structured_output to True (dict return in root class)."""
+def test_create_model_structured_output_defaults_to_configuration(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model' leaves the return type to the template, which here means a bare tensor.
+
+    The root of the ConvNeXtV2 template sets no STRUCTURED_OUTPUT, so its single `cls` output must
+    stay a plain tensor a loss can consume; only the multi-output Backbone opts into a dict.
+    """
     out = str(tmp_path / "model.py")
     result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--output", out])
+    assert result.exit_code == 0, result.output
+    script = (tmp_path / "model.py").read_text()
+    assert "return {'feat1'" in script  # the Backbone's own STRUCTURED_OUTPUT is still honored
+    assert "return {'" not in script.rsplit("class Model", 1)[-1]
+
+
+def test_create_model_forced_structured_output(tmp_path: Any, cli_runner: CliRunner) -> None:
+    """'create model --structured-output' overrides the template and returns a dict from the root."""
+    out = str(tmp_path / "model.py")
+    result = cli_runner.invoke(app, ["create", "model", MODEL_CFG, "--structured-output", "--output", out])
     assert result.exit_code == 0, result.output
     last_class = (tmp_path / "model.py").read_text().rsplit("class Model", 1)[-1]
     assert "return {'" in last_class
@@ -343,8 +422,9 @@ def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: C
     script = (tmp_path / "learner.py").read_text()
     assert "class Learner" in script
     # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
-    for member in ("def update(self", "def training_step(self", "def inference_step(self", "def models(self"):
+    for member in ("def update(self", "def training_step(self", "def inference_step(self"):
         assert member in script
+    assert "def models(self" in script
 
 
 def test_create_learner_passes_default_classname(tmp_path: Any, cli_runner: CliRunner) -> None:
@@ -413,17 +493,6 @@ def test_instantiate_builds_linear_with_args() -> None:
     assert isinstance(result, torch.nn.Linear)
     assert result.in_features == 8
     assert result.out_features == 4
-
-
-# ---------------------------------------------------------------------------
-# _compile_module
-# ---------------------------------------------------------------------------
-
-
-def test_compile_module_returns_module_when_no_kwargs() -> None:
-    """_compile_module returns the module unchanged when compile_kw is None."""
-    module = torch.nn.Linear(4, 2)
-    assert _compile_module(module, None) is module
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +595,8 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
             trainer_pattern=None,
             epochs=1,
             start_epoch=1,
+            resume=None,
+            strategy_pattern=None,
             training_dataset_pattern="TRAIN_DS",
             validation_dataset_pattern=None,
             validation_frequency=1,
@@ -559,6 +630,8 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
             trainer_pattern=None,
             epochs=1,
             start_epoch=1,
+            resume=None,
+            strategy_pattern=None,
             training_dataset_pattern="TRAIN_DS",
             validation_dataset_pattern=None,
             validation_frequency=1,
@@ -625,6 +698,7 @@ def _invoke_train(
     log_arguments: list[dict[str, Any]] | None = None,
     log_artifacts: list[pathlib.Path] | None = None,
     epochs: int = 2,
+    resume: str | None = None,
 ) -> None:
     """Invoke the ``train`` callback with real modules, patching only the dataset instantiation."""
     if training_data is None:
@@ -648,6 +722,7 @@ def _invoke_train(
             trainer_pattern=trainer_pattern,
             epochs=epochs,
             start_epoch=1,
+            resume=resume,
             training_dataset_pattern="TRAIN_DS",
             validation_dataset_pattern="VALID_DS",
             validation_frequency=1,
@@ -663,6 +738,7 @@ def _invoke_train(
             ci=ci,
             dist_backend=None,
             dist_url=None,
+            strategy_pattern=None,
         )
 
 
@@ -681,6 +757,19 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     assert run.data.metrics["best_acc"] == pytest.approx(0.9)
     artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)]
     assert {"training_state", "best_acc", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
+
+
+def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
+    """--resume must continue at the epoch after the saved one instead of training the run again."""
+    _invoke_train(tmp_path, epochs=2)
+    # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
+    (state,) = (tmp_path / "mlruns").rglob("training_state/state_dict.pth")
+    _invoke_train(tmp_path, epochs=3, resume=str(state))
+    runs = mlflow.search_runs(experiment_names=["test-e2e"], output_format="list")
+    assert len(runs) == 2
+    resumed = max(runs, key=lambda run: run.info.start_time)
+    history = MlflowClient().get_metric_history(resumed.info.run_id, "val_loss")
+    assert [metric.step for metric in history] == [3]
 
 
 def test_train_ci_mode_with_learner_outputs_fallback(tmp_path: pathlib.Path) -> None:
@@ -798,19 +887,21 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
 # ---------------------------------------------------------------------------
 
 
-def _patch_ddp_for_cpu() -> None:
-    """Monkey-patch DDP __init__ to drop device_ids/output_device for CPU-only testing.
+def _init_worker_group(rank: int, world_size: int, init_file: str) -> None:
+    """Join the gloo group of a spawned worker.
 
-    Safe to call in a forked child process -- does not affect the parent.
+    The timeout turns a collective the ranks disagree on into a failure rather than a hung CI job.
     """
-    _orig_init = torch.nn.parallel.DistributedDataParallel.__init__
-
-    def _cpu_safe_init(
-        self: Any, module: torch.nn.Module, device_ids: Any = None, output_device: Any = None, **kwargs: Any
-    ) -> None:
-        _orig_init(self, module, device_ids=None, output_device=None, **kwargs)
-
-    torch.nn.parallel.DistributedDataParallel.__init__ = _cpu_safe_init
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
 
 
 def _ddp_train_worker(
@@ -821,13 +912,7 @@ def _ddp_train_worker(
     ci: bool,
 ) -> None:
     """Worker function for DDP training tests launched by mp.spawn."""
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
-    _patch_ddp_for_cpu()
-
+    _init_worker_group(rank, world_size, init_file)
     try:
         mlflow.set_tracking_uri(mlflow_uri)
         training_data = _make_training_dataset()
@@ -850,6 +935,8 @@ def _ddp_train_worker(
                 trainer_pattern=None,
                 epochs=2,
                 start_epoch=1,
+                resume=None,
+                strategy_pattern=None,
                 training_dataset_pattern="TRAIN_DS",
                 validation_dataset_pattern="VALID_DS",
                 validation_frequency=1,
@@ -892,13 +979,7 @@ def _ddp_rank_gating_worker(
     result_dir: str,
 ) -> None:
     """Worker that verifies rank-based gating: only rank 0 creates MLflow runs."""
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
-    _patch_ddp_for_cpu()
-
+    _init_worker_group(rank, world_size, init_file)
     try:
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
@@ -919,6 +1000,8 @@ def _ddp_rank_gating_worker(
                 trainer_pattern=None,
                 epochs=1,
                 start_epoch=1,
+                resume=None,
+                strategy_pattern=None,
                 training_dataset_pattern="TRAIN_DS",
                 validation_dataset_pattern=None,
                 validation_frequency=1,
@@ -962,11 +1045,7 @@ def _ddp_seed_offset_worker(
     seed: int,
 ) -> None:
     """Worker that records the seed applied after train() so we can verify rank offset."""
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
-    _patch_ddp_for_cpu()
+    _init_worker_group(rank, world_size, init_file)
     try:
         mlflow_uri = os.path.join(result_dir, "mlruns")
         mlflow.set_tracking_uri(mlflow_uri)
@@ -987,6 +1066,8 @@ def _ddp_seed_offset_worker(
                 trainer_pattern=None,
                 epochs=1,
                 start_epoch=1,
+                resume=None,
+                strategy_pattern=None,
                 training_dataset_pattern="TRAIN_DS",
                 validation_dataset_pattern=None,
                 validation_frequency=1,
@@ -1026,39 +1107,122 @@ def test_train_distributed_seeds_offset_by_rank(tmp_path: pathlib.Path) -> None:
     assert seed0 != seed1
 
 
-def _ddp_unwrap_state_worker(
+def _run_train_on_rank(
     rank: int,
     world_size: int,
     init_file: str,
     result_dir: str,
+    training_data: list[dict[str, torch.Tensor]],
+    **overrides: Any,
 ) -> None:
-    """Worker that verifies DDP models are properly unwrapped."""
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    """Run a one-epoch, validation-free `train` on one rank of a spawned gloo group."""
+    _init_worker_group(rank, world_size, init_file)
+    mlflow.set_tracking_uri(os.path.join(result_dir, "mlruns"))
+    options: dict[str, Any] = {
+        "model_patterns": [{"model": MODEL_PATTERN}],
+        "initializer_patterns": None,
+        "shapes": [{"x": (4,)}],
+        "device": "cpu",
+        "learner_pattern": _learner_pattern(),
+        "learner_outputs": None,
+        "compile_pattern": None,
+        "trainer_pattern": None,
+        "epochs": 1,
+        "start_epoch": 1,
+        "resume": None,
+        "strategy_pattern": None,
+        "training_dataset_pattern": "TRAIN_DS",
+        "validation_dataset_pattern": None,
+        "validation_frequency": 1,
+        "lower_criteria": [],
+        "higher_criteria": [],
+        "save_criteria": [],
+        "seed": 42,
+        "matmul_precision": "high",
+        "logger_name": "mlflow",
+        "log_arguments": None,
+        "log_artifacts": None,
+        "ci": True,
+        "dist_backend": "gloo",
+        "dist_url": f"file://{init_file}",
+        **overrides,
+    }
+    deps = {"instantiate_object": _make_instantiate_fn(training_data=training_data)}
+    train_fn = _train_callback()
+    originals = {k: _CMD_GLOBALS.get(k) for k in deps}
+    _CMD_GLOBALS.update(deps)
     try:
-        model = torch.nn.Linear(4, 2)
-        ddp_model = torch.nn.parallel.DistributedDataParallel(model)
-        result = _unwrap_ddp({"model": ddp_model})
-        assert result["model"] is model
-        state = _get_state_dict(_unwrap_ddp({"model": ddp_model}))
-        assert "model" in state
-        assert "weight" in state["model"]
-        pathlib.Path(result_dir, f"unwrap_rank_{rank}_ok").write_text("ok")
+        train_fn(**options)
     except Exception:
         traceback.print_exc()
         raise
     finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        _CMD_GLOBALS.update(originals)
 
 
-def test_train_distributed_unwraps_ddp_when_saving_state(tmp_path: pathlib.Path) -> None:
-    """_unwrap_ddp correctly unwraps real DDP models in multi-process setting."""
-    init_file = str(tmp_path / "dist_init_unwrap")
+class _WrapAssertingTrainer(TorchTrainer):
+    """Trainer checking the learner it was built with holds the models the strategy wrapped."""
+
+    def fit(self, *args: Any, **kwargs: Any) -> dict[int, dict[str, Any]]:
+        """Assert the wrap reached the learner, then train."""
+        models = self.learner.models
+        assert all(isinstance(m, torch.nn.parallel.DistributedDataParallel) for m in models.values()), (
+            f"the learner was built with unwrapped models: {models}"
+        )
+        return super().fit(*args, **kwargs)
+
+
+def _ddp_wrapped_models_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Worker that verifies the learner receives DDP-wrapped models."""
+    _run_train_on_rank(
+        rank,
+        world_size,
+        init_file,
+        result_dir,
+        _make_training_dataset(),
+        trainer_pattern=_WrapAssertingTrainer,
+        experiment="test-wrap",
+    )
+    pathlib.Path(result_dir, f"wrap_rank_{rank}_ok").write_text("ok")
+
+
+def test_train_distributed_builds_the_learner_with_wrapped_models(tmp_path: pathlib.Path) -> None:
+    """The strategy must wrap before the learner is built: a learner holding raw modules never syncs."""
+    init_file = str(tmp_path / "dist_init_wrap")
     result_dir = str(tmp_path / "results")
     os.makedirs(result_dir, exist_ok=True)
-    mp.spawn(_ddp_unwrap_state_worker, args=(2, init_file, result_dir), nprocs=2, join=True)
-    assert (tmp_path / "results" / "unwrap_rank_0_ok").exists()
-    assert (tmp_path / "results" / "unwrap_rank_1_ok").exists()
+    mp.spawn(_ddp_wrapped_models_worker, args=(2, init_file, result_dir), nprocs=2, join=True)
+    assert (tmp_path / "results" / "wrap_rank_0_ok").exists()
+    assert (tmp_path / "results" / "wrap_rank_1_ok").exists()
+
+
+def _ddp_gradient_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Worker training one batch, whose gradient alone differs per rank, through the real CLI path."""
+    os.environ["GRADIENT_DIR"] = result_dir
+    x, target = ([[1.0, 0.0]], 1.0) if rank == 0 else ([[0.0, 1.0]], 2.0)
+    _run_train_on_rank(
+        rank,
+        world_size,
+        init_file,
+        result_dir,
+        [{"x": torch.tensor(x), "target": torch.tensor([target])}],
+        model_patterns=[{"model": ZERO_MODEL_PATTERN}],
+        shapes=[{"x": (2,)}],
+        learner_pattern=_learner_pattern("GradientLearner"),
+        experiment="test-gradient",
+    )
+
+
+def test_train_distributed_ddp_synchronizes_gradients(tmp_path: pathlib.Path) -> None:
+    """A DDP run must all-reduce the gradients: both ranks step on the average, not on their batch.
+
+    From zero weights, rank 0's batch alone produces [-2, 0] and rank 1's [0, -4]; the wrap the
+    command installs averages them, so every rank reads [-1, -2] right after its backward.
+    """
+    init_file = str(tmp_path / "dist_init_gradient")
+    result_dir = str(tmp_path / "results")
+    os.makedirs(result_dir, exist_ok=True)
+    mp.spawn(_ddp_gradient_worker, args=(2, init_file, result_dir), nprocs=2, join=True)
+    for rank in (0, 1):
+        gradient = json.loads((tmp_path / "results" / f"grad_{rank}.json").read_text())
+        assert gradient == pytest.approx([-1.0, -2.0]), f"rank {rank} kept its own gradient"
