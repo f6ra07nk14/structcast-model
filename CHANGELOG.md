@@ -1,3 +1,43 @@
+## [4.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v3.0.0...v4.0.0) (2026-08-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **base-trainer:** lifecycle events no longer pass **models keyword
+arguments; every handler signature is on_*(info) and
+on_best(info, best), with models read from info.models. on_best's
+criterion parameter tightens from BestCriterion[Any] to
+BestCriterion[ModelT].
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **torch:** --resume must match the active --logger; resuming from the
+other service's reference (e.g. --logger wandb with runs:/...) now fails
+with a ValueError. Download the artifact and resume from a local path
+instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+### 📔 Docs
+
+* **reference:** correct CFG and TYPE sublayer semantics ([fdb72be](https://github.com/f6ra07nk14/structcast-model/commit/fdb72bea43b67ce1e0d2f3d63a1b4aa1c9c06de5))
+
+
+### 🔧 Fixes
+
+* **base-trainer:** cache the provider step counts on first read ([25f4c2a](https://github.com/f6ra07nk14/structcast-model/commit/25f4c2a5e4b4a54460e9794d011f24df82853f9f))
+
+
+### 🔨 Refactor
+
+* **base-trainer:** move models onto the info object ([38e05dd](https://github.com/f6ra07nk14/structcast-model/commit/38e05dd543662380a1a17351f425c9a4978d0c0a))
+* **builders:** move resolver utilities ([c42f5a1](https://github.com/f6ra07nk14/structcast-model/commit/c42f5a18bdfda4c7acfae2e2680fafff88d990e8))
+* **torch:** move training-state fetching into the loggers ([a4daee6](https://github.com/f6ra07nk14/structcast-model/commit/a4daee6f58303d7111a26197ad5e838105147fbe))
+
+
+### 🚨 Tests
+
+* use canonical cfg configs and move fixtures under tests/fixtures ([c58a5fa](https://github.com/f6ra07nk14/structcast-model/commit/c58a5fa2bf01648780dda21cfe05e3fb2d747ccb))
+
 ## [3.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v2.0.0...v3.0.0) (2026-08-15)
 
 
