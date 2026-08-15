@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 __all__ = ["base_trainer", "builders", "flax", "keras", "torch", "utils"]
 
 if TYPE_CHECKING:

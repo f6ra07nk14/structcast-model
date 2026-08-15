@@ -1,3 +1,168 @@
+## [3.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v2.0.0...v3.0.0) (2026-08-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **torch:** TorchTrainer.no_sync, _unwrap_ddp, and _get_state_dict are
+gone; TrainingStateSaver and TorchBestCriterion.from_criteria require a
+strategy and accept a None logger; interrupt-time saving is removed.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **builders:** generated learner scripts changed shape (flow functions,
+sync gates, __grad_scaler_creator__); MIXED_PRECISION with a non-float16
+MIXED_PRECISION_TYPE is now a SpecError; bf16 learners expose empty
+grad_scalers.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **torch:** TorchLearnerFactory is gone and the loggers import from new
+module paths.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **base-trainer:** BaseTrainer requires data= at construction and
+SimpleDataProvider takes keyword arguments only.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **torch:** the Timm* classes are no longer part of
+structcast_model.torch.trainer, and train no longer logs timm_version.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **base-trainer:** objects implementing Learner must expose optimizers and
+learning_rates properties.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **cli,builders:** the backward CLI vocabulary, BACKWARDS template key,
+cfg/torch/backwards/ directory and create_with_scheduler cfg patterns are gone.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **torch:** create_with_scheduler and the scheduler registration side
+channel are removed; TorchTracker.reset and the wrapper's set_dataset_epoch/
+set_dataloader_epoch methods are replaced.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **base-trainer:** GLOBAL_CALLBACKS, callbacks_session, NamedCallbackList and
+the Callbacks dataclass are removed; Backward is renamed Learner; fit() no
+longer accepts datasets.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **builders:** unannotated dummy inputs are now bfloat16, not float32
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+### 💥 Breaking Changes
+
+* **base-trainer:** require optimizers and learning_rates on the Learner protocol ([e48ce25](https://github.com/f6ra07nk14/structcast-model/commit/e48ce255498337857b1591d356ffbba153e300f8))
+* **base-trainer:** require the data provider and keyword-only SimpleDataProvider ([ad6aebc](https://github.com/f6ra07nk14/structcast-model/commit/ad6aebc9288dc581e751e12aa5c04039d998296a))
+* **base-trainer:** restore runtime-checkable protocols via typing_extensions ([d711c79](https://github.com/f6ra07nk14/structcast-model/commit/d711c79e4e64c75d501451bc328a235cb3a0eff8))
+* **base-trainer:** route callbacks by protocol and rename Backward to Learner ([bd69016](https://github.com/f6ra07nk14/structcast-model/commit/bd6901680b835befa8689c15b8f7dad58d5e3c9c))
+* **builders:** bind learner steps directly, dropping forward_* indirection ([58b4d7b](https://github.com/f6ra07nk14/structcast-model/commit/58b4d7bcd112a1da22a8862085250edb4db17aa5))
+* **builders:** generate strategy-aware learners with flow functions and sync gates ([4429202](https://github.com/f6ra07nk14/structcast-model/commit/4429202d430a1f39a8310a05c0a077ff4358d5ad))
+* **builders:** generated steps become class methods importing package helpers ([a20880e](https://github.com/f6ra07nk14/structcast-model/commit/a20880e6d2a721708ab4cfc95ed071abe7b01154))
+* **cli,builders:** cascade Learner rename and rewire the train command ([c5f2b59](https://github.com/f6ra07nk14/structcast-model/commit/c5f2b59f25e098585498d7744265d1a607a3579a))
+* **commands:** let the configuration decide structured output; compile in place ([cd50ead](https://github.com/f6ra07nk14/structcast-model/commit/cd50ead7f2f6b5858306a21d53c6a1964c858bcc))
+* **example:** attention and RoPE live in the configuration; Transformer becomes SmallLanguageModel ([af84a9c](https://github.com/f6ra07nk14/structcast-model/commit/af84a9c7e38b30994e76121c740044f55e997320))
+* **torch:** assemble training through the distributed strategy and add resume ([274f49c](https://github.com/f6ra07nk14/structcast-model/commit/274f49c102a51864dffea1f979c7dd2f340ed513))
+* **torch:** move timm.data integrations to examples and make the CLI timm-agnostic ([6215eca](https://github.com/f6ra07nk14/structcast-model/commit/6215eca09adcbb11f07476d1831e6e310089bb0c))
+* **torch:** move torch layer to protocol-routed Learner design ([fb7d44d](https://github.com/f6ra07nk14/structcast-model/commit/fb7d44d86bba85d8bd87da6046b580d6932511b4))
+* **torch:** split loggers behind a Logger protocol and revert the learner factory ([89a402a](https://github.com/f6ra07nk14/structcast-model/commit/89a402a796c597d3d175164527a09eef08eb7c16))
+* **trainer:** own step counts on the DataProvider and rework callback wiring ([25ddffc](https://github.com/f6ra07nk14/structcast-model/commit/25ddffcb0bdcec3b5be23e0f3943c7baca0b8b78))
+
+
+### 👷 Build
+
+* **docker:** add a GPU training image for DGX validation runs ([0df26cc](https://github.com/f6ra07nk14/structcast-model/commit/0df26cc0835c1c46fbea9003bb5409820809e178))
+
+
+### 📦 Other
+
+* add anysearch skill ([179186c](https://github.com/f6ra07nk14/structcast-model/commit/179186cd981782e32bc9da978a4639b1d3562b80))
+* add devcontainer and agent skills ([e8e79fb](https://github.com/f6ra07nk14/structcast-model/commit/e8e79fbbbb3d997238fc76c2fa6f622baa4d4e89))
+* refresh uv.lock for structcast 2.0 ([f8ffec3](https://github.com/f6ra07nk14/structcast-model/commit/f8ffec3d0742131ade5988dbb21dfadc22349807))
+* remove anysearch skill ([bd6894c](https://github.com/f6ra07nk14/structcast-model/commit/bd6894ceed0e400570ac09a12686eef0551103ff))
+* update .gitignore to exclude Claude Code settings and symlink ([7f9c490](https://github.com/f6ra07nk14/structcast-model/commit/7f9c4906ab0e44dc078f86ab976e1c8fe4aafa15))
+* update devcontainer configuration by removing unused variables and scripts ([e0ca6cf](https://github.com/f6ra07nk14/structcast-model/commit/e0ca6cf2589b42c92d56f7e12af515b4d2c65efa))
+
+
+### 📔 Docs
+
+* add domain glossary and training-loop redesign ADR ([ab9ab52](https://github.com/f6ra07nk14/structcast-model/commit/ab9ab52c4292890016bde9bdbe39b179fc3b0681))
+* Add StructCast-Model Reference documentation ([8c444cc](https://github.com/f6ra07nk14/structcast-model/commit/8c444ccd7470baf4b33f65755d3de000a9f4ad72))
+* **adr:** record distributed strategy, sync gating, and checkpoint decisions ([6e739e5](https://github.com/f6ra07nk14/structcast-model/commit/6e739e5e35161b7e6c70e63eec643ed779c3e5e3))
+* align distributed training claims with the strategy design ([d4a28e8](https://github.com/f6ra07nk14/structcast-model/commit/d4a28e83fe0aa44cfa90fbb7e2a57205faf44aa1))
+* align guides with setter sync_gate, strategy compile, and NullLogger; drop redundant update_models ([2eca54e](https://github.com/f6ra07nk14/structcast-model/commit/2eca54ebea35e750885216661c8bad3164848881))
+* align the docs with the current public API ([268ac76](https://github.com/f6ra07nk14/structcast-model/commit/268ac76208eb201755d2c99635983926f3bb19fc))
+* **references:** bound the vision run-to-run spread and retract a compile regression ([7176ae9](https://github.com/f6ra07nk14/structcast-model/commit/7176ae9b6496518c1138c322f1207aae16deaf3d))
+* **references:** complete the vision strategy matrix ([6919f0a](https://github.com/f6ra07nk14/structcast-model/commit/6919f0a33d2a0bb0b438794910defec7ced995c0))
+* **references:** explain the ConvNeXt V2-B per-epoch cost and the compile relaunch ([4ebfd79](https://github.com/f6ra07nk14/structcast-model/commit/4ebfd79fa742d11b131032c0d5658044364df6ac))
+* **references:** note the vision matrix runs a single seed ([4b3deee](https://github.com/f6ra07nk14/structcast-model/commit/4b3deeed07bbebc730ebf43749e86a81d66aa4a0))
+* **references:** record per-block FSDP2 validation on H200 ([27c75b5](https://github.com/f6ra07nk14/structcast-model/commit/27c75b545c045d0d113b5af000d58c4b1a288cbf))
+* **references:** record strategy comparison runs on H200 ([b2520cc](https://github.com/f6ra07nk14/structcast-model/commit/b2520cc39c3ea3975ed111117712d353ad4b2d98))
+* **references:** record the completed ViT-B strategy triplet ([7beed4e](https://github.com/f6ra07nk14/structcast-model/commit/7beed4e65be4f334911fc2f96d33118885d253c5))
+* **references:** replace concrete host paths with placeholders ([9fb54a9](https://github.com/f6ra07nk14/structcast-model/commit/9fb54a9418ddb402fe4453cedb5ea6b5b92adad9))
+* **references:** restate the micro-benchmark method instead of keeping the scripts ([d517f04](https://github.com/f6ra07nk14/structcast-model/commit/d517f049ea6754bb3a45ed1bd567b1807b1ec70d))
+* **references:** state the vision augmentation recipe ([bdd1056](https://github.com/f6ra07nk14/structcast-model/commit/bdd10567874956e9286c09b18452423f9f515b6e))
+* rewrite README and reference docs for the Learner design ([b7f08c0](https://github.com/f6ra07nk14/structcast-model/commit/b7f08c09b6739edee25cdffb131fc9190ec437bb))
+* update worktree guidelines for devcontainer compatibility ([e97ac03](https://github.com/f6ra07nk14/structcast-model/commit/e97ac035dd25dceea2c2fcb89ffa64829582631d))
+
+
+### 📝 Examples
+
+* add simple training tutorial ([76bf107](https://github.com/f6ra07nk14/structcast-model/commit/76bf107b5d20899ff35ea0016723b76539ed11d4))
+* **torch:** decoder-only transformer LM on Tiny Shakespeare ([0148295](https://github.com/f6ra07nk14/structcast-model/commit/01482954a4e8962ca0743fa2bbc5cde3ebe50f32))
+* **torch:** ViT-B/16 configuration bit-exact against timm ([d570dbc](https://github.com/f6ra07nk14/structcast-model/commit/d570dbc2899f464f57444324d669a003e72d23a5))
+
+
+### 💎 Features
+
+* **builders:** add INPUT_SHAPES tensor specification with dtype and initializer support ([323c664](https://github.com/f6ra07nk14/structcast-model/commit/323c6640e4b3c2f9dfb4e7d53169574ae0f77dfc))
+* **commands:** compile per shard block and slim train() into orchestration ([fdc6949](https://github.com/f6ra07nk14/structcast-model/commit/fdc69496d2cd299803c9d747646f70a4958c3a8c))
+* **devcontainer:** add GitHub CLI feature to devcontainer configuration ([a4ea145](https://github.com/f6ra07nk14/structcast-model/commit/a4ea145231b31871d1723c7b3fff281b133544ab))
+* **torch:** add CausalSelfAttention layer ([2b1dc8d](https://github.com/f6ra07nk14/structcast-model/commit/2b1dc8dacdb843195b063d992bce390b9e38fd7f))
+* **torch:** add distributed strategies owning wrap, weight sync, and checkpoint state ([a32e964](https://github.com/f6ra07nk14/structcast-model/commit/a32e9640253c219eaa30148efede782f49b4042a))
+* **torch:** shard FSDP2 models per block via shard_modules patterns ([f20438b](https://github.com/f6ra07nk14/structcast-model/commit/f20438bb60b5ceb5d3f0146cfdc5f9be86a80b04))
+* **torch:** strategies own compilation placement; distributed module leaves the lazy shim ([cae3998](https://github.com/f6ra07nk14/structcast-model/commit/cae3998e5f7e8b0fd10f4002f0ab596db7c4d729))
+
+
+### 🔧 Fixes
+
+* address adversarial review findings across the redesign ([52041f0](https://github.com/f6ra07nk14/structcast-model/commit/52041f02c143b736ad80356dbeea70a678405a80))
+* **base-trainer:** make DataProvider not runtime_checkable for Python 3.11 ([06bceff](https://github.com/f6ra07nk14/structcast-model/commit/06bceffb88f21bbb0e42176767709a16a881a708)), closes [#121](https://github.com/f6ra07nk14/structcast-model/issues/121)
+* **builders:** report unscaled loss when accumulating gradients ([16332ae](https://github.com/f6ra07nk14/structcast-model/commit/16332ae0f5d8b4563741ffbf31915b80891ede7d))
+* **cli:** build TimmDataProvider for timm dataset wrappers in train ([1c11432](https://github.com/f6ra07nk14/structcast-model/commit/1c114321cc913803e0d8a005307bd8271bd6a634))
+* **commands:** assign the display callbacks instead of augmenting a Sequence ([158c255](https://github.com/f6ra07nk14/structcast-model/commit/158c25509955a9df510155425d016405c3fc7407))
+* **dependencies:** migrate to structcast 2.0 security API ([a4548cf](https://github.com/f6ra07nk14/structcast-model/commit/a4548cf4c8b2aadf4fdff1b53a8202e396b5370b))
+* **dependencies:** update structcast version to 2.0.0 ([c4a7a45](https://github.com/f6ra07nk14/structcast-model/commit/c4a7a45edbd72e5dc1d221d993f4d3cc20b67ba6))
+* **dependencies:** update structcast version to 2.0.0 ([0a7b50d](https://github.com/f6ra07nk14/structcast-model/commit/0a7b50dfc662bedbd93f07cfebf3996931f7593d))
+* **torch:** route proxy optimizers through their own state dicts and make python -m work ([1dc4e21](https://github.com/f6ra07nk14/structcast-model/commit/1dc4e216659617c5509b5096e97a644817cc4705))
+* **torch:** set sync flags for backward-time readers and respect user-frozen parameters ([bfb8b2d](https://github.com/f6ra07nk14/structcast-model/commit/bfb8b2d7d63984e2f963c654b6df148af015af3b))
+
+
+### 🚀 Performance
+
+* **torch:** compile flow functions only on a single device, backed by H200 step timings ([f77510a](https://github.com/f6ra07nk14/structcast-model/commit/f77510af5b416a1bd62c5b70b92dbaa1f8f4640b))
+
+
+### 🔨 Refactor
+
+* **commands:** drop configure_security calls made obsolete by structcast 2.0 ([b938ad0](https://github.com/f6ra07nk14/structcast-model/commit/b938ad0b302be92f32435967341717c996b4eee5))
+* **commands:** route all compilation through strategy.compile ([35e36b9](https://github.com/f6ra07nk14/structcast-model/commit/35e36b917fe46c16bc19919aabd9c7c88b44485e))
+* remove InferenceWrapper from __all__ exports ([9f91516](https://github.com/f6ra07nk14/structcast-model/commit/9f9151636b15f50b43a09b18c17baf74e936b273))
+* remove InferenceWrapper protocol definition ([3baa7a2](https://github.com/f6ra07nk14/structcast-model/commit/3baa7a2ae5332e1c51392390ece5f24a9f44183d))
+* **torch:** drop the redundant is_successful guard around _imports.check() ([bfbb150](https://github.com/f6ra07nk14/structcast-model/commit/bfbb150abb435cc832e439f535890c091748662f))
+* **torch:** move distributed env init into the strategy module via try_import guards ([ea804cb](https://github.com/f6ra07nk14/structcast-model/commit/ea804cbd4fb6bff5e709f653979aa4cfa2965abe))
+* **torch:** replace the None logger with a NullLogger null object ([77cfc87](https://github.com/f6ra07nk14/structcast-model/commit/77cfc87d213eeafa7d4daf8d79cdd7096037d163))
+* **torch:** sync_gate becomes a plain setter statement ([d3d5db7](https://github.com/f6ra07nk14/structcast-model/commit/d3d5db7bd779c1729eb6918186aa378356199a6f))
+
+
+### ✨ Style
+
+* satisfy ruff line length and zip strictness across the new codegen ([f3ec878](https://github.com/f6ra07nk14/structcast-model/commit/f3ec878fbbe71b14adc4e0309c0e4b6219218572))
+
+
+### 🚨 Tests
+
+* **torch:** prove distributed semantics with analytic two-rank tests ([d40a6f0](https://github.com/f6ra07nk14/structcast-model/commit/d40a6f0469a8d93c8742f5ad99d3331e582be32b))
+* **torch:** prove native-engine weight decay and layer decay end to end ([a94bf0e](https://github.com/f6ra07nk14/structcast-model/commit/a94bf0e5b3340b52d368418573f8f62d2afd10dd))
+
 ## [2.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v1.5.0...v2.0.0) (2026-04-12)
 
 
