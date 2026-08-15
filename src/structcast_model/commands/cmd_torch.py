@@ -574,23 +574,20 @@ def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typ
     strategy = _resolve_strategy(strategy_pattern, device, local_rank, distributed)
     is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
-    initializers = instantiator.instantiate(reduce_dict(initializer_patterns))
-    compile_kw = instantiator.instantiate(compile_pattern)
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
     provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     if is_main:
         print("Count the dataset sizes...")
-    if is_main:
         print(f"Training dataset size: {provider.steps_per_epoch} steps.")
         print(f"Validation dataset size: {provider.validation_steps} steps.")
     models, learner, learner_outputs, tracker = _assemble_learner(
         model_patterns=model_patterns,
         input_shapes=input_shapes,
-        initializers=initializers,
+        initializers=instantiator.instantiate(reduce_dict(initializer_patterns)),
         resume=resume,
         strategy=strategy,
-        compile_kw=compile_kw,
+        compile_kw=instantiator.instantiate(compile_pattern),
         learner_pattern=learner_pattern,
         learner_outputs=learner_outputs,
         device=device,
