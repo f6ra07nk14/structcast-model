@@ -8,10 +8,10 @@ from typer import Typer
 from typer.testing import CliRunner
 
 from structcast_model.commands.cmd_flax import app
-from tests import ASSETS_DIR
+from tests import CFG_DIR, FIXTURES_DIR
 
-LINEAR_CFG = str(ASSETS_DIR / "cfg" / "flax" / "Linear.yaml")
-MODEL_CFG = str(ASSETS_DIR / "cfg" / "flax" / "ConvNeXtV2.yaml")
+LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
+MODEL_CFG = str(CFG_DIR / "flax" / "models" / "ConvNeXtV2.yaml")
 
 # ---------------------------------------------------------------------------
 # Helper: access cmd_flax's real globals (bypasses LazySelectedImporter proxy)

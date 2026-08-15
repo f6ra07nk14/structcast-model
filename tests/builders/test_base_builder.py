@@ -19,7 +19,7 @@ from structcast_model.builders.base_builder import (
 from structcast_model.builders.schema import Parameters, UserLayer
 from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from structcast_model.builders.utils import resolve_getter, resolve_object
-from tests import ASSETS_DIR
+from tests import CFG_DIR
 
 
 def test_resolve_object_collects_import_and_class_name() -> None:
@@ -117,8 +117,8 @@ def test_resolve_getter_rejects_unknown_identifier(monkeypatch: pytest.MonkeyPat
 
 def test_base_model_builder_from_path_and_user_defined_entry() -> None:
     """Build from path and resolve a named user-defined layer."""
-    builder = BaseModelBuilder.from_path(ASSETS_DIR / "cfg" / "torch" / "ConvNeXtV2.yaml")
-    assert builder.current_path.endswith("cfg/torch/ConvNeXtV2.yaml")
+    builder = BaseModelBuilder.from_path(CFG_DIR / "torch" / "models" / "ConvNeXtV2.yaml")
+    assert builder.current_path.endswith("cfg/torch/models/ConvNeXtV2.yaml")
     assert builder.from_references[builder.current_path] == ["__root__"]
     sublayer = builder(classname="BackboneOnly", user_defined_layer="Backbone")
     assert sublayer.classname == "BackboneOnly"
