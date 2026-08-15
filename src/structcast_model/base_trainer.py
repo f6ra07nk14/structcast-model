@@ -108,8 +108,9 @@ class DataProvider(Protocol):
 class SimpleDataProvider:
     """Data provider holding an already-built training dataset and an optional validation dataset.
 
-    The step counts come from :func:`get_dataset_size`: a dataset exposing no ``__len__`` is
-    counted by iterating it, so reading them consumes a one-shot iterable.
+    The step counts come from :func:`get_dataset_size`, computed on the first read and cached for
+    the rest of the run. The first read of a dataset exposing no ``__len__`` counts it by
+    iterating, which consumes a one-shot iterable.
 
     Example:
         >>> provider = SimpleDataProvider(training_dataset=[{"x": 1}])
@@ -125,15 +126,25 @@ class SimpleDataProvider:
     validation_dataset: DatasetLike | Callable[[], DatasetLike] | None = None
     """The dataset used for validation, or None to skip validation."""
 
+    _steps_per_epoch: int | None = field(default=None, init=False, repr=False)
+    """Cache of steps_per_epoch, counted on the first read."""
+
+    _validation_steps: int | None = field(default=None, init=False, repr=False)
+    """Cache of validation_steps, counted on the first read."""
+
     @property
     def steps_per_epoch(self) -> int:
-        """Number of training steps in one epoch, counted from the training dataset."""
-        return get_dataset_size(self.training_dataset)
+        """Number of training steps in one epoch, counted from the training dataset on the first read."""
+        if self._steps_per_epoch is None:
+            self._steps_per_epoch = get_dataset_size(self.training_dataset)
+        return self._steps_per_epoch
 
     @property
     def validation_steps(self) -> int:
-        """Number of validation steps in one epoch, 0 when there is no validation dataset."""
-        return 0 if self.validation_dataset is None else get_dataset_size(self.validation_dataset)
+        """Number of validation steps in one epoch, counted on the first read, 0 without a validation dataset."""
+        if self._validation_steps is None:
+            self._validation_steps = 0 if self.validation_dataset is None else get_dataset_size(self.validation_dataset)
+        return self._validation_steps
 
 
 @dataclass(kw_only=True)

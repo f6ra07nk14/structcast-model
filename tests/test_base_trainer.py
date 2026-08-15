@@ -110,6 +110,19 @@ def test_simple_data_provider_counts_steps_from_its_datasets() -> None:
     assert provider.validation_steps == 1
 
 
+def test_simple_data_provider_caches_the_step_counts_after_the_first_read() -> None:
+    """The counts are per-run constants read several times per run (print, progress bar, log_params).
+
+    Recounting a dataset without __len__ re-iterates it, so a one-shot iterable would be consumed by
+    the first read and report 0 on the second.
+    """
+    provider = SimpleDataProvider(training_dataset=iter([{"x": 1}, {"x": 2}]), validation_dataset=iter([{"x": 3}]))
+    assert provider.steps_per_epoch == 2
+    assert provider.steps_per_epoch == 2
+    assert provider.validation_steps == 1
+    assert provider.validation_steps == 1
+
+
 def test_simple_data_provider_satisfies_the_data_provider_protocol() -> None:
     """Widening the protocol must not orphan the package's own provider.
 
