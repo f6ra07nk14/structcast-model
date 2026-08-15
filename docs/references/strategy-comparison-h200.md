@@ -172,6 +172,33 @@ Both loaders were probed under `torchrun --nproc-per-node=4` before the matrix r
   never calls `set_epoch`, so the shuffle order repeats every epoch. Harmless for a fixed-length
   language-model corpus, but it is a real difference from the timm wrapper.
 
+## How the micro-benchmarks were measured
+
+The throughput and profile figures quoted above come from short scratch scripts, not from the
+training runs. They are not kept in the repository; the method is short enough to restate, and
+each needs the generated `model_vit` / `model_cnv2` modules on `PYTHONPATH`, which only exist
+after `structcast_model.commands.main torch create model`.
+
+Every measurement times a full training step — forward under `torch.autocast("cuda",
+torch.bfloat16)`, cross-entropy against random labels, `backward()`, `zero_grad(set_to_none=True)`
+— on random input tensors, after materialising the lazy modules with one no-grad forward. Discard
+the first 5–8 iterations so compilation and cuDNN autotuning fall outside the window, then average
+12–15 iterations between `torch.cuda.synchronize()` calls.
+
+- **Memory format**: same script twice, once with `model.to(memory_format=torch.channels_last)`
+  and the input made `contiguous(memory_format=torch.channels_last)`.
+- **Compilation**: same script twice, once with `model.compile()` after materialisation.
+- **Per-GPU batch**: sweep batch 128 / 256 / 512 on one GPU with compilation on.
+- **All-reduce**: `torchrun --nproc-per-node=2` wrapping the compiled model in
+  `DistributedDataParallel`, same per-rank batch as the single-GPU arm, `dist.barrier()` before
+  and after the timed window. Comparing per-rank throughput against the single-GPU number at the
+  same batch isolates communication from everything the data pipeline does.
+- **Operator breakdown**: `torch.profiler.profile(activities=[ProfilerActivity.CUDA])` over three
+  steps, sorted by `self_cuda_time_total`.
+
+Absolute numbers carry whatever contention the host had at the time; only compare arms measured
+in the same session.
+
 ## Operational notes
 
 - `PYTHONUNBUFFERED=1` is mandatory. Without it Python block-buffers stdout and a healthy run's
