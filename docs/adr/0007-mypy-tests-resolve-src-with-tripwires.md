@@ -13,9 +13,9 @@ config regression turns red instead of silently green.
 Untyped dependencies are handled by escalation, narrowest mechanism first: an isolated boundary site
 uses an explained `# type: ignore[no-any-unimported]` or an explicit `Any` (tqdm, jax); the
 keras-facing modules get the two tripwires switched off via a scoped override (keras ships no
-`py.typed` and its internals are not analyzable); and the in-house `structcast` package — annotated
-but not yet shipping `py.typed` — is analyzed from its installed sources via
-`follow_untyped_imports`, turning its formerly-`Any` API into real checking.
+`py.typed` and its internals are not analyzable). The in-house `structcast` package ships `py.typed`
+since 2.1.0 and is checked like any typed dependency (a `follow_untyped_imports` override bridged
+the gap before that release).
 
 Considered and rejected: the split-import stopgap proposed in issue #25 (`typing_extensions` behind
 `TYPE_CHECKING`) is a no-op — mypy bundles `typing_extensions` stubs in typeshed's stdlib, so
