@@ -1,6 +1,10 @@
 """Types for torch module."""
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
+
+# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
+# inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
+from typing_extensions import Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from typing import TypeAlias

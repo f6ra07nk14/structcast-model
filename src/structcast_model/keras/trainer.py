@@ -1,11 +1,15 @@
 """Trainer helpers for Keras models."""
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
 import ml_dtypes
 import numpy as np
 from pydantic import TypeAdapter, ValidationError
+
+# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
+# inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
+from typing_extensions import Protocol, runtime_checkable
 
 import keras
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
