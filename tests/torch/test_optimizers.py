@@ -432,7 +432,7 @@ def test_example_adamw_with_cosine_steps_the_schedule_on_epoch_end() -> None:
         optimizer_kwargs={"opt": "adamw", "lr": 0.1},
         scheduler_kwargs={"sched": "cosine", "num_epochs": 4, "min_lr": 0.0, "criterion": "loss"},
     )
-    info = BaseInfo(epoch=3)
+    info: BaseInfo[Any] = BaseInfo(epoch=3)
     info.logs()["loss"] = 0.5
     optimizer.on_epoch_end(info)
     assert optimizer.param_groups[0]["lr"] < 0.1

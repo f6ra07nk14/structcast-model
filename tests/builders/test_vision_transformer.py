@@ -156,7 +156,7 @@ def test_generated_blocks_are_addressable_for_per_block_sharding(model: torch.nn
     # Every backbone parameter has to sit inside a matched block; one left outside would silently
     # stay unsharded. The blocks are not of one class -- the drop path ramp gives each its own, as in
     # ConvNeXt V2 -- so the pattern, not the type, is what has to cover them.
-    assert {name for name, _ in model.backbone.named_parameters()} == {
+    assert {name for name, _ in paths["backbone"].named_parameters()} == {
         f"{path.removeprefix('backbone.')}.{name}" for path in matched for name, _ in paths[path].named_parameters()
     }
 

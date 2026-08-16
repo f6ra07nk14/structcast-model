@@ -69,11 +69,13 @@ def _sync_gate_worker(rank: int, world_size: int, init_file: str, result_dir: st
         sync_gate(ddp, False)
         out = ddp(x)
         ((out - target) ** 2).sum().backward()
+        assert model.weight.grad is not None, "the unarmed backward must still accumulate a local gradient"
         unarmed = model.weight.grad.detach().clone()
 
         sync_gate(ddp, True)
         out = ddp(x)
         ((out - target) ** 2).sum().backward()
+        assert model.weight.grad is not None
         armed = model.weight.grad.detach().clone()
 
         _report(result_dir, rank, {"unarmed": unarmed, "armed": armed})
@@ -121,8 +123,13 @@ def _fsdp2_sync_gate_worker(rank: int, world_size: int, init_file: str, result_d
         sync_gate(wrapped, True)
         out = wrapped(x)
         ((out - target) ** 2).sum().backward()
-        grad = wrapped.weight.grad
-        armed = grad.full_tensor().detach().clone() if hasattr(grad, "full_tensor") else grad.detach().clone()
+        grad = wrapped.get_parameter("weight").grad
+        assert grad is not None, "the armed backward must reduce-scatter a gradient onto the sharded parameter"
+        armed = (
+            grad.full_tensor().detach().clone()
+            if isinstance(grad, torch.distributed.tensor.DTensor)
+            else grad.detach().clone()
+        )
 
         _report(result_dir, rank, {"unarmed_grad_missing": unarmed_grad_missing, "armed": armed})
     except Exception:
@@ -223,7 +230,7 @@ def _train_one_step(model: torch.nn.Module, optimizer: torch.optim.Optimizer) ->
 
 def _full_weight(model: torch.nn.Module) -> torch.Tensor:
     """Return the (possibly sharded) linear weight as a plain full tensor."""
-    weight = model.weight if hasattr(model, "weight") else model.module.weight
+    weight = model.get_parameter("weight" if hasattr(model, "weight") else "module.weight")
     full = weight.full_tensor() if isinstance(weight, torch.distributed.tensor.DTensor) else weight
     return full.detach().clone()
 
@@ -319,12 +326,12 @@ def _per_block_round_trip_worker(rank: int, world_size: int, init_file: str, res
         optimizer = torch.optim.SGD(models["model"].parameters(), lr=0.1, momentum=0.9)
         _train_one_step(models["model"], optimizer)
         saved = strategy.state_dict(models, {"opt": optimizer}, {"opt": ["model"]})
-        trained = _full_weight(models["model"].block1)
+        trained = _full_weight(models["model"].get_submodule("block1"))
 
         torch.manual_seed(7 + rank)
         fresh = strategy.wrap(OrderedDict(model=_BlockModel()))
         fresh_optimizer = torch.optim.SGD(fresh["model"].parameters(), lr=0.1, momentum=0.9)
-        before_load = _full_weight(fresh["model"].block1)
+        before_load = _full_weight(fresh["model"].get_submodule("block1"))
         strategy.load_state_dict(fresh, {"opt": fresh_optimizer}, {"opt": ["model"]}, saved if rank == 0 else None)
 
         _report(
@@ -335,7 +342,7 @@ def _per_block_round_trip_worker(rank: int, world_size: int, init_file: str, res
                 "keys": sorted(saved["models"]["model"]),
                 "trained": trained,
                 "before_load": before_load,
-                "restored": _full_weight(fresh["model"].block1),
+                "restored": _full_weight(fresh["model"].get_submodule("block1")),
             },
         )
     except Exception:
@@ -372,7 +379,9 @@ def _grad_scaler_worker(rank: int, world_size: int, init_file: str, result_dir: 
         before = _full_weight(model)
         scaler.scale(((model(torch.ones(3, 4)) - torch.zeros(3, 2)) ** 2).sum()).backward()
         if rank == 1:
-            local_grad = model.weight.grad.to_local()
+            grad = model.get_parameter("weight").grad
+            assert isinstance(grad, torch.distributed.tensor.DTensor), "fully_shard must keep the gradient sharded"
+            local_grad = grad.to_local()
             assert local_grad.numel() > 0, "rank 1 holds no shard of the weight to poison"
             local_grad.mul_(float("inf"))
 

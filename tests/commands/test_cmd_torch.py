@@ -38,7 +38,9 @@ LEARNER_CFG = str(CFG_DIR / "torch" / "learners" / "ConvNeXtV2.yaml")
 # Helper: access cmd_torch's real globals (bypasses LazySelectedImporter proxy)
 # ---------------------------------------------------------------------------
 
-_CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
+_FIRST_CALLBACK = app.registered_commands[0].callback
+assert _FIRST_CALLBACK is not None, "cmd_torch registers every command with a callback"
+_CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
 
 # Access private functions from cmd_torch via its module globals
 _get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
@@ -105,7 +107,9 @@ class ZeroLinear(torch.nn.Linear):
         super().__init__(2, 1, bias=False)
         torch.nn.init.zeros_(self.weight)
 
-    def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    # `Linear.forward` names its parameter `input`; renaming it is what this fake is for, and the
+    # command calls modules as `model(**inputs)`, keyed by the shape names, so the rename is required.
+    def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:  # type: ignore[override]
         """Forward pass, taking the input under the name the datasets and the shapes use."""
         return super().forward(x)
 

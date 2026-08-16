@@ -28,7 +28,8 @@ def test_serializable_frozen() -> None:
         value: int
 
     with pytest.raises(ValidationError, match="Instance is frozen"):
-        TestConfig.model_validate({"value": 42}).value = 100
+        # The forbidden write is deliberate: the test proves the frozen model rejects it at runtime.
+        TestConfig.model_validate({"value": 42}).value = 100  # type: ignore[misc]
 
 
 def test_serializable_extra_forbid() -> None:
@@ -209,18 +210,17 @@ def test_resolve_inputs_with_unsupported_identifier_raises_error() -> None:
         resolve_inputs(FlexSpec.model_validate("skip:"))
 
 
+class _EscapedFlexSpec(FlexSpec):
+    """A FlexSpec whose spec escaped the validated structures, the only state reaching the unsupported-type branches."""
+
+    def _get_spec(self) -> Any:
+        return "invalid_string"
+
+
 def test_resolve_inputs_with_unsupported_spec_type_raises_error() -> None:
     """Test _resolve_inputs with unsupported spec type raises SpecError."""
-
-    class FakeFlexSpec:
-        def __init__(self, spec: Any) -> None:
-            self.spec = spec
-
-        def model_dump(self) -> dict[str, Any]:
-            return {"spec": self.spec}
-
     with pytest.raises(SpecError, match="Unsupported spec type"):
-        resolve_inputs(FakeFlexSpec("invalid_string"))
+        resolve_inputs(_EscapedFlexSpec())
 
 
 # Test _resolve_outputs error cases (raise SpecError)
@@ -238,17 +238,8 @@ def test_resolve_outputs_with_multiple_indices_raises_error() -> None:
 
 def test_resolve_outputs_with_unsupported_type_raises_error() -> None:
     """Test _resolve_outputs with unsupported type raises SpecError."""
-
-    class FakeFlexSpec:
-        def __init__(self, spec: Any) -> None:
-            self.spec = spec
-
-        def model_dump(self) -> dict[str, Any]:
-            return {"spec": self.spec}
-
-    fake_spec = FakeFlexSpec("invalid_string")
     with pytest.raises(SpecError, match="Outputs must be a dictionary or consist of a source identifier"):
-        resolve_outputs(fake_spec)
+        resolve_outputs(_EscapedFlexSpec())
 
 
 # Test _resolve_inputs and _resolve_outputs through integration tests
@@ -396,13 +387,13 @@ def test_base_builder_with_predefined_layers() -> None:
     """Test BaseBuilder with predefined user-defined layers."""
     raw = {"INPUTS": "input1", "OUTPUTS": "output1", "FLOW": []}
     predefined = {"predefined_layer": {"INPUTS": "x", "OUTPUTS": "y"}}
-    builder = BaseModelBuilder(raw=raw, predefined_user_defined_layers=predefined)
+    builder: BaseModelBuilder[LayerIntermediate] = BaseModelBuilder(raw=raw, predefined_user_defined_layers=predefined)
     assert "predefined_layer" in builder.user_defined_layers
 
 
 def test_base_builder_call_simple() -> None:
     """Test BaseBuilder __call__ method with simple layer."""
-    result = BaseModelBuilder(raw={"FLOW": []})({}, "TestLayer")
+    result: LayerIntermediate = BaseModelBuilder(raw={"FLOW": []})({}, "TestLayer")
     assert isinstance(result, LayerIntermediate)
     assert result.classname == "TestLayer"
     assert result.inputs == []
@@ -437,7 +428,7 @@ def test_base_builder_flow_with_name_reference() -> None:
             [["output1"], ["output2"], "my_layer"],  # Reference to the same layer by NAME
         ],
     }
-    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
+    result: LayerIntermediate = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "my_layer" in result.layers
 
@@ -470,7 +461,7 @@ def test_base_builder_flow_with_object_pattern() -> None:
         "OUTPUTS": "output1",
         "FLOW": [[["input1"], ["output1"], {"_obj_": [["_addr_", "torch.nn.Linear"]]}]],
     }
-    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
+    result: LayerIntermediate = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "linear" in result.layers  # Auto-named based on class name
 
@@ -494,7 +485,7 @@ def test_base_builder_flow_with_user_layer_type() -> None:
         "FLOW": [[["input1"], ["output1"], {"TYPE": "custom_layer"}]],
         "custom_layer": {"FLOW": [[["input1"], ["output1"], {"_obj_": [["_addr_", "torch.nn.Identity"]]}]]},
     }
-    result = BaseModelBuilder(raw=raw)({}, "TestLayer")
+    result: LayerIntermediate = BaseModelBuilder(raw=raw)({}, "TestLayer")
     assert len(result.layers) == 1
     assert "custom_layer" in result.layers
 
