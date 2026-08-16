@@ -25,7 +25,10 @@ class CriteriaTracker(Module):
         """Update the total and count for each criterion."""
         with autocast(device_type=self.total.device.type, enabled=False):
             self.total.add_(self.total.new_ones(1, dtype=float32))
-            return {c: self.get_buffer(c).add_(values[c].to(float32)).div(self.total) for c in self.criteria}
+            return {
+                c: self.get_buffer(c).add_(values[c].to(self.total.device, float32)).div(self.total)
+                for c in self.criteria
+            }
 
     @no_grad()
     def reset(self) -> None:

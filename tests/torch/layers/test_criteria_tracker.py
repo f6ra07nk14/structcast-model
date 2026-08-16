@@ -1,5 +1,7 @@
 """Tests for criteria tracker layer."""
 
+from torch._subclasses.fake_tensor import FakeTensorMode
+
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
 import torch
 
@@ -28,6 +30,19 @@ def test_criteria_tracker_updates_own_buffers_after_dtype_move() -> None:
     assert tracker.get_buffer("loss").dtype == torch.float64
     assert torch.equal(tracker.get_buffer("loss"), torch.tensor([2.0], dtype=torch.float64))
     assert torch.equal(tracker.state_dict()["loss"], torch.tensor([2.0], dtype=torch.float64))
+
+
+def test_criteria_tracker_accepts_host_side_values_after_device_move() -> None:
+    """Pull incoming values onto the buffers' device, so values follow the module as its buffers already do.
+
+    `Module._apply` (`.cuda()`, `.to(device)`) moves the checkpoint-facing buffers but not the caller's values, so a
+    host-resident value would otherwise hit a cross-device in-place add. `FakeTensorMode` reproduces that mismatch on a
+    CPU-only build; torch exempts 0-dim CPU tensors from the same-device rule, hence the 1-element value.
+    """
+    with FakeTensorMode():
+        tracker = CriteriaTracker(["loss"]).to("cuda:0")
+        result = tracker({"loss": torch.zeros(1, device="cpu")})
+        assert result["loss"].device == torch.device("cuda:0")
 
 
 def test_criteria_tracker_reset() -> None:
