@@ -428,7 +428,7 @@ def _build_callbacks(
 
 
 @app.command()
-def train(  # noqa: PLR0913  # The CLI surface: every training option is one Typer parameter.
+def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help="The object patterns used to instantiate models. "

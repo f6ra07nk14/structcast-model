@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Generator
 import importlib
+import os
 import pathlib
 import sys
 from typing import Any
@@ -12,6 +13,12 @@ from typer.testing import CliRunner
 import torch.distributed as dist
 
 WANDB_LOGGER = "structcast_model.torch.wandb_logger"
+
+# MLflow 3.15 put the filesystem tracking backend into maintenance mode and refuses it unless this
+# opt-out is set. The MLflow tests point at a temporary file store on purpose, so they exercise the
+# real client without a server; production callers pick their own backend URI and are unaffected.
+# Set here rather than in a fixture because the distributed tests spawn workers that inherit it.
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
 
 
 @pytest.fixture
