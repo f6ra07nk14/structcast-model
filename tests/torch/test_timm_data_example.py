@@ -39,6 +39,7 @@ class _StubLearner:
 
     models: dict[str, Any] = {}
     optimizers: dict[str, Any] = {}
+    optimizer_models: dict[str, list[str]] = {}
     learning_rates: dict[str, float] = {}
 
     def update(self, step: int) -> bool:
@@ -458,8 +459,9 @@ def test_timm_data_provider_satisfies_the_data_provider_protocol() -> None:
     getattr_static and never execute a property getter (counting steps builds a real loader).
     """
     provider = TimmDataProvider(training=_training_wrapper())
+    concrete: Any = provider  # the protocol view below has no ``training`` member
     assert isinstance(provider, DataProvider)
-    assert provider.training_dataset is provider.training
+    assert provider.training_dataset is concrete.training
     assert provider.validation_dataset is None
 
 

@@ -14,13 +14,6 @@ LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
 MODEL_CFG = str(CFG_DIR / "flax" / "models" / "ConvNeXtV2.yaml")
 
 # ---------------------------------------------------------------------------
-# Helper: access cmd_flax's real globals (bypasses LazySelectedImporter proxy)
-# ---------------------------------------------------------------------------
-
-_CMD_GLOBALS: dict[str, Any] = app.registered_commands[0].callback.__globals__
-
-
-# ---------------------------------------------------------------------------
 # app structure
 # ---------------------------------------------------------------------------
 

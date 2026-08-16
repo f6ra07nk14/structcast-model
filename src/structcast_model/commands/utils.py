@@ -79,7 +79,9 @@ def bool_or_path_or_dict_parser(value: str) -> dict[str, Any] | None:
     """
     if not value:
         return None
-    data = pydantic.TypeAdapter(bool | str | dict[str, Any]).validate_python(load_yaml_from_string(value))
+    data: bool | str | dict[str, Any] = pydantic.TypeAdapter(bool | str | dict[str, Any]).validate_python(
+        load_yaml_from_string(value)
+    )
     if isinstance(data, bool):
         return {} if data else None
     if isinstance(data, str):

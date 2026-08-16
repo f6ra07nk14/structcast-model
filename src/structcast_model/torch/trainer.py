@@ -48,7 +48,7 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
         ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        node = TypeAdapter(TensorSpecTree).validate_python(shape)
+        node: TensorSpecTree = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
         raise ValueError(f"Invalid tensor shape: {shape}") from None
     if isinstance(node, TensorSpec):
@@ -176,7 +176,8 @@ class TorchTracker:
         """
         tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            tracker = compile_fn(tracker)
+            # torch.compile returns an OptimizedModule proxying the tracker, typed as a plain Module.
+            tracker = cast("CriteriaTracker", compile_fn(tracker))
         if distributed is None:
             distributed = torch.distributed.is_initialized()
         return cls(tracker=tracker, distributed=distributed)
@@ -262,9 +263,7 @@ class TrainingStateSaver:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
         # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
-        states = self.strategy.state_dict(
-            dict(info.models), getattr(learner, "optimizers", None), getattr(learner, "optimizer_models", None)
-        )
+        states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
         states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}

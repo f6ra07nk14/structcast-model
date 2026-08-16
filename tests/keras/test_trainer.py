@@ -72,7 +72,9 @@ def test_initial_model_raises_for_layer_without_shapes() -> None:
 def test_initial_model_builds_model_from_symbolic_inputs() -> None:
     """A Keras layer is wrapped into a built Keras model using symbolic inputs."""
 
-    class AddLayer(keras.layers.Layer):
+    # keras ships no py.typed, so `Layer` is `Any` here; the src-side config relaxes both checks
+    # for `structcast_model.keras.*` only.
+    class AddLayer(keras.layers.Layer):  # type: ignore[misc, no-any-unimported]
         def call(self, x: Any, y: Any) -> Any:
             """Add two inputs."""
             return x + y
@@ -170,7 +172,8 @@ def test_create_keras_inputs_uses_spec_dtype(shape: Any, expected: str) -> None:
 def test_initial_model_with_list_inputs() -> None:
     """A layer accepting positional args is wrapped via list shaped inputs."""
 
-    class ConcatLayer(keras.layers.Layer):
+    # keras ships no py.typed, so `Layer` is `Any` here (see `AddLayer` above).
+    class ConcatLayer(keras.layers.Layer):  # type: ignore[misc, no-any-unimported]
         def call(self, a: Any, b: Any) -> Any:
             """Concatenate two inputs."""
             return keras.ops.concatenate([a, b], axis=-1)

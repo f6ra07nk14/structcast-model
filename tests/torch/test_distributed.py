@@ -1,7 +1,7 @@
 """Tests for the distributed strategies and the sync gate."""
 
 from collections import OrderedDict
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -103,11 +103,16 @@ def test_single_device_wrap_and_sync_are_no_ops() -> None:
     strategy.sync_initial_weights(models)  # must not require a process group
 
 
+def _compiled_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Compile *module* into its ``OptimizedModule`` wrapper, which torch.compile only types as a callable."""
+    return cast(torch.nn.Module, torch.compile(module))
+
+
 def test_single_device_state_dict_strips_the_compile_wrapper() -> None:
     """Checkpoints must stay loadable no matter whether the model was compiled when saved."""
     strategy = SingleDeviceStrategy(device="cpu")
     models = _linear_models()
-    compiled = OrderedDict(model=torch.compile(models["model"]))
+    compiled = OrderedDict(model=_compiled_module(models["model"]))
     states = strategy.state_dict(compiled)
     assert set(states["models"]["model"]) == {"weight", "bias"}
 
@@ -126,7 +131,7 @@ def test_single_device_round_trips_models_and_optimizers() -> None:
     fresh_models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=torch.nn.Linear(4, 2))
     fresh_optimizer = torch.optim.SGD(fresh_models["model"].parameters(), lr=0.5, momentum=0.9)
     returned = strategy.load_state_dict(fresh_models, {"opt": fresh_optimizer}, pairing, state)
-    assert torch.equal(fresh_models["model"].weight, models["model"].weight)
+    assert torch.equal(fresh_models["model"].get_parameter("weight"), models["model"].get_parameter("weight"))
     assert fresh_optimizer.param_groups[0]["lr"] == 0.125
     assert returned is state
 
@@ -216,9 +221,9 @@ def test_ddp_strategy_sync_initial_weights_broadcasts_rank0(single_process_gloo:
     """The broadcast must run on plain pre-wrap tensors; with one rank it is an exact no-op."""
     strategy = DistributedDataParallelStrategy(device="cpu")
     models = _linear_models()
-    before = models["model"].weight.clone()
+    before = models["model"].get_parameter("weight").clone()
     strategy.sync_initial_weights(models)
-    assert torch.equal(models["model"].weight, before)
+    assert torch.equal(models["model"].get_parameter("weight"), before)
 
 
 def test_ddp_strategy_state_dict_has_wrapper_free_keys(single_process_gloo: None) -> None:
@@ -240,7 +245,7 @@ def test_ddp_strategy_round_trips_through_wrapped_models(single_process_gloo: No
     fresh = strategy.wrap(OrderedDict(model=torch.nn.Linear(4, 2)))
     fresh_optimizer = torch.optim.SGD(fresh["model"].parameters(), lr=0.75)
     strategy.load_state_dict(fresh, {"opt": fresh_optimizer}, {"opt": ["model"]}, state)
-    assert torch.equal(fresh["model"].module.weight, wrapped["model"].module.weight)
+    assert torch.equal(fresh["model"].get_parameter("module.weight"), wrapped["model"].get_parameter("module.weight"))
     assert fresh_optimizer.param_groups[0]["lr"] == 0.25
 
 
@@ -268,7 +273,7 @@ def test_fsdp2_strategy_shards_in_place_and_saves_plain_tensors(single_process_g
     pytest.importorskip("torch.distributed.fsdp")
     strategy = FullyShardedDataParallelStrategy(device="cpu")
     models = _linear_models()
-    reference = models["model"].weight.clone()
+    reference = models["model"].get_parameter("weight").clone()
     wrapped = strategy.wrap(models)
     states = strategy.state_dict(wrapped)
     weight = states["models"]["model"]["weight"]
@@ -332,13 +337,18 @@ def _block_models() -> "OrderedDict[str, torch.nn.Module]":
     return OrderedDict(model=_BlockModel())
 
 
+def _param_group(module: Any) -> Any:
+    """*module*'s own ``fully_shard`` group. Reached through private FSDP2 state, which torch does not type."""
+    return module._get_fsdp_state()._fsdp_param_group
+
+
 def _group_size(module: torch.nn.Module) -> int:
     """Number of parameters in *module*'s own ``fully_shard`` group.
 
     FSDP2 exposes no public view of a group's membership, and membership is the whole point of
     per-block sharding: the root must hold only what no matched block claimed.
     """
-    return len(module._get_fsdp_state()._fsdp_param_group.fsdp_params)
+    return len(_param_group(module).fsdp_params)
 
 
 def test_matched_shard_modules_keeps_named_modules_order() -> None:
@@ -349,7 +359,7 @@ def test_matched_shard_modules_keeps_named_modules_order() -> None:
 
 def test_matched_shard_modules_sees_through_the_compile_wrapper() -> None:
     """torch.compile prefixes every path with '_orig_mod.'; patterns must not have to know that."""
-    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=torch.compile(_BlockModel()))
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_compiled_module(_BlockModel()))
     matched = matched_shard_modules(models, ["block?"])
     assert [path for path, _ in matched["model"]] == ["_orig_mod.block0", "_orig_mod.block1"]
 
@@ -378,7 +388,7 @@ def test_matched_shard_modules_never_matches_the_root() -> None:
     """Wrap shards the root last unconditionally; a catch-all pattern must not shard it twice."""
     matched = matched_shard_modules(_block_models(), ["*"])
     assert "" not in [path for path, _ in matched["model"]]
-    compiled: OrderedDict[str, torch.nn.Module] = OrderedDict(model=torch.compile(_BlockModel()))
+    compiled: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_compiled_module(_BlockModel()))
     assert "_orig_mod" not in [path for path, _ in matched_shard_modules(compiled, ["*"])["model"]]
 
 
@@ -386,19 +396,19 @@ def test_fsdp2_per_block_wrap_refuses_a_tie_across_sibling_blocks(single_process
     """fully_shard replaces each group's parameters, so a tie split across groups silently diverges."""
     pytest.importorskip("torch.distributed.fsdp")
     models = _block_models()
-    models["model"].block0[1].weight = models["model"].block0[0].weight
+    models["model"].get_submodule("block0.1").weight = models["model"].get_parameter("block0.0.weight")
     strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block0.0", "block0.1"])
     with pytest.raises(RuntimeError, match="Tied parameter"):
         strategy.wrap(models)
     # The guard must run before any sharding: a half-sharded model cannot be recovered from.
-    assert type(models["model"].block0[0].weight) is torch.nn.Parameter
+    assert type(models["model"].get_parameter("block0.0.weight")) is torch.nn.Parameter
 
 
 def test_fsdp2_per_block_wrap_refuses_a_tie_with_an_unmatched_module(single_process_gloo: None) -> None:
     """A tie to a module outside every pattern lands in the root group, which is a different group."""
     pytest.importorskip("torch.distributed.fsdp")
     models = _block_models()
-    models["model"].head.weight = models["model"].block1.weight
+    models["model"].get_submodule("head").weight = models["model"].get_parameter("block1.weight")
     strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block1"])
     with pytest.raises(RuntimeError, match="Tied parameter"):
         strategy.wrap(models)
@@ -408,10 +418,10 @@ def test_fsdp2_per_block_wrap_allows_a_tie_inside_one_block(single_process_gloo:
     """A tie both of whose ends land in the same group is sharded once and stays tied."""
     pytest.importorskip("torch.distributed.fsdp")
     models = _block_models()
-    models["model"].block0[1].weight = models["model"].block0[0].weight
+    models["model"].get_submodule("block0.1").weight = models["model"].get_parameter("block0.0.weight")
     strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block0"])
     wrapped = strategy.wrap(models)["model"]
-    assert wrapped.block0[1].weight is wrapped.block0[0].weight
+    assert wrapped.get_parameter("block0.1.weight") is wrapped.get_parameter("block0.0.weight")
 
 
 def test_fsdp2_per_block_wrap_gives_every_matched_module_its_own_group(single_process_gloo: None) -> None:
@@ -443,7 +453,7 @@ def test_fsdp2_sync_gate_on_the_root_reaches_the_block_groups(single_process_glo
     strategy = FullyShardedDataParallelStrategy(device="cpu", shard_modules=["block?"])
     wrapped = strategy.wrap(_block_models())["model"]
     sync_gate(wrapped, armed=False)
-    assert wrapped.block0._get_fsdp_state()._fsdp_param_group.reduce_grads is False
+    assert _param_group(wrapped.block0).reduce_grads is False
 
 
 def _is_compiled(module: torch.nn.Module) -> bool:

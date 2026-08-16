@@ -313,7 +313,7 @@ The generated class manages:
 - optimizer stepping, zeroing, and automatic train/eval mode switching
 - learning-rate and parameter-group inspection helpers
 
-The result implements the `Learner` protocol — the `models`, `optimizers`, and `learning_rates` properties plus `update`, `training_step`, and `inference_step` — and the optional `grad_scalers`, `weight_decays`, and `param_group_names` properties the toolkit reads when present (the loggers merge `learning_rates` and `weight_decays` into the epoch metrics). Any object with those members can be trained, generated or hand-written; see [`examples/torch/simple_training.py`](examples/torch/simple_training.py).
+The result implements the `Learner` protocol — the `models`, `optimizers`, `optimizer_models`, and `learning_rates` properties plus `update`, `training_step`, and `inference_step` — and the optional `grad_scalers`, `weight_decays`, and `param_group_names` properties the toolkit reads when present (the loggers merge `learning_rates` and `weight_decays` into the epoch metrics). Any object with those members can be trained, generated or hand-written; see [`examples/torch/simple_training.py`](examples/torch/simple_training.py).
 
 For example, a CycleGAN learner template defines three `LEARNERS` entries — one for the generator pair and one for each discriminator — each with its own flow, optimizer, and trainable layers:
 

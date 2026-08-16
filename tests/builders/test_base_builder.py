@@ -4,7 +4,7 @@ from collections import defaultdict
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType
-from typing import TypeAlias
+from typing import TYPE_CHECKING
 
 import pytest
 from structcast.core.exceptions import SpecError
@@ -20,6 +20,12 @@ from structcast_model.builders.schema import Parameters, UserLayer
 from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from structcast_model.builders.utils import resolve_getter, resolve_object
 from tests import CFG_DIR
+
+if TYPE_CHECKING:
+    from structcast_model.builders.base_builder import _Intermediate
+else:
+    # LazySelectedImporter only exposes __all__; get _Intermediate via its public subclass.
+    _Intermediate = LayerIntermediate.__bases__[0]
 
 
 def test_resolve_object_collects_import_and_class_name() -> None:
@@ -117,7 +123,9 @@ def test_resolve_getter_rejects_unknown_identifier(monkeypatch: pytest.MonkeyPat
 
 def test_base_model_builder_from_path_and_user_defined_entry() -> None:
     """Build from path and resolve a named user-defined layer."""
-    builder = BaseModelBuilder.from_path(CFG_DIR / "torch" / "models" / "ConvNeXtV2.yaml")
+    builder: BaseModelBuilder[LayerIntermediate] = BaseModelBuilder.from_path(
+        CFG_DIR / "torch" / "models" / "ConvNeXtV2.yaml"
+    )
     assert builder.current_path.endswith("cfg/torch/models/ConvNeXtV2.yaml")
     assert builder.from_references[builder.current_path] == ["__root__"]
     sublayer = builder(classname="BackboneOnly", user_defined_layer="Backbone")
@@ -230,7 +238,7 @@ def test_base_model_builder_get_sublayer_cfg_with_type(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    builder = BaseModelBuilder(raw={"FLOW": []})
+    builder: BaseModelBuilder[LayerIntermediate] = BaseModelBuilder(raw={"FLOW": []})
     cfg_unit = UserLayer.model_validate({"CFG": cfg_path, "TYPE": "Backbone"})
     subclassname, _sub = builder._get_layer(Parameters(), cfg_unit)
     assert subclassname.endswith("Backbone")
@@ -243,7 +251,7 @@ def test_base_model_builder_flow_inputs_dict_and_partial_inout_error() -> None:
         "OUTPUTS": ["out"],
         "FLOW": [[{"left": "x", "right": "y"}, "out", {"_obj_": [["_addr_", "torch.add"]]}]],
     }
-    built = BaseModelBuilder(raw=raw_ok)(classname="DictInput")
+    built: LayerIntermediate = BaseModelBuilder(raw=raw_ok)(classname="DictInput")
     assert built.flow[0][0] == "left=x, right=y"
     raw_bad = {"FLOW": [{"INPUTS": "x"}]}
     with pytest.raises(SpecError, match="Both INPUTS and OUTPUTS"):
@@ -458,8 +466,6 @@ def test_torch_learner_builder_with_extra_kwargs() -> None:
 
 def test_intermediate_get_scripts_raises_not_implemented() -> None:
     """_Intermediate._get_scripts must be overridden; calling it bare raises."""
-    # LazySelectedImporter only exposes __all__; get _Intermediate via its public subclass.
-    _Intermediate: TypeAlias = LayerIntermediate.__bases__[0]
 
     class _BareIntermediate(_Intermediate):
         """Subclass that does NOT override _get_scripts."""

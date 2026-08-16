@@ -5,10 +5,10 @@ References:
     - `ReinMax GitHub <https://github.com/microsoft/ReinMax>`_
 """
 
-from typing import Any
+from typing import Any, cast
 
 from torch.autograd import Function
-from torch.autograd.function import FunctionCtx
+from torch.autograd.function import BackwardCFunction, FunctionCtx
 from torch.jit import unused
 
 from structcast_model.torch.types import Tensor
@@ -28,9 +28,10 @@ class ReinMaxCore(Function):
         return one_hot, y_soft
 
     @staticmethod
-    def backward(ctx: FunctionCtx, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:
+    def backward(ctx: BackwardCFunction, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:
         """Backward method."""
-        one_hot_sample, logits, y_soft, tau = ctx.saved_tensors
+        # `torch._C._FunctionBase.saved_tensors` is typed as a 1-tuple upstream, but it holds every saved tensor.
+        one_hot_sample, logits, y_soft, tau = cast("tuple[Tensor, Tensor, Tensor, Tensor]", ctx.saved_tensors)
 
         shifted_y_soft = 0.5 * ((logits / tau).softmax(dim=-1) + one_hot_sample)
         grad_at_input_1 = (2 * grad_at_sample) * shifted_y_soft

@@ -1,9 +1,10 @@
 """API-level tests for builder schema models."""
 
-from typing import Any
+from typing import Any, cast
 
 from pydantic import TypeAdapter, ValidationError
 import pytest
+from structcast.core.base import WithExtra
 from structcast.core.exceptions import SpecError
 from structcast.utils.base import register_dir, unregister_dir
 
@@ -21,7 +22,7 @@ from structcast_model.builders.schema import (
     resolve_inputs,
 )
 
-TREE = TypeAdapter(TensorSpecTree)
+TREE: TypeAdapter[TensorSpecTree] = TypeAdapter(TensorSpecTree)
 """Adapter validating a single INPUT_SHAPES entry, the way consumers of the tree do."""
 
 
@@ -48,7 +49,8 @@ def test_user_defined_layer_normalizes_imports() -> None:
 def test_layer_behavior_serialization_and_instance_passthrough() -> None:
     """Serialize LayerBehavior with NAME/LAYER and accept instance input."""
     behavior = LayerBehavior.model_validate(["x", "y", "unit", {"_obj_": [["_addr_", "torch.nn.Identity"]]}])
-    dumped = behavior.model_dump()
+    # `LayerBehavior` serializes to a list, which `model_dump` cannot express in its return type.
+    dumped = cast(list[Any], behavior.model_dump())
     assert dumped[2] == "unit"
     assert len(dumped) == 4
     assert LayerBehavior.model_validate(behavior) is behavior
@@ -314,7 +316,7 @@ def test_template_from_path_loads_yaml_file(tmp_path: Any) -> None:
     try:
         cfg = tmp_path / "simple.yaml"
         cfg.write_text("key: value\ncount: 42\n")
-        tmpl = Template.from_path(cfg)
+        tmpl: Template[WithExtra] = Template.from_path(cfg)
         assert isinstance(tmpl, Template)
     finally:
         unregister_dir(tmp_path)
@@ -326,7 +328,7 @@ def test_template_raw_and_others_for_with_extra_target(tmp_path: Any) -> None:
     try:
         cfg = tmp_path / "extra.yaml"
         cfg.write_text("foo: 1\nbar: 2\n")
-        tmpl = Template.from_path(cfg)
+        tmpl: Template[WithExtra] = Template.from_path(cfg)
         # Template.target_type defaults to WithExtra, so all extra fields land in raw
         assert "foo" in tmpl.raw
         assert tmpl.others == {}

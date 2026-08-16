@@ -81,6 +81,11 @@ class _StubLearner:
         """Return the optimizers dict; the trainer scan must handle an empty mapping."""
         return self._optimizers
 
+    @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """Pair every optimizer with every model, which is the pairing a single-model learner reports."""
+        return {name: list(self._models) for name in self._optimizers}
+
     def update(self, step: int) -> bool:
         """Always signal that an update should occur."""
         return True
@@ -575,10 +580,12 @@ class _RecordingStrategy(SingleDeviceStrategy):
         """Start with nothing recorded."""
         super().__init__(device="cpu")
         self.calls: list[dict[str, Any]] = []
+        self.pairings: list[Any] = []
 
     def state_dict(self, models: Any, optimizers: Any = None, optimizer_models: Any = None) -> dict[str, Any]:
-        """Record the models handed over and return a state no plain `state_dict()` call could produce."""
+        """Record the models and pairing handed over, returning a state no plain `state_dict()` could produce."""
         self.calls.append(dict(models))
+        self.pairings.append(optimizer_models)
         return {"models": {"gathered": True}, "optimizers": {}}
 
 
@@ -588,15 +595,20 @@ def test_training_state_saver_produces_state_on_null_logger_ranks() -> None:
     Skipping the producer on the null-logger ranks hangs the job under FSDP2.
     """
     model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    learner = _StubLearner(models={"model": model}, optimizers={"opt": optimizer})
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(models={"model": model}),
+        learner=learner,
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=SimpleDataProvider(training_dataset=[]),
     )
     strategy = _RecordingStrategy()
     TrainingStateSaver(logger=NullLogger(), strategy=strategy).on_epoch_end(trainer)
     assert strategy.calls == [{"model": model}]
+    # The learner's own pairing must reach the strategy: without it the strategy cannot key sharded
+    # optimizer state by parameter name and falls back to unloadable plain state dicts.
+    assert strategy.pairings == [learner.optimizer_models] == [{"opt": ["model"]}]
 
 
 # ---------------------------------------------------------------------------

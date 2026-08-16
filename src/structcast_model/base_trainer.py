@@ -65,6 +65,14 @@ class Learner(Protocol, Generic[ModelT]):
         """The optimizers by name; members implementing event protocols are routed by the trainer."""
 
     @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """The names of the models each optimizer updates (optimizer name -> model names).
+
+        Used by checkpointing to pair sharded optimizer state with its modules; empty when the
+        pairing is not declared.
+        """
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The current learning rate of each optimizer, for display and logging."""
 
@@ -585,8 +593,12 @@ class ProgressBar:
     validation_criteria: Sequence[str] = ()
     """Log keys shown next to the bar during validation."""
 
-    bar: "tqdm.tqdm" = field(init=False, repr=False)
-    """The underlying bar, created at construction."""
+    bar: Any = field(init=False, repr=False)
+    """The underlying ``tqdm.tqdm`` bar, created at construction.
+
+    Spelled ``Any`` because tqdm ships no stubs, so the precise annotation would be an
+    unfollowed-import ``Any`` anyway, on this field and on the synthesized ``replace()``.
+    """
 
     def __post_init__(self) -> None:
         """Create the bar sized to one training epoch."""

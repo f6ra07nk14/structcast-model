@@ -146,7 +146,7 @@ def test_simple_data_provider_reports_zero_validation_steps_without_a_validation
 
 def test_base_info_logs_returns_dict_for_current_epoch() -> None:
     """logs() without arguments returns a dict keyed to the current epoch."""
-    info = BaseInfo()
+    info: BaseInfo[Any] = BaseInfo()
     info.epoch = 2
     logs = info.logs()
     assert isinstance(logs, dict)
@@ -155,7 +155,7 @@ def test_base_info_logs_returns_dict_for_current_epoch() -> None:
 
 def test_base_info_logs_with_valid_epoch() -> None:
     """logs(epoch) returns the log for a known epoch."""
-    info = BaseInfo()
+    info: BaseInfo[Any] = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
     assert info.logs(1) == {"loss": 0.5}
@@ -163,7 +163,7 @@ def test_base_info_logs_with_valid_epoch() -> None:
 
 def test_base_info_logs_raises_key_error_for_unknown_epoch() -> None:
     """logs(epoch) raises KeyError when the epoch is not in history."""
-    info = BaseInfo()
+    info: BaseInfo[Any] = BaseInfo()
     with pytest.raises(KeyError, match="No logs found for key: 99"):
         info.logs(99)
 
@@ -200,6 +200,7 @@ class _FakeLearner:
         self._should_update = should_update
         self._inference_loss = inference_loss
         self.optimizers = dict(optimizers) if optimizers is not None else {}
+        self.optimizer_models: dict[str, list[str]] = {}
         self.learning_rates = {"lr": 0.1}
         self.named_models: dict[str, Any] = {"model": "the-model"}
 
@@ -648,13 +649,13 @@ def test_fit_rejects_invalid_loop_parameters(kwargs: dict[str, int], message: st
 
 def test_best_criterion_min_mode_initial_best_is_inf() -> None:
     """In 'min' mode the initial best value is +inf, so any first value improves on it."""
-    criterion = BestCriterion(target="loss", mode="min")
+    criterion: BestCriterion[Any] = BestCriterion(target="loss", mode="min")
     assert criterion.value == inf
 
 
 def test_best_criterion_max_mode_initial_best_is_neg_inf() -> None:
     """In 'max' mode the initial best value is -inf, so any first value improves on it."""
-    criterion = BestCriterion(target="acc", mode="max")
+    criterion: BestCriterion[Any] = BestCriterion(target="acc", mode="max")
     assert criterion.value == -inf
 
 
@@ -671,8 +672,8 @@ def test_best_criterion_tracks_the_best_value(
     mode: Literal["min", "max"], values: list[float], expected: float
 ) -> None:
     """The best value survives regressions: that is what makes 'best' meaningful."""
-    criterion = BestCriterion(target="loss", mode=mode)
-    info = BaseInfo()
+    criterion: BestCriterion[Any] = BestCriterion(target="loss", mode=mode)
+    info: BaseInfo[Any] = BaseInfo()
     for epoch, value in enumerate(values, start=1):
         info.epoch = epoch
         info.step = epoch
@@ -708,7 +709,7 @@ def test_best_criterion_on_best_called_even_without_improvement() -> None:
     """on_best fires whenever the target is present, so consumers can log the best value each epoch."""
     recorder = _BestRecorder()
     criterion = BestCriterion(target="loss", callbacks=[recorder])
-    info = BaseInfo()
+    info: BaseInfo[Any] = BaseInfo()
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
     criterion.on_epoch_end(info)
@@ -728,7 +729,7 @@ def test_best_criterion_on_best_skipped_when_target_missing() -> None:
     """A criterion that was not produced this epoch must not trigger best-value side effects."""
     recorder = _BestRecorder()
     criterion = BestCriterion(target="loss", callbacks=[recorder])
-    info = BaseInfo()
+    info: BaseInfo[Any] = BaseInfo()
     info.epoch = 1
     info.history[1] = {}
     criterion.on_epoch_end(info)
@@ -737,7 +738,7 @@ def test_best_criterion_on_best_skipped_when_target_missing() -> None:
 
 def test_best_criterion_routes_through_the_trainer() -> None:
     """Passed as a callback, BestCriterion is routed by its on_epoch_end method alone."""
-    criterion = BestCriterion(target="val_loss", mode="min")
+    criterion: BestCriterion[Any] = BestCriterion(target="val_loss", mode="min")
     trainer = _make_trainer(
         learner=_FakeLearner(inference_loss=0.2),
         data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),

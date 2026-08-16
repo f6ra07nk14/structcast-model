@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "structcast>=2.0.0",
+    "structcast>=2.1.0",
     "jinja2>=3.1.6",
     "pydantic>=2.12.5",
     "ruamel-yaml[jinja2]>=0.19.1",
@@ -193,11 +193,20 @@ relative_files = true
 data_file = ".pytest_cache/.coverage"
 
 [tool.mypy]
-python_version = "3.11"
+# See docs/adr/0007-mypy-tests-resolve-src-with-tripwires.md: tests resolve the package from src,
+# site-package types stay on, and the tripwires turn silent Any-degradation into errors.
 disallow_untyped_defs = true
 ignore_missing_imports = true
 plugins = ["pydantic.mypy"]
-no_site_packages = true
+mypy_path = ["src"]
+disallow_any_unimported = true
+disallow_subclassing_any = true
+
+[[tool.mypy.overrides]]
+# keras ships no py.typed and is not analyzable; keras-facing modules keep Any at the boundary.
+module = ["structcast_model.keras", "structcast_model.keras.*"]
+disallow_any_unimported = false
+disallow_subclassing_any = false
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
