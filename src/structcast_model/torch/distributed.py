@@ -593,7 +593,10 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
             self._mesh = init_device_mesh(device_type, (torch.distributed.get_world_size(),))
         kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
-            kwargs["mp_policy"] = MixedPrecisionPolicy(**{k: _DTYPES[v] for k, v in self.mp_policy.items()})
+            # Any-valued because a dict[str, dtype] unpacked as **kwargs is checked against every
+            # MixedPrecisionPolicy field, including the bool cast_forward_inputs no dtype ever fills.
+            dtypes: dict[str, Any] = {k: _DTYPES[v] for k, v in self.mp_policy.items()}
+            kwargs["mp_policy"] = MixedPrecisionPolicy(**dtypes)
         if self.shard_modules:
             matched = matched_shard_modules(models, self.shard_modules)
             # Every model is validated before any is sharded: a tie violation surfacing halfway
@@ -605,7 +608,11 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
                 # ancestor claim its whole subtree and re-sharding the descendant then throws.
                 for _, submodule in reversed(matched[name]):
                     fully_shard(submodule, **kwargs)
-        return OrderedDict((n, fully_shard(m, **kwargs)) for n, m in models.items())
+        # fully_shard shards in place and hands back the very module it was given; its declared
+        # FSDPModule return type is the runtime-injected mixin, which is not statically an nn.Module.
+        for model in models.values():
+            fully_shard(model, **kwargs)
+        return OrderedDict(models)
 
     def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
         """Compile the sharded submodules in place, so compile units follow the shard boundaries.

@@ -48,7 +48,7 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
         ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        node = TypeAdapter(TensorSpecTree).validate_python(shape)
+        node: TensorSpecTree = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
         raise ValueError(f"Invalid tensor shape: {shape}") from None
     if isinstance(node, TensorSpec):
@@ -176,7 +176,8 @@ class TorchTracker:
         """
         tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            tracker = compile_fn(tracker)
+            # torch.compile returns an OptimizedModule proxying the tracker, typed as a plain Module.
+            tracker = cast("CriteriaTracker", compile_fn(tracker))
         if distributed is None:
             distributed = torch.distributed.is_initialized()
         return cls(tracker=tracker, distributed=distributed)

@@ -66,7 +66,7 @@ def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
         ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        node = TypeAdapter(TensorSpecTree).validate_python(shape)
+        node: TensorSpecTree = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
         raise ValueError(f"Invalid tensor shape: {shape}") from None
     if isinstance(node, TensorSpec):
@@ -83,8 +83,9 @@ def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     return [create_jax_inputs(value, batch_size=batch_size) for value in node]
 
 
+# `jax.Device` is Any to mypy: jaxlib re-exports it from its `_jax` C extension, which ships no stubs.
 @lru_cache(maxsize=1)
-def get_jax_devices() -> OrderedDict[str, jax.Device]:
+def get_jax_devices() -> OrderedDict[str, jax.Device]:  # type: ignore[no-any-unimported]
     """Get a mapping of available JAX devices.
 
     Returns:
@@ -94,7 +95,8 @@ def get_jax_devices() -> OrderedDict[str, jax.Device]:
     return OrderedDict((f"{d.platform}:{d.id}", d) for d in jax.devices())
 
 
-def get_jax_device(device: str | None = None) -> jax.Device:
+# `jax.Device` is Any to mypy, as above.
+def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-any-unimported]
     """Get a JAX device based on the provided device string.
 
     Args:

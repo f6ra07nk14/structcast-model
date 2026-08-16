@@ -226,9 +226,13 @@ def create_opt(
         weight_decay = 0.0
     else:
         parameters = params
-    engine = opt if callable(opt) else _native_optimizer(opt)
-    if engine is None:
-        return create_optimizer_v2(parameters, opt=opt, weight_decay=weight_decay, **kwargs)
+    if callable(opt):
+        engine: Callable[..., Optimizer] = opt
+    else:
+        native = _native_optimizer(opt)
+        if native is None:
+            return create_optimizer_v2(parameters, opt=opt, weight_decay=weight_decay, **kwargs)
+        engine = native
     optimizer = engine(parameters, weight_decay=weight_decay, **kwargs)
     if has_lr_scale:
         set_lr_scale(optimizer, True)

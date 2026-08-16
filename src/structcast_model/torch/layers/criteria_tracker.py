@@ -9,6 +9,9 @@ from torch import autocast, float32, no_grad, zeros
 class CriteriaTracker(Module):
     """A tracker for multiple criteria."""
 
+    total: Tensor
+    """Number of updates, registered as a buffer; annotated so `Module.__getattr__` does not widen it."""
+
     def __init__(self, criteria: list[str]) -> None:
         """Initialize the criteria tracker."""
         super().__init__()

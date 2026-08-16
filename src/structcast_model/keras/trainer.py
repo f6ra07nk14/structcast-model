@@ -66,7 +66,7 @@ def create_numpy_inputs(shape: Any, *, batch_size: int = 1) -> Any:
         ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        node = TypeAdapter(TensorSpecTree).validate_python(shape)
+        node: TensorSpecTree = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
         raise ValueError(f"Invalid tensor shape: {shape}") from None
     if isinstance(node, TensorSpec):
@@ -102,7 +102,7 @@ def create_keras_inputs(shape: Any, *, batch_size: int | None = None, name: str 
         ValueError: If the shape is neither a tensor specification nor a dictionary or list nesting more of them.
     """
     try:
-        node = TypeAdapter(TensorSpecTree).validate_python(shape)
+        node: TensorSpecTree = TypeAdapter(TensorSpecTree).validate_python(shape)
     except ValidationError:
         raise ValueError(f"Invalid tensor shape: {shape}") from None
     if isinstance(node, TensorSpec):

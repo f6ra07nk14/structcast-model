@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from functools import cached_property
 from logging import getLogger
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar, cast
 
 from pydantic import (
     AfterValidator,
@@ -546,7 +546,10 @@ class Template(WithExtra, Generic[SerializableT]):
     PARAMETERS: Parameters = Field(default_factory=Parameters)
     """Parameters for template formatting."""
 
-    target_type: ClassVar[type[SerializableT]] = WithExtra
+    # Subclasses bind `target_type` to the concrete type they parametrize `Template` with,
+    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
+    # `ClassVar` instead would make pydantic treat the attribute as a model field.
+    target_type: ClassVar[type[SerializableT]] = cast(type[SerializableT], WithExtra)
 
     @classmethod
     def from_path(cls, path: PathLike) -> Self:
@@ -592,12 +595,13 @@ class Template(WithExtra, Generic[SerializableT]):
         Returns:
             An instance of the target type created from the formatted template.
         """
+        # `create` is annotated to return the base `Parameters` while it instantiates `cls` at runtime.
         if merged:
-            parameters = Parameters.create(self.PARAMETERS, parameters)
+            parameters = cast(Parameters, Parameters.create(self.PARAMETERS, parameters))
         elif parameters is None:
             parameters = self.PARAMETERS
         else:
-            parameters = Parameters.create(parameters)
+            parameters = cast(Parameters, Parameters.create(parameters))
         return self.target_type.model_validate(extend_structure(self.raw, template_kwargs=parameters))
 
 

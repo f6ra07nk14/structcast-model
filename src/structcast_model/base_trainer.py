@@ -593,8 +593,12 @@ class ProgressBar:
     validation_criteria: Sequence[str] = ()
     """Log keys shown next to the bar during validation."""
 
-    bar: "tqdm.tqdm" = field(init=False, repr=False)
-    """The underlying bar, created at construction."""
+    bar: Any = field(init=False, repr=False)
+    """The underlying ``tqdm.tqdm`` bar, created at construction.
+
+    Spelled ``Any`` because tqdm ships no stubs, so the precise annotation would be an
+    unfollowed-import ``Any`` anyway, on this field and on the synthesized ``replace()``.
+    """
 
     def __post_init__(self) -> None:
         """Create the bar sized to one training epoch."""

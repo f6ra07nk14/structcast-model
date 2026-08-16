@@ -1,6 +1,7 @@
 """Base builder for building layers or learners from templates."""
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
@@ -233,7 +234,10 @@ LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
 class BaseModelBuilder(Generic[LayerIntermediateT]):
     """Base model builder for building layers from templates."""
 
-    user_defined_layer_type: ClassVar[type[LayerIntermediateT]] = LayerIntermediate
+    # Subclasses bind the type to the concrete intermediate they parametrize the builder with,
+    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
+    # `ClassVar` instead would turn the attribute into a per-instance dataclass field.
+    user_defined_layer_type: ClassVar[type[LayerIntermediateT]] = cast(type[LayerIntermediateT], LayerIntermediate)
 
     raw: Any
     predefined_user_defined_layers: dict[str, Any] = field(default_factory=dict)
@@ -256,14 +260,15 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
 
     def get_user_defined_layer(
         self,
-        parts: list[str],
+        parts: Sequence[str | int],
         parameters: dict[str, dict[str, Any]] | Parameters,
         classname: str,
     ) -> LayerIntermediateT:
         """Get the user-defined layer with the given parts and parameters.
 
         Args:
-            parts (list[str]): The parts of the user-defined layer reference to resolve.
+            parts (Sequence[str | int]): The parts of the user-defined layer reference to resolve,
+                as returned by `split_attribute`. Numeric index parts never name a user-defined layer.
             parameters (dict[str, dict[str, Any]] | Parameters):
                 The template keyword arguments to format the user-defined layer with,
                 or a `Parameters` instance containing the template keyword arguments.
@@ -275,7 +280,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         if not parts:
             return self(parameters, classname)
         first, *parts = parts
-        if first not in self.user_defined_layers:
+        if not isinstance(first, str) or first not in self.user_defined_layers:
             raise SpecError(f'User-defined layer with key "{first}" not found in the template.')
         current_parts = self.from_references.get(self.current_path, None) or []
         circular_detected = first in current_parts
@@ -299,7 +304,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             else:
                 if "__root__" in current_parts:
                     raise SpecError(f"Circular reference detected for layer configuration: {self.from_references}")
-                current_parts, parts = (current_parts + ["__root__"]), []
+                current_parts, parts = (current_parts + ["__root__"]), ()
             builder = type(self)(
                 raw=load_any(unit.CFG),
                 predefined_user_defined_layers=self.user_defined_layers,
@@ -310,7 +315,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             subclassname, parts, builder = to_pascal(unit.TYPE), split_attribute(unit.TYPE), self
         else:
             raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
-        return subclassname, builder.get_user_defined_layer(parts, parameters.merge(unit.PARAM), subclassname)
+        # `merge` is annotated to return the base `Parameters` while it instantiates `type(self)` at runtime.
+        merged = cast(Parameters, parameters.merge(unit.PARAM))
+        return subclassname, builder.get_user_defined_layer(parts, merged, subclassname)
 
     def __call__(
         self,
@@ -356,6 +363,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
 
         def _create_flow(units: list[LayerBehavior]) -> list[tuple[str, str, str | None]]:
             flow: list[tuple[str, str, str | None]] = []
+            subinst: LayerIntermediate | str
             for unit in units:
                 if unit.LAYER is None:
                     if unit.NAME and unit.NAME not in layers:
@@ -527,7 +535,12 @@ LearnerIntermediateT = TypeVar("LearnerIntermediateT", bound=LearnerIntermediate
 class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
     """Base learner builder for building learners from templates."""
 
-    user_defined_learner_layer_type: ClassVar[type[LearnerIntermediateT]] = LearnerIntermediate
+    # Subclasses bind the type to the concrete intermediate they parametrize the builder with,
+    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
+    # `ClassVar` instead would turn the attribute into a per-instance dataclass field.
+    user_defined_learner_layer_type: ClassVar[type[LearnerIntermediateT]] = cast(
+        type[LearnerIntermediateT], LearnerIntermediate
+    )
     layer_builder_type: ClassVar[type[BaseModelBuilder]] = BaseModelBuilder
 
     raw: Any
