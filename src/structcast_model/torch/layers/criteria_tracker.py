@@ -17,23 +17,21 @@ class CriteriaTracker(Module):
         super().__init__()
         self.criteria = criteria
         self.register_buffer("total", zeros(1, dtype=float32))
-        self.trackers = {}
         for criterion in criteria:
             self.register_buffer(f"{criterion}", zeros(1, dtype=float32))
-            self.trackers[criterion] = getattr(self, criterion)
 
     @no_grad()
     def forward(self, values: dict[str, Tensor]) -> dict[str, Tensor]:
         """Update the total and count for each criterion."""
         with autocast(device_type=self.total.device.type, enabled=False):
             self.total.add_(self.total.new_ones(1, dtype=float32))
-            return {c: v.add_(values[c].to(float32)).div(self.total) for c, v in self.trackers.items()}
+            return {c: self.get_buffer(c).add_(values[c].to(float32)).div(self.total) for c in self.criteria}
 
     @no_grad()
     def reset(self) -> None:
         """Reset all trackers."""
-        for tracker in self.trackers.values():
-            tracker.zero_()
+        for criterion in self.criteria:
+            self.get_buffer(criterion).zero_()
         self.total.zero_()
 
 
