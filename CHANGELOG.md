@@ -1,3 +1,44 @@
+## [5.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v4.0.0...v5.0.0) (2026-08-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **base-trainer:** hand-written learners must expose optimizer_models;
+a learner without it raises AttributeError when training state is
+saved at epoch end or restored on resume. Generated learners are
+unaffected.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+### 👷 Build
+
+* **deps:** upgrade locked dependencies ([95b94dc](https://github.com/f6ra07nk14/structcast-model/commit/95b94dc7b395e6729ba40f455e74c2caf2ac3218))
+* **mypy:** drop the structcast override and the python_version pin ([cfd3ba9](https://github.com/f6ra07nk14/structcast-model/commit/cfd3ba9821cf2e3e2c7990e2319040aa38ecf51d)), closes [#26](https://github.com/f6ra07nk14/structcast-model/issues/26)
+* **mypy:** resolve tests against src and enable dependency types ([eb06700](https://github.com/f6ra07nk14/structcast-model/commit/eb06700d6cd3d2f98c111d88d3cfc2cb892b79a8)), closes [#25](https://github.com/f6ra07nk14/structcast-model/issues/25)
+
+
+### 💎 Features
+
+* **base-trainer:** require optimizer_models on the Learner protocol ([cd7060a](https://github.com/f6ra07nk14/structcast-model/commit/cd7060ad86291ae41e2099bbb13edf2f1369ea9a))
+
+
+### 🔧 Fixes
+
+* **protocols:** import TensorInitializer protocols from typing_extensions ([1e57dab](https://github.com/f6ra07nk14/structcast-model/commit/1e57dab7126a438a49c2d06957a33132eb8c8e47))
+* **torch:** convert incoming criteria values to the buffer device ([30bcc64](https://github.com/f6ra07nk14/structcast-model/commit/30bcc646e58ad28a887be4f2e13d36934c80158d))
+* **torch:** resolve criteria buffers live instead of caching them ([f32dfdd](https://github.com/f6ra07nk14/structcast-model/commit/f32dfdd09cb5653430e75f16890b2f86faec4f01))
+
+
+### 🔨 Refactor
+
+* align src annotations with real dependency types ([b691886](https://github.com/f6ra07nk14/structcast-model/commit/b691886150accdae4864e64e32058a7ecdd31805))
+* instantiate initializers and compile_kw directly in the _assemble_learner call ([30d4af0](https://github.com/f6ra07nk14/structcast-model/commit/30d4af072ea23058d86a3a218c5f2233e4d2ee94))
+
+
+### 🚨 Tests
+
+* **mypy:** add protocol-conformance canary ([f5b563c](https://github.com/f6ra07nk14/structcast-model/commit/f5b563cdb6e6029b30041c446dd672e2baf82b9b)), closes [#25](https://github.com/f6ra07nk14/structcast-model/issues/25)
+
 ## [4.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v3.0.0...v4.0.0) (2026-08-15)
 
 
