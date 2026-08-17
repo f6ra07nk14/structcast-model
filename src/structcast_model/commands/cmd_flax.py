@@ -123,7 +123,7 @@ def measure_inference_time(
     training_mode_kw = (
         {"training": training_mode, "deterministic": not training_mode, "use_running_average": not training_mode}
         if training_mode_kwargs_pattern is None
-        else instantiate_object(training_mode_kwargs_pattern)
+        else instantiator.instantiate(training_mode_kwargs_pattern)
     )
     print("Initializing the model...")
     model = instantiate_object(model_pattern)

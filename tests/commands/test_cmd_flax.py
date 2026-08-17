@@ -99,3 +99,30 @@ def test_time_linear(cli_runner: CliRunner) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Average inference time" in result.output
+
+
+def test_time_linear_training_mode_kwargs_mapping(cli_runner: CliRunner) -> None:
+    """'time --training-mode-kwargs' accepts a plain mapping of "nnx.view" flags, as its help documents."""
+    pattern = (
+        "[_obj_, {_addr_: flax.nnx.Linear},"
+        " {_call_: {in_features: 4, out_features: 2,"
+        " rngs: [_obj_, {_addr_: flax.nnx.Rngs}, {_call_: [0]}]}}]"
+    )
+    result = cli_runner.invoke(
+        app,
+        [
+            "time",
+            pattern,
+            "--shape",
+            "inputs: [4]",
+            "--training-mode-kwargs",
+            "{deterministic: true}",
+            "--warmup-runs",
+            "1",
+            "--times",
+            "1",
+            "--batch-size",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
