@@ -190,10 +190,11 @@ What happens:
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
 3. The selected `DistributedStrategy` wraps every model before the learner is constructed — `DistributedDataParallelStrategy` by default in a distributed environment, `SingleDeviceStrategy` or `FullyShardedDataParallelStrategy` (FSDP2) via `--strategy`.
-4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
-5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
-6. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
-7. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
+4. Both multi-rank strategies convert `BatchNorm` layers to `SyncBatchNorm` at the top of `wrap()`, before DDP construction or FSDP2 sharding — no manual `convert_sync_batchnorm` call in the model definition. timm's converter is used, so a fused `BatchNormAct2d` becomes a `SyncBatchNormAct` with its activation intact. Skipped on CPU; opt out with `_bind_: {sync_batchnorm: false}` on the strategy pattern (no CLI flag). The conversion is idempotent: pre-existing `SyncBatchNorm` layers pass through untouched, `process_group` included. Watch out for `torch.compile` graph breaks on `SyncBatchNorm`, non-timm `_BatchNorm` subclasses flattened to a plain `SyncBatchNorm`, and hooks (or an in-place root/`shard_modules` compile) lost on a replaced layer.
+5. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
+6. `TorchTracker` uses `all_reduce` to average metrics across ranks.
+7. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
+8. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
 
 ## CLI Surface
 
@@ -313,7 +314,7 @@ These live in `examples/torch/data.py` and are referenced from a configuration b
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
 | Distributed environment detection | `initial_distributed_env(device, ...)` | Read `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars, init process group |
-| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, place the compile units, and produce wrapper-free state dicts |
+| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, convert `BatchNorm` to `SyncBatchNorm` on the multi-rank strategies, place the compile units, and produce wrapper-free state dicts |
 | Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
 | Gradient sync gating | `sync_gate(model, armed)` (in generated learners) | Let gradients synchronize only on the owning segment's last model call of an update step |
 

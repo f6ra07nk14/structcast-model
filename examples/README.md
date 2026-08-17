@@ -257,6 +257,16 @@ shard every block as its own communication group, uncomment `shard_modules` in t
 configuration — the patterns are globs over `named_modules()` paths whose `*` and `?` never cross
 a `.`, so `"backbone.block*"` matches the blocks this model generates but not their contents.
 
+The same configuration carries a commented `sync_batchnorm: false`, the off-switch for the other
+wrap-time knob: under DDP and FSDP2 the strategy converts every `BatchNorm` layer to
+`SyncBatchNorm` before the models are wrapped or sharded, so a convolutional model needs no
+`convert_sync_batchnorm` call of its own (a model that already made one still works). The
+conversion uses timm's converter, which turns a fused `BatchNormAct2d` into a `SyncBatchNormAct`
+instead of dropping its activation, and it is skipped on CPU. This language model has no
+normalization of that kind, so the knob changes nothing here; bind it to `false` when a model
+carries `BatchNorm` layers you want left alone — a third-party `_BatchNorm` subclass timm does not
+know, or a run whose `torch.compile` graph must not break on `SyncBatchNorm`.
+
 ## File-addressed datasets
 
 [`torch/data.py`](torch/data.py) holds the timm dataset and dataloader wrappers for the same reason:
