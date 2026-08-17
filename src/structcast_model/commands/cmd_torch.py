@@ -17,9 +17,11 @@ from structcast_model.base_trainer import (
     SimpleDataProvider,
 )
 from structcast_model.commands.utils import (
+    TEMPLATE_PARAM_HELP,
     bool_or_path_or_dict_parser,
     dict_parser,
     instantiate_object,
+    object_pattern_help,
     path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
@@ -60,48 +62,65 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating PyTorch models and learner classes.")
 
+# The pattern options accepting a file path all say so the same way.
+PATH_FORM_HELP = " The pattern may also be given as a path to a YAML/JSON file holding it."
+# --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
+SHAPES_HELP = (
+    "Input tensor shapes for one sample, without the batch dimension, as a YAML mapping of input name to "
+    'specification. Compact form: "image: [3, 224, 224]". '
+    'Explicit form: "tokens: {_SHAPE_: [512], _DTYPE_: int64, _INIT_: torch.zeros}". '
+    "Specifications may nest in mappings and lists. _DTYPE_ defaults to bfloat16 (not float32), and an integer "
+    "dtype without _INIT_ falls back to zeros with a warning."
+)
+DEVICE_HELP = (
+    'Computation device to use: "cpu", "cuda", or an indexed form such as "cuda:1". '
+    'If not specified, "cuda" is used when available, otherwise "cpu"; an explicitly requested CUDA device '
+    "falls back to CPU with a warning when CUDA is unavailable."
+)
+
 template_param = Option(
     None,
     "--parameter",
     "-p",
     parser=dict_parser,
-    help="Parameters to format the template configuration file with. "
-    'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
-    "and the value is a dictionary of keyword arguments for formatting the template. "
-    'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
+    help=TEMPLATE_PARAM_HELP
+    + ' For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
 )
-output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
+output_script_path = Option(
+    None,
+    "--output",
+    "-o",
+    help='Path of the generated Python script. Defaults to the snake_case --classname plus ".py" in the current '
+    "directory. An existing file is overwritten and missing parent directories are created.",
+)
 model_pattern = Argument(
     parser=path_or_any_parser,
-    help="The object pattern used to instantiate models. "
-    "For example, if the model is defined as `my_package.MyModel(...)`, "
-    'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
-    '"[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+    help=object_pattern_help("the model", "MyModel") + PATH_FORM_HELP,
 )
 shapes = Option(
     None,
     "--shape",
     "-s",
     parser=tensor_shape_parser,
-    help="Input tensor shapes as a dictionary, e.g., 'image: [3, 224, 224]'.",
+    help=SHAPES_HELP
+    + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
+    "neither exists.",
 )
-device = Option(
-    None,
-    "--device",
-    "-d",
-    help='Computation device to use, either "cpu" or "cuda". '
-    'If not specified, it will use "cuda" if available, otherwise "cpu".',
-)
+device = Option(None, "--device", "-d", help=DEVICE_HELP)
 compile_pattern: dict[str, Any] | None = Option(
     None,
     "--compile",
     "-c",
     parser=bool_or_path_or_dict_parser,
-    help='Whether to compile the model using "torch.compile". '
-    'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
+    help='Whether to compile the model using "torch.compile". Omitted or false leaves the model uncompiled; '
+    "true compiles with default options. Can also be a path to an existing YAML/JSON file, or a dictionary of "
+    'keyword arguments for "torch.compile".',
 )
 matmul_precision: Literal["highest", "high", "medium"] = Option(
-    "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
+    "high",
+    envvar="MATMUL_PRECISION",
+    help='Precision for float32 matrix multiplications: "highest" keeps full float32, while "high" and "medium" '
+    "trade accuracy for tensor-core speed.",
 )
 
 
@@ -110,7 +129,7 @@ def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Model", "--classname", "-c", help="Name the model class."),
+    classname: str = Option("Model", "--classname", "-c", help="Name of the generated model class."),
     structured_output: bool | None = Option(
         None,
         "--structured-output/--no-structured-output",
@@ -136,7 +155,7 @@ def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Learner", "--classname", "-c", help="Name the learner class."),
+    classname: str = Option("Learner", "--classname", "-c", help="Name of the generated Learner class."),
 ) -> None:
     """Create a PyTorch learner class from the given configuration file and parameters."""
     builder = torch_builder.TorchLearnerBuilder.from_path(cfg_path)
@@ -229,12 +248,15 @@ def call_ptflops(
     model_pattern: Any = model_pattern,
     shapes: dict | None = shapes,
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
-    flops_units: Literal["GMac", "MMac", "KMac"] = Option("GMac", help="Units for FLOPs: GMac, MMac, or KMac."),
+    flops_units: Literal["GMac", "MMac", "KMac"] = Option(
+        "GMac", help="Unit for the reported multiply-accumulate count."
+    ),
     param_units: Literal["M", "K", "B"] = Option(
         "M", help="Units for parameters: M (millions), K (thousands), or B (billions)."
     ),
     backend: Literal["pytorch", "aten"] = Option(
-        "aten", help='Backend for FLOPs computation. Note: Don\'t use "pytorch" backend for transformer architectures.'
+        "aten",
+        help='Backend for the FLOPs computation. Do not use the "pytorch" backend for transformer architectures.',
     ),
     device: str | None = device,
 ) -> None:
@@ -431,100 +453,142 @@ def _build_callbacks(
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
-        help="The object patterns used to instantiate models. "
-        "For example, if the model is defined as `model_name = my_package.MyModel(...)`, then the pattern should be "
-        '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+        help=object_pattern_help("the model", "MyModel", keyed=True)
+        + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
+        "inline; a file path is not accepted here. The names are passed to the --learner factory as keyword "
+        "arguments and are the keys used by --initializer.",
     ),
     initializer_patterns: list[dict] | None = Option(
         None,
         "--initializer",
         "-I",
         parser=dict_parser,
-        help="The object patterns used to instantiate initializers for the models. "
-        "For example, if the initializer is defined as `my_package.initialize_fn`, then the pattern should be "
-        '"model_name: [_obj_, {_addr_: my_package.initialize_fn, _file_: my_package.py}]" or '
-        '"model_name: [_obj_, [_addr_, my_package.initialize_fn, my_package.py]]".',
+        help=object_pattern_help("the initializer", "initialize_fn", keyed=True, call=False)
+        + " Key each pattern by one of the model names given as positional arguments; a key matching no model is "
+        "ignored. Each initializer is applied to every submodule of its model on rank 0 and broadcast to the other "
+        "ranks, and the whole option is skipped when --resume is given, because the loaded state would overwrite it.",
     ),
-    shapes: list[dict] | None = shapes,
-    device: str | None = device,
+    shapes: list[dict] | None = Option(
+        None,
+        "--shape",
+        "-s",
+        parser=tensor_shape_parser,
+        help=SHAPES_HELP
+        + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
+        "twice keeps only the last occurrence. When omitted, the INPUT_SHAPES declared by the built models are "
+        "used, merged across them.",
+    ),
+    device: str | None = Option(
+        None,
+        "--device",
+        "-d",
+        help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
+    ),
     learner_pattern: Any = Option(
         ...,
         "--learner",
         "-L",
         parser=path_or_any_parser,
-        help="The object pattern used to instantiate the learner class. "
-        "For example, if the learner class is defined as `my_package.MyLearner(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyLearner, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyLearner, my_package.py], {_call_: {...}}]".',
+        help=object_pattern_help("the learner class", "MyLearner")
+        + PATH_FORM_HELP
+        + " The factory is called with one keyword argument per positional model pattern, so its parameter names "
+        "must match those model names.",
     ),
     learner_outputs: list[str] | None = Option(
         None,
         "--learner-outputs",
         "-LO",
-        help="Default outputs for the learner module if it doesn't have an 'outputs' attribute.",
+        help="Criterion names the Learner's steps produce; they build the tracker and the progress-bar rows. "
+        "Overrides the names the Learner declares itself, and is required when it declares none. Give the "
+        'unprefixed names: the criterion options then take "loss" for the training criterion and "val_loss" for '
+        "the validation one.",
     ),
     compile_pattern: dict[str, Any] | None = compile_pattern,
     trainer_pattern: Any | None = Option(
         None,
         "--trainer",
         parser=path_or_any_parser,
-        help="The object pattern used to instantiate the trainer. "
-        "For example, if the trainer is defined as `my_package.MyTrainer`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyTrainer, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyTrainer, my_package.py]]".',
+        help=object_pattern_help("the trainer", "MyTrainer", call=False)
+        + PATH_FORM_HELP
+        + " The pattern must build a callable accepted as trainer(device=..., learner=..., tracker=..., data=..., "
+        "callbacks=[]) whose result exposes training_prefix, validation_prefix, callbacks, describe() and "
+        "fit(epochs, start_epoch, validation_frequency); subclassing TorchTrainer is the intended way.",
     ),
-    epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
-    start_epoch: int = Option(1, help="Starting epoch number."),
+    epochs: int = Option(
+        1,
+        "--epochs",
+        "-e",
+        help="Epoch number to train up to, inclusive: training runs from --start-epoch (or the resumed epoch) "
+        "through this number, so it is a count only when starting at epoch 1 and must not be smaller than the "
+        "starting epoch. A resumed run must set it above the epoch stored in the resumed state.",
+    ),
+    start_epoch: int = Option(
+        1,
+        help="First epoch number to run, 1-based and at most --epochs. It only offsets the loop counter; no data "
+        "is skipped. Ignored when --resume is given, which continues at the epoch stored in the resumed state "
+        "plus one.",
+    ),
     resume: str | None = Option(
         None,
         "--resume",
         help="Training state to resume from, in a form the active --logger understands: a local path always "
         "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
         "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
-        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch.",
+        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch. Resume is exact "
+        "only at epoch boundaries: the saved state carries the epoch, step and update counters but no data-order, "
+        "sampler or RNG state, so the resumed epoch restarts from the beginning of the dataset.",
     ),
     training_dataset_pattern: Any = Option(
         ...,
         "--training-dataset",
         parser=path_or_any_parser,
-        help="The object pattern used to instantiate the training dataset. "
-        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
+        help=object_pattern_help("the training dataset", "MyDataset") + PATH_FORM_HELP,
     ),
     validation_dataset_pattern: Any | None = Option(
         None,
         "--validation-dataset",
         "-V",
         parser=path_or_any_parser,
-        help="The object pattern used to instantiate the validation dataset. "
-        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
+        help=object_pattern_help("the validation dataset", "MyDataset") + PATH_FORM_HELP,
     ),
-    validation_frequency: int = Option(1, "--validation-frequency", "-f", help="Frequency of validation (in epochs)."),
+    validation_frequency: int = Option(
+        1,
+        "--validation-frequency",
+        "-f",
+        help="Run validation every N epochs; must be at least 1. On epochs where validation does not run, no "
+        '"val_" criterion is produced, so val_-named best and save criteria are only monitored on validated epochs.',
+    ),
     lower_criteria: list[str] = Option(
         ...,
         "--lower-criterion",
         "-LC",
         default_factory=list,
-        help="Criterion names that require lower values.",
+        show_default=False,
+        help="Criterion names whose lower values are better, monitored for their lowest value. Name them as they "
+        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
+        'prefix (e.g. "val_loss"). A name no epoch produces is silently never monitored, and omitting the option '
+        "monitors nothing.",
     ),
     higher_criteria: list[str] = Option(
         ...,
         "--higher-criterion",
         "-HC",
         default_factory=list,
-        help="Criterion names that require higher values.",
+        show_default=False,
+        help="Criterion names whose higher values are better, monitored for their highest value. Name them as they "
+        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
+        'prefix (e.g. "val_accuracy"). A name no epoch produces is silently never monitored, and omitting the option '
+        "monitors nothing.",
     ),
     save_criteria: list[str] = Option(
         ...,
         "--save-criterion",
         "-SC",
         default_factory=list,
-        help="Criterion names to monitor for saving the best model. "
-        "Should be a subset of lower_criteria and higher_criteria.",
+        show_default=False,
+        help='Criterion names whose best-scoring model states are saved, as a "best_<criterion>" artifact. Each '
+        "name must also be given to --lower-criterion or --higher-criterion, spelled the same way; a name in "
+        "neither list is silently ignored, and omitting the option saves no best-model artifact.",
     ),
     seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
@@ -535,9 +599,20 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "mlflow", "--logger", help="Experiment tracking service to record the run to."
     ),
     log_arguments: list[dict] | None = Option(
-        None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log."
+        None,
+        "--log-arguments",
+        "-K",
+        parser=dict_parser,
+        help='Extra key-value pairs to record in the run\'s "arguments.yaml" artifact, in the format "key: value". '
+        "Repeat the option to add more keys; a key given twice keeps only the last occurrence, and the keys the run "
+        "records itself take precedence over keys of the same name.",
     ),
-    log_artifacts: list[Path] | None = Option(None, "--log-artifacts", "-A", help="Artifacts to log."),
+    log_artifacts: list[Path] | None = Option(
+        None,
+        "--log-artifacts",
+        "-A",
+        help="Paths to files to upload as run artifacts. Repeat the option to add more.",
+    ),
     ci: bool = Option(
         False,
         help="Whether to run in CI mode. "
@@ -546,21 +621,25 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     dist_backend: str | None = Option(
         None,
         envvar="DIST_BACKEND",
-        help="Distributed backend to use (e.g., 'nccl', 'gloo'). If None, it will be automatically selected.",
+        help='Communication library for the distributed process group (e.g. "nccl", "gloo"). '
+        "Selected automatically from the device when not specified.",
     ),
     dist_url: str | None = Option(
-        None, envvar="DIST_URL", help="URL to use for setting up distributed training. If None, it will use 'env://'."
+        None,
+        envvar="DIST_URL",
+        help='Rendezvous URL for setting up distributed training. Defaults to "env://" when not specified.',
     ),
     strategy_pattern: Any | None = Option(
         None,
         "--strategy",
         parser=path_or_any_parser,
-        help="Object pattern instantiating a distributed strategy factory; called with device=... and local_rank=.... "
-        "Defaults to DistributedDataParallelStrategy when a distributed environment is detected, "
-        "else SingleDeviceStrategy.",
+        help=object_pattern_help("the distributed strategy factory", "MyStrategy", call=False)
+        + PATH_FORM_HELP
+        + " The factory is called with the resolved device and local rank. Defaults to "
+        "DistributedDataParallelStrategy when a distributed environment is detected, otherwise SingleDeviceStrategy.",
     ),
 ) -> None:
-    """Train a PyTorch model, recording the run to an experiment tracking service."""
+    """Train PyTorch models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
     device, global_rank, local_rank, world_size, distributed = torch_distributed.initial_distributed_env(

@@ -19,6 +19,39 @@ else:
     base = LazyModuleImporter("structcast_model.utils.base")
 
 
+TEMPLATE_PARAM_HELP = (
+    "Parameters to format the template configuration file with. "
+    'Each parameter is "group: {...}", where the group name selects the parameter group '
+    '("SHARED" applies to every group, "DEFAULT" to the default one) and the value is a dictionary of '
+    "keyword arguments for the template. Repeat the option for more groups; a group named twice keeps "
+    "only the last occurrence, so pass all of a group's keys together."
+)
+
+
+def object_pattern_help(subject: str, symbol: str, *, keyed: bool = False, call: bool = True) -> str:
+    """Build the help text documenting the object pattern accepted for `subject`.
+
+    Args:
+        subject (str): What the pattern instantiates, written with its article so that it reads both as
+            "used to instantiate <subject>" and as "if <subject> is defined as ...", e.g. "the model".
+        symbol (str): The symbol used in the example, e.g. "MyModel".
+        keyed (bool): Whether the pattern is keyed by a name, e.g. "model_name: [_obj_, ...]".
+        call (bool): Whether the example object is called, adding the "_call_" entry to the pattern.
+
+    Returns:
+        str: The help text documenting both accepted spellings of the object pattern.
+    """
+    prefix = "model_name: " if keyed else ""
+    call_part = ", {_call_: {...}}" if call else ""
+    definition = "(...)" if call else ""
+    return (
+        f"The object pattern used to instantiate {subject}. "
+        f"For example, if {subject} is defined as `my_package.{symbol}{definition}`, then the pattern should be "
+        f'"{prefix}[_obj_, {{_addr_: my_package.{symbol}, _file_: my_package.py}}{call_part}]" or '
+        f'"{prefix}[_obj_, [_addr_, my_package.{symbol}, my_package.py]{call_part}]".'
+    )
+
+
 def reduce_dict(params: list[dict[str, Any]] | None) -> dict[str, Any]:
     """Reduce a list of dictionaries into a single dictionary.
 
@@ -126,9 +159,11 @@ def instantiate_object(raw: Any) -> Any:
 
 
 __all__ = [
+    "TEMPLATE_PARAM_HELP",
     "bool_or_path_or_dict_parser",
     "dict_parser",
     "instantiate_object",
+    "object_pattern_help",
     "path_or_any_parser",
     "reduce_dict",
     "tensor_shape_parser",

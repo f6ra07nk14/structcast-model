@@ -1,11 +1,36 @@
 """Unit tests for structcast_model.commands.main."""
 
+from collections.abc import Callable, Iterator
+import inspect
 from typing import Any
 
 from structcast.utils.base import register_dir, unregister_dir
+from typer import Typer
+from typer.models import ArgumentInfo, OptionInfo
 from typer.testing import CliRunner
 
 from structcast_model.commands.main import app
+
+
+def _iter_commands(typer_app: Typer, path: tuple[str, ...] = ()) -> Iterator[tuple[str, Callable[..., Any]]]:
+    """Yield ``(command path, callback)`` for every command registered under `typer_app`, recursively."""
+    for command in typer_app.registered_commands:
+        assert command.callback is not None
+        yield " ".join((*path, command.name or command.callback.__name__)), command.callback
+    for group in typer_app.registered_groups:
+        assert group.typer_instance is not None
+        yield from _iter_commands(group.typer_instance, (*path, group.name or ""))
+
+
+def test_every_cli_parameter_has_help() -> None:
+    """Every option and argument of every command must document itself, or `--help` shows a blank description."""
+    missing = [
+        f"{command_path} / {param_name}"
+        for command_path, callback in _iter_commands(app)
+        for param_name, param in inspect.signature(callback).parameters.items()
+        if isinstance(param.default, OptionInfo | ArgumentInfo) and not (param.default.help or "").strip()
+    ]
+    assert not missing, f"CLI parameters without help text: {missing}"
 
 
 def test_app_no_args_is_help(cli_runner: CliRunner) -> None:

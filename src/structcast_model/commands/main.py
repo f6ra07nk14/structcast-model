@@ -7,7 +7,7 @@ from structcast.utils.base import dump_yaml, dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.commands import cmd_flax, cmd_keras, cmd_torch
-from structcast_model.commands.utils import dict_parser, reduce_dict
+from structcast_model.commands.utils import TEMPLATE_PARAM_HELP, dict_parser, reduce_dict
 
 if TYPE_CHECKING:
     import jinja2
@@ -40,10 +40,7 @@ def format_template(
         "--parameter",
         "-p",
         parser=dict_parser,
-        help="Parameters to format the template configuration file with. "
-        'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
-        "and the value is a dictionary of keyword arguments for formatting the template. "
-        'For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"',
+        help=TEMPLATE_PARAM_HELP + ' For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"',
     ),
 ) -> None:
     """Format a template configuration file with the provided parameters and print or save the result."""

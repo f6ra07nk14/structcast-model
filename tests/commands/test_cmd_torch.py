@@ -327,6 +327,18 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
     assert cli_runner.invoke(app, ["calflops", "--help"]).exit_code == 0
 
 
+def test_train_help_shows_no_python_repr(cli_runner: CliRunner) -> None:
+    """'train --help' must describe values, never Python objects.
+
+    The three criterion options pair `...` with `default_factory=list`, which Typer renders as
+    "[default: <class 'list'>]" unless show_default is off; a user shown a class repr cannot tell that
+    the real default is "no criteria monitored".
+    """
+    result = cli_runner.invoke(app, ["train", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "<class" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # 'create model' command
 # ---------------------------------------------------------------------------

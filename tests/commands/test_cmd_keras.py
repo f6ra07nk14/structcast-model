@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from typer import Typer
@@ -39,6 +40,21 @@ def test_time_help_exits_zero(cli_runner: CliRunner) -> None:
     """Time subcommand --help should exit with code 0."""
     result = cli_runner.invoke(app, ["time", "--help"])
     assert result.exit_code == 0
+
+
+def test_time_help_documents_both_pattern_spellings_and_optimizer_constraint() -> None:
+    """'time' must document both object pattern spellings and that "optimizer" cannot be passed to --compile.
+
+    Both spellings are accepted by the instantiator, so documenting only one hides a valid input, and
+    `--compile "{optimizer: adam}"` raises a TypeError because the command already passes `optimizer=None`.
+    """
+    command = next(cmd for cmd in app.registered_commands if cmd.name == "time")
+    assert command.callback is not None
+    params = inspect.signature(command.callback).parameters
+    pattern_help = params["model_pattern"].default.help
+    assert "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" in pattern_help
+    assert "[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]" in pattern_help
+    assert '"optimizer" is always passed as None' in params["compile_pattern"].default.help
 
 
 # ---------------------------------------------------------------------------
