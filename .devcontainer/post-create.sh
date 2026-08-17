@@ -107,6 +107,8 @@ if ! command -v claude >/dev/null 2>&1; then
   echo "Claude CLI not found. Skipping Claude plugin setup."
 else
   claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail
+  claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman
+  claude plugin marketplace add openai/codex-plugin-cc && claude plugin install codex@openai-codex
 fi
 
 echo "Devcontainer post-create setup complete."
