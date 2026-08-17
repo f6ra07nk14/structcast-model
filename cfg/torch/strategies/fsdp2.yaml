@@ -2,9 +2,11 @@
 # device=... and local_rank=...; bind wrap-time knobs here. shard_modules takes glob patterns
 # (* and ? never cross a ".") over named_modules() paths and shards every matched submodule as
 # its own communication group (and compiles it as its own graph); unset, each model is sharded
-# as a single group.
+# as a single group. BatchNorm layers are converted to SyncBatchNorm before sharding (skipped on
+# CPU); bind sync_batchnorm: false to opt out.
 - _obj_
 - _addr_: structcast_model.torch.distributed.FullyShardedDataParallelStrategy
 - _bind_:
     reshard_after_forward: true
     # shard_modules: ["backbone.block*"]
+    # sync_batchnorm: false

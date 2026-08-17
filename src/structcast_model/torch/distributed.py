@@ -1,9 +1,10 @@
 """Distributed strategies: how models are wrapped, synchronized, and turned into checkpointable state.
 
 A distributed strategy is the replaceable unit deciding how models are wrapped for a training run,
-how their initial weights are made identical across ranks, and how model/optimizer state becomes a
-loadable checkpoint. Exactly one strategy is active per run; single-device training uses
-:class:`SingleDeviceStrategy` rather than a special case.
+how their initial weights are made identical across ranks, whether their ``BatchNorm`` layers are
+converted to ``SyncBatchNorm``, and how model/optimizer state becomes a loadable checkpoint. Exactly
+one strategy is active per run; single-device training uses :class:`SingleDeviceStrategy` rather than
+a special case.
 
 Every ``state_dict``/``load_state_dict`` implementation routes through
 ``torch.distributed.checkpoint.state_dict`` so checkpoint keys are identical for raw,
@@ -20,7 +21,9 @@ import re
 from typing import Any, Literal, overload
 
 from structcast.utils.lazy_import import try_import
+from timm.layers import convert_sync_batchnorm
 from timm.utils.distributed import init_distributed_device_so, is_distributed_env, world_info_from_env
+from torch.nn.modules.batchnorm import _BatchNorm
 from typing_extensions import Protocol, runtime_checkable
 
 from structcast_model.torch.utils import get_torch_device, get_torch_device_type
@@ -442,6 +445,57 @@ class _MultiRankMixin:
         return _shared_meta(state)
 
 
+def _convert_module_sync_batchnorm(module: torch.nn.Module) -> torch.nn.Module:
+    """Return *module* with every ``_BatchNorm`` layer that is not already synchronized converted.
+
+    Walks the tree instead of handing the root to timm's converter, because that converter is not
+    idempotent: it matches ``_BatchNorm``, and ``SyncBatchNormAct`` — timm's fused variant — is a
+    ``torch.nn.SyncBatchNorm`` subclass but not a ``BatchNormAct2d``, so a second pass rebuilds it as a
+    plain ``SyncBatchNorm`` and silently drops the activation, leaving the ``state_dict`` keys
+    unchanged. A layer that already is a ``torch.nn.SyncBatchNorm`` is therefore left completely
+    untouched — same object, same hooks, same ``process_group``.
+
+    Every other ``_BatchNorm`` goes through timm's converter, so timm's fused norm-act layers survive:
+    ``BatchNormAct2d`` becomes a ``SyncBatchNormAct`` that keeps running its activation, where torch's
+    converter would replace it with a plain ``SyncBatchNorm`` and drop it. Other third-party
+    ``_BatchNorm`` subclasses are still flattened to plain ``SyncBatchNorm``; the off-switch is their
+    escape.
+    """
+    if isinstance(module, torch.nn.SyncBatchNorm):
+        return module
+    if isinstance(module, _BatchNorm):
+        return convert_sync_batchnorm(module)
+    for name, child in module.named_children():
+        converted = _convert_module_sync_batchnorm(child)
+        if converted is not child:
+            module.add_module(name, converted)
+    return module
+
+
+def _convert_sync_batchnorm(
+    models: "OrderedDict[str, torch.nn.Module]",
+    device: str,
+) -> "OrderedDict[str, torch.nn.Module]":
+    """Return *models* with every ``_BatchNorm`` layer replaced by its ``SyncBatchNorm`` equivalent.
+
+    Runs before any wrapping or sharding: the wrapper must see the final module tree, and per-block
+    sharding matches paths on it. The conversion's return value is what callers must use — containers
+    are converted in place, but a model that *is* a ``_BatchNorm`` comes back as a new module.
+    Parameters and buffers are carried over by reference, so the rank-0 broadcast that ran before
+    wrapping survives the conversion.
+
+    The conversion is idempotent: layers that already are ``torch.nn.SyncBatchNorm`` instances, timm's
+    fused ones included, are skipped along with their ``process_group``, so a pre-converted model comes
+    back as it went in.
+
+    Skipped on CPU devices, where ``SyncBatchNorm``'s training forward rejects the input outright
+    once a process group is initialized, even with a single rank.
+    """
+    if "cpu" in device:
+        return models
+    return OrderedDict((n, _convert_module_sync_batchnorm(m)) for n, m in models.items())
+
+
 @dataclass(kw_only=True)
 class DistributedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
     """Strategy wrapping every model in ``DistributedDataParallel``."""
@@ -452,10 +506,15 @@ class DistributedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDict
     local_rank: int = 0
     """Local rank used as the single CUDA device id; ignored on CPU."""
 
+    sync_batchnorm: bool = True
+    """Whether to convert ``BatchNorm`` layers to ``SyncBatchNorm`` before wrapping; a no-op on CPU."""
+
     grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap every model in DDP. ``device_ids`` must be ``None`` on CPU, where passing one raises."""
+        if self.sync_batchnorm:
+            models = _convert_sync_batchnorm(models, self.device)
         device_ids = None if "cpu" in self.device else [self.local_rank]
         return OrderedDict(
             (n, torch.nn.parallel.DistributedDataParallel(m, device_ids=device_ids)) for n, m in models.items()
@@ -588,6 +647,9 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
     e.g. ``["backbone.block*"]``; ``*`` and ``?`` never cross a ``.``. ``None`` shards each model
     as a single group."""
 
+    sync_batchnorm: bool = True
+    """Whether to convert ``BatchNorm`` layers to ``SyncBatchNorm`` before sharding; a no-op on CPU."""
+
     grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     _broadcast_on_load = True
@@ -607,7 +669,12 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         With ``shard_modules`` set, the matched submodules are sharded first and the root last: the
         root's managed-module walk stops at children that are already ``FSDPModule``s, so the root
         group ends up holding exactly the parameters no matched submodule claimed.
+
+        The ``SyncBatchNorm`` conversion runs before everything else, so the patterns match — and
+        ``fully_shard`` shards — the converted tree rather than modules about to be replaced.
         """
+        if self.sync_batchnorm:
+            models = _convert_sync_batchnorm(models, self.device)
         if self._mesh is None:
             # Without an explicit mesh, fully_shard follows the accelerator, which reports CUDA on
             # CUDA-enabled builds even when this strategy trains on CPU — the mesh must follow the

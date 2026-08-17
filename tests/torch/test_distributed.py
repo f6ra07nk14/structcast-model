@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from timm.layers import BatchNormAct2d, SyncBatchNormAct
 
+from structcast_model.torch import distributed
 from structcast_model.torch.distributed import (
     DistributedDataParallelStrategy,
     DistributedStrategy,
@@ -609,3 +611,216 @@ def test_fsdp2_compile_falls_back_to_the_root_when_the_patterns_match_nothing() 
     model = torch.nn.Linear(4, 2)
     assert strategy.compile(model, {}) is model
     assert _is_compiled(model)
+
+
+# ---------------------------------------------------------------------------
+# SyncBatchNorm conversion
+# ---------------------------------------------------------------------------
+
+
+class _BatchNormModel(torch.nn.Module):
+    """A model carrying a nested BatchNorm layer, the shape the conversion targets."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.body = torch.nn.Sequential(torch.nn.Conv2d(2, 2, 1), torch.nn.BatchNorm2d(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the body."""
+        return self.body(x)
+
+
+def _unreachable_conversion(
+    models: "OrderedDict[str, torch.nn.Module]",
+    device: str,
+) -> "OrderedDict[str, torch.nn.Module]":
+    """Stand in for the conversion in the tests that require wrap never to reach it."""
+    raise AssertionError("wrap must not convert when sync_batchnorm is off")
+
+
+def test_convert_sync_batchnorm_replaces_nested_layers_and_keeps_the_tensors() -> None:
+    """Converted layers must reuse the parameter objects, or the pre-wrap rank-0 broadcast is discarded."""
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    weight = models["model"].get_parameter("body.1.weight")
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    layer = converted["model"].get_submodule("body.1")
+    assert isinstance(layer, torch.nn.SyncBatchNorm)
+    assert layer.weight is weight
+
+
+def test_convert_sync_batchnorm_keeps_the_activation_of_timms_fused_norm_act_layers() -> None:
+    """Fused ``BatchNormAct2d`` layers from timm must keep running their activation after the conversion.
+
+    torch's stock converter replaces it with a plain ``SyncBatchNorm`` whose forward never calls the
+    fused activation, and the ``state_dict`` keys stay identical — the model silently trains without
+    the activation. This pins the timm converter that keeps it.
+    """
+    fused = BatchNormAct2d(4, act_layer=torch.nn.ReLU)
+    weight = fused.weight
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(
+        model=torch.nn.Sequential(fused, torch.nn.BatchNorm2d(4)),
+    )
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    sync_fused = converted["model"].get_submodule("0")
+    assert isinstance(sync_fused, SyncBatchNormAct)
+    assert isinstance(sync_fused, torch.nn.SyncBatchNorm)
+    assert sync_fused.weight is weight
+    assert type(converted["model"].get_submodule("1")) is torch.nn.SyncBatchNorm
+    inputs = torch.linspace(-1.0, 1.0, 8).reshape(1, 4, 2, 1)
+    assert inputs.min() < 0  # eval mode leaves the values untouched, so only the ReLU can clamp them
+    assert sync_fused.eval()(inputs).min() >= 0
+
+
+def test_convert_sync_batchnorm_is_idempotent_for_timms_fused_layers() -> None:
+    """Converting twice must not undo the first conversion, which timm's raw converter would.
+
+    ``SyncBatchNormAct`` subclasses ``torch.nn.SyncBatchNorm`` but not ``BatchNormAct2d``, so a second
+    pass through timm's converter rebuilds it as a plain ``SyncBatchNorm`` and silently drops the fused
+    activation while the ``state_dict`` keys stay identical. A model converted by hand, or wrapped a
+    second time, must keep its activation.
+    """
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(
+        model=torch.nn.Sequential(BatchNormAct2d(4, act_layer=torch.nn.ReLU)),
+    )
+    once = distributed._convert_sync_batchnorm(models, "cuda:0")
+    converted_layer = once["model"].get_submodule("0")
+    twice = distributed._convert_sync_batchnorm(once, "cuda:0")
+    layer = twice["model"].get_submodule("0")
+    assert layer is converted_layer  # the second pass left the already-converted layer alone
+    assert isinstance(layer, SyncBatchNormAct)
+    inputs = torch.linspace(-1.0, 1.0, 8).reshape(1, 4, 2, 1)
+    assert inputs.min() < 0  # eval mode leaves the values untouched, so only the ReLU can clamp them
+    assert layer.eval()(inputs).min() >= 0
+
+
+def test_convert_sync_batchnorm_leaves_an_existing_sync_batch_norm_and_its_process_group_untouched() -> None:
+    """A hand-converted layer must pass through as the very same object, process group included.
+
+    Re-creating it would reset ``process_group`` to the default group, silently discarding a hand-built
+    subgroup, and would drop everything else attached to the layer.
+    """
+    group = object()
+    layer = torch.nn.SyncBatchNorm(4, process_group=group)
+    converted = distributed._convert_sync_batchnorm(OrderedDict(model=layer), "cuda:0")
+    assert converted["model"] is layer
+    assert layer.process_group is group
+
+
+def test_convert_sync_batchnorm_leaves_a_model_without_batch_norm_untouched() -> None:
+    """A model with no ``BatchNorm`` must come out identical: every distributed run walks through this.
+
+    The conversion is on by default, so models that have nothing to convert must keep their identity and
+    their layer types — the strategies wrap whatever it returns.
+    """
+    model = torch.nn.Sequential(torch.nn.Linear(4, 2), torch.nn.LayerNorm(2))
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=model)
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    assert converted["model"] is model
+    assert [type(child) for child in model] == [torch.nn.Linear, torch.nn.LayerNorm]
+
+
+def test_convert_sync_batchnorm_returns_a_new_module_when_the_root_is_a_batch_norm() -> None:
+    """A root BatchNorm cannot be converted in place, so the strategies must wrap the returned object."""
+    root = torch.nn.BatchNorm1d(2)
+    converted = distributed._convert_sync_batchnorm(OrderedDict(model=root), "cuda:0")
+    assert isinstance(converted["model"], torch.nn.SyncBatchNorm)
+    assert converted["model"] is not root
+
+
+def test_convert_sync_batchnorm_skips_cpu_devices() -> None:
+    """SyncBatchNorm's training forward rejects CPU input once a process group exists, even with one rank."""
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    assert distributed._convert_sync_batchnorm(models, "cpu") is models
+    assert type(models["model"].get_submodule("body.1")) is torch.nn.BatchNorm2d
+
+
+def test_ddp_wrap_wraps_the_conversion_result_and_converts_for_its_own_device(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DDP must wrap what the conversion returned, and convert for the device the strategy trains on.
+
+    A model that is itself a BatchNorm comes back as a new object, so wrapping the input would wrap a
+    discarded module. The device decides whether the conversion runs at all, so a hardcoded one would
+    convert (or skip) against hardware this rank does not train on.
+    """
+    converted = torch.nn.Linear(4, 2)
+    seen: list[str] = []
+
+    def _spy(
+        models: "OrderedDict[str, torch.nn.Module]",
+        device: str,
+    ) -> "OrderedDict[str, torch.nn.Module]":
+        """Record the device wrap passes down and hand back a different module."""
+        seen.append(device)
+        return OrderedDict(model=converted)
+
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _spy)
+    wrapped = DistributedDataParallelStrategy(device="cpu:0").wrap(_linear_models())
+    assert wrapped["model"].get_submodule("module") is converted
+    assert seen == ["cpu:0"]  # the strategy's own device, not a hardcoded "cpu"
+
+
+def test_ddp_wrap_leaves_the_models_alone_when_sync_batchnorm_is_off(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The YAML off-switch (`_bind_: {sync_batchnorm: false}`) is the only way out, so it must really opt out."""
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _unreachable_conversion)
+    models = _linear_models()
+    original = models["model"]
+    wrapped = DistributedDataParallelStrategy(device="cpu", sync_batchnorm=False).wrap(models)
+    assert wrapped["model"].get_submodule("module") is original
+
+
+def test_fsdp2_wrap_converts_before_the_mesh_and_shards_the_converted_tree(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conversion must come first: the mesh and the shard matching would otherwise see replaced modules.
+
+    The device it runs for is the strategy's own; a hardcoded one would convert (or skip) against
+    hardware this rank does not train on.
+    """
+    fsdp = pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu:0", shard_modules=["block?"])
+    converted = _block_models()
+    seen: list[Any] = []
+
+    def _spy(
+        models: "OrderedDict[str, torch.nn.Module]",
+        device: str,
+    ) -> "OrderedDict[str, torch.nn.Module]":
+        """Record the mesh state and device the conversion runs under, and hand back a different module tree."""
+        seen.append((strategy._mesh, device))
+        return converted
+
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _spy)
+    wrapped = strategy.wrap(_block_models())
+    assert seen == [(None, "cpu:0")]  # ran before the mesh was derived, for the strategy's own device
+    assert wrapped["model"] is converted["model"]
+    assert isinstance(converted["model"].block0, fsdp.FSDPModule)
+
+
+def test_fsdp2_wrap_leaves_the_models_alone_when_sync_batchnorm_is_off(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The off-switch must reach FSDP2 too, its field being a separate one from DDP's."""
+    pytest.importorskip("torch.distributed.fsdp")
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _unreachable_conversion)
+    strategy = FullyShardedDataParallelStrategy(device="cpu", sync_batchnorm=False)
+    models = _linear_models()
+    assert strategy.wrap(models)["model"] is models["model"]
+
+
+def test_single_device_wrap_never_converts_batch_norm() -> None:
+    """A single device has no ranks to synchronize statistics across, so SyncBatchNorm is pure overhead.
+
+    The device is the only thing the conversion gates on, so a non-CPU one here would convert if the
+    single-device strategy ever grew the call. ``wrap`` never touches the device itself.
+    """
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    wrapped = SingleDeviceStrategy(device="cuda:0").wrap(models)
+    assert wrapped is models
+    assert type(models["model"].get_submodule("body.1")) is torch.nn.BatchNorm2d
