@@ -47,7 +47,7 @@ The CLI takes `--strategy`, an object pattern like every other configurable in t
 the instantiated factory with the runtime arguments (`device`, `local_rank`). Without a pattern, a detected
 distributed environment defaults to `DistributedDataParallelStrategy` (preserving the existing torchrun UX)
 and a single device to `SingleDeviceStrategy`. FSDP2's wrap-time knobs (`reshard_after_forward`,
-`mp_policy`) and both multi-rank strategies' `sync_batchnorm` (ADR-0008) are constructor arguments expressed
+`mp_policy`) and both multi-rank strategies' `sync_batchnorm` (ADR-0009) are constructor arguments expressed
 in the pattern; the device mesh derives from the default process group. Dedicated CLI flags per knob were
 rejected as surface-area growth that breaks the "everything is a pattern" convention.
 
