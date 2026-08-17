@@ -225,10 +225,17 @@ def _innermost_module(module: torch.nn.Module) -> torch.nn.Module:
             return module
 
 
+@dataclass(kw_only=True)
 class _StateDictMixin:
     """Shared DCP-based state production and loading."""
 
     _broadcast_on_load = False
+
+    strict_optimizer_load: bool = True
+    """Whether a resumed optimizer state must cover every trainable parameter. ``True`` keeps torch's
+    rejection of a gap (descriptive on torch >= 2.10, a bare ``KeyError`` before); ``False`` accepts
+    any coverage — even none — leaving unmatched parameters the zeroed state torch materializes.
+    Missing state is never synthesized."""
 
     def _options(self, api: Any) -> Any:
         return api.StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -317,9 +324,25 @@ class _StateDictMixin:
         must infer a placement device from the *local* optimizer state, and stateless optimizers
         (e.g. plain SGD) never have one. For those, the saved state carries nothing but
         hyperparameters, which are restored directly.
+
+        State keyed by parameter index comes from a save that had no pairing; this path matches
+        entries by parameter name and cannot resolve positions, so such a state is refused instead
+        of being silently discarded or half-applied (ADR-0008). Name-keyed state loads under
+        ``strict_optimizer_load``, which decides whether it must cover every trainable parameter.
+
+        Raises:
+            ValueError: if the saved optimizer state is keyed by parameter index.
         """
-        if any(osd.get("state", {}).values()):
-            options = api.StateDictOptions(full_state_dict=True)
+        state = osd.get("state", {})
+        if state and all(isinstance(key, int) for key in state):
+            raise ValueError(
+                "The saved optimizer state is keyed by parameter index, not by parameter name: it was "
+                "saved without an optimizer_models pairing, so its entries cannot be matched to the "
+                "parameter names of this run. Resume from a training state saved with the pairing, "
+                "or restart training."
+            )
+        if any(state.values()):
+            options = api.StateDictOptions(full_state_dict=True, strict=self.strict_optimizer_load)
             api.set_optimizer_state_dict(container, optimizer, optim_state_dict=osd, options=options)
             return
         for group, saved in zip(optimizer.param_groups, osd.get("param_groups", []), strict=False):

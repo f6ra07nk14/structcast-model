@@ -1,6 +1,9 @@
 """Tests for the distributed strategies and the sync gate."""
 
 from collections import OrderedDict
+from collections.abc import Callable
+from functools import partial
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -205,6 +208,98 @@ def test_single_device_load_without_state_fails_loud() -> None:
         strategy.load_state_dict(_linear_models(), {}, None, None)
 
 
+@pytest.mark.parametrize(
+    "optimizer_creator",
+    [partial(torch.optim.SGD, lr=0.1, momentum=0.9), partial(torch.optim.Adam, lr=0.1)],
+    ids=["sgd-momentum", "adam"],
+)
+def test_single_device_refuses_index_keyed_optimizer_state(
+    optimizer_creator: Callable[..., torch.optim.Optimizer], tmp_path: Path
+) -> None:
+    """A state saved without a pairing keys optimizer state by position and must be refused, not restored.
+
+    The name-keyed load path cannot resolve positions, and today it fails differently per optimizer:
+    SGD momentum is silently discarded, so the run resumes with fresh moments, while Adam dies with an
+    opaque ``KeyError: 'state.0.step'``. Both must become one explicit refusal (ADR-0008).
+    """
+    strategy = SingleDeviceStrategy(device="cpu")
+    models = _linear_models()
+    optimizer = optimizer_creator(models["model"].parameters())
+    models["model"](torch.randn(1, 4)).sum().backward()
+    optimizer.step()
+    saved = strategy.state_dict(models, {"opt": optimizer})  # no pairing -> state keyed 0, 1, ...
+    path = tmp_path / "legacy.pt"
+    torch.save(saved, path)
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    assert set(state["optimizers"]["opt"]["state"]) == {0, 1}
+
+    fresh = _linear_models()
+    fresh_optimizer = optimizer_creator(fresh["model"].parameters())
+    with pytest.raises(ValueError, match="keyed by parameter index"):
+        strategy.load_state_dict(fresh, {"opt": fresh_optimizer}, {"opt": ["model"]}, state)
+
+
+def _trunk_and_head() -> "OrderedDict[str, torch.nn.Module]":
+    """Two paired models of which a warmup step exercises only the trunk, leaving the head unstepped."""
+    torch.manual_seed(0)
+    return OrderedDict(trunk=torch.nn.Linear(4, 2), head=torch.nn.Linear(2, 1))
+
+
+def test_single_device_resumes_partial_optimizer_state_only_when_asked(tmp_path: Path) -> None:
+    """A parameter that has not been stepped yet has no optimizer state, and torch refuses the gap.
+
+    One optimizer pairs a trunk and a head that a warmup phase never runs, so a normal mid-run save
+    covers the trunk only. torch's default strict load rejects such a training state outright, which
+    would make the run unresumable; ``strict_optimizer_load=False`` accepts the gap and lets the
+    uncovered parameters start fresh. Missing state is never synthesized, so a zero-filled moment can
+    never masquerade as a restored one.
+    """
+    strategy = SingleDeviceStrategy(device="cpu")
+    models = _trunk_and_head()
+    pairing = {"opt": ["trunk", "head"]}
+    optimizer = torch.optim.SGD([p for m in models.values() for p in m.parameters()], lr=0.1, momentum=0.9)
+    models["trunk"](torch.randn(3, 4)).sum().backward()
+    optimizer.step()
+    saved = strategy.state_dict(models, {"opt": optimizer}, pairing)
+    assert set(saved["optimizers"]["opt"]["state"]) == {"trunk.weight", "trunk.bias"}
+    path = tmp_path / "partial.pt"
+    torch.save(saved, path)
+    covered = {n: e["momentum_buffer"].clone() for n, e in saved["optimizers"]["opt"]["state"].items()}
+
+    strict_models = _trunk_and_head()
+    strict_optimizer = torch.optim.SGD([p for m in strict_models.values() for p in m.parameters()], lr=0.5)
+    with pytest.raises(RuntimeError, match="Missing optimizer state"):
+        strategy.load_state_dict(
+            strict_models,
+            {"opt": strict_optimizer},
+            pairing,
+            torch.load(path, map_location="cpu", weights_only=True),
+        )
+
+    lenient = SingleDeviceStrategy(device="cpu", strict_optimizer_load=False)
+    resumed = _trunk_and_head()
+    resumed_optimizer = torch.optim.SGD([p for m in resumed.values() for p in m.parameters()], lr=0.5, momentum=0.9)
+    lenient.load_state_dict(
+        resumed,
+        {"opt": resumed_optimizer},
+        pairing,
+        torch.load(path, map_location="cpu", weights_only=True),
+    )
+    parameters = {f"trunk.{n}": p for n, p in resumed["trunk"].named_parameters()}
+    for name, buffer in covered.items():
+        assert torch.equal(resumed_optimizer.state[parameters[name]]["momentum_buffer"], buffer)
+    # Nothing is synthesized for the head, but its entries are not absent either: torch materializes
+    # state for every parameter (a step with lr=0) before loading, so the head keeps zero-filled
+    # moments. For SGD momentum that is arithmetically the unstepped state (buf = 0 * momentum + grad),
+    # so no restored-looking moment can reach it.
+    head_buffers = [resumed_optimizer.state[p]["momentum_buffer"] for p in resumed["head"].parameters()]
+    assert len(head_buffers) == 2
+    assert not any(buffer.any() for buffer in head_buffers)
+    assert resumed_optimizer.param_groups[0]["lr"] == 0.1
+    resumed["trunk"](torch.randn(3, 4)).sum().backward()
+    resumed_optimizer.step()
+
+
 # ---------------------------------------------------------------------------
 # DistributedDataParallelStrategy
 # ---------------------------------------------------------------------------
@@ -311,6 +406,28 @@ def test_fsdp2_strategy_refuses_optimizer_state_without_pairing(single_process_g
     optimizer = torch.optim.SGD(wrapped["model"].parameters(), lr=0.25)
     with pytest.raises(ValueError, match="optimizer_models"):
         strategy.state_dict(wrapped, {"opt": optimizer}, None)
+
+
+def test_fsdp2_strategy_refuses_index_keyed_optimizer_state(single_process_gloo: None) -> None:
+    """The shared refusal must reach FSDP2, where a positional load would corrupt sharded state silently.
+
+    Today an index-keyed state passes torch's int-key passthrough and installs unsharded tensors
+    beside DTensor parameters without an error (ADR-0008) — the worst of the silent outcomes, so the
+    mixin guard must fire here and not be shadowed by FSDP2's own overrides.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    single = SingleDeviceStrategy(device="cpu")
+    models = _linear_models()
+    optimizer = torch.optim.SGD(models["model"].parameters(), lr=0.1, momentum=0.9)
+    models["model"](torch.randn(1, 4)).sum().backward()
+    optimizer.step()
+    legacy = single.state_dict(models, {"opt": optimizer})  # no pairing -> state keyed 0, 1, ...
+
+    strategy = FullyShardedDataParallelStrategy(device="cpu")
+    wrapped = strategy.wrap(_linear_models())
+    sharded_optimizer = torch.optim.SGD(wrapped["model"].parameters(), lr=0.1, momentum=0.9)
+    with pytest.raises(ValueError, match="keyed by parameter index"):
+        strategy.load_state_dict(wrapped, {"opt": sharded_optimizer}, {"opt": ["model"]}, legacy)
 
 
 # ---------------------------------------------------------------------------

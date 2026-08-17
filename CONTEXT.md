@@ -12,6 +12,11 @@ The object that owns the models being trained and defines how they learn: when a
 training step runs, and how an inference step runs.
 _Avoid_: Backward, backward class, backward pass configuration
 
+**Pairing**:
+The Learner's declaration of which models each optimizer updates (`optimizer_models`). What allows a training
+state to key optimizer state by parameter name rather than by position.
+_Avoid_: optimizer mapping, optimizer-model map
+
 **Trainer**:
 Runs the training loop — epochs, steps, and validation — over a Learner, dispatching lifecycle events to callbacks.
 
