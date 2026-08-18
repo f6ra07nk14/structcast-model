@@ -7,7 +7,8 @@ from structcast.utils.base import dump_yaml, dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.commands import cmd_flax, cmd_keras, cmd_torch
-from structcast_model.commands.utils import TEMPLATE_PARAM_HELP, dict_parser, reduce_dict
+from structcast_model.commands.shared_args import template_param_option
+from structcast_model.commands.utils import reduce_dict
 
 if TYPE_CHECKING:
     import jinja2
@@ -35,12 +36,8 @@ def format_template(
         "-o",
         help="Path to save the formatted template. If not provided, the formatted template will be printed to stdout.",
     ),
-    parameters: list[dict] | None = Option(
-        None,
-        "--parameter",
-        "-p",
-        parser=dict_parser,
-        help=TEMPLATE_PARAM_HELP + ' For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"',
+    parameters: list[dict] | None = template_param_option(
+        'For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"'
     ),
 ) -> None:
     """Format a template configuration file with the provided parameters and print or save the result."""

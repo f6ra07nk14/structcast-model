@@ -33,6 +33,23 @@ def test_every_cli_parameter_has_help() -> None:
     assert not missing, f"CLI parameters without help text: {missing}"
 
 
+def test_short_flags_are_globally_unique() -> None:
+    """One letter, one meaning: a short flag reused for a different long option would silently change meaning."""
+    meanings: dict[str, str] = {}
+    collisions = []
+    for command_path, callback in _iter_commands(app):
+        for param_name, param in inspect.signature(callback).parameters.items():
+            if not isinstance(param.default, OptionInfo):
+                continue
+            decls = list(param.default.param_decls or ())
+            long = next((decl for decl in decls if decl.startswith("--")), param_name)
+            shorts = [decl for decl in decls if decl.startswith("-") and not decl.startswith("--")]
+            for short in shorts:
+                if meanings.setdefault(short, long) != long:
+                    collisions.append(f"{short}: {meanings[short]} vs {long} (at {command_path} / {param_name})")
+    assert not collisions, f"Short flags meaning more than one long option: {collisions}"
+
+
 def test_app_no_args_is_help(cli_runner: CliRunner) -> None:
     """Calling the app with no arguments should display help text (exit 0 or 2)."""
     result = cli_runner.invoke(app, [])

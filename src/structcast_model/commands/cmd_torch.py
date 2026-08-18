@@ -16,12 +16,22 @@ from structcast_model.base_trainer import (
     ProgressBar,
     SimpleDataProvider,
 )
+from structcast_model.commands.shared_args import (
+    PATH_FORM_HELP,
+    batch_size,
+    compile_option,
+    model_pattern,
+    object_pattern_help,
+    output_script_path,
+    shapes_help,
+    template_param_option,
+    times,
+    training_mode,
+    warmup_runs,
+)
 from structcast_model.commands.utils import (
-    TEMPLATE_PARAM_HELP,
-    bool_or_path_or_dict_parser,
     dict_parser,
     instantiate_object,
-    object_pattern_help,
     path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
@@ -62,41 +72,17 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating PyTorch models and learner classes.")
 
-# The pattern options accepting a file path all say so the same way.
-PATH_FORM_HELP = " The pattern may also be given as a path to a YAML/JSON file holding it."
-# --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
-SHAPES_HELP = (
-    "Input tensor shapes for one sample, without the batch dimension, as a YAML mapping of input name to "
-    'specification. Compact form: "image: [3, 224, 224]". '
-    'Explicit form: "tokens: {_SHAPE_: [512], _DTYPE_: int64, _INIT_: torch.zeros}". '
-    "Specifications may nest in mappings and lists. _DTYPE_ defaults to bfloat16 (not float32), and an integer "
-    "dtype without _INIT_ falls back to zeros with a warning."
-)
 DEVICE_HELP = (
     'Computation device to use: "cpu", "cuda", or an indexed form such as "cuda:1". '
     'If not specified, "cuda" is used when available, otherwise "cpu"; an explicitly requested CUDA device '
     "falls back to CPU with a warning when CUDA is unavailable."
 )
 
-template_param = Option(
-    None,
-    "--parameter",
-    "-p",
-    parser=dict_parser,
-    help=TEMPLATE_PARAM_HELP
-    + ' For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
+SHAPES_HELP = shapes_help('"image: [3, 224, 224]"', "torch.zeros")
+template_param = template_param_option(
+    'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"'
 )
-output_script_path = Option(
-    None,
-    "--output",
-    "-o",
-    help='Path of the generated Python script. Defaults to the snake_case --classname plus ".py" in the current '
-    "directory. An existing file is overwritten and missing parent directories are created.",
-)
-model_pattern = Argument(
-    parser=path_or_any_parser,
-    help=object_pattern_help("the model", "MyModel") + PATH_FORM_HELP,
-)
+# --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
 shapes = Option(
     None,
     "--shape",
@@ -107,15 +93,7 @@ shapes = Option(
     "neither exists.",
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
-compile_pattern: dict[str, Any] | None = Option(
-    None,
-    "--compile",
-    "-c",
-    parser=bool_or_path_or_dict_parser,
-    help='Whether to compile the model using "torch.compile". Omitted or false leaves the model uncompiled; '
-    "true compiles with default options. Can also be a path to an existing YAML/JSON file, or a dictionary of "
-    'keyword arguments for "torch.compile".',
-)
+compile_pattern: dict[str, Any] | None = compile_option("torch.compile")
 matmul_precision: Literal["highest", "high", "medium"] = Option(
     "high",
     envvar="MATMUL_PRECISION",
@@ -191,16 +169,10 @@ def measure_inference_time(
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = Option(
-        False,
-        help="Whether to set the model to training mode during inference time measurement. "
-        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
-    ),
-    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
-    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
-    batch_size: int = Option(
-        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
-    ),
+    training_mode: bool = training_mode,
+    warmup_runs: int = warmup_runs,
+    times: int = times,
+    batch_size: int = batch_size,
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""

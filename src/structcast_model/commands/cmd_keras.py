@@ -5,13 +5,19 @@ from typing import TYPE_CHECKING, Any
 
 from typer import Argument, Option, Typer
 
+from structcast_model.commands.shared_args import (
+    batch_size,
+    model_pattern,
+    output_script_path,
+    shapes_help,
+    template_param_option,
+    times,
+    training_mode,
+    warmup_runs,
+)
 from structcast_model.commands.utils import (
-    TEMPLATE_PARAM_HELP,
     bool_or_path_or_dict_parser,
-    dict_parser,
     instantiate_object,
-    object_pattern_help,
-    path_or_any_parser,
     reduce_dict,
     tensor_shape_parser,
 )
@@ -39,35 +45,14 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating Keras layer classes.")
 
-template_param = Option(
-    None,
-    "--parameter",
-    "-p",
-    parser=dict_parser,
-    help=TEMPLATE_PARAM_HELP + ' For example: --parameter "model: {input_size: 128, output_size: 10}"',
-)
-output_script_path = Option(
-    None,
-    "--output",
-    "-o",
-    help='Path of the generated Python script. Defaults to the snake_case --classname plus ".py" in the current '
-    "directory. An existing file is overwritten and missing parent directories are created.",
-)
-model_pattern = Argument(
-    parser=path_or_any_parser,
-    help=object_pattern_help("the model", "MyModel")
-    + " The pattern can be given inline or as a path to a YAML/JSON file holding it.",
-)
+template_param = template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
 shapes = Option(
     None,
     "--shape",
     "-s",
     parser=tensor_shape_parser,
-    help="Input tensor shapes for one sample, without the batch dimension, as a YAML mapping of input name to "
-    "specification. Compact form: 'image: [224, 224, 3]'. Explicit form: "
-    "'tokens: {_SHAPE_: [512], _DTYPE_: int64, _INIT_: numpy.zeros}'. Specifications may nest in mappings and lists. "
-    "_DTYPE_ defaults to bfloat16 (not float32), and an integer dtype without _INIT_ falls back to zeros with a "
-    "warning. Omit it only when the model declares INPUT_SHAPES itself.",
+    help=shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+    + " Omit it only when the model declares INPUT_SHAPES itself.",
 )
 device = Option(
     None,
@@ -131,16 +116,10 @@ def measure_inference_time(
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = Option(
-        False,
-        help="Whether to set the model to training mode during inference time measurement. "
-        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
-    ),
-    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
-    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
-    batch_size: int = Option(
-        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
-    ),
+    training_mode: bool = training_mode,
+    warmup_runs: int = warmup_runs,
+    times: int = times,
+    batch_size: int = batch_size,
 ) -> None:
     """Measure the average inference time of a Keras model."""
     device = keras_trainer.get_keras_device(device)
