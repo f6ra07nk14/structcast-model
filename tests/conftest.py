@@ -53,14 +53,18 @@ def wandb_logger_with(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[An
     def _reload() -> Any:
         """Reload the logger module and re-point its package shim at the reloaded object.
 
-        `structcast_model.loggers` is a `LazySelectedImporter`, which caches the submodule object it
-        first resolved, while `importlib.reload` leaves a *new* object in `sys.modules`. Without the
-        re-point, `loggers.wandb` -- the attribute the CLI reaches the logger through -- would keep
-        serving the module resolved before the reload.
+        `structcast_model.loggers` is a `LazySelectedImporter`, which caches every attribute it first
+        resolved, while `importlib.reload` leaves a *new* module object -- holding new class objects
+        -- in `sys.modules`. Without the re-point, `loggers.wandb` -- the attribute the CLI reaches
+        the logger through -- and the flat `loggers.WandbLogger` it routes would keep serving what
+        was resolved before the reload, for the rest of the session.
         """
         reloaded = importlib.reload(importlib.import_module(WANDB_LOGGER))
         package, _, attribute = WANDB_LOGGER.rpartition(".")
-        setattr(importlib.import_module(package), attribute, reloaded)
+        shim = importlib.import_module(package)
+        setattr(shim, attribute, reloaded)
+        for symbol in shim._imported_structure[attribute]:
+            setattr(shim, symbol, getattr(reloaded, symbol))
         return reloaded
 
     def _reload_with(fake: Any) -> Any:

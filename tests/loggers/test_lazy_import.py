@@ -18,7 +18,9 @@ def test_importing_the_loggers_does_not_import_torch() -> None:
             sys.executable,
             "-c",
             "import structcast_model.loggers.base, structcast_model.loggers.mlflow, "
-            "structcast_model.loggers.wandb; import sys; "
+            "structcast_model.loggers.wandb; "
+            "import structcast_model.loggers as pkg; pkg.Logger; pkg.NullLogger; "
+            "import sys; "
             "raise SystemExit('torch was imported' if 'torch' in sys.modules else 0)",
         ],
         capture_output=True,

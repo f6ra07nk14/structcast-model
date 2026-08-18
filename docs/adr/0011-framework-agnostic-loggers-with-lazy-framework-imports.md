@@ -26,7 +26,13 @@ keras logger backends use the same `LazyModuleImporter` pattern.
 ## Package `__init__` files are lazy submodule routers
 
 `loggers/__init__.py` and `torch/__init__.py` adopt the `LazySelectedImporter` + `import_structure` pattern already
-used by the top-level `structcast_model/__init__.py`: empty symbol lists, submodule-only routing. Consumers then
+used by the top-level `structcast_model/__init__.py`. Every module file lists its public symbols, so they are also
+reachable flat on the package (`structcast_model.torch.TorchTrainer`, `structcast_model.loggers.Logger`); subpackage
+entries stay submodule-only with an empty list. A name re-exported by several modules is listed exactly once — under
+the module that defines it when that module has an entry of its own, otherwise under the module that re-exports it —
+because `_class_to_module` is a dict comprehension and keeps the last writer. Hence `initial_distributed_env` routes to
+`torch/distributed.py`, not to `torch/trainer.py`, while `CriteriaTracker`, defined inside the submodule-only
+`torch/layers/` subpackage, routes through the `torch/trainer.py` that re-exports it. Consumers then
 hold one lazy binding per package instead of one per module — `commands/cmd_torch.py` drops five
 `LazyModuleImporter` bindings for `scm_loggers` and `scm_torch`, reached by chained access
 (`scm_loggers.base.Logger`, `scm_torch.trainer.TorchTrainer`). The two handles are plain imports of
