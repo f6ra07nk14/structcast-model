@@ -6,6 +6,8 @@ distributed concern lives behind one replaceable object.
 
 ## Why the wrap moves before learner construction
 
+> **Renamed by ADR-0011.** `torch_builder.py` is now `builders/torch.py`; the reasoning below is unchanged.
+
 Generated learner step closures and optimizers capture the exact module objects handed to `__init__`
 (`torch_builder.py` emits the step functions as closures over the constructor arguments). Wrapping after
 construction can therefore never reach the training path: with DDP the reducer never arms and gradient
