@@ -10,8 +10,8 @@ import pytest
 from torch.nn import Module
 
 from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
+from structcast_model.loggers.base import NullLogger
 from structcast_model.torch.distributed import SingleDeviceStrategy
-from structcast_model.torch.logger import NullLogger
 from structcast_model.torch.trainer import (
     TorchBestCriterion,
     TorchTracker,

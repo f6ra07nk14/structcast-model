@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Any, Literal
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
+# Both are package shims routing to lazy submodules, so importing them pulls in no framework.
+# Wrapping them in `LazyModuleImporter` would not work: it copies the shim's still unresolved
+# submodule slots, so every access after the first would hand back `None`.
+from structcast_model import loggers as scm_loggers, torch as scm_torch
 from structcast_model.base_trainer import (
     Printer,
     ProgressBar,
@@ -44,13 +48,6 @@ if TYPE_CHECKING:
     from structcast.core import instantiator
 
     from structcast_model.builders import torch_builder
-    from structcast_model.torch import (
-        distributed as torch_distributed,
-        logger as torch_logger,
-        mlflow_logger,
-        trainer as torch_trainer,
-        wandb_logger,
-    )
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -60,11 +57,6 @@ else:
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
-    torch_distributed = LazyModuleImporter("structcast_model.torch.distributed")
-    torch_logger = LazyModuleImporter("structcast_model.torch.logger")
-    mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
-    torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
-    wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
     torch = LazyModuleImporter("torch")
 
 
@@ -173,14 +165,14 @@ def measure_inference_time(
     """Measure the average inference time of a PyTorch model."""
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.trainer.get_torch_device(device)
     print("Initializing the model...")
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        shapes = torch_trainer.resolve_input_shapes(model, shapes)
-        torch_trainer.initial_model(model, shapes)
+        shapes = scm_torch.trainer.resolve_input_shapes(model, shapes)
+        scm_torch.trainer.initial_model(model, shapes)
     print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
-    model = torch_distributed.SingleDeviceStrategy(device=device).compile(
+    model = scm_torch.distributed.SingleDeviceStrategy(device=device).compile(
         model, instantiator.instantiate(compile_pattern)
     )
     if training_mode:
@@ -188,13 +180,13 @@ def measure_inference_time(
     else:
         model.eval()
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
-    device_type = torch_trainer.get_torch_device_type(device)
+    device_type = scm_torch.trainer.get_torch_device_type(device)
 
     def _measure_single_run() -> float:
         with torch.device(device):
-            inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
+            inputs = scm_torch.trainer.create_torch_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        with torch_trainer.autocast_inputs(inputs, device_type):
+        with scm_torch.trainer.autocast_inputs(inputs, device_type):
             model(**inputs)
         cuda_sync()
         return time() - start_time
@@ -228,11 +220,11 @@ def call_ptflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = torch_trainer.initial_model(model, shapes)
-        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.trainer.initial_model(model, shapes)
+        with scm_torch.trainer.autocast_inputs(inputs, scm_torch.trainer.get_torch_device_type(device)):
             flops, params = ptflops.get_model_complexity_info(
                 model=model,
                 input_res=(1,),
@@ -262,11 +254,11 @@ def call_calflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.trainer.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = torch_trainer.initial_model(model, shapes)
-        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.trainer.initial_model(model, shapes)
+        with scm_torch.trainer.autocast_inputs(inputs, scm_torch.trainer.get_torch_device_type(device)):
             flops, macs, params = calflops.calculate_flops(
                 model=model,
                 input_shape=None,
@@ -289,13 +281,13 @@ def call_calflops(
 
 def _resolve_strategy(
     strategy_pattern: Any, device: str, local_rank: int, distributed: bool
-) -> "torch_distributed.DistributedStrategy":
+) -> "scm_torch.distributed.DistributedStrategy":
     """Resolve the run's strategy: an explicit pattern wins, then DDP when distributed, else single-device."""
     if strategy_pattern is not None:
         return instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
     if distributed:
-        return torch_distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
-    return torch_distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
+        return scm_torch.distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
+    return scm_torch.distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
 
 
 def _assemble_learner(
@@ -304,7 +296,7 @@ def _assemble_learner(
     input_shapes: dict[str, Any],
     initializers: dict[str, Any],
     resume: str | None,
-    strategy: "torch_distributed.DistributedStrategy",
+    strategy: "scm_torch.distributed.DistributedStrategy",
     compile_kw: dict[str, Any] | None,
     learner_pattern: Any,
     learner_outputs: list[str] | None,
@@ -318,8 +310,8 @@ def _assemble_learner(
     # CPU buffers.
     with torch.device(device):
         models = _instantiate_models(model_patterns)
-        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
-        torch_trainer.initial_model(models, input_shapes)
+        input_shapes = scm_torch.trainer.resolve_input_shapes(models, input_shapes) or {}
+        scm_torch.trainer.initial_model(models, input_shapes)
         # A resumed run loads its weights later, which would overwrite whatever the initializers and
         # the initial-weight broadcast produce here.
         if is_main and resume is None:
@@ -342,7 +334,7 @@ def _assemble_learner(
         else:
             learner = factory(**models)
         learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-        tracker = torch_trainer.TorchTracker.from_criteria(
+        tracker = scm_torch.trainer.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
         )
     # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
@@ -358,12 +350,12 @@ def _assemble_learner(
 def _restore_training_state(
     *,
     resume: str,
-    strategy: "torch_distributed.DistributedStrategy",
+    strategy: "scm_torch.distributed.DistributedStrategy",
     models: "OrderedDict[str, torch.nn.Module]",
     learner: Any,
     start_epoch: int,
     is_main: bool,
-    logger: "torch_logger.Logger",
+    logger: "scm_loggers.base.Logger",
 ) -> int:
     """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch.
 
@@ -385,20 +377,20 @@ def _build_callbacks(
     *,
     trainer: Any,
     provider: SimpleDataProvider,
-    strategy: "torch_distributed.DistributedStrategy",
+    strategy: "scm_torch.distributed.DistributedStrategy",
     learner_outputs: list[str],
     higher_criteria: list[str],
     lower_criteria: list[str],
     save_criteria: list[str],
-    logger: "torch_logger.Logger",
+    logger: "scm_loggers.base.Logger",
     ci: bool,
     is_main: bool,
 ) -> None:
     """Install the logger and the saver/best/display callbacks on the trainer."""
     # The saver and the best-criterion monitors run collectives, so they are built on every rank;
     # only rank 0 holds a real logger and writes anything. See ADR-0005.
-    saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
-    bests = torch_trainer.TorchBestCriterion.from_criteria(
+    saver = scm_torch.trainer.TrainingStateSaver(logger=logger, strategy=strategy)
+    bests = scm_torch.trainer.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     display: list[Any] = []
@@ -605,7 +597,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train PyTorch models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    device, global_rank, local_rank, world_size, distributed = torch_distributed.initial_distributed_env(
+    device, global_rank, local_rank, world_size, distributed = scm_torch.distributed.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
     torch.backends.cudnn.benchmark = True
@@ -639,10 +631,10 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     # Built before the resume, which fetches the state through it. Only the experiment name is stored
     # here: the run itself starts in __enter__.
     if is_main:
-        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
-        logger: torch_logger.Logger = logger_type(experiment=experiment)
+        logger_type = scm_loggers.mlflow.MLflowLogger if logger_name == "mlflow" else scm_loggers.wandb.WandbLogger
+        logger: scm_loggers.base.Logger = logger_type(experiment=experiment)
     else:
-        logger = torch_logger.NullLogger()
+        logger = scm_loggers.base.NullLogger()
     if resume is not None:
         start_epoch = _restore_training_state(
             resume=resume,
@@ -653,7 +645,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             is_main=is_main,
             logger=logger,
         )
-    trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer_type = scm_torch.trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
     _build_callbacks(
         trainer=trainer,

@@ -1,4 +1,4 @@
-"""Unit tests for structcast_model.torch.wandb_logger."""
+"""Unit tests for structcast_model.loggers.wandb."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from structcast_model.torch.logger import Logger
+from structcast_model.loggers.base import Logger
+from structcast_model.loggers.wandb import WandbLogger
 from structcast_model.torch.trainer import TorchTrainer
-from structcast_model.torch.wandb_logger import WandbLogger
 import torch
 
 

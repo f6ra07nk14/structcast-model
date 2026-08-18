@@ -1,4 +1,4 @@
-"""Pytest configuration shared by the torch tests."""
+"""Pytest configuration shared by the logger tests."""
 
 from typing import Any
 

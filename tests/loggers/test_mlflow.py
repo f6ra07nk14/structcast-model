@@ -1,4 +1,4 @@
-"""Unit tests for structcast_model.torch.mlflow_logger."""
+"""Unit tests for structcast_model.loggers.mlflow."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from typing import Any
 import mlflow
 import pytest
 
-from structcast_model.torch.logger import Logger
-from structcast_model.torch.mlflow_logger import MLflowLogger
+from structcast_model.loggers.base import Logger
+from structcast_model.loggers.mlflow import MLflowLogger
 from structcast_model.torch.trainer import TorchTrainer
 import torch
 

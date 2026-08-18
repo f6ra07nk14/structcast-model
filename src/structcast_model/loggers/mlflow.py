@@ -8,12 +8,22 @@ from typing import TYPE_CHECKING, Any
 from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.logger import Logger, _epoch_metrics, _local_training_state
-import torch
+from structcast_model.loggers.base import Logger, _epoch_metrics, _local_training_state
+
+if TYPE_CHECKING:
+    import mlflow.pytorch as mlflow_pytorch
+
+    import torch
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    # `mlflow.pytorch` imports torch at its top level, so it is bound lazily as well: importing it
+    # eagerly would drag torch into every process that merely imports this module.
+    mlflow_pytorch = LazyModuleImporter("mlflow.pytorch")
+    torch = LazyModuleImporter("torch")
 
 with try_import() as _imports:
     import mlflow
-    import mlflow.pytorch
 
 
 @dataclass(kw_only=True, slots=True)
@@ -64,7 +74,7 @@ class MLflowLogger(Logger):
 
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
         """Log a state dictionary under the given artifact name."""
-        mlflow.pytorch.log_state_dict(dict(states), name)
+        mlflow_pytorch.log_state_dict(dict(states), name)
 
     def fetch_training_state(self, reference: str) -> dict[str, Any]:
         """Load a saved training state from an MLflow `runs:/` URI or a local path.

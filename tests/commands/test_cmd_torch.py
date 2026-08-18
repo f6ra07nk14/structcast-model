@@ -895,9 +895,10 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
     fake = _FakeWandb(tmp_path / "wandb_run")
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
-    # The command's lazy handle caches the module it first loaded, so it needs the reloaded one.
-    with patch_cmd_globals(wandb_logger=wandb_logger_with(fake)):
-        _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
+    # The fixture publishes the fake through `loggers.wandb`, the attribute the command reads, so the
+    # run exercises the real `scm_loggers` chained access rather than a stand-in for it.
+    wandb_logger_with(fake)
+    _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
     assert fake.projects == ["test-e2e"]
     assert fake.finished == 1
     assert fake.params["epochs"] == 2

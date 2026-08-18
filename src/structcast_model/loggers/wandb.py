@@ -10,8 +10,14 @@ from structcast.utils.base import dump_yaml
 from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.logger import Logger, _epoch_metrics, _local_training_state
-import torch
+from structcast_model.loggers.base import Logger, _epoch_metrics, _local_training_state
+
+if TYPE_CHECKING:
+    import torch
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    torch = LazyModuleImporter("torch")
 
 with try_import() as _imports:
     import wandb

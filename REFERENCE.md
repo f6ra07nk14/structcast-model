@@ -564,12 +564,12 @@ The models and the learner of a CLI run are assembled inline by `scm torch train
 
 ### Loggers
 
-**`Logger`** (`structcast_model.torch.logger`) — The runtime-checkable protocol both backends implement: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, `log_state_dict`, `on_epoch_end`, and the `__enter__` / `__exit__` pair that owns the run.
+**`Logger`** (`structcast_model.loggers.base`) — The runtime-checkable protocol both backends implement: `log_params`, `log_dict`, `log_artifact`, `log_metric`, `log_metrics`, `log_state_dict`, `on_epoch_end`, and the `__enter__` / `__exit__` pair that owns the run.
 
-**`MLflowLogger`** (`structcast_model.torch.mlflow_logger`) and **`WandbLogger`** (`structcast_model.torch.wandb_logger`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates and its optional `weight_decays` — so passing a logger in `callbacks` is enough to get per-epoch metrics, including weight/layer-decay dynamics.
+**`MLflowLogger`** (`structcast_model.loggers.mlflow`) and **`WandbLogger`** (`structcast_model.loggers.wandb`) — Record a run to MLflow or to Weights & Biases through that protocol. Each is a context manager owning the run: entering it starts the run, leaving it ends the run. Both also implement `on_epoch_end`, which logs the criteria of the finished epoch together with the learner's learning rates and its optional `weight_decays` — so passing a logger in `callbacks` is enough to get per-epoch metrics, including weight/layer-decay dynamics.
 
 ```python
-from structcast_model.torch.mlflow_logger import MLflowLogger
+from structcast_model.loggers.mlflow import MLflowLogger
 
 with MLflowLogger(experiment="my-experiment") as logger:
     trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger])

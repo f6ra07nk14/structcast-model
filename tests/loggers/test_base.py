@@ -1,8 +1,8 @@
-"""Unit tests for structcast_model.torch.logger."""
+"""Unit tests for structcast_model.loggers.base."""
 
 from __future__ import annotations
 
-from structcast_model.torch.logger import Logger, NullLogger
+from structcast_model.loggers.base import Logger, NullLogger
 
 
 def test_null_logger_fetches_no_training_state() -> None:

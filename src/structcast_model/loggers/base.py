@@ -7,7 +7,13 @@ from typing import TYPE_CHECKING, Any, cast
 from typing_extensions import Protocol, runtime_checkable
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer
-import torch
+
+if TYPE_CHECKING:
+    import torch
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    torch = LazyModuleImporter("torch")
 
 
 @runtime_checkable

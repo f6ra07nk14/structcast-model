@@ -3,10 +3,10 @@
 from typing import TYPE_CHECKING
 
 __version__ = "5.0.0"
-__all__ = ["base_trainer", "builders", "flax", "keras", "torch", "utils"]
+__all__ = ["base_trainer", "builders", "flax", "keras", "loggers", "torch", "utils"]
 
 if TYPE_CHECKING:
-    from structcast_model import base_trainer, builders, flax, keras, torch, utils
+    from structcast_model import base_trainer, builders, flax, keras, loggers, torch, utils
 else:
     import sys
 
@@ -16,6 +16,7 @@ else:
         "builders": [],
         "flax": [],
         "keras": [],
+        "loggers": [],
         "torch": [],
         "utils": [],
         "base_trainer": [],
