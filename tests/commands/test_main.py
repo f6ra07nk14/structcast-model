@@ -14,6 +14,8 @@ from structcast_model.commands.main import app
 
 def _iter_commands(typer_app: Typer, path: tuple[str, ...] = ()) -> Iterator[tuple[str, Callable[..., Any]]]:
     """Yield ``(command path, callback)`` for every command registered under `typer_app`, recursively."""
+    if typer_app.registered_callback is not None and typer_app.registered_callback.callback is not None:
+        yield " ".join((*path, "(callback)")), typer_app.registered_callback.callback
     for command in typer_app.registered_commands:
         assert command.callback is not None
         yield " ".join((*path, command.name or command.callback.__name__)), command.callback
@@ -36,7 +38,7 @@ def test_every_cli_parameter_has_help() -> None:
 def test_short_flags_are_globally_unique() -> None:
     """One letter, one meaning: a short flag reused for a different long option would silently change meaning."""
     meanings: dict[str, str] = {}
-    collisions = []
+    collisions: list[str] = []
     for command_path, callback in _iter_commands(app):
         for param_name, param in inspect.signature(callback).parameters.items():
             if not isinstance(param.default, OptionInfo):

@@ -1,4 +1,4 @@
-"""Typer declarations shared by the torch, keras and flax sub-apps.
+"""Typer declarations shared across the commands package.
 
 Where a declaration lives follows three rules (see docs/adr/0010):
 
@@ -17,7 +17,12 @@ from typing import Any
 
 from typer import Argument, Option
 
-from structcast_model.commands.utils import bool_or_path_or_dict_parser, dict_parser, path_or_any_parser
+from structcast_model.commands.utils import (
+    bool_or_path_or_dict_parser,
+    dict_parser,
+    path_or_any_parser,
+    tensor_shape_parser,
+)
 
 TEMPLATE_PARAM_HELP = (
     "Parameters to format the template configuration file with. "
@@ -86,6 +91,18 @@ def shapes_help(compact_example: str, init_example: str) -> str:
     )
 
 
+def shapes_option(help_text: str) -> Any:
+    """Build a `--shape` option carrying `help_text`, typically composed from `shapes_help`.
+
+    Args:
+        help_text (str): The full help text, e.g. `shapes_help(...)` plus the command's fallback sentence.
+
+    Returns:
+        Any: The typer `Option` declaration for `--shape`.
+    """
+    return Option(None, "--shape", "-s", parser=tensor_shape_parser, help=help_text)
+
+
 def compile_option(api: str) -> Any:
     """Build the `--compile` option for the frameworks that compile the model graph.
 
@@ -132,13 +149,13 @@ training_mode = Option(
 
 __all__ = [
     "PATH_FORM_HELP",
-    "TEMPLATE_PARAM_HELP",
     "batch_size",
     "compile_option",
     "model_pattern",
     "object_pattern_help",
     "output_script_path",
     "shapes_help",
+    "shapes_option",
     "template_param_option",
     "times",
     "training_mode",

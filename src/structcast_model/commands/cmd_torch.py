@@ -24,6 +24,7 @@ from structcast_model.commands.shared_args import (
     object_pattern_help,
     output_script_path,
     shapes_help,
+    shapes_option,
     template_param_option,
     times,
     training_mode,
@@ -34,7 +35,6 @@ from structcast_model.commands.utils import (
     instantiate_object,
     path_or_any_parser,
     reduce_dict,
-    tensor_shape_parser,
 )
 
 if TYPE_CHECKING:
@@ -83,14 +83,9 @@ template_param = template_param_option(
     'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"'
 )
 # --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
-shapes = Option(
-    None,
-    "--shape",
-    "-s",
-    parser=tensor_shape_parser,
-    help=SHAPES_HELP
-    + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
-    "neither exists.",
+shapes = shapes_option(
+    SHAPES_HELP + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
+    "neither exists."
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
 compile_pattern: dict[str, Any] | None = compile_option("torch.compile")
@@ -440,15 +435,11 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "ignored. Each initializer is applied to every submodule of its model on rank 0 and broadcast to the other "
         "ranks, and the whole option is skipped when --resume is given, because the loaded state would overwrite it.",
     ),
-    shapes: list[dict] | None = Option(
-        None,
-        "--shape",
-        "-s",
-        parser=tensor_shape_parser,
-        help=SHAPES_HELP
+    shapes: list[dict] | None = shapes_option(
+        SHAPES_HELP
         + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
         "twice keeps only the last occurrence. When omitted, the INPUT_SHAPES declared by the built models are "
-        "used, merged across them.",
+        "used, merged across them."
     ),
     device: str | None = Option(
         None,

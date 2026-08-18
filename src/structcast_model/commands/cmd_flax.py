@@ -11,6 +11,7 @@ from structcast_model.commands.shared_args import (
     model_pattern,
     output_script_path,
     shapes_help,
+    shapes_option,
     template_param_option,
     times,
     warmup_runs,
@@ -19,7 +20,6 @@ from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     instantiate_object,
     reduce_dict,
-    tensor_shape_parser,
 )
 
 if TYPE_CHECKING:
@@ -44,13 +44,9 @@ creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating Flax nnx modules.")
 
 template_param = template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
-shapes = Option(
-    None,
-    "--shape",
-    "-s",
-    parser=tensor_shape_parser,
-    help=shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
-    + " Omit it only when the model declares INPUT_SHAPES itself.",
+shapes = shapes_option(
+    shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
+    + " Omit it only when the model declares INPUT_SHAPES itself."
 )
 device = Option(
     None,
