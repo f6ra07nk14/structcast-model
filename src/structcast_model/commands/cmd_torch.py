@@ -129,7 +129,7 @@ def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Model", "--classname", "-c", help="Name of the generated model class."),
+    classname: str = Option("Model", "--classname", "-n", help="Name of the generated model class."),
     structured_output: bool | None = Option(
         None,
         "--structured-output/--no-structured-output",
@@ -138,7 +138,7 @@ def create_model(
         "selected layer's own configuration decides.",
     ),
     sublayer: str | None = Option(
-        None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
+        None, "--sublayer", help="The reference to a sublayer in the template to build instead of the root layer."
     ),
 ) -> None:
     """Create a PyTorch model from the given configuration file and parameters."""
@@ -155,7 +155,7 @@ def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Learner", "--classname", "-c", help="Name of the generated Learner class."),
+    classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
 ) -> None:
     """Create a PyTorch learner class from the given configuration file and parameters."""
     builder = torch_builder.TorchLearnerBuilder.from_path(cfg_path)

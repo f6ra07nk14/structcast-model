@@ -282,9 +282,9 @@ scm torch create model cfg/torch/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: 
 **Common options** — All three framework commands share the same options:
 
 - `-p/--parameter`: override template parameters
-- `-c/--classname`: set the generated class name, default `Model`
+- `-n/--classname`: set the generated class name, default `Model`
 - `--structured-output/--no-structured-output`: force the root model's return type. `scm torch` defaults to the template's `STRUCTURED_OUTPUT` (a plain tuple-like return unless the template sets it); `scm flax` and `scm keras` default to a structured output mapping
-- `-s/--sublayer`: generate a named sublayer from the template instead of the root model
+- `--sublayer`: generate a named sublayer from the template instead of the root model
 - `-o/--output`: output file path; if omitted, defaults to the snake-cased class name in the current directory (e.g., `model.py` for the default class name `Model`)
 
 The ConvNeXtV2 template uses Jinja parameter groups to switch between backbone variants such as `atto`, `femto`, `tiny`, and `base`.
@@ -299,7 +299,7 @@ The learner is the object that owns the models and defines how they learn: when 
 scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
 ```
 
-Options: `-p/--parameter` overrides template parameters, `-c/--classname` sets the generated class name (default `Learner`), and `-o/--output` sets the output path.
+Options: `-p/--parameter` overrides template parameters, `-n/--classname` sets the generated class name (default `Learner`), and `-o/--output` sets the output path.
 
 The generated class manages:
 

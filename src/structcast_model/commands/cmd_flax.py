@@ -90,7 +90,7 @@ def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
     output: str | None = output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Model", "--classname", "-c", help="Name of the generated model class."),
+    classname: str = Option("Model", "--classname", "-n", help="Name of the generated model class."),
     structured_output: bool = Option(
         True,
         help="Return the module outputs as a dict keyed by output name instead of positionally. Defaults to true, "
@@ -98,7 +98,7 @@ def create_model(
         "Ignored with --sublayer: the selected layer's own configuration decides.",
     ),
     sublayer: str | None = Option(
-        None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
+        None, "--sublayer", help="The reference to a sublayer in the template to build instead of the root layer."
     ),
 ) -> None:
     """Create a Flax nnx module from the given configuration file and parameters."""
