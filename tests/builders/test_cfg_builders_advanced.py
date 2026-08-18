@@ -1,6 +1,7 @@
 """Advanced builder tests using real cfg templates."""
 
 from pathlib import Path
+from re import findall
 
 import pytest
 
@@ -93,6 +94,17 @@ def test_learner_script_gates_model_invocations() -> None:
     assert "def _sync_gate(module, armed):" not in script  # the package helper, never an inline copy
     assert 'restore_requires_grad(model, self._requires_grad_defaults["model"])' in script
     assert "def _restore" not in script  # the package helper, never an inline copy
+
+
+def test_learner_script_bind_arguments_are_deterministic() -> None:
+    """Bind-lambda argument names derive from the pattern position, never from id().
+
+    An id()-derived suffix changes with every process, so the same template rendered twice would
+    differ byte-for-byte -- phantom diffs for committed scripts and no way to hash-check "already
+    generated". The template's single bind must therefore always render as `_arg0`.
+    """
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
+    assert set(findall(r"_arg\d+", script)) == {"_arg0"}
 
 
 def test_learner_script_defines_steps_as_methods() -> None:

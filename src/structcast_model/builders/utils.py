@@ -79,7 +79,7 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
                 "First pattern of an ObjectPattern must be an AddressPattern or ObjectPattern "
                 f"but got: {to_jsonable_python(pattern)}"
             )
-        for ptn in rest:
+        for bind_index, ptn in enumerate(rest):
             if isinstance(ptn, (AddressPattern, ObjectPattern)):
                 raise SpecError(
                     "Only the first pattern of an ObjectPattern can be an AddressPattern or ObjectPattern "
@@ -90,8 +90,10 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             elif isinstance(ptn, CallPattern):
                 res = f"{res}({_args(ptn.call)})"
             elif isinstance(ptn, BindPattern):
-                pid = str(id(ptn))[1:4]
-                aname, kwname = f"_arg{pid}", f"_kw{pid}"
+                # The position in `rest` is deterministic, unlike an id()-derived suffix, so the same
+                # pattern always renders the same script. Reuse across nesting levels is safe: a
+                # nested lambda only ever references its own arguments, shadowing any outer ones.
+                aname, kwname = f"_arg{bind_index}", f"_kw{bind_index}"
                 args = _args(ptn.bind)
                 if isinstance(ptn.bind, dict):
                     res = f"(lambda *{aname}, **{kwname}: {res}(*{aname}, {args}, **{kwname}))"
