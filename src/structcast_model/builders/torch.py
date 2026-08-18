@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from structcast.core.instantiator import ObjectPattern
 
-from structcast_model.builders.base_builder import (
+from structcast_model.builders.base import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,

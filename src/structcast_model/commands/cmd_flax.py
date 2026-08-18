@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from structcast.core import instantiator
 
     from flax import nnx
-    from structcast_model.builders import flax_builder
+    from structcast_model.builders import flax as flax_builder
     from structcast_model.flax import trainer as flax_trainer
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -35,7 +35,7 @@ else:
     jax = LazyModuleImporter("jax")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     nnx = LazyModuleImporter("flax.nnx")
-    flax_builder = LazyModuleImporter("structcast_model.builders.flax_builder")
+    flax_builder = LazyModuleImporter("structcast_model.builders.flax")
     flax_trainer = LazyModuleImporter("structcast_model.flax.trainer")
 
 

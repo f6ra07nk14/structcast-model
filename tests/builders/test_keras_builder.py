@@ -2,7 +2,7 @@
 
 import pytest
 
-from structcast_model.builders.keras_builder import (
+from structcast_model.builders.keras import (
     KerasBuilder,
     KerasLayerIntermediate,
 )

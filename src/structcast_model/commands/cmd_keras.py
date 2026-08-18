@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from structcast.core import instantiator
 
     import keras
-    from structcast_model.builders import keras_builder
+    from structcast_model.builders import keras as keras_builder
     from structcast_model.keras import trainer as keras_trainer
     import torch
 else:
@@ -36,7 +36,7 @@ else:
     jax = LazyModuleImporter("jax")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
-    keras_builder = LazyModuleImporter("structcast_model.builders.keras_builder")
+    keras_builder = LazyModuleImporter("structcast_model.builders.keras")
     keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
     torch = LazyModuleImporter("torch")
 

@@ -221,7 +221,7 @@ What happens:
 
 ## Builder APIs
 
-**Modules**: `structcast_model.builders.base_builder`, `structcast_model.builders.torch_builder`, `structcast_model.builders.flax_builder`, `structcast_model.builders.keras_builder`
+**Modules**: `structcast_model.builders.base`, `structcast_model.builders.torch`, `structcast_model.builders.flax`, `structcast_model.builders.keras`
 
 ### Generic generation layer
 
@@ -259,7 +259,7 @@ What happens:
 ### Builder usage pattern
 
 ```python
-from structcast_model.builders.torch_builder import TorchBuilder
+from structcast_model.builders.torch import TorchBuilder
 
 built = TorchBuilder.from_path("cfg/torch/models/ConvNeXtV2.yaml")(
     parameters={"DEFAULT": {"backbone": "femto"}},
@@ -296,7 +296,7 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Average criteria per pass, reset on training/validation begin, reduce across ranks |
 | Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization; gradient sync is gated inside the generated training step |
 | Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion; `.from_criteria(...)` builds the CLI's wired monitors |
-| Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment=...)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
+| Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.loggers.mlflow`) / `WandbLogger(experiment=...)` (`structcast_model.loggers.wandb`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.loggers.base` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
 ### timm integration layer (example code)

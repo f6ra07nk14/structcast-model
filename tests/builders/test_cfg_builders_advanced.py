@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from structcast_model.builders.torch_builder import TorchLearnerBuilder
+from structcast_model.builders.torch import TorchLearnerBuilder
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR
 

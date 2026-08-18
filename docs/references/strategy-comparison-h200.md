@@ -159,7 +159,7 @@ The single-device language-model arms reported `ce_loss` 0.2866 against 1.1649 f
 at the same global batch size — exactly the factor `accumulate_gradients: 4`. The generated
 training step rebound the tracked loss to the accumulation-scaled value before `backward()`, so
 every reported loss metric was divided by the accumulation count. Fixed in
-`builders/torch_builder.py` by scaling inside the backward expression only; gradients were never
+`builders/torch.py` by scaling inside the backward expression only; gradients were never
 affected, and `val_ce_loss` (no accumulation in validation) needs no correction.
 
 ## Per-rank data verification

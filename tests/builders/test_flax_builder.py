@@ -2,7 +2,7 @@
 
 import pytest
 
-from structcast_model.builders.flax_builder import (
+from structcast_model.builders.flax import (
     FlaxBuilder,
     FlaxLayerIntermediate,
 )

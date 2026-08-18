@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import timm
 
-from structcast_model.builders.torch_builder import TorchBuilder, TorchLearnerBuilder
+from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
 from structcast_model.torch.distributed import matched_shard_modules
 from tests import TEST_DIR
 import torch

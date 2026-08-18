@@ -11,7 +11,7 @@ Configuration-driven toolkit that generates PyTorch models and training workflow
 
 Key modules:
 - `builders/schema.py` — Pydantic schemas for YAML templates
-- `builders/base_builder.py` → `builders/torch_builder.py` — Template-to-code pipeline
+- `builders/base.py` → `builders/torch.py` — Template-to-code pipeline
 - `commands/main.py` + `commands/cmd_torch.py` — Typer CLI (`scm` entry point)
 - `base_trainer.py` — Generic trainer, callbacks, best-criterion tracking
 - `torch/trainer.py` — PyTorch training steps, tracker, timm wrappers, distributed environment setup via `torchrun`

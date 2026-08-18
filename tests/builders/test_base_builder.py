@@ -11,18 +11,18 @@ from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 from structcast.core.specifier import SpecIntermediate
 
-from structcast_model.builders.base_builder import (
+from structcast_model.builders.base import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
-from structcast_model.builders.torch_builder import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
+from structcast_model.builders.torch import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from structcast_model.builders.utils import resolve_getter, resolve_object
 from tests import CFG_DIR
 
 if TYPE_CHECKING:
-    from structcast_model.builders.base_builder import _Intermediate
+    from structcast_model.builders.base import _Intermediate
 else:
     # LazySelectedImporter only exposes __all__; get _Intermediate via its public subclass.
     _Intermediate = LayerIntermediate.__bases__[0]

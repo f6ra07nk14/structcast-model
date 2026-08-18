@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
-from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
+from structcast_model.builders.base import BaseModelBuilder, LayerIntermediate
 
 
 class KerasLayerIntermediate(LayerIntermediate):
@@ -13,7 +13,7 @@ class KerasLayerIntermediate(LayerIntermediate):
     propagating it to every sub-layer call to support Keras's standard training/inference mode.
 
     Example:
-        >>> from structcast_model.builders.keras_builder import KerasLayerIntermediate
+        >>> from structcast_model.builders.keras import KerasLayerIntermediate
         >>> script = KerasLayerIntermediate(
         ...     classname="Unit",
         ...     imports={},
@@ -75,10 +75,10 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
     """Builder for Keras models.
 
     Generates Python scripts containing ``keras.Layer`` subclasses from a YAML template,
-    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
+    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch.TorchBuilder`.
 
     Example:
-        >>> from structcast_model.builders.keras_builder import KerasBuilder
+        >>> from structcast_model.builders.keras import KerasBuilder
         >>> raw = {
         ...     "INPUTS": ["x"],
         ...     "OUTPUTS": ["y"],

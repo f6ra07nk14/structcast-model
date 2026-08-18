@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
-from structcast_model.builders.base_builder import BaseModelBuilder, LayerIntermediate
+from structcast_model.builders.base import BaseModelBuilder, LayerIntermediate
 
 
 class FlaxLayerIntermediate(LayerIntermediate):
@@ -14,7 +14,7 @@ class FlaxLayerIntermediate(LayerIntermediate):
     whose ``__call__`` accepts a ``training: bool`` keyword argument for toggling training vs. inference behaviour.
 
     Example:
-        >>> from structcast_model.builders.flax_builder import FlaxLayerIntermediate
+        >>> from structcast_model.builders.flax import FlaxLayerIntermediate
         >>> script = FlaxLayerIntermediate(
         ...     classname="Unit",
         ...     imports={},
@@ -81,13 +81,13 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     """Builder for Flax nnx models.
 
     Generates Python scripts containing ``flax.nnx.Module`` subclasses from a YAML template,
-    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch_builder.TorchBuilder`.
+    following the same template-to-code pipeline as :class:`~structcast_model.builders.torch.TorchBuilder`.
 
     Sub-modules that require a random-number generator should receive ``rngs: "eval: rngs"`` in
     their ``_call_`` arguments so that the builder emits ``rngs=rngs`` in the generated ``__init__`` body.
 
     Example:
-        >>> from structcast_model.builders.flax_builder import FlaxBuilder
+        >>> from structcast_model.builders.flax import FlaxBuilder
         >>> layer_spec = {"_obj_": [["_addr_", "flax.nnx.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
         >>> raw = {"INPUTS": ["x"], "OUTPUTS": ["y"], "FLOW": [["x", "y", layer_spec]]}
         >>> built = FlaxBuilder(raw=raw)(classname="TinyNet")

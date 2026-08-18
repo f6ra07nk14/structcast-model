@@ -33,11 +33,11 @@ examples/torch/
 src/structcast_model/
 ├── base_trainer.py            # Generic trainer, event protocols, best-criterion handling
 ├── builders/
-│   ├── base_builder.py        # Generic template -> intermediate -> script pipeline
+│   ├── base.py                # Generic template -> intermediate -> script pipeline
 │   ├── schema.py              # Pydantic schemas for layer/learner templates
-│   ├── torch_builder.py       # PyTorch-specific code generation
-│   ├── flax_builder.py        # Flax-specific code generation
-│   └── keras_builder.py       # Keras-specific code generation
+│   ├── torch.py               # PyTorch-specific code generation
+│   ├── flax.py                # Flax-specific code generation
+│   └── keras.py               # Keras-specific code generation
 ├── commands/
 │   ├── main.py                # Top-level scm CLI
 │   ├── cmd_torch.py           # PyTorch CLI commands
@@ -48,12 +48,13 @@ src/structcast_model/
 │   ├── trainer.py             # Trainer, tracker, best criterion, training-state saver
 │   ├── distributed.py         # Distributed strategies, sync_gate, compile placement
 │   ├── utils.py               # get_torch_device / get_torch_device_type
-│   ├── logger.py              # Logger protocol shared by the experiment tracking backends
-│   ├── mlflow_logger.py       # MLflowLogger
-│   ├── wandb_logger.py        # WandbLogger
 │   ├── optimizers.py          # create_opt: regex parameter grouping; get_decays: decay metrics
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
+├── loggers/
+│   ├── base.py                # Logger protocol shared by the experiment tracking backends
+│   ├── mlflow.py              # MLflowLogger
+│   └── wandb.py               # WandbLogger
 ├── flax/
 │   ├── trainer.py             # Flax inference time measurement
 │   └── layers/                # Reusable Flax layers (e.g. GlobalResponseNorm)
@@ -81,9 +82,9 @@ YAML template in cfg/[torch/flax/keras]/
   |  TemplateLayer / TemplateLearner validation      <- builders/schema.py
   v
 Builder intermediate objects
-  |  BaseModelBuilder / BaseLearnerBuilder           <- builders/base_builder.py
-  |  TorchBuilder / FlaxBuilder / KerasBuilder       <- builders/{torch,flax,keras}_builder.py
-  |  TorchLearnerBuilder                             <- builders/torch_builder.py
+  |  BaseModelBuilder / BaseLearnerBuilder           <- builders/base.py
+  |  TorchBuilder / FlaxBuilder / KerasBuilder       <- builders/{torch,flax,keras}.py
+  |  TorchLearnerBuilder                             <- builders/torch.py
   v
 Generated Python source files
   |  scm [torch/flax/keras] create model
@@ -248,9 +249,11 @@ torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train ...
 
 ## Builder Architecture
 
+The builder modules are named after the framework they emit (`builders/torch.py`, `builders/flax.py`, `builders/keras.py`). Import them under an alias -- `from structcast_model.builders import torch as torch_builder` -- because a bare `from structcast_model.builders import torch` shadows the real `torch` in the importing module.
+
 ### Generic builder layer
 
-`builders/base_builder.py` is the generic code generation engine.
+`builders/base.py` is the generic code generation engine.
 
 Key responsibilities:
 
@@ -271,7 +274,7 @@ Key APIs:
 
 ### PyTorch builder layer
 
-`builders/torch_builder.py` specializes the generic intermediates into concrete PyTorch code.
+`builders/torch.py` specializes the generic intermediates into concrete PyTorch code.
 
 Important classes:
 
@@ -291,7 +294,7 @@ Important generation details:
 
 ### Flax builder layer
 
-`builders/flax_builder.py` specializes the generic intermediates into Flax (JAX) code.
+`builders/flax.py` specializes the generic intermediates into Flax (JAX) code.
 
 Important classes:
 
@@ -306,7 +309,7 @@ Important generation details:
 
 ### Keras builder layer
 
-`builders/keras_builder.py` specializes the generic intermediates into Keras code.
+`builders/keras.py` specializes the generic intermediates into Keras code.
 
 Important classes:
 
@@ -356,9 +359,9 @@ Training/evaluation helpers:
 
 Loggers (run-owning context managers that also implement `on_epoch_end`):
 
-- `Logger` — the shared protocol, in `structcast_model.torch.logger`
-- `MLflowLogger` — in `structcast_model.torch.mlflow_logger`
-- `WandbLogger` — in `structcast_model.torch.wandb_logger`
+- `Logger` — the shared protocol, in `structcast_model.loggers.base`
+- `MLflowLogger` — in `structcast_model.loggers.mlflow`
+- `WandbLogger` — in `structcast_model.loggers.wandb`
 
 timm data integrations — example code in `examples/torch/data.py`, not package API; a configuration loads them by file path (`_addr_` plus `_file_`):
 
@@ -461,7 +464,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Google-style docstrings are expected.
 - Dataclasses use `@dataclass(kw_only=True, slots=True)`.
 - Lazy import wrappers are used broadly:
-  - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
+  - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops) and the framework imports in `structcast_model.loggers` (torch in all three modules, plus `mlflow.pytorch`, whose top level imports torch); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
   - `LazySelectedImporter` for module export surfaces (`__all__`) — except `structcast_model.torch.distributed`, deliberately exempt: generated compiled flows call `sync_gate` and the shim breaks dynamo's tracer (see the module tail comment and ADR-0004).
 - Generated code should stay minimal and preserve current public APIs.
 - The `outputs` attribute on a generated learner is significant — the CLI reads it to determine which keys `TorchTracker` should track, falling back to `--learner-outputs`.
@@ -470,7 +473,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 ## Testing Notes
 
 - Tests mirror the source layout: builders, commands, trainer, and torch layers each have dedicated test modules.
-- CLI tests patch command callback globals directly because lazy import wrappers make normal monkeypatching less reliable.
+- CLI tests patch command callback globals directly because lazy import wrappers make normal monkeypatching less reliable; the globals are package handles (`scm_loggers`, `scm_torch`), so a patch replaces one handle with a namespace serving the submodules.
 - Trainer tests often patch function globals instead of module attributes for the same reason.
 - The pytest configuration runs doctests in `src/` as well as tests under `tests/`.
 

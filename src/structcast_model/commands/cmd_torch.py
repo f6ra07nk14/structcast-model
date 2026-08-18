@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     import ptflops
     from structcast.core import instantiator
 
-    from structcast_model.builders import torch_builder
+    from structcast_model.builders import torch as torch_builder
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -56,7 +56,7 @@ else:
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
-    torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
+    torch_builder = LazyModuleImporter("structcast_model.builders.torch")
     torch = LazyModuleImporter("torch")
 
 
