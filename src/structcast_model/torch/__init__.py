@@ -21,6 +21,9 @@ __all__ = [
     "create_torch_inputs",
     "distributed",
     "get_decays",
+    "get_learning_rate",
+    "get_named_parameters",
+    "get_param_groups",
     "get_torch_device",
     "get_torch_device_type",
     "initial_distributed_env",
@@ -29,6 +32,7 @@ __all__ = [
     "matched_shard_modules",
     "optimizers",
     "resolve_input_shapes",
+    "restore_requires_grad",
     "set_lr_scale",
     "sync_gate",
     "trainer",
@@ -47,7 +51,15 @@ if TYPE_CHECKING:
         matched_shard_modules,
         sync_gate,
     )
-    from structcast_model.torch.optimizers import create_opt, get_decays, set_lr_scale
+    from structcast_model.torch.optimizers import (
+        create_opt,
+        get_decays,
+        get_learning_rate,
+        get_named_parameters,
+        get_param_groups,
+        restore_requires_grad,
+        set_lr_scale,
+    )
     from structcast_model.torch.trainer import (
         CriteriaTracker,
         TorchBestCriterion,
@@ -82,7 +94,15 @@ else:
             "sync_gate",
         ],
         "layers": [],
-        "optimizers": ["create_opt", "get_decays", "set_lr_scale"],
+        "optimizers": [
+            "create_opt",
+            "get_decays",
+            "get_learning_rate",
+            "get_named_parameters",
+            "get_param_groups",
+            "restore_requires_grad",
+            "set_lr_scale",
+        ],
         "trainer": [
             "CriteriaTracker",
             "TorchBestCriterion",

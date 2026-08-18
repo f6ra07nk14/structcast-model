@@ -80,7 +80,13 @@ class TorchLearnerIntermediate(LearnerIntermediate):
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
-        "structcast_model.torch.optimizers": {"get_decays"},
+        "structcast_model.torch.optimizers": {
+            "get_decays",
+            "get_learning_rate",
+            "get_named_parameters",
+            "get_param_groups",
+            "restore_requires_grad",
+        },
         "structcast_model.torch.distributed": {"sync_gate"},
     }
     """Default imports for PyTorch learners; the generated steps and properties call these directly."""
@@ -200,7 +206,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
             )
             step += [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
             step += [
-                f'_restore_requires_grad({m}, self._requires_grad_defaults["{m}"])'
+                f'restore_requires_grad({m}, self._requires_grad_defaults["{m}"])'
                 if m in trainable_layers
                 else f"{m}.requires_grad_(False)"
                 for m in self.models
@@ -246,18 +252,10 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         inputs += ", " if inputs else ""
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         return f"""\
-def _restore_requires_grad(module, defaults):
-    for p, d in zip(module.parameters(), defaults):
-        p.requires_grad_(d)
-
-
 class {self.classname}:
 
     def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
-        def _get_param(models):
-            return [p for m in models for p in (m.named_parameters() if hasattr(m, "named_parameters") else m)]
-
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
         {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
         {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
@@ -304,10 +302,7 @@ class {self.classname}:
 
     @property
     def learning_rates(self):
-        def _get_lr(opt):
-            return opt.param_groups[0]["lr"]
-
-        return {{k: _get_lr(v) for k, v in self.optimizers.items()}}
+        return {{k: get_learning_rate(v) for k, v in self.optimizers.items()}}
 
     @property
     def weight_decays(self):
@@ -315,10 +310,7 @@ class {self.classname}:
 
     @property
     def param_group_names(self):
-        def _get_param_groups(opt):
-            return [{{k: v for k, v in pg.items() if k != "params"}} for pg in opt.param_groups]
-
-        return {{k: _get_param_groups(v) for k, v in self.optimizers.items()}}
+        return {{k: get_param_groups(v) for k, v in self.optimizers.items()}}
 """
 
 
@@ -355,7 +347,7 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         trainable_layers: list[str],
     ) -> tuple[str, str]:
         opt_inst, opt_cls = resolve_object(imports, optimizer)
-        return f"{opt_inst}(_get_param([{', '.join(trainable_layers)}]))", opt_cls
+        return f"{opt_inst}(get_named_parameters([{', '.join(trainable_layers)}]))", opt_cls
 
 
 __all__ = ["TorchBuilder", "TorchLayerIntermediate", "TorchLearnerBuilder", "TorchLearnerIntermediate"]

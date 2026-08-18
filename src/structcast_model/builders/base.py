@@ -80,7 +80,7 @@ class _Intermediate(Serializable):
         }
         from_imports = {p: {m for m in i if m} for p, i in module_imports.items()}
         imported_code = "\n".join(
-            [f"from {p} import {', '.join([m for m in i if m])}" for p, i in from_imports.items() if i]
+            [f"from {p} import {', '.join(sorted(m for m in i if m))}" for p, i in from_imports.items() if i]
             + [f"import {p}" for p, i in module_imports.items() if None in i]
             + (["from structcast.utils.base import import_from_address"] if file_imports else [])
         ).strip()
