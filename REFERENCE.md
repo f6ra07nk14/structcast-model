@@ -484,8 +484,8 @@ history = trainer.fit(epochs=10)
 
 ```python
 class SaveCheckpoint:
-    def on_best(self, info: BaseInfo, best: BestCriterion) -> None:
-        ...  # log or save by best.value / best.step
+    def on_best(self, info: BaseInfo, best: BestCriterion) -> None: ...  # log or save by best.value / best.step
+
 
 checkpoint = BestCriterion(target="val_acc1", mode="max", callbacks=[SaveCheckpoint()])
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[checkpoint])

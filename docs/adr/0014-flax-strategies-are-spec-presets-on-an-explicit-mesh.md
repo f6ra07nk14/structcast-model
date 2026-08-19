@@ -5,12 +5,12 @@ single-device, data-parallel, and FSDP execution, with XLA inserting every colle
 `DistributedStrategy` implementation is therefore **one class**, not a mirror of the three torch classes: on
 this side `wrap()` returns the models untouched (sharding is Variable metadata applied eagerly at
 construction), `sync_initial_weights()` is a no-op (single controller, one globally-addressable init),
-`grad_scaler_creator` is `None` (bf16 needs no scaler), and `compile()` is the `nnx.jit` seam. What
+`grad_scaler_creator` raises (bf16 needs no scaler, and the protocol types it as a callable), and `compile()` is the `nnx.jit` seam. What
 distinguishes strategies is only a **preset**: the mesh to build and an ordered `(parameter-path regex, tactic)`
 rule table deciding each parameter's spec — the shape used by big_vision/scalax, first match wins, with a
 minimum-size cutoff so biases and norm scales stay replicated.
 
-v1 ships `single`, `dp`, and `fsdp` (alias `zero3`). Presets are YAML/CLI-selectable; a custom rule table
+v1 ships `single`, `dp`, and `fsdp`. Presets are YAML/CLI-selectable; a custom rule table
 remains expressible through the strategy object pattern.
 
 ## Explicit axis types everywhere, including a size-1 mesh

@@ -10,10 +10,11 @@ Variables. The Flax side therefore ships **no** `create_opt`. The YAML `OPTIMIZE
 pattern resolver:
 
 ```python
-self.optimizer_g = (lambda *_arg0, **_kw0: Optimizer(*_arg0,
-    tx=chain(clip_by_global_norm(max_norm=2.0),
-             inject_hyperparams(adamw)(learning_rate=0.0002)),
-    **_kw0))(List([G_AB, G_BA]), wrt=Param)
+self.optimizer_g = (
+    lambda *_arg0, **_kw0: Optimizer(
+        *_arg0, tx=chain(clip_by_global_norm(max_norm=2.0), inject_hyperparams(adamw)(learning_rate=0.0002)), **_kw0
+    )
+)(List([G_AB, G_BA]), wrt=Param)
 ```
 
 `FlaxLearnerBuilder._get_optimizer` mirrors the torch emission point: it appends the owned-module container
@@ -47,8 +48,10 @@ stashed arrays lazily so the host sync lands on the epoch-end read, not on the s
 updates and dispatches the Update event from it. `MultiSteps` duplicates that counter in device state
 (`mini_step`/`gradient_step`), returns all-zero update trees on non-apply steps, defaults to `use_grad_mean`
 (which double-scales against the emitted `loss / k`), moves LR-schedule cadence depending on nesting, and its
-`has_updated` helper raises on nnx-wrapped state. The generated learner instead keeps a params-shaped pure-dict
-accumulator: add gradients every micro-step, feed the accumulated tree to `optimizer.update` and zero it under
+`has_updated` helper raises on nnx-wrapped state. The generated learner instead keeps a params-shaped
+`nnx.State` accumulator (the only tree shape `nnx.Optimizer.update` accepts — it filters the incoming gradients
+through `wrt`, and a plain dict filters to empty): add gradients every micro-step, feed the accumulated tree to
+`optimizer.update` and zero it under
 the host-computed `__need_update__` flag. Clipping placed first in the tx chain then applies once per update, to
 the accumulated gradients — the same semantics as the emitted torch `if __need_update__:` block.
 
