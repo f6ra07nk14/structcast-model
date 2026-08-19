@@ -23,6 +23,17 @@ with try_import() as _imports:
     import wandb
 
 
+def _active_run_dir() -> Path:
+    """The directory of the active run, which only exists between `__enter__` and `__exit__`.
+
+    `wandb.run` is None outside a run, so resolving it here turns a misuse of the logger into one
+    clear error instead of an `AttributeError` deep inside a file write.
+    """
+    if wandb.run is None:
+        raise RuntimeError("No active wandb run: enter the WandbLogger context first.")
+    return Path(wandb.run.dir)
+
+
 @dataclass(kw_only=True, slots=True)
 class WandbLogger(Logger):
     """Logger recording a run to Weights & Biases, with the same interface as `MLflowLogger`."""
@@ -49,7 +60,7 @@ class WandbLogger(Logger):
 
     def log_dict(self, data: Mapping[str, Any], name: str) -> None:
         """Write a dictionary into the run directory as YAML, matching what MLflow stores."""
-        dump_yaml(dict(data), Path(wandb.run.dir) / name)
+        dump_yaml(dict(data), _active_run_dir() / name)
 
     def log_artifact(self, path: str) -> None:
         """Log a local file as an artifact."""
@@ -65,7 +76,7 @@ class WandbLogger(Logger):
 
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
         """Save a state dictionary into the run directory."""
-        torch.save(dict(states), Path(wandb.run.dir) / f"{name}.pt")
+        torch.save(dict(states), _active_run_dir() / f"{name}.pt")
 
     def fetch_training_state(self, reference: str) -> dict[str, Any]:
         """Load a saved training state from a `wandb://` reference or a local path.
