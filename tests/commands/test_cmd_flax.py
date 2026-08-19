@@ -28,6 +28,7 @@ from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
 from structcast_model.commands.cmd_flax import app
 from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.flax.trainer import FlaxTrainer
+from structcast_model.utils.base import load_any
 from tests import CFG_DIR, FIXTURES_DIR
 
 LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
@@ -208,7 +209,7 @@ VALIDATION_DATASET = f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: 
 """Object pattern building a shorter validation dataset."""
 
 EPOCHS_SEEN: list[int] = []
-"""Epochs the hook of `epoch_aware_batches` was called with; cleared by the test that reads it."""
+"""Epochs the event method of `epoch_aware_batches` was called with; cleared by the test that reads it."""
 
 
 class _EpochAwareDataset(list[dict[str, Any]]):
@@ -220,7 +221,7 @@ class _EpochAwareDataset(list[dict[str, Any]]):
 
 
 def epoch_aware_batches() -> _EpochAwareDataset:
-    """Return the fixed training batches as a dataset carrying a lifecycle hook."""
+    """Return the fixed training batches as a dataset that is also an event callback."""
     return _EpochAwareDataset(linear_batches())
 
 
@@ -440,16 +441,16 @@ def test_train_keeps_the_contract_compilation_arguments(
     assert overridden.data.metrics["loss"] == plain.data.metrics["loss"]
 
 
-def test_train_routes_the_lifecycle_hooks_of_the_dataset_it_shards(
+def test_train_routes_the_events_of_the_dataset_it_shards(
     tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
 ) -> None:
-    """Placing the batches wraps the dataset, which must not hide the hooks the trainer scans for."""
+    """Placing the batches wraps the dataset, which must not hide the events the trainer scans for."""
     EPOCHS_SEEN.clear()
     _train(
         cli_runner,
         patterns,
         tmp_path,
-        experiment="flax-dataset-hook",
+        experiment="flax-dataset-events",
         epochs=2,
         extra=["--training-dataset", EPOCH_AWARE_DATASET],
     )
@@ -498,6 +499,34 @@ def test_train_resumes_from_a_saved_training_state(
     assert [metric.step for metric in history] == [3]
     # Training continued from the restored weights rather than from a fresh initialization.
     assert history[0].value < first.data.metrics["loss"]
+
+
+def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """A resumed run rebuilds `tx` from the configuration, and a changed schedule must be reported.
+
+    The restored optimizer state carries the step count but not the transformation, so a run resumed
+    against another rate silently continues the new schedule from the old count. The digests the
+    generated learner emits are what makes that visible, end to end: saved with one rate, resumed
+    with another, the loader names the segment.
+    """
+    _train(cli_runner, patterns, tmp_path, experiment="flax-rebuilt-optimizer", epochs=1)
+    (state,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
+    raw = load_any(LEARNER_CFG)
+    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"] = 0.2
+    FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "faster_learner.py")
+    rebuilt = (patterns[0], f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'faster_learner.py'}}}]")
+
+    with pytest.warns(UserWarning, match='optimizer of segment "optimizer" is not the one the state was saved with'):
+        _train(
+            cli_runner,
+            rebuilt,
+            tmp_path,
+            experiment="flax-rebuilt-optimizer",
+            epochs=2,
+            extra=["--resume", str(state)],
+        )
 
 
 # ---------------------------------------------------------------------------

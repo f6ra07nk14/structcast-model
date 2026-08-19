@@ -16,8 +16,9 @@ import jax.numpy as jnp
 import pytest
 
 from flax import nnx
-from structcast_model.base_trainer import Learner
+from structcast_model.base_trainer import Learner, SimpleDataProvider
 from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
+from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer
 from structcast_model.utils.base import load_any
 from tests import FIXTURES_DIR
 
@@ -57,6 +58,15 @@ def _learner_type(tmp_path: Path, path: Path = LEARNER_YAML, **kwargs: Any) -> A
 def _parameters(model: Any) -> list[jax.Array]:
     """Read the parameter arrays of a model, in a stable order."""
     return jax.tree.leaves(nnx.state(model, nnx.Param))
+
+
+def _optimizer_state(learner: Any, name: str = "optimizer") -> list[jax.Array]:
+    """Read the optimizer's own state arrays -- its step count above all -- in a stable order.
+
+    Through `nnx.to_pure_dict`: a tree walk over an `nnx.State` yields Variables, which do not
+    compare as arrays.
+    """
+    return jax.tree.leaves(nnx.to_pure_dict(nnx.state(learner.optimizers[name])))
 
 
 def _sgd_step(model: Any, learning_rate: float) -> tuple[jax.Array, jax.Array]:
@@ -164,14 +174,20 @@ def test_inference_step_runs_deterministically_and_leaves_the_parameters_untouch
     model = _Dropped(rngs=nnx.Rngs(0))
     learner = _learner_type(tmp_path)(model)
     before = _parameters(model)
+    optimizer_state = _optimizer_state(learner)
 
     first = learner.inference_step(x=X, y=Y)
     second = learner.inference_step(x=X, y=Y)
 
     assert float(first["loss"]) == float(second["loss"])
     assert all(jnp.array_equal(a, b) for a, b in zip(before, _parameters(model), strict=True))
+    # The optimizer's own state has to be bitwise untouched too: an evaluation that stepped it would
+    # leave the parameters alone on this fixture and only show up as a drifted schedule later.
+    assert all(jnp.array_equal(a, b) for a, b in zip(optimizer_state, _optimizer_state(learner), strict=True))
     # The same batch through the trained models drops activations, so it cannot report the same loss.
     assert float(learner.training_step(x=X, y=Y)["loss"]) != float(first["loss"])
+    # ... and that training step does move the optimizer state, so the comparison above can fail.
+    assert not all(jnp.array_equal(a, b) for a, b in zip(optimizer_state, _optimizer_state(learner), strict=True))
 
 
 def test_inference_views_see_the_trained_parameters(tmp_path: Path) -> None:
@@ -342,3 +358,92 @@ def test_running_statistics_move_while_training_and_hold_while_evaluating(tmp_pa
 
     assert not any(jnp.array_equal(a, b) for a, b in zip(initial, trained, strict=True))
     assert all(jnp.array_equal(a, b) for a, b in zip(trained, evaluated, strict=True))
+
+
+class _UpdateRecorder:
+    """A callback recording the trainer step of every update event it receives."""
+
+    def __init__(self) -> None:
+        """Start with no updates recorded."""
+        self.steps: list[int] = []
+
+    def on_update(self, info: Any) -> None:
+        """Record the step the update landed on."""
+        self.steps.append(info.step)
+
+
+def test_a_generated_accumulating_learner_updates_twice_over_six_trainer_steps(tmp_path: Path) -> None:
+    """The accumulation window is the learner's, and the trainer must see exactly its updates.
+
+    `BaseTrainer` asks the learner whether this step updates and counts the answer, so a window the
+    generated `update` got wrong -- one update too many, or a buffer reset per epoch -- shows up here
+    as an update count that no longer matches the configured `ACCUMULATE_GRADIENTS`. Six steps at
+    three is the smallest run that closes two windows.
+
+    The events land on steps 2 and 5, not 3 and 6: the emitted gate is `(step + 1) % 3 == 0`, which
+    counts from zero, while the trainer's own step counter starts at one. The first window is
+    therefore one step short and every later one is exactly three. This is what the PyTorch learners
+    emit too (`builders/torch.py`), so it is asserted as parity rather than fixed here.
+    """
+    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
+        _model_type(tmp_path)(rngs=nnx.Rngs(0))
+    )
+    recorder = _UpdateRecorder()
+    trainer = FlaxTrainer(
+        learner=learner,
+        tracker=FlaxTracker.from_criteria(learner.outputs),
+        data=SimpleDataProvider(training_dataset=[{"x": X, "y": Y}] * 6),
+        callbacks=[recorder],
+    )
+
+    trainer.fit(epochs=1)
+
+    assert recorder.steps == [2, 5]
+    assert trainer.update == 2
+
+
+SGD_TX = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 1.0}}]
+"""A transformation whose step is the raw gradient: whatever the clip lets through is what moves."""
+
+CLIPPED_TX = [
+    "_obj_",
+    {"_addr_": "optax.chain"},
+    {"_call_": [["_obj_", {"_addr_": "optax.clip_by_global_norm"}, {"_call_": {"max_norm": 1e-3}}], SGD_TX]},
+]
+
+LOUD_Y = 100.0 * Y
+"""Targets far from anything the model predicts, so an unclipped step is orders of magnitude too big."""
+
+
+def _tx_learner(tmp_path: Path, name: str, tx: list[Any]) -> Any:
+    """Generate a learner from the linear fixture with *tx* as its optimizer's transformation."""
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = tx
+    FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()(tmp_path / f"{name}.py")
+    return _load(tmp_path / f"{name}.py", f"{name}_learner").Learner
+
+
+def _step_distance(learner: Any) -> float:
+    """Run one training step on the loud batch and return how far the parameters moved."""
+    before = _parameters(learner.models["model"])
+    learner.update(0)
+    learner.training_step(x=X, y=LOUD_Y)
+    after = _parameters(learner.models["model"])
+    return float(jnp.sqrt(sum(jnp.sum((a - b) ** 2) for a, b in zip(before, after, strict=True))))
+
+
+def test_a_chained_clip_bounds_what_a_generated_update_actually_moves(tmp_path: Path) -> None:
+    """A transformation the pattern chains before the optimizer has to reach the applied update.
+
+    The builder emits the pattern and appends the owned container to it; nothing in the emitted code
+    re-implements the transformation, so the only proof that the chain survived is the parameters
+    moving no further than the clip allows. The twin without the clip moves on the same batch, so a
+    step that simply did nothing could not pass.
+    """
+    model_type = _model_type(tmp_path)
+    clipped = _tx_learner(tmp_path, "clipped", CLIPPED_TX)(model_type(rngs=nnx.Rngs(0)))
+    plain = _tx_learner(tmp_path, "plain", SGD_TX)(model_type(rngs=nnx.Rngs(0)))
+
+    # The bound is the clip's, up to the float32 error of summing the squared deltas back up.
+    assert _step_distance(clipped) <= 1e-3 * (1 + 1e-4)
+    assert _step_distance(plain) > 1.0

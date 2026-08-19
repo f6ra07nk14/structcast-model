@@ -96,3 +96,8 @@ _Avoid_: DataModule, dataset wrapper
 **Object pattern**:
 A YAML/CLI expression describing how to instantiate an object (`_obj_` / `_addr_` / `_call_`).
 
+**Optimizer segment**:
+One `LEARNERS` entry of a learner template: a loss, the flow computing it, the trainable layers that
+entry's optimizer owns, and that optimizer. A learner has one segment per optimizer, applied in order.
+_Avoid_: optimizer block, learner behavior
+

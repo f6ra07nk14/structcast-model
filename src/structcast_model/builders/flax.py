@@ -4,6 +4,8 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
+from hashlib import sha256
+from json import dumps
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 from warnings import warn
 
@@ -211,6 +213,25 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     return ObjectPattern.model_validate(rewritten), True
 
 
+def optimizer_hash(optimizer: ObjectPattern) -> str:
+    """Return the digest identifying one `OPTIMIZER` pattern, as it was written.
+
+    Recorded in the generated learner and in the training state so a resume can report an optimizer
+    that was rebuilt from a different configuration (`docs/adr/0015`): optax builds `tx` from the
+    pattern and the restored state cannot see it, so a swapped schedule would otherwise continue
+    silently from the old step count. The pattern is hashed before `inject_learning_rate` rewrites
+    it, so turning the injection on or off never moves the digest.
+
+    Args:
+        optimizer (ObjectPattern): The validated `OPTIMIZER` pattern of one learner behavior.
+
+    Returns:
+        str: The hex SHA-256 of the pattern's canonical JSON dump.
+    """
+    dumped = optimizer.model_dump(by_alias=True)
+    return sha256(dumps(dumped, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def _container(trainable_layers: list[str]) -> str:
     """Return the name of the variable holding the modules one optimizer owns.
 
@@ -228,7 +249,15 @@ def _stored(output: str) -> list[str]:
     return [name.strip() for name in output.strip("()").split(",") if name.strip()]
 
 
-class FlaxLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
+@dataclass(kw_only=True, slots=True)
+class FlaxOptimizerSegment(OptimizerSegment):
+    """One optimizer step of a Flax learner flow, carrying the digest of the pattern that built it."""
+
+    optimizer_hash: str
+    """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES` in the learner."""
+
+
+class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     """Intermediate representation of a Flax (nnx) learner.
 
     The two steps are emitted as module-level functions taking the models, the optimizers and the
@@ -255,12 +284,12 @@ class FlaxLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
     """Default imports for Flax learners; the generated steps and properties call these directly."""
 
     @cached_property
-    def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], OptimizerSegment]]:
+    def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], FlaxOptimizerSegment]]:
         """Split the training flow into the (flow steps, optimizer segment) pairs to emit in order."""
-        segments: list[tuple[list[tuple[str, str, str | None]], OptimizerSegment]] = []
+        segments: list[tuple[list[tuple[str, str, str | None]], FlaxOptimizerSegment]] = []
         units: list[tuple[str, str, str | None]] = []
         for unit in self.flow:
-            if isinstance(unit, OptimizerSegment):
+            if isinstance(unit, FlaxOptimizerSegment):
                 segments.append((units, unit))
                 units = []
             else:
@@ -380,7 +409,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
         body = [f"{name} = flax.nnx.List([{', '.join(owned)}])" for name, owned in self._module_lists.items()]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
         layers = [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]
+        hashes = ", ".join(f"{s.optimizer!r}: {s.optimizer_hash!r}" for _, s in self._segments)
         parts = ["\n".join(layers)] if layers else []
+        parts.append(f"OPTIMIZER_HASHES: dict[str, str] = {{{hashes}}}")
         parts.append(f"""\
 def _training_step(models, optimizers, acc_grads, need_update, {named}**kwargs):
     {sep.join(self._forward_training_flow)}""")
@@ -468,7 +499,7 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
         naming: AutoName,
         layers: dict[str, LayerIntermediate | str],
         others: dict[str, str],
-    ) -> OptimizerSegment:
+    ) -> FlaxOptimizerSegment:
         """Build the optimizer segment, rejecting a container name something else already holds.
 
         The container of a multi-module segment is a generated name, but nothing stops a user model
@@ -484,7 +515,13 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
         # Named base rather than a zero-argument `super()`: `slots=True` rebuilds the class, and on
         # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
         # discarded one, so `super()` raises "obj must be an instance or subtype of type" here.
-        return BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
+        base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
+        return FlaxOptimizerSegment(
+            loss=base.loss,
+            optimizer=base.optimizer,
+            trainable_layers=base.trainable_layers,
+            optimizer_hash=optimizer_hash(learner.OPTIMIZER),
+        )
 
     def _get_optimizer(
         self,
@@ -515,7 +552,9 @@ __all__ = [
     "FlaxLayerIntermediate",
     "FlaxLearnerBuilder",
     "FlaxLearnerIntermediate",
+    "FlaxOptimizerSegment",
     "inject_learning_rate",
+    "optimizer_hash",
 ]
 
 

@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from pathlib import Path
-from re import search
+from re import findall, search
 from typing import Any
 
 import pytest
@@ -14,6 +14,7 @@ from structcast_model.builders.flax import (
     FlaxLayerIntermediate,
     FlaxLearnerBuilder,
     inject_learning_rate,
+    optimizer_hash,
 )
 from structcast_model.builders.utils import resolve_object
 from structcast_model.utils.base import load_any
@@ -475,7 +476,8 @@ def test_flax_learner_rejects_a_segment_that_does_not_compute_its_own_loss() -> 
     raw["LEARNERS"][1]["LOSS"] = "loss_ab"
 
     with pytest.raises(SpecError, match='its FLOW does not compute its LOSS "loss_ab"'):
-        FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts  # noqa: B018
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
 def test_flax_convnext_learner_cfg_keeps_its_rate_readable_and_its_norms_undecayed() -> None:
@@ -523,7 +525,8 @@ def test_flax_learner_rejects_a_segment_that_reads_a_name_it_stores_later() -> N
     raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: out_b * 2.0", "doubled", None])
 
     with pytest.raises(SpecError, match='reads "out_b" before its own FLOW stores it'):
-        FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts  # noqa: B018
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
 def test_flax_learner_rejects_a_layer_named_like_a_module_container() -> None:
@@ -594,3 +597,44 @@ def test_the_learner_builder_never_uses_the_zero_argument_super() -> None:
     for name, member in vars(FlaxLearnerBuilder).items():
         code = getattr(member, "__code__", None)
         assert code is None or "__class__" not in code.co_freevars, name
+
+
+def _emitted_hashes(script: str) -> dict[str, str]:
+    """Read the `OPTIMIZER_HASHES` constant back out of a generated learner script."""
+    line = search(r"OPTIMIZER_HASHES: dict\[str, str\] = \{(.*)\}", script)
+    assert line is not None, script
+    return dict(findall(r"'(\w+)': '(\w+)'", line.group(1)))
+
+
+def test_flax_learner_emits_the_digest_of_the_optimizer_pattern_as_written() -> None:
+    """The emitted digest identifies the OPTIMIZER pattern, so a resume can report a rebuilt optimizer.
+
+    It is taken before `inject_learning_rate` rewrites the pattern, so the digest a run records is
+    the one the configuration itself hashes to -- turning the injection on or off must not read as a
+    changed optimizer.
+    """
+    pattern = ObjectPattern.model_validate(load_any(LEARNER_YAML)["LEARNERS"][0]["OPTIMIZER"])
+
+    assert _emitted_hashes(_learner_script(LEARNER_YAML)) == {"optimizer": optimizer_hash(pattern)}
+
+
+def test_flax_learner_optimizer_hashes_are_stable_but_move_with_the_schedule() -> None:
+    """Regenerating the same configuration must repeat the digest, and a new rate must change it.
+
+    A digest that drifted would make every resume warn; one that did not move with the rate would
+    never warn, and optax rebuilds `tx` from configuration without the restored state noticing.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"] = 0.2
+    rebuilt = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+    assert _emitted_hashes(_learner_script(LEARNER_YAML)) == _emitted_hashes(_learner_script(LEARNER_YAML))
+    assert _emitted_hashes(rebuilt) != _emitted_hashes(_learner_script(LEARNER_YAML))
+
+
+def test_flax_learner_emits_one_optimizer_hash_per_segment() -> None:
+    """Two segments are two independently rebuildable optimizers, so each carries its own digest."""
+    hashes = _emitted_hashes(_learner_script(SEGMENTS_YAML))
+
+    assert sorted(hashes) == ["optimizer_ab", "optimizer_c"]
+    assert len(set(hashes.values())) == 2

@@ -28,8 +28,10 @@ So the strategy always runs under `jax.set_mesh(mesh)` with Explicit axis types 
 `make_mesh((1,), ('data',))`, not a branch — and model construction must happen inside the mesh scope (eager
 sharding raises otherwise; note `jax.set_mesh` takes effect at `__init__`, not `__enter__`). Batch sharding
 lives at the loader seam via `jax.device_put(batch, NamedSharding(mesh, P('data', None)))`; divisibility of the
-per-microbatch size by the mesh is validated at configuration time, and a parameter whose dimension does not
-divide falls back to replicate rather than erroring inside a trace.
+per-microbatch size by the mesh is checked there, as each batch is placed, and a batch entry the mesh does not
+divide is rejected by name -- a configuration-time check is impossible, since a dataset is an object pattern
+whose batch shapes only exist at run time. A parameter whose dimension does not divide falls back to replicate
+rather than erroring inside a trace.
 
 ## What is deliberately not shipped
 

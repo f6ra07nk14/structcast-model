@@ -23,15 +23,34 @@ from structcast_model.base_trainer import (
 from structcast_model.commands.shared_args import (
     PATH_FORM_HELP,
     batch_size,
+    ci,
     compile_option,
+    epochs,
+    experiment,
+    higher_criteria,
+    learner_outputs,
+    learner_pattern,
+    log_arguments,
+    log_artifacts,
+    logger_name,
+    lower_criteria,
+    matmul_precision_option,
     model_pattern,
     object_pattern_help,
     output_script_path,
+    resume_option,
+    save_criteria,
+    seed_option,
     shapes_help,
     shapes_option,
+    start_epoch,
     template_param_option,
     times,
+    trainer_option,
+    training_dataset_option,
     training_mode,
+    validation_dataset_pattern,
+    validation_frequency,
     warmup_runs,
 )
 from structcast_model.commands.utils import (
@@ -82,12 +101,7 @@ shapes = shapes_option(
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
 compile_pattern: dict[str, Any] | None = compile_option("torch.compile")
-matmul_precision: Literal["highest", "high", "medium"] = Option(
-    "high",
-    envvar="MATMUL_PRECISION",
-    help='Precision for float32 matrix multiplications: "highest" keeps full float32, while "high" and "medium" '
-    "trade accuracy for tensor-core speed.",
-)
+matmul_precision: Literal["highest", "high", "medium"] = matmul_precision_option()
 
 
 @creator.command(name="model")
@@ -428,140 +442,30 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "-d",
         help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
     ),
-    learner_pattern: Any = Option(
-        ...,
-        "--learner",
-        "-L",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the learner class", "MyLearner")
-        + PATH_FORM_HELP
-        + " The factory is called with one keyword argument per positional model pattern, so its parameter names "
-        "must match those model names.",
-    ),
-    learner_outputs: list[str] | None = Option(
-        None,
-        "--learner-outputs",
-        "-LO",
-        help="Criterion names the Learner's steps produce; they build the tracker and the progress-bar rows. "
-        "Overrides the names the Learner declares itself, and is required when it declares none. Give the "
-        'unprefixed names: the criterion options then take "loss" for the training criterion and "val_loss" for '
-        "the validation one.",
-    ),
+    learner_pattern: Any = learner_pattern,
+    learner_outputs: list[str] | None = learner_outputs,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    trainer_pattern: Any | None = Option(
-        None,
-        "--trainer",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the trainer", "MyTrainer", call=False)
-        + PATH_FORM_HELP
-        + " The pattern must build a callable accepted as trainer(device=..., learner=..., tracker=..., data=..., "
-        "callbacks=[]) whose result exposes training_prefix, validation_prefix, callbacks, describe() and "
-        "fit(epochs, start_epoch, validation_frequency); subclassing TorchTrainer is the intended way.",
+    trainer_pattern: Any | None = trainer_option(
+        "trainer(device=..., learner=..., tracker=..., data=..., callbacks=[])", "TorchTrainer"
     ),
-    epochs: int = Option(
-        1,
-        "--epochs",
-        "-e",
-        help="Epoch number to train up to, inclusive: training runs from --start-epoch (or the resumed epoch) "
-        "through this number, so it is a count only when starting at epoch 1 and must not be smaller than the "
-        "starting epoch. A resumed run must set it above the epoch stored in the resumed state.",
+    epochs: int = epochs,
+    start_epoch: int = start_epoch,
+    resume: str | None = resume_option(
+        "Restores models, optimizers, grad scalers, and continues from the saved epoch.", "data-order, sampler or RNG"
     ),
-    start_epoch: int = Option(
-        1,
-        help="First epoch number to run, 1-based and at most --epochs. It only offsets the loop counter; no data "
-        "is skipped. Ignored when --resume is given, which continues at the epoch stored in the resumed state "
-        "plus one.",
-    ),
-    resume: str | None = Option(
-        None,
-        "--resume",
-        help="Training state to resume from, in a form the active --logger understands: a local path always "
-        "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
-        "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
-        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch. Resume is exact "
-        "only at epoch boundaries: the saved state carries the epoch, step and update counters but no data-order, "
-        "sampler or RNG state, so the resumed epoch restarts from the beginning of the dataset.",
-    ),
-    training_dataset_pattern: Any = Option(
-        ...,
-        "--training-dataset",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the training dataset", "MyDataset") + PATH_FORM_HELP,
-    ),
-    validation_dataset_pattern: Any | None = Option(
-        None,
-        "--validation-dataset",
-        "-V",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the validation dataset", "MyDataset") + PATH_FORM_HELP,
-    ),
-    validation_frequency: int = Option(
-        1,
-        "--validation-frequency",
-        "-f",
-        help="Run validation every N epochs; must be at least 1. On epochs where validation does not run, no "
-        '"val_" criterion is produced, so val_-named best and save criteria are only monitored on validated epochs.',
-    ),
-    lower_criteria: list[str] = Option(
-        ...,
-        "--lower-criterion",
-        "-LC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose lower values are better, monitored for their lowest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_loss"). A name no epoch produces is silently never monitored, and omitting the option '
-        "monitors nothing.",
-    ),
-    higher_criteria: list[str] = Option(
-        ...,
-        "--higher-criterion",
-        "-HC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose higher values are better, monitored for their highest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_accuracy"). A name no epoch produces is silently never monitored, and omitting the option '
-        "monitors nothing.",
-    ),
-    save_criteria: list[str] = Option(
-        ...,
-        "--save-criterion",
-        "-SC",
-        default_factory=list,
-        show_default=False,
-        help='Criterion names whose best-scoring model states are saved, as a "best_<criterion>" artifact. Each '
-        "name must also be given to --lower-criterion or --higher-criterion, spelled the same way; a name in "
-        "neither list is silently ignored, and omitting the option saves no best-model artifact.",
-    ),
-    seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
+    training_dataset_pattern: Any = training_dataset_option(),
+    validation_dataset_pattern: Any | None = validation_dataset_pattern,
+    validation_frequency: int = validation_frequency,
+    lower_criteria: list[str] = lower_criteria,
+    higher_criteria: list[str] = higher_criteria,
+    save_criteria: list[str] = save_criteria,
+    seed: int = seed_option(),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
-    experiment: str = Option(
-        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for the logger."
-    ),
-    logger_name: Literal["mlflow", "wandb"] = Option(
-        "mlflow", "--logger", help="Experiment tracking service to record the run to."
-    ),
-    log_arguments: list[dict] | None = Option(
-        None,
-        "--log-arguments",
-        "-K",
-        parser=dict_parser,
-        help='Extra key-value pairs to record in the run\'s "arguments.yaml" artifact, in the format "key: value". '
-        "Repeat the option to add more keys; a key given twice keeps only the last occurrence, and the keys the run "
-        "records itself take precedence over keys of the same name.",
-    ),
-    log_artifacts: list[Path] | None = Option(
-        None,
-        "--log-artifacts",
-        "-A",
-        help="Paths to files to upload as run artifacts. Repeat the option to add more.",
-    ),
-    ci: bool = Option(
-        False,
-        help="Whether to run in CI mode. "
-        "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
-    ),
+    experiment: str = experiment,
+    logger_name: Literal["mlflow", "wandb"] = logger_name,
+    log_arguments: list[dict] | None = log_arguments,
+    log_artifacts: list[Path] | None = log_artifacts,
+    ci: bool = ci,
     dist_backend: str | None = Option(
         None,
         envvar="DIST_BACKEND",

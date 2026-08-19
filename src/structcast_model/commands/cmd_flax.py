@@ -28,14 +28,33 @@ from structcast_model.base_trainer import (
 from structcast_model.commands.shared_args import (
     PATH_FORM_HELP,
     batch_size,
+    ci,
     compile_option,
+    epochs,
+    experiment,
+    higher_criteria,
+    learner_outputs,
+    learner_pattern,
+    log_arguments,
+    log_artifacts,
+    logger_name,
+    lower_criteria,
+    matmul_precision_option,
     model_pattern,
     object_pattern_help,
     output_script_path,
+    resume_option,
+    save_criteria,
+    seed_option,
     shapes_help,
     shapes_option,
+    start_epoch,
     template_param_option,
     times,
+    trainer_option,
+    training_dataset_option,
+    validation_dataset_pattern,
+    validation_frequency,
     warmup_runs,
 )
 from structcast_model.commands.utils import (
@@ -217,11 +236,23 @@ def _config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mappi
     """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
 
     Recorded in the saved training state so a resumed run can be told apart from the configuration it
-    was saved from. The optimizers are not part of it: they are built inside the generated learner
-    class, which carries neither its configuration nor a hash of it (issue #22).
+    was saved from. The optimizers are not part of it: they are hashed separately, by the builder
+    that emits them, and reported per segment as `optimizer_hashes`.
     """
     payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
     return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
+    """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
+
+    A generated learner class is loaded from a file rather than imported by name, so its module never
+    lands in `sys.modules`: the globals its methods were defined in are the only handle on the
+    constant next to it. A hand-written learner declares none, and the resume check skips what is
+    missing.
+    """
+    namespace = getattr(type(learner).__init__, "__globals__", {})
+    return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
 
 
 def _resolve_strategy(strategy: Any, device: str | None) -> "flax_distributed.FlaxDistributedStrategy":
@@ -262,16 +293,16 @@ class _ShardedDataset:
         return get_dataset_size(self.dataset)
 
     def __post_init__(self) -> None:
-        """Take over the wrapped dataset's lifecycle hooks, so the trainer still routes them.
+        """Take over the wrapped dataset's event methods, so the trainer still routes them to it.
 
         Copied onto the instance rather than forwarded from `__getattr__`: the trainer selects the
         participants of an event with `isinstance` against a protocol, and a protocol check looks its
         attributes up statically, which never reaches a `__getattr__`.
         """
         for event in EVENTS:
-            hook = getattr(self.dataset, event, None)
-            if hook is not None:
-                object.__setattr__(self, event, hook)
+            method = getattr(self.dataset, event, None)
+            if method is not None:
+                object.__setattr__(self, event, method)
 
 
 @app.command()
@@ -299,25 +330,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         '"gpu:0"). If not specified, the first available JAX device is used. The multi-device strategies span the '
         "devices themselves and ignore it.",
     ),
-    learner_pattern: Any = Option(
-        ...,
-        "--learner",
-        "-L",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the learner class", "MyLearner")
-        + PATH_FORM_HELP
-        + " The factory is called with one keyword argument per positional model pattern, so its parameter names "
-        "must match those model names.",
-    ),
-    learner_outputs: list[str] | None = Option(
-        None,
-        "--learner-outputs",
-        "-LO",
-        help="Criterion names the Learner's steps produce; they build the tracker and the progress-bar rows. "
-        "Overrides the names the Learner declares itself, and is required when it declares none. Give the "
-        'unprefixed names: the criterion options then take "loss" for the training criterion and "val_loss" for '
-        "the validation one.",
-    ),
+    learner_pattern: Any = learner_pattern,
+    learner_outputs: list[str] | None = learner_outputs,
     compile_pattern: dict[str, Any] | None = Option(
         "",
         "--compile",
@@ -330,143 +344,44 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "arguments deciding what is static and what is donated are the generated step's contract and cannot be "
         "overridden.",
     ),
-    trainer_pattern: Any | None = Option(
-        None,
-        "--trainer",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the trainer", "MyTrainer", call=False)
-        + PATH_FORM_HELP
-        + " The pattern must build a callable accepted as trainer(learner=..., tracker=..., data=..., "
-        "callbacks=[]) whose result exposes training_prefix, validation_prefix, callbacks, describe() and "
-        "fit(epochs, start_epoch, validation_frequency); subclassing FlaxTrainer is the intended way.",
+    trainer_pattern: Any | None = trainer_option(
+        "trainer(learner=..., tracker=..., data=..., callbacks=[])", "FlaxTrainer"
     ),
-    epochs: int = Option(
-        1,
-        "--epochs",
-        "-e",
-        help="Epoch number to train up to, inclusive: training runs from --start-epoch (or the resumed epoch) "
-        "through this number, so it is a count only when starting at epoch 1 and must not be smaller than the "
-        "starting epoch. A resumed run must set it above the epoch stored in the resumed state.",
+    epochs: int = epochs,
+    start_epoch: int = start_epoch,
+    resume: str | None = resume_option(
+        "Restores models and optimizers, and continues from the saved epoch. The models are built exactly as they "
+        "are without it -- the restore overwrites the initialization rather than replacing it.",
+        "data-order or RNG",
     ),
-    start_epoch: int = Option(
-        1,
-        help="First epoch number to run, 1-based and at most --epochs. It only offsets the loop counter; no data "
-        "is skipped. Ignored when --resume is given, which continues at the epoch stored in the resumed state "
-        "plus one.",
+    training_dataset_pattern: Any = training_dataset_option(
+        " Every batch it yields is placed across the strategy's mesh before it reaches the Learner, so each "
+        "entry needs a leading dimension the mesh size divides."
     ),
-    resume: str | None = Option(
-        None,
-        "--resume",
-        help="Training state to resume from, in a form the active --logger understands: a local path always "
-        "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
-        "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
-        "supported. Restores models and optimizers, and continues from the saved epoch. The models are built "
-        "exactly as they are without it -- the restore overwrites the initialization rather than replacing it. "
-        "Resume is exact only at epoch boundaries: the saved state carries the epoch, step and update counters "
-        "but no data-order or RNG state, so the resumed epoch restarts from the beginning of the dataset.",
+    validation_dataset_pattern: Any | None = validation_dataset_pattern,
+    validation_frequency: int = validation_frequency,
+    lower_criteria: list[str] = lower_criteria,
+    higher_criteria: list[str] = higher_criteria,
+    save_criteria: list[str] = save_criteria,
+    seed: int = seed_option(
+        " It keys the run's RNG streams, so it decides both the model initialization and every random draw a "
+        "step makes."
     ),
-    training_dataset_pattern: Any = Option(
-        ...,
-        "--training-dataset",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the training dataset", "MyDataset")
-        + PATH_FORM_HELP
-        + " Every batch it yields is placed across the strategy's mesh before it reaches the Learner, so each "
-        "entry needs a leading dimension the mesh size divides.",
+    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision_option(
+        ", the latter by computing in bfloat16"
     ),
-    validation_dataset_pattern: Any | None = Option(
-        None,
-        "--validation-dataset",
-        "-V",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the validation dataset", "MyDataset") + PATH_FORM_HELP,
-    ),
-    validation_frequency: int = Option(
-        1,
-        "--validation-frequency",
-        "-f",
-        help="Run validation every N epochs; must be at least 1. On epochs where validation does not run, no "
-        '"val_" criterion is produced, so val_-named best and save criteria are only monitored on validated epochs.',
-    ),
-    lower_criteria: list[str] = Option(
-        ...,
-        "--lower-criterion",
-        "-LC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose lower values are better, monitored for their lowest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_loss"). A name no epoch produces is silently never monitored, and omitting the option '
-        "monitors nothing.",
-    ),
-    higher_criteria: list[str] = Option(
-        ...,
-        "--higher-criterion",
-        "-HC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose higher values are better, monitored for their highest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_accuracy"). A name no epoch produces is silently never monitored, and omitting the '
-        "option monitors nothing.",
-    ),
-    save_criteria: list[str] = Option(
-        ...,
-        "--save-criterion",
-        "-SC",
-        default_factory=list,
-        show_default=False,
-        help='Criterion names whose best-scoring model states are saved, as a "best_<criterion>" artifact. Each '
-        "name must also be given to --lower-criterion or --higher-criterion, spelled the same way; a name in "
-        "neither list is silently ignored, and omitting the option saves no best-model artifact.",
-    ),
-    seed: int = Option(
-        42,
-        envvar="SEED",
-        help="Random seed for reproducibility. It keys the run's RNG streams, so it decides both the model "
-        "initialization and every random draw a step makes.",
-    ),
-    matmul_precision: Literal["highest", "high", "medium"] = Option(
-        "high",
-        envvar="MATMUL_PRECISION",
-        help='Precision for float32 matrix multiplications: "highest" keeps full float32, while "high" and '
-        '"medium" trade accuracy for tensor-core speed, the latter by computing in bfloat16.',
-    ),
-    experiment: str = Option(
-        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for the logger."
-    ),
-    logger_name: Literal["mlflow", "wandb"] = Option(
-        "mlflow", "--logger", help="Experiment tracking service to record the run to."
-    ),
-    log_arguments: list[dict] | None = Option(
-        None,
-        "--log-arguments",
-        "-K",
-        parser=dict_parser,
-        help='Extra key-value pairs to record in the run\'s "arguments.yaml" artifact, in the format "key: value". '
-        "Repeat the option to add more keys; a key given twice keeps only the last occurrence, and the keys the run "
-        "records itself take precedence over keys of the same name.",
-    ),
-    log_artifacts: list[Path] | None = Option(
-        None,
-        "--log-artifacts",
-        "-A",
-        help="Paths to files to upload as run artifacts. Repeat the option to add more.",
-    ),
-    ci: bool = Option(
-        False,
-        help="Whether to run in CI mode. "
-        "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
-    ),
+    experiment: str = experiment,
+    logger_name: Literal["mlflow", "wandb"] = logger_name,
+    log_arguments: list[dict] | None = log_arguments,
+    log_artifacts: list[Path] | None = log_artifacts,
+    ci: bool = ci,
     strategy_pattern: Any = Option(
         "single",
         "--strategy",
         parser=_strategy_parser,
         help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
         'every device, parameters replicated) or "fsdp" (the batch split and the parameters sharded too). '
-        + object_pattern_help("a strategy factory", "MyStrategy", call=False).replace(
-            "The object pattern", "Or the object pattern"
-        )
+        + object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
         + PATH_FORM_HELP
         + " The factory is called with the resolved device; the templates under cfg/flax/strategies bind the "
         "remaining knobs.",
@@ -532,6 +447,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     logger: scm_loggers.base.Logger = logger_type(
         experiment=experiment, state_backend=scm_loggers.state_backends.FlaxStateBackend()
     )
+    optimizer_hashes = _optimizer_hashes(learner)
     if resume is not None:
         start_epoch = flax_trainer.restore_training_state(
             resume=resume,
@@ -540,6 +456,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             learner=learner,
             start_epoch=start_epoch,
             logger=logger,
+            optimizer_hashes=optimizer_hashes,
             config_hash=config_hash,
         )
     trainer_type = flax_trainer.FlaxTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
@@ -559,10 +476,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     saver = flax_trainer.FlaxTrainingStateSaver(
         logger=logger,
         strategy=strategy,
-        # The optimizer hashes stay empty: they would have to come from the OPTIMIZER patterns, which
-        # the generated learner class does not carry (issue #22). The resume check skips what is
-        # missing, so the slot is here and unfilled rather than absent.
-        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": {}},
+        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": dict(optimizer_hashes)},
     )
     bests = flax_trainer.FlaxBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
