@@ -62,6 +62,6 @@ the accumulated gradients — the same semantics as the emitted torch `if __need
 - Constant learning rates pay one inject wrapper they do not strictly need; in exchange constants, schedules,
   and future runtime LR overrides all read through one mechanism, and the checkpoint layout does not depend on
   which kind the YAML used.
-- `nnx.Optimizer.update()` return values and the `graph=` kwarg are never used: the supported range starts at
-  flax 0.12.6, where `update()` returns `None` and Dropout/BatchNorm defaults still predate the 0.12.7 change —
-  generated code always passes `deterministic`/`use_running_average` explicitly.
+- `nnx.Optimizer.update()` return values and the `graph=` kwarg are never used, and generated code always
+  passes `deterministic`/`use_running_average` explicitly — the emitted source stays valid across the whole
+  supported flax range (floored at 0.12.7, where `nnx.as_pure` first appears) without version branches.

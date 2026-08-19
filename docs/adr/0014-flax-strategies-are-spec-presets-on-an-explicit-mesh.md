@@ -36,8 +36,7 @@ divide falls back to replicate rather than erroring inside a trace.
 - **ZeRO-2**: no JAX/Flax API expresses it and it is not reachable by composition — under jit, per-step
   gradients are fused-program intermediates, and forcing sharded-gradients-with-replicated-params back costs
   the full ZeRO-3 all-gather for ~1.5Ψ less saving than ZeRO-3 itself.
-- **ZeRO-1** (`optimizer_sharding` metadata): deferred. It requires flax ≥ 0.12.7 while the floor is 0.12.6
-  where the metadata is silently inert; it is not a sharding fixed point (params drift to `P('data', None)`
+- **ZeRO-1** (`optimizer_sharding` metadata): deferred. It is not a sharding fixed point (params drift to `P('data', None)`
   after `update`, and the repair reshard makes its communication identical to FSDP for less than half the
   memory saving); and the checkpoint round-trip silently drops the optimizer-state sharding.
 - **Tensor parallelism**: verified feasible (the `dot_general=` constructor hook reaches row-parallel
