@@ -41,7 +41,7 @@ segment type. The segment construction moves behind a `_build_segment` hook on `
 ## Trade-offs
 
 - Breaking for anyone importing `UserDefinedLearner` to validate torch YAML or introspecting `flow` tuples; the
-  torch classes keep the old behavior under new names, and the flat routers re-export both sets.
+  torch classes keep the old behavior under new names, imported from their own builder modules.
 - Generic pydantic models bind the house `ClassVar` + `cast` pattern one level deeper (the template's
   `target_type` is a parametrized class object); the pydantic mypy plugin handles this, plain `mypy --strict`
   users of the schema module would not notice a difference.

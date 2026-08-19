@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
 from json import dumps as json_dumps
-from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, Union, cast
 
@@ -23,16 +22,17 @@ from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.constants import FILE_IMPORT_PREFIX
 from structcast_model.builders.schema import (
     LayerBehavior,
+    LearnerBehavior,
     Parameters,
+    Template,
     TemplateLayer,
     TemplateLearner,
     TensorSpecTree,
+    UserDefinedLearner,
     UserLayer,
 )
 from structcast_model.builders.utils import resolve_getter, resolve_object
 from structcast_model.utils.base import load_any, to_pascal, to_snake, unique
-
-logger = getLogger(__name__)
 
 
 def _merge_imports(*imports_list: dict[str, set[str | None]]) -> dict[str, set[str | None]]:
@@ -406,7 +406,27 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         )
 
 
-class LearnerIntermediate(_Intermediate):
+@dataclass(kw_only=True, slots=True)
+class OptimizerSegment:
+    """One optimizer step of a learner flow."""
+
+    loss: str
+    """The name of the loss variable the optimizer minimizes."""
+
+    backward_kwargs: str = ""
+    """The rendered keyword arguments of the backward call, rendered by the caller after the flow."""
+
+    optimizer: str
+    """The variable name of the optimizer instance."""
+
+    trainable_layers: list[str]
+    """The names of the models the optimizer updates."""
+
+
+OptimizerSegmentT = TypeVar("OptimizerSegmentT", bound=OptimizerSegment)
+
+
+class LearnerIntermediate(_Intermediate, Generic[OptimizerSegmentT]):
     """Intermediate representation of a learner during the building process."""
 
     imports: dict[str, set[str | None]]
@@ -415,9 +435,6 @@ class LearnerIntermediate(_Intermediate):
 
     classname: str
     """The name of the learner class."""
-
-    mixed_precision_type: str | None
-    """The mixed precision type for the learner, or `None` if mixed precision is not used."""
 
     accumulate_gradients: int | None
     """The number of steps to accumulate gradients for before performing an optimizer step,
@@ -437,10 +454,9 @@ class LearnerIntermediate(_Intermediate):
     """Other instances used in the learner that are not layers, where the keys are the instance names and
     the values are the string representations of the instances to be used directly in the script."""
 
-    flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]]
+    flow: list[tuple[str, str, str | None] | OptimizerSegmentT]
     """The forward flow during training, where each element is either a tuple of the form (input, output, layer)
-    for regular steps, or a tuple of the form (loss, output, optimizer, clip, mixed_precision_scale, trainable_models)
-    for optimizer steps."""
+    for regular steps, or an `OptimizerSegment` for optimizer steps."""
 
     inference_flow: list[tuple[str, str, str | None]]
     """The forward flow during inference, where each element is a tuple of the form (input, output, layer)."""
@@ -454,17 +470,12 @@ class LearnerIntermediate(_Intermediate):
     @cached_property
     def models(self) -> list[str]:
         """Get the models used in the layer."""
-        return unique([m for u in self.flow if len(u) == 6 for m in u[-1]])
+        return unique([m for u in self.flow if isinstance(u, OptimizerSegment) for m in u.trainable_layers])
 
     @cached_property
     def optimizers(self) -> list[str]:
         """Get the optimizers used in the layer."""
-        return unique([u[2] for u in self.flow if len(u) == 6])
-
-    @cached_property
-    def mixed_precision_scales(self) -> list[str]:
-        """Get the mixed precision scales used in the layer."""
-        return unique([u[4] for u in self.flow if len(u) == 6 and u[4]])
+        return unique([u.optimizer for u in self.flow if isinstance(u, OptimizerSegment)])
 
     @cached_property
     def _learner_models(self) -> str:
@@ -542,10 +553,13 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
         type[LearnerIntermediateT], LearnerIntermediate
     )
     layer_builder_type: ClassVar[type[BaseModelBuilder]] = BaseModelBuilder
+    # The template class decides which keys count as learner fields and which fall through to the
+    # layer builder, so a framework extending the learner schema must bind its own template here.
+    template_type: ClassVar[type[Template[Any]]] = TemplateLearner
 
     raw: Any
     current_path: str = ""
-    template: TemplateLearner = field(init=False)
+    template: Template[Any] = field(init=False)
     layer_builder: BaseModelBuilder = field(init=False)
 
     @classmethod
@@ -555,22 +569,38 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
 
     def __post_init__(self) -> None:
         """Post-initialization to set up the template."""
-        self.template = TemplateLearner.model_validate(self.raw)
+        self.template = self.template_type.model_validate(self.raw)
         from_references = {self.current_path: ["__root__"]} if self.current_path else {}
         self.layer_builder = self.layer_builder_type(
             raw=self.template.others, current_path=self.current_path, from_references=from_references
         )
 
-    def _get_mixed_precision(
+    def _build_segment(
         self,
         imports: defaultdict[str, set[str | None]],
-        mixed_precision: bool | dict[str, Any],
-        mixed_precision_type: str | None,
-    ) -> tuple[str, str | None]:
-        logger.warning(
-            "Mixed precision is not implemented in the base learner builder. Returning None for mixed precision."
+        module: Any,
+        learner: LearnerBehavior,
+        opt_name: str,
+        naming: AutoName,
+        layers: dict[str, LayerIntermediate | str],
+        others: dict[str, str],
+    ) -> OptimizerSegment:
+        """Build the optimizer segment of one learner behavior.
+
+        Subclasses extending the learner schema narrow `module` to their own schema type, return their
+        own `OptimizerSegment` subclass, and register the extra instances they need (under a name from
+        `naming`, rejecting collisions with `layers` and `others`) in `others`, so those instances are
+        constructed by the generated learner.
+        """
+        return OptimizerSegment(
+            loss=learner.LOSS,
+            optimizer=opt_name,
+            trainable_layers=learner.TRAINABLE_LAYERS,
         )
-        return "", None
+
+    def _intermediate_fields(self, module: Any) -> dict[str, Any]:
+        """Get the framework-specific fields of the built learner intermediate."""
+        return {}
 
     def _get_optimizer(
         self,
@@ -580,7 +610,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
     ) -> tuple[str, str]:
         return resolve_object(imports, optimizer)
 
-    def __call__(  # noqa: PLR0915
+    def __call__(
         self,
         parameters: dict[str, dict[str, Any]] | Parameters | None = None,
         classname: str = "Learner",
@@ -598,7 +628,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
             LearnerIntermediateT: The built learner class as a `LearnerIntermediateT` instance.
         """
         parameters = cast(Parameters, Parameters.create(self.template.PARAMETERS, parameters))
-        module = self.template(parameters, merged=False)
+        module: UserDefinedLearner[LearnerBehavior] = self.template(parameters, merged=False)
         imports: defaultdict[str, set[str | None]] = defaultdict(set)
         imports.update(module.IMPORTS)
         layers: dict[str, LayerIntermediate | str] = {}
@@ -648,37 +678,23 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
                     )
             return flow
 
-        learner_flow: list[tuple[str, str, str | None] | tuple[str, str, str, str | None, str | None, list[str]]] = []
+        learner_flow: list[tuple[str, str, str | None] | OptimizerSegment] = []
         inference_flow: list[tuple[str, str, str | None]] = []
-        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION, module.MIXED_PRECISION_TYPE)
         for learner in module.LEARNERS:
             opt_inst, opt_cls = self._get_optimizer(imports, learner.OPTIMIZER, learner.TRAINABLE_LAYERS)
             if (opt_name := learner.NAME or naming(to_snake(opt_cls))) in layers or opt_name in others:
                 raise SpecError(f'Duplicate variable name "{opt_name}" for optimizer found in the learner flow.')
             others[opt_name] = opt_inst
-            if learner.CLIP:
-                clip_inst, clip_cls = resolve_object(imports, learner.CLIP)
-                if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers or clip_name in others:
-                    raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the learner flow.')
-                others[clip_name] = clip_inst
-            else:
-                clip_inst, clip_name = None, None
-            if amp_cls is None:
-                amp_name = None
-            else:
-                if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers or amp_name in others:
-                    raise SpecError(
-                        f'Duplicate variable name "{amp_name}" for mixed precision instance found in the learner flow.'
-                    )
-                others[amp_name] = amp_inst
+            segment = self._build_segment(imports, module, learner, opt_name, naming, layers, others)
             learner_flow += _create_flow(learner.FLOW)
             inference_flow += _create_flow(learner.INFERENCE_FLOW or learner.FLOW)
-            backward_kw = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in learner.EXTRA.items())
-            learner_flow.append((learner.LOSS, backward_kw, opt_name, clip_name, amp_name, learner.TRAINABLE_LAYERS))
+            # Rendered after the flow: `collected_imports` keeps insertion order, so resolving EXTRA any
+            # earlier reorders the emitted import header for every config that uses it.
+            segment.backward_kwargs = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in learner.EXTRA.items())
+            learner_flow.append(segment)
         return self.user_defined_learner_layer_type(
             imports=imports,
             classname=classname,
-            mixed_precision_type=module.MIXED_PRECISION_TYPE,
             accumulate_gradients=module.ACCUMULATE_GRADIENTS,
             inputs=module.INPUTS,
             outputs=module.OUTPUTS,
@@ -686,10 +702,17 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
             others=others,
             flow=learner_flow,
             inference_flow=inference_flow,
+            **self._intermediate_fields(module),
         )
 
 
-__all__ = ["BaseLearnerBuilder", "BaseModelBuilder", "LayerIntermediate", "LearnerIntermediate"]
+__all__ = [
+    "BaseLearnerBuilder",
+    "BaseModelBuilder",
+    "LayerIntermediate",
+    "LearnerIntermediate",
+    "OptimizerSegment",
+]
 
 if not TYPE_CHECKING:
     import sys

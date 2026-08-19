@@ -393,10 +393,6 @@ class LearnerBehavior(Serializable):
     NAME: str | None = None
     """The name of the learner class or an instance of the learner."""
 
-    CLIP: ObjectPattern | None = None
-    """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
-    or a pattern to instantiate the gradient clipping configuration."""
-
     EXTRA: dict[str, Any] = Field(default_factory=dict)
     """Extra fields for the learner behavior,
     which will be passed to the optimizer or the backward process in general."""
@@ -422,8 +418,15 @@ class LearnerBehavior(Serializable):
         return data
 
 
-class UserDefinedLearner(Serializable):
-    """User defined learner configuration."""
+LearnerBehaviorT = TypeVar("LearnerBehaviorT", bound=LearnerBehavior)
+
+
+class UserDefinedLearner(Serializable, Generic[LearnerBehaviorT]):
+    """User defined learner configuration.
+
+    The learner behavior type is a type variable so that framework-specific schemas
+    (see `structcast_model.builders.torch.TorchUserDefinedLearner`) can add their own fields.
+    """
 
     IMPORTS: dict[str, set[str | None]] = Field(default_factory=dict)
     """Imports required for the learner behavior,
@@ -444,17 +447,8 @@ class UserDefinedLearner(Serializable):
     TRAINABLE_LAYERS: list[str] = Field(default_factory=list)
     """Trainable layer names required for the learner behavior."""
 
-    LEARNERS: list[LearnerBehavior] = Field(default_factory=list, min_length=1)
+    LEARNERS: list[LearnerBehaviorT] = Field(default_factory=list, min_length=1)
     """Learner behavior configuration."""
-
-    MIXED_PRECISION: bool | dict[str, Any] = False
-    """Whether to use mixed precision during backward pass.
-
-    If the value is a dictionary, it will be used as the keyword arguments for configuring mixed precision context.
-    """
-
-    MIXED_PRECISION_TYPE: Literal["bfloat16", "float16"] | None = None
-    """The mixed precision type to use during backward pass when mixed precision is enabled."""
 
     ACCUMULATE_GRADIENTS: PositiveInt | None = None
     """Whether to accumulate gradients for multiple steps before updating the parameters,
@@ -476,23 +470,9 @@ class UserDefinedLearner(Serializable):
         if missing := set(layers) - set(self.TRAINABLE_LAYERS):
             raise SpecError(f"Missing trainable layers found: {missing}.")
 
-    def _validate_mixed_precision(self) -> None:
-        """Validate the mixed precision configuration.
-
-        MIXED_PRECISION enables gradient scaling, which only counteracts float16 underflow;
-        MIXED_PRECISION_TYPE alone configures autocast and is valid without a scaler.
-        """
-        enabled = bool(self.MIXED_PRECISION) if isinstance(self.MIXED_PRECISION, bool) else True
-        if enabled and self.MIXED_PRECISION_TYPE != "float16":
-            raise SpecError(
-                "MIXED_PRECISION enables gradient scaling, which only applies to float16: set "
-                "MIXED_PRECISION_TYPE: float16, or disable MIXED_PRECISION (bfloat16 autocast needs no scaler)."
-            )
-
     @model_validator(mode="after")
     def _validate_user_defined_learner(self) -> Self:
         """Validate the user-defined learner configuration."""
-        self._validate_mixed_precision()
         self._validate_trainable_layers()
         train_inputs: list[str] = []
         train_outputs: list[str] = []
@@ -611,10 +591,10 @@ class TemplateLayer(Template[UserDefinedLayer]):
     target_type: ClassVar[type[UserDefinedLayer]] = UserDefinedLayer
 
 
-class TemplateLearner(Template[UserDefinedLearner]):
+class TemplateLearner(Template[UserDefinedLearner[LearnerBehavior]]):
     """Template for user-defined learners."""
 
-    target_type: ClassVar[type[UserDefinedLearner]] = UserDefinedLearner
+    target_type: ClassVar[type[UserDefinedLearner[LearnerBehavior]]] = UserDefinedLearner[LearnerBehavior]
 
 
 __all__ = [

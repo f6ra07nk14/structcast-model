@@ -15,6 +15,8 @@ from structcast_model.builders.base import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
+    LearnerIntermediate,
+    OptimizerSegment,
 )
 from structcast_model.builders.schema import Parameters, UserLayer
 from structcast_model.builders.torch import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
@@ -283,24 +285,54 @@ def test_base_learner_builder_duplicate_name_and_optimizer_raise() -> None:
         TorchLearnerBuilder(raw=duplicate_learner)()
 
 
-def test_base_learner_builder_mixed_precision_default_warns(caplog: pytest.LogCaptureFixture) -> None:
-    """Base learner builder logs a warning for mixed precision and returns None."""
+def test_base_learner_builder_builds_a_framework_neutral_segment() -> None:
+    """The base `_build_segment` records only what every framework shares.
 
-    class _NoMixedPrecisionBuilder(BaseLearnerBuilder):
-        pass
-
+    Everything torch-specific (clipping, gradient scaling) is added by a subclass through this seam,
+    so a segment built by the base must stay a plain `OptimizerSegment`: if base ever grew a
+    framework field again, a non-torch builder would inherit machinery it cannot honor.
+    """
     raw = {
         "LEARNERS": [
             {
                 "LOSS": "loss",
                 "TRAINABLE_LAYERS": ["model"],
                 "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "EXTRA": {"retain_graph": True},
                 "FLOW": [["x", "loss"]],
             },
         ],
     }
-    _NoMixedPrecisionBuilder(raw=raw)()
-    assert "Mixed precision is not implemented" in caplog.text
+    built = BaseLearnerBuilder[LearnerIntermediate[OptimizerSegment]](raw=raw)()
+    segment = built.flow[-1]
+    assert type(segment) is OptimizerSegment
+    assert segment.loss == "loss"
+    assert segment.backward_kwargs == "retain_graph=True"
+    assert segment.optimizer == built.optimizers[0]
+    assert segment.trainable_layers == ["model"]
+
+
+def test_learner_extra_imports_are_collected_after_the_flow() -> None:
+    """`EXTRA` resolves last so the emitted import header stays stable.
+
+    `collected_imports` is insertion-ordered and drives the emitted `from ... import ...` lines, so
+    resolving `EXTRA` before the flow would silently reorder the header of every regenerated learner.
+    """
+    raw = {
+        "LEARNERS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "EXTRA": {"retain_graph": {"_obj_": [{"_addr_": "os.sep"}]}},
+                "FLOW": [["x", "loss", "crit", {"_obj_": [{"_addr_": "torch.nn.MSELoss"}, "_call_"]}]],
+                "INFERENCE_FLOW": [["x", "loss", "crit"]],
+            },
+        ],
+    }
+    built = BaseLearnerBuilder[LearnerIntermediate[OptimizerSegment]](raw=raw)()
+    collected = list(built.collected_imports)
+    assert collected.index("torch.nn") < collected.index("os")
 
 
 # ---------------------------------------------------------------------------
