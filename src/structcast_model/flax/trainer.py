@@ -1,11 +1,13 @@
 """Trainer helpers for Flax models."""
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from pydantic import TypeAdapter, ValidationError
 
@@ -13,6 +15,8 @@ from pydantic import TypeAdapter, ValidationError
 # inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
 from typing_extensions import Protocol, runtime_checkable
 
+from flax import nnx
+from structcast_model.base_trainer import BaseInfo, BaseTrainer
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
@@ -121,7 +125,98 @@ def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
-__all__ = ["TensorInitializer", "create_jax_inputs", "get_jax_device", "get_jax_devices", "resolve_input_shapes"]
+@dataclass(kw_only=True, slots=True)
+class FlaxTracker:
+    """Running mean of the criteria of one training or validation split.
+
+    The device-side sums are plain JAX arrays, so accumulating a step costs one asynchronous add.
+    The means come back as Python floats, not arrays: `BaseTrainer.tracker` is typed
+    `Callable[..., dict[str, float]]` and everything downstream -- the epoch history, the
+    `BestCriterion` comparison against a float infinity, and the loggers' `log_metric(value: float)`
+    -- consumes that contract, as the torch tracker's `.item()` does. The host read is a single
+    `jax.device_get` over all criteria at once, and it lands inside the region `BaseTrainer.train`
+    times, where the torch loop blocks on `torch.cuda.synchronize()` for the same reason.
+
+    Unlike the torch tracker there is no all-reduce: JAX is single-controller, so a criterion
+    computed from a sharded batch is already the global value.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from structcast_model.flax.trainer import FlaxTracker
+        >>> tracker = FlaxTracker.from_criteria(["loss"])
+        >>> tracker(loss=jnp.asarray(1.0))
+        {'loss': 1.0}
+        >>> tracker(loss=jnp.asarray(3.0))
+        {'loss': 2.0}
+        >>> tracker.reset()
+        >>> tracker.logs()
+        {}
+    """
+
+    criteria: tuple[str, ...]
+    """Names of the criteria to track; a step must report every one of them."""
+
+    sums: dict[str, jax.Array] = field(init=False)
+    """Device-side sum of each criterion over the steps seen since the last reset."""
+
+    count: int = field(default=0, init=False)
+    """Number of steps summed since the last reset."""
+
+    def __post_init__(self) -> None:
+        """Start every criterion at a zero sum."""
+        self.reset()
+
+    def reset(self) -> None:
+        """Zero the sums and the step count."""
+        self.sums = {criterion: jnp.zeros((), jnp.float32) for criterion in self.criteria}
+        self.count = 0
+
+    def on_training_begin(self, info: BaseInfo[Any]) -> None:
+        """Reset the tracker so an epoch's training averages start empty."""
+        self.reset()
+
+    def on_validation_begin(self, info: BaseInfo[Any]) -> None:
+        """Reset the tracker so validation averages do not carry training values."""
+        self.reset()
+
+    def __call__(self, **criteria: Any) -> dict[str, float]:
+        """Add one step's criteria to the sums and return the running means."""
+        for criterion in self.criteria:
+            self.sums[criterion] += criteria[criterion]
+        self.count += 1
+        return self.logs()
+
+    def logs(self) -> dict[str, float]:
+        """Return the running mean of each criterion, or an empty mapping before the first step."""
+        if not self.count:
+            return {}
+        return {name: float(total) / self.count for name, total in jax.device_get(self.sums).items()}
+
+    @classmethod
+    def from_criteria(cls, outputs: Iterable[str]) -> "FlaxTracker":
+        """Create a tracker for the named criteria, mirroring `TorchTracker.from_criteria`."""
+        return cls(criteria=tuple(outputs))
+
+
+@dataclass(kw_only=True)
+class FlaxTrainer(BaseTrainer[nnx.Module]):
+    """Trainer for Flax (nnx) models.
+
+    `BaseTrainer.sync` stays the inherited no-op: `FlaxTracker.logs` reads the criteria to host
+    memory on every step, which already waits for the step's program, and the device a run uses is
+    the strategy's mesh, not a trainer field.
+    """
+
+
+__all__ = [
+    "FlaxTracker",
+    "FlaxTrainer",
+    "TensorInitializer",
+    "create_jax_inputs",
+    "get_jax_device",
+    "get_jax_devices",
+    "resolve_input_shapes",
+]
 
 
 if not TYPE_CHECKING:
