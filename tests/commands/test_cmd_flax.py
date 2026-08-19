@@ -3,25 +3,31 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
+import json
 from math import isfinite
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import mlflow
 from mlflow.tracking import MlflowClient
+import optax
 import pytest
 from typer import Typer
 from typer.testing import CliRunner
+import wandb
 from yaml import safe_load
 
 from flax import nnx
 from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
 from structcast_model.commands.cmd_flax import app
 from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.trainer import FlaxTrainer
 from tests import CFG_DIR, FIXTURES_DIR
 
 LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
@@ -187,12 +193,12 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
 # ---------------------------------------------------------------------------
 
 
-def linear_batches(count: int = 3) -> list[dict[str, Any]]:
-    """Return a fixed dataset, so a run's criteria depend on the seed alone.
+def linear_batches(count: int = 3, size: int = 2) -> list[dict[str, Any]]:
+    """Return a fixed dataset of *count* batches of *size* rows, so criteria depend on the seed alone.
 
     Public and addressable: the runs build it through an object pattern, as a real dataset is built.
     """
-    return [{"x": jnp.full((2, 4), float(index + 1)), "y": jnp.zeros((2, 2))} for index in range(count)]
+    return [{"x": jnp.full((size, 4), float(index + 1)), "y": jnp.zeros((size, 2))} for index in range(count)]
 
 
 DATASET = f"[_obj_, {{_addr_: {__name__}.linear_batches}}, _call_]"
@@ -220,6 +226,80 @@ def epoch_aware_batches() -> _EpochAwareDataset:
 
 EPOCH_AWARE_DATASET = f"[_obj_, {{_addr_: {__name__}.epoch_aware_batches}}, _call_]"
 """Object pattern building the training dataset that reacts to epochs."""
+
+
+class PrebuiltModel(nnx.Module):
+    """A module a pattern can build on its own, standing in for a pattern that carries "_call_"."""
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """Never reached: the command refuses the pattern before any step runs."""
+        return x
+
+
+class NamelessLearner:
+    """A hand-written learner that trains but declares no criterion names, as the protocol allows."""
+
+    def __init__(self, model: nnx.Module) -> None:
+        """Keep *model* and the optimizer over it."""
+        self._models = {"model": model}
+        self._optimizers = {"optimizer": nnx.Optimizer(model, tx=optax.sgd(0.1), wrt=nnx.Param)}
+        self.learning_rates = {"optimizer": 0.1}
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """The single model the learner was built over."""
+        return self._models
+
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """The single optimizer."""
+        return self._optimizers
+
+    @property
+    def optimizer_models(self) -> dict[str, list[str]]:
+        """The optimizer owns the only model."""
+        return {"optimizer": ["model"]}
+
+    def update(self, step: int) -> bool:
+        """Every step applies the optimizer."""
+        return True
+
+    def training_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:
+        """Take one plain gradient step and report the squared error."""
+        model, optimizer = self._models["model"], self._optimizers["optimizer"]
+        loss, grads = nnx.value_and_grad(lambda m: jnp.mean((m(x) - y) ** 2))(model)
+        optimizer.update(model, grads)
+        return {"loss": loss}
+
+    def inference_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:
+        """Report the squared error without touching any state."""
+        return {"loss": jnp.mean((self._models["model"](x) - y) ** 2)}
+
+
+COMPILE_CALLS: list[tuple[str, dict[str, Any]]] = []
+"""What the recording strategy below was asked to compile; cleared by the test that reads it."""
+
+
+class RecordingStrategy(FlaxDistributedStrategy):
+    """A strategy recording the compilation contract the command hands each flow function."""
+
+    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+        """Record the arguments, then compile exactly as the shipped strategy does."""
+        COMPILE_CALLS.append((getattr(module, "__name__", repr(module)), dict(compile_kw or {})))
+        return super().compile(module, compile_kw)
+
+
+class RecordingTrainer(FlaxTrainer):
+    """A trainer recording that --trainer reached the run."""
+
+    def fit(self, *args: Any, **kwargs: Any) -> Any:
+        """Note the run before handing over to the shared loop."""
+        TRAINERS_USED.append(type(self).__name__)
+        return super().fit(*args, **kwargs)
+
+
+TRAINERS_USED: list[str] = []
+"""Names of the trainers `RecordingTrainer` ran under; cleared by the test that reads it."""
 
 
 class ReplacingStrategy(FlaxDistributedStrategy):
@@ -418,3 +498,272 @@ def test_train_resumes_from_a_saved_training_state(
     assert [metric.step for metric in history] == [3]
     # Training continued from the restored weights rather than from a fresh initialization.
     assert history[0].value < first.data.metrics["loss"]
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — argument validation
+# ---------------------------------------------------------------------------
+
+
+UNUSED_PATTERN = "[_obj_, {_addr_: builtins.dict}]"
+"""A well-formed pattern for the options a validation failure is reached before using."""
+
+
+def _train_error(cli_runner: CliRunner, arguments: Sequence[str]) -> BaseException:
+    """Invoke `train` with *arguments* and return the exception it failed with."""
+    result = cli_runner.invoke(app, ["train", *arguments])
+    assert result.exit_code != 0
+    assert result.exception is not None, result.output
+    return result.exception
+
+
+def test_train_refuses_an_empty_model_pattern_list() -> None:
+    """Without a model there is nothing to give the learner, and the failure must say so here.
+
+    Typer rejects a missing positional argument itself, so the guard is reached only by calling the
+    command as a function -- which is how a caller embedding the CLI reaches it too.
+    """
+    (command,) = (cmd for cmd in app.registered_commands if cmd.callback and cmd.callback.__name__ == "train")
+    assert command.callback is not None
+
+    with pytest.raises(ValueError, match="At least one model pattern"):
+        command.callback(model_patterns=[])
+
+
+def test_train_refuses_a_pattern_naming_two_models(cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
+    """One argument is one named model: two entries would silently drop one of them."""
+    model_pattern, learner_pattern = patterns
+    body = model_pattern.split("model: ", 1)[1]
+    doubled = f"{{model: {body}, second: {body}}}"
+    error = _train_error(cli_runner, [doubled, "--learner", learner_pattern, "--training-dataset", DATASET])
+
+    assert isinstance(error, ValueError)
+    assert "exactly one model definition" in str(error)
+
+
+def test_train_refuses_a_model_pattern_that_builds_the_module_itself(cli_runner: CliRunner) -> None:
+    """A pattern carrying "_call_" hands back a built module, so the run's seeded RNG never reaches it.
+
+    Left through, the command calls the module -- running its forward pass with a `rngs` keyword --
+    and the failure surfaces from inside the generated model instead of from the pattern.
+    """
+    pattern = f"model: [_obj_, {{_addr_: {__name__}.PrebuiltModel}}, _call_]"
+    error = _train_error(cli_runner, [pattern, "--learner", UNUSED_PATTERN, "--training-dataset", DATASET])
+
+    assert isinstance(error, ValueError)
+    assert 'Drop the "_call_" entry' in str(error)
+
+
+def test_train_refuses_a_learner_that_names_no_criteria(cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
+    """The criterion names build the tracker, so a learner declaring none must be named on the command line."""
+    model_pattern, _ = patterns
+    learner = f"[_obj_, {{_addr_: {__name__}.NamelessLearner}}]"
+    error = _train_error(cli_runner, [model_pattern, "--learner", learner, "--training-dataset", DATASET])
+
+    assert isinstance(error, ValueError)
+    assert 'Module "learner" does not have an "outputs" attribute' in str(error)
+
+
+def test_train_names_the_criteria_from_learner_outputs(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """--learner-outputs is the only source of names for a learner declaring none, and it must be used."""
+    model_pattern, _ = patterns
+    learner = f"[_obj_, {{_addr_: {__name__}.NamelessLearner}}]"
+    _train(
+        cli_runner,
+        (model_pattern, learner),
+        tmp_path,
+        experiment="flax-outputs",
+        epochs=1,
+        extra=["--learner-outputs", "loss"],
+    )
+
+    (run,) = _runs("flax-outputs")
+    assert isfinite(run.data.metrics["loss"])
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — the seams the options are supposed to reach
+# ---------------------------------------------------------------------------
+
+
+def test_train_compiles_each_flow_under_its_own_contract(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], recwarn: pytest.WarningsRecorder
+) -> None:
+    """--compile is what binds the steps, and the training step alone is static-flagged and donated.
+
+    Comparing losses cannot see any of this: an ignored --compile reaches the same numbers eagerly.
+    Donating the inference views -- which share their arrays with the models -- or failing to donate
+    the training state shows up only as a JAX warning, so the recorded warnings are checked too.
+    """
+    COMPILE_CALLS.clear()
+    strategy = f"[_obj_, {{_addr_: {__name__}.RecordingStrategy}}]"
+    _train(cli_runner, patterns, tmp_path, experiment="flax-compile", epochs=1, extra=["--strategy", strategy])
+
+    contracts = dict(COMPILE_CALLS)
+    assert contracts["_training_step"] == {
+        "static_argnames": "need_update",
+        "donate_argnames": ("models", "optimizers", "acc_grads"),
+    }
+    # Every other flow is an inference one: no static flag, and nothing donated.
+    assert [arguments for name, arguments in COMPILE_CALLS if name != "_training_step"] == [{}] * (
+        len(COMPILE_CALLS) - 1
+    )
+    assert not [warning for warning in recwarn.list if "donated" in str(warning.message)]
+
+
+def test_train_without_compilation_binds_nothing(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """--compile none must leave the steps as the learner defined them, not compile them anyway."""
+    COMPILE_CALLS.clear()
+    strategy = f"[_obj_, {{_addr_: {__name__}.RecordingStrategy}}]"
+    _train(
+        cli_runner,
+        patterns,
+        tmp_path,
+        experiment="flax-no-compile",
+        epochs=1,
+        extra=["--strategy", strategy, "--compile", "none"],
+    )
+
+    assert COMPILE_CALLS == []
+
+
+def test_train_runs_the_trainer_the_option_names(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """--trainer replaces the loop driver, so a run must go through the named class, not FlaxTrainer."""
+    TRAINERS_USED.clear()
+    trainer = f"[_obj_, {{_addr_: {__name__}.RecordingTrainer}}]"
+    _train(cli_runner, patterns, tmp_path, experiment="flax-trainer", epochs=1, extra=["--trainer", trainer])
+
+    assert TRAINERS_USED == ["RecordingTrainer"]
+
+
+def test_train_shows_a_progress_bar_without_ci(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """Without --ci the run must register the bar; the routed-callback map is where that is visible."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    model_pattern, learner_pattern = patterns
+    result = cli_runner.invoke(
+        app,
+        [
+            "train",
+            model_pattern,
+            "--learner",
+            learner_pattern,
+            "--training-dataset",
+            DATASET,
+            "--epochs",
+            "1",
+            "--experiment",
+            "flax-bar",
+        ],
+    )
+
+    assert result.exit_code == 0, f"{result.output}\n{result.exception}"
+    assert "ProgressBar" in result.output
+    assert "Printer" not in result.output
+
+
+def test_train_records_a_run_through_the_wandb_backend(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--logger wandb has to carry the Flax state backend, or the run writes a torch pickle of jax arrays."""
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    monkeypatch.setenv("WANDB_CONSOLE", "off")
+
+    _train(cli_runner, patterns, tmp_path, experiment="flax-wandb", epochs=1, extra=["--logger", "wandb"])
+
+    assert wandb.run is None, "the command must close the run it opened"
+    assert list(tmp_path.rglob("training_state.tar.gz"))
+    assert list(tmp_path.rglob("arguments.yaml"))
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — more devices than a running JAX process can gain
+# ---------------------------------------------------------------------------
+
+MULTI_DEVICE_SCRIPT = """
+import json, sys
+import jax
+import mlflow
+from typer.testing import CliRunner
+
+from structcast_model.commands.cmd_flax import app
+
+directory = sys.argv[1]
+mlflow.set_tracking_uri(directory + "/mlruns")
+
+
+def dataset(size):
+    return "[_obj_, {_addr_: batches, _file_: " + directory + "/data.py}, {_call_: {size: " + str(size) + "}}]"
+
+
+def run(experiment, strategy, size):
+    # The mesh is process-wide and each run activates its own, so the previous one has to go first.
+    jax.set_mesh(None)
+    result = CliRunner().invoke(app, [
+        "train",
+        *("%s: [_obj_, {_addr_: Model, _file_: %s/model.py}]" % (name, directory) for name in "abc"),
+        "--learner", "[_obj_, {_addr_: Learner, _file_: " + directory + "/learner.py}]",
+        "--training-dataset", dataset(size),
+        "--epochs", "1",
+        "--experiment", experiment,
+        "--strategy", strategy,
+        "--ci",
+    ])
+    if result.exit_code != 0:
+        return {"error": str(result.exception)}
+    run, = mlflow.search_runs(experiment_names=[experiment], output_format="list")
+    return {name: run.data.metrics[name] for name in ("loss_ab", "loss_c")}
+
+
+print(json.dumps({
+    "devices": jax.device_count(),
+    "single": run("single", "single", 8),
+    "dp": run("dp", "dp", 8),
+    "indivisible": run("odd", "dp", 2),
+}))
+"""
+
+DATA_MODULE = '''
+"""The dataset the multi-device run trains on, addressed by file from an object pattern."""
+
+import jax.numpy as jnp
+
+
+def batches(size):
+    """Return three fixed batches of *size* rows."""
+    return [{"x": jnp.full((size, 4), float(i + 1)), "y": jnp.zeros((size, 2))} for i in range(3)]
+'''
+
+
+def test_train_splits_a_batch_across_four_devices_without_changing_the_criteria(tmp_path: Path) -> None:
+    """The CLI's own seam -- strategy, sharded loader, learner -- has to hold on more than one device.
+
+    Two segments, so a per-segment optimizer that picked up the other segment's gradients under
+    sharding would move the wrong parameters and shift the criterion that reports them. The batch
+    that the mesh cannot split must be refused by name rather than silently padded or replicated.
+    """
+    FlaxBuilder.from_path(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")()(tmp_path / "model.py")
+    FlaxLearnerBuilder.from_path(FIXTURES_DIR / "cfg" / "flax" / "TwoSegmentLearner.yaml")()(tmp_path / "learner.py")
+    (tmp_path / "data.py").write_text(DATA_MODULE)
+    script = tmp_path / "script.py"
+    script.write_text(f"import jax\njax.config.update('jax_num_cpu_devices', 4)\n{MULTI_DEVICE_SCRIPT}")
+
+    process = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)], capture_output=True, text=True, timeout=600, check=False
+    )
+    assert process.returncode == 0, process.stderr
+    result = json.loads(process.stdout.splitlines()[-1])
+
+    assert result["devices"] == 4
+    for criterion in ("loss_ab", "loss_c"):
+        assert result["dp"][criterion] == pytest.approx(result["single"][criterion], rel=1e-6)
+    assert '"x"' in result["indivisible"]["error"]

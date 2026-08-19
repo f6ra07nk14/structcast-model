@@ -24,7 +24,7 @@ from typer.testing import CliRunner
 
 from structcast_model.base_trainer import BaseInfo
 from structcast_model.commands.cmd_torch import app
-from structcast_model.commands.utils import instantiate_object
+from structcast_model.commands.utils import get_module_outputs as _get_module_outputs, instantiate_object
 from structcast_model.torch.trainer import TorchTrainer
 from tests import CFG_DIR, FIXTURES_DIR
 import torch
@@ -43,7 +43,6 @@ assert _FIRST_CALLBACK is not None, "cmd_torch registers every command with a ca
 _CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 
 

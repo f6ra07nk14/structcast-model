@@ -285,3 +285,60 @@ def test_compiled_training_step_settles_at_one_variant_per_gate(
     assert [str(w.message) for w in caught if "donated" in str(w.message)] == []
     assert traces == [False, True]
     assert learner.learning_rates == rates
+
+
+def test_a_training_forward_draws_exactly_one_dropout_key(tmp_path: Path) -> None:
+    """A stochastic layer must advance its stream once per logical forward, and never during evaluation.
+
+    Advancing twice would make the mask depend on how many times the step internally calls the model
+    -- the differentiated flow runs it once -- and advancing during evaluation would make validation
+    depend on how often it ran. Both are invisible in the criteria and only surface as a run that
+    cannot be reproduced from its seed.
+    """
+    model = _Dropped(rngs=nnx.Rngs(0))
+    learner = _learner_type(tmp_path)(model)
+    counts = []
+
+    for step in range(2):
+        learner.update(step)
+        learner.training_step(x=X, y=Y)
+        counts.append(int(model.dropout.rngs.count[...]))
+    before_inference = counts[-1]
+    learner.inference_step(x=X, y=Y)
+
+    assert counts == [1, 2]
+    assert int(model.dropout.rngs.count[...]) == before_inference
+
+
+class _Normalized(nnx.Module):
+    """A model with batch normalization, whose running statistics are state the run has to carry."""
+
+    def __init__(self, *, rngs: nnx.Rngs) -> None:
+        """Build the linear layer the fixture learner feeds and the norm that follows it."""
+        self.fc = nnx.Linear(4, 2, rngs=rngs)
+        self.bn = nnx.BatchNorm(2, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """Normalize the layer's output, in whichever mode the caller's view selected."""
+        return self.bn(self.fc(x))
+
+
+def test_running_statistics_move_while_training_and_hold_while_evaluating(tmp_path: Path) -> None:
+    """Normalization is stateful, and the two flows must treat that state differently.
+
+    A training step has to fold the batch into the running mean and variance; an inference step has
+    to read them and leave them alone. A view that missed `use_running_average=True` would keep
+    updating them during validation, quietly training on the data the run is being measured on.
+    """
+    model = _Normalized(rngs=nnx.Rngs(0))
+    learner = _learner_type(tmp_path)(model)
+    initial = jax.tree.leaves(nnx.state(model, nnx.BatchStat))
+
+    learner.update(0)
+    learner.training_step(x=X, y=Y)
+    trained = jax.tree.leaves(nnx.state(model, nnx.BatchStat))
+    learner.inference_step(x=X, y=Y)
+    evaluated = jax.tree.leaves(nnx.state(model, nnx.BatchStat))
+
+    assert not any(jnp.array_equal(a, b) for a, b in zip(initial, trained, strict=True))
+    assert all(jnp.array_equal(a, b) for a, b in zip(trained, evaluated, strict=True))

@@ -132,3 +132,21 @@ def test_flax_backend_refuses_an_archive_writing_outside_the_extraction_director
         FlaxStateBackend().load(archive_path)
 
     assert not (tmp_path / "evil").exists()
+
+
+def test_flax_backend_refuses_to_extract_on_an_interpreter_without_the_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python 3.11.0-3.11.3 is inside the project floor and ships no `tarfile.data_filter`.
+
+    On such interpreters the path-traversal guard would silently not exist (the `filter` argument
+    resolves against whatever the module registered at import time), so the backend must refuse to
+    extract at all rather than extract unsafely or die with an error that reads as a backend bug.
+    """
+    monkeypatch.delattr(tarfile, "data_filter")
+    archive_path = tmp_path / "state.tar.gz"
+    with tarfile.open(archive_path, "w:gz"):
+        pass
+
+    with pytest.raises(RuntimeError, match="Python 3.11.4"):
+        FlaxStateBackend().load(archive_path)

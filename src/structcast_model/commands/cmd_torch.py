@@ -36,6 +36,7 @@ from structcast_model.commands.shared_args import (
 )
 from structcast_model.commands.utils import (
     dict_parser,
+    get_module_outputs,
     instantiate_object,
     path_or_any_parser,
     reduce_dict,
@@ -136,18 +137,6 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
         model_name, ptn = next(iter(raw.items()))
         res[model_name] = instantiate_object(ptn)
     return res
-
-
-def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
-    """Return output names from a module attribute or the provided default, raising if neither is available."""
-    if default:
-        return default
-    if hasattr(module, "outputs"):
-        return module.outputs
-    raise ValueError(
-        f'Module "{name}" does not have an "outputs" attribute. '
-        f'Please provide default outputs using the "--{name}-outputs" option.'
-    )
 
 
 @app.command(name="time")
@@ -333,7 +322,7 @@ def _assemble_learner(
             learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
         else:
             learner = factory(**models)
-        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
+        learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
         tracker = scm_torch.trainer.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
         )

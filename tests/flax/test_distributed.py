@@ -9,7 +9,6 @@ can gain after it started, so those tests re-run the work in a subprocess that s
 from collections import OrderedDict
 import json
 from pathlib import Path
-import pickle
 import subprocess
 import sys
 from typing import Any
@@ -147,48 +146,69 @@ for step in range(6):
 print(json.dumps({"losses": losses, "accumulator": accumulator}))
 """
 
-SAVE_SCRIPT = """
+STATE_PRELUDE = """
 import json, pickle, sys
-import jax, optax
+import jax, jax.numpy as jnp, optax
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
 
-strategy = FlaxDistributedStrategy(preset="fsdp", min_size=0)
-model = nnx.Linear(4, 2, rngs=nnx.Rngs(params=jax.random.key(0), dropout=jax.random.key(1)))
-strategy.wrap({"model": model})
-optimizer = nnx.Optimizer(model, tx=optax.adam(learning_rate=0.1), wrt=nnx.Param)
-grads = jax.tree.map(jax.numpy.ones_like, nnx.state(model, nnx.Param))
-optimizer.update(model, grads)
+class Model(nnx.Module):
+    def __init__(self, seed):
+        rngs = nnx.Rngs(params=jax.random.key(seed), dropout=jax.random.key(seed + 1))
+        self.fc = nnx.Linear(1024, 4, rngs=rngs)
+        self.bn = nnx.BatchNorm(4, rngs=rngs)
+        self.dropout = nnx.Dropout(0.5, rngs=rngs)
 
-states = strategy.state_dict({"model": model}, {"optimizer": optimizer})
-with open(sys.argv[1], "wb") as handle:
-    pickle.dump(states, handle)
-print(json.dumps({
-    "kernel_spec": str(model.kernel[...].sharding.spec),
-    "kernel": model.kernel[...].tolist(),
-}))
+def build(seed):
+    model = Model(seed)
+    FlaxDistributedStrategy(preset="fsdp", min_size=0).wrap({"model": model})
+    # A scheduled learning rate so the optimizer carries a count of its own beside nnx's step.
+    tx = optax.adam(learning_rate=optax.linear_schedule(0.1, 0.0, 10))
+    return model, nnx.Optimizer(model, tx=tx, wrt=nnx.Param)
+
+def fingerprint(model, optimizer):
+    kernel = model.fc.kernel[...]
+    return {
+        "params": [v.tolist() for v in jax.tree.leaves(nnx.to_pure_dict(nnx.state(model, nnx.Param)))],
+        "batch_stats": [v.tolist() for v in jax.tree.leaves(nnx.to_pure_dict(nnx.state(model, nnx.BatchStat)))],
+        # Raw key data, so a key restored as plain uint32 would still be comparable -- and typed,
+        # so the run's next draw comes from the stream the saved run was on.
+        "key": jax.random.key_data(model.dropout.rngs.key[...]).tolist(),
+        "typed_key": bool(jnp.issubdtype(model.dropout.rngs.key[...].dtype, jax.dtypes.prng_key)),
+        "opt_state": [jnp.asarray(v).tolist() for v in jax.tree.leaves(nnx.as_pure(optimizer.opt_state))],
+        "step": int(jnp.asarray(nnx.state(optimizer).step[...])),
+        "kernel_spec": str(kernel.sharding.spec),
+        "kernel_devices": kernel.sharding.num_devices,
+    }
 """
 
-RESTORE_SCRIPT = """
-import json, pickle, sys
-import jax, optax
-from flax import nnx
-from structcast_model.flax.distributed import FlaxDistributedStrategy
+SAVE_SCRIPT = (
+    STATE_PRELUDE
+    + """
+model, optimizer = build(0)
+# Move every kind of state off its initial value: parameters and the optimizer's moments through an
+# update, the batch statistics through a training-mode forward, the dropout key by hand.
+optimizer.update(model, jax.tree.map(jnp.ones_like, nnx.state(model, nnx.Param)))
+model.bn(model.fc(jnp.ones((8, 1024))), use_running_average=False)
+model.dropout.rngs.key[...] = jax.random.fold_in(jax.random.key(1), 7)
 
+with open(sys.argv[1], "wb") as handle:
+    pickle.dump(FlaxDistributedStrategy(preset="fsdp", min_size=0).state_dict({"model": model},
+                                                                             {"optimizer": optimizer}), handle)
+print(json.dumps(fingerprint(model, optimizer)))
+"""
+)
+
+RESTORE_SCRIPT = (
+    STATE_PRELUDE
+    + """
 strategy = FlaxDistributedStrategy(preset="fsdp", min_size=0)
-model = nnx.Linear(4, 2, rngs=nnx.Rngs(params=jax.random.key(2), dropout=jax.random.key(3)))
-strategy.wrap({"model": model})
-optimizer = nnx.Optimizer(model, tx=optax.adam(learning_rate=0.1), wrt=nnx.Param)
+model, optimizer = build(2)
 with open(sys.argv[1], "rb") as handle:
     strategy.load_state_dict({"model": model}, {"optimizer": optimizer}, None, pickle.load(handle))
-
-kernel = model.kernel[...]
-print(json.dumps({
-    "kernel_spec": str(kernel.sharding.spec),
-    "kernel_devices": kernel.sharding.num_devices,
-    "kernel": kernel.tolist(),
-}))
+print(json.dumps(fingerprint(model, optimizer)))
 """
+)
 
 
 def test_the_strategy_satisfies_the_distributed_strategy_protocol() -> None:
@@ -372,22 +392,36 @@ def test_a_generated_learner_trains_to_the_same_losses_on_four_devices(preset: s
     assert four["accumulator"] == [four["accumulator"][0]] * 6
 
 
+def _assert_same_state(saved: dict[str, Any], restored: dict[str, Any], *, devices: int) -> None:
+    """Assert *restored* holds the very state *saved* recorded, placed on *devices* devices."""
+    # Every kind of state moved off its initialization first, or "restored == saved" proves nothing.
+    assert saved["step"] == 1
+    assert saved["batch_stats"] != [[0.0] * 4, [1.0] * 4]
+    for entry in ("params", "batch_stats", "key", "opt_state", "step"):
+        # Bitwise: these are the numbers the next step reads, and a resharding round trip must not
+        # round any of them. `step` and the schedule count inside `opt_state` decide the next
+        # update's bias correction and learning rate, so they travel with the moments.
+        assert restored[entry] == saved[entry], entry
+    assert restored["typed_key"], "the dropout key came back as raw data and would break the next draw"
+    # Placement follows the live run, not the checkpoint: the state itself carries no topology.
+    # The spec is the preset's either way -- how many devices it spreads over is what changed.
+    assert restored["kernel_spec"] == "P('data', None)"
+    assert restored["kernel_devices"] == devices
+
+
 def test_a_state_saved_on_four_devices_restores_on_one(tmp_path: Path) -> None:
-    """Checkpoints outlive the machine that wrote them, so a host-memory state must be topology-free."""
+    """Checkpoints outlive the machine that wrote them, so a host-memory state must be topology-free.
+
+    The mirror of the test below: a run that shrank its device count keeps every number, and the
+    sharded arrays are gathered onto the one device that is left.
+    """
     states_path = tmp_path / "states.pkl"
     saved = _run_script(SAVE_SCRIPT, tmp_path, str(states_path), devices=4)
-    assert saved["kernel_spec"] == "P('data', None)"
+    assert saved["kernel_devices"] == 4
 
-    strategy = FlaxDistributedStrategy(preset="single")
-    model = nnx.Linear(4, 2, rngs=nnx.Rngs(params=jax.random.key(2), dropout=jax.random.key(3)))
-    optimizer = nnx.Optimizer(model, tx=optax.adam(learning_rate=0.1), wrt=nnx.Param)
-    with states_path.open("rb") as handle:
-        strategy.load_state_dict({"model": model}, {"optimizer": optimizer}, None, pickle.load(handle))
+    restored = _run_script(RESTORE_SCRIPT, tmp_path, str(states_path), devices=1)
 
-    assert jnp.allclose(model.kernel[...], jnp.asarray(saved["kernel"]))
-    # The kernel arrived sharded over four devices and now lives on this process's single one.
-    assert model.kernel[...].sharding.num_devices == 1
-    assert _step_count(optimizer) == 1
+    _assert_same_state(saved, restored, devices=1)
 
 
 def test_a_state_restored_on_four_devices_lands_on_the_live_run_s_sharding(tmp_path: Path) -> None:
@@ -399,9 +433,8 @@ def test_a_state_restored_on_four_devices_lands_on_the_live_run_s_sharding(tmp_p
     """
     states_path = tmp_path / "states.pkl"
     saved = _run_script(SAVE_SCRIPT, tmp_path, str(states_path), devices=1)
+    assert saved["kernel_devices"] == 1
 
     restored = _run_script(RESTORE_SCRIPT, tmp_path, str(states_path), devices=4)
 
-    assert restored["kernel_spec"] == "P('data', None)"
-    assert restored["kernel_devices"] == 4
-    assert restored["kernel"] == saved["kernel"]
+    _assert_same_state(saved, restored, devices=4)

@@ -41,6 +41,7 @@ from structcast_model.commands.shared_args import (
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     dict_parser,
+    get_module_outputs,
     instantiate_object,
     path_or_any_parser,
     reduce_dict,
@@ -484,25 +485,32 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         if len(raw) != 1:
             raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
         model_name, pattern = next(iter(raw.items()))
-        models[model_name] = instantiate_object(pattern)(rngs=rngs)
+        factory = instantiate_object(pattern)
+        if isinstance(factory, nnx.Module):
+            # The pattern already called the class, so the command holds a built module and the run's
+            # RNG never reached it. Calling it anyway would run the module's forward pass with a
+            # `rngs` keyword and fail somewhere inside the generated model instead.
+            raise ValueError(
+                f'The pattern of model "{model_name}" builds the module itself, so the run\'s seeded RNG cannot '
+                'reach it. Drop the "_call_" entry and let the command call the class with rngs.'
+            )
+        models[model_name] = factory(rngs=rngs)
     input_shapes = flax_trainer.resolve_input_shapes(models, reduce_dict(shapes)) or {}
     config_hash = _config_hash(model_patterns, learner_pattern, input_shapes)
     # Before the learner: an optimizer inherits the sharding of the parameters it is built over, and
     # the learner's inference views are taken from the models as they are when it is constructed.
     models = strategy.wrap(models)
     learner = instantiate_object(learner_pattern)(**models)
-    outputs = learner_outputs or getattr(learner, "outputs", None)
-    if not outputs:
-        raise ValueError(
-            'The learner declares no "outputs" attribute. Please name its criteria with --learner-outputs.'
-        )
+    outputs = get_module_outputs(learner, learner_outputs, "learner")
     compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
     if compile_kw is not None:
         # Both spellings of both contract arguments go: --help promises they cannot be overridden,
         # and the argnums form would renumber what the argnames form fixes.
         fixed = {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"}
         extra = {key: value for key, value in compile_kw.items() if key not in fixed}
-        for flow_name in list(learner.flow_functions):
+        # `flow_functions` is what a generated learner exposes, not part of the Learner protocol:
+        # a hand-written learner has nothing to bind, as in `cmd_torch`.
+        for flow_name in list(getattr(learner, "flow_functions", ())):
             # The generated learner names its steps after the contract they follow: only the training
             # one takes the static flag and the donated state (`docs/adr/0015`).
             arguments = {**TRAINING_COMPILE_KW, **extra} if flow_name == "_training_step" else extra

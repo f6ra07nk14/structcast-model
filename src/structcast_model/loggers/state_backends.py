@@ -101,6 +101,15 @@ class FlaxStateBackend:
         The restore names no target and no sharding, so a state saved on four devices comes back on
         any topology; the strategy places it afterwards.
         """
+        if not hasattr(tarfile, "data_filter"):
+            # The extraction filters landed in 3.11.4, below the interpreters the project floor
+            # admits. Without them `extractall` takes no `filter`, and the raw `TypeError` reads as
+            # a bug here rather than as the interpreter being too old to extract safely.
+            raise RuntimeError(
+                "Reading a Flax training state needs the tarfile extraction filters added in Python 3.11.4, "
+                "which this interpreter does not have. Extracting without them would let a crafted archive "
+                "write outside the destination, so upgrade the interpreter instead."
+            )
         with TemporaryDirectory() as workspace:
             checkpoint = Path(workspace) / "checkpoint"
             with tarfile.open(path, "r:gz") as archive:
