@@ -1,5 +1,6 @@
 """Utilities shared by builder modules."""
 
+import ast
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,16 @@ from structcast.utils.base import resolve_address
 
 from structcast_model.builders.constants import FILE_IMPORT_PREFIX
 from structcast_model.builders.schema import SPEC_EVAL
+
+
+def statement_names(line: str) -> tuple[set[str], set[str]]:
+    """Return the (loaded, stored) variable names of one generated statement."""
+    loads: set[str] = set()
+    stores: set[str] = set()
+    for node in ast.walk(ast.parse(line.strip())):
+        if isinstance(node, ast.Name):
+            (stores if isinstance(node.ctx, ast.Store) else loads).add(node.id)
+    return loads, stores
 
 
 def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
@@ -150,7 +161,7 @@ def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variab
     return _getter(spec, variable)
 
 
-__all__ = ["resolve_getter", "resolve_object"]
+__all__ = ["resolve_getter", "resolve_object", "statement_names"]
 
 if not TYPE_CHECKING:
     import sys

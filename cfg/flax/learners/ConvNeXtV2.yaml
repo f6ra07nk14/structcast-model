@@ -1,0 +1,79 @@
+# Supervised image classification for the Flax model "cfg/flax/models/ConvNeXtV2.yaml", which reads
+# "image" and emits a structured output whose only key is "cls".
+# The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
+# learning rate, and "flax.nnx.Optimizer" only binds that chain to the module (see "docs/adr/0013").
+# The builder wraps the factory carrying "learning_rate" in "optax.inject_hyperparams" so the rate
+# stays readable at run time; writing that wrapper here by hand is equally valid.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: 1.0
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
+# specify the number of steps to accumulate gradients before updating parameters.
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # Clipping comes first in the chain, so it applies once per update to the accumulated gradients.
+    # "no_weight_decay_mask" exempts every bias and normalization scale -- the "kernel" arrays of the
+    # convolutions and the two projections of each block are all that is left to decay.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _jinja_yaml_: |-
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.chain
+                - _call_:
+                    - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                    - - _obj_
+                      - _addr_: optax.adamw
+                      - _call_:
+                          learning_rate: {{lr}}
+                          weight_decay: {{weight_decay}}
+                          b1: 0.9
+                          b2: 0.999
+                          mask:
+                            - _obj_
+                            - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                            - _call_:
+                                - ^(?:\w+\.)*bias$
+                                - ^(?:\w+\.)*scale$
+    EXTRA: {}
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - INPUTS: {logits: cls, labels: label}
+        OUTPUTS: sample_losses
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: optax.softmax_cross_entropy_with_integer_labels}]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - [{logits: cls, labels: label}, sample_losses, cross_entropy_loss]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

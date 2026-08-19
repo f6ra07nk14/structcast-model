@@ -1,6 +1,5 @@
 """Builder for PyTorch models."""
 
-import ast
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
@@ -19,18 +18,8 @@ from structcast_model.builders.base import (
     OptimizerSegment,
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
-from structcast_model.builders.utils import resolve_getter, resolve_object
+from structcast_model.builders.utils import resolve_getter, resolve_object, statement_names
 from structcast_model.utils.base import to_snake, unique
-
-
-def _statement_names(line: str) -> tuple[set[str], set[str]]:
-    """Return the (loaded, stored) variable names of one generated statement."""
-    loads: set[str] = set()
-    stores: set[str] = set()
-    for node in ast.walk(ast.parse(line.strip())):
-        if isinstance(node, ast.Name):
-            (stores if isinstance(node.ctx, ast.Store) else loads).add(node.id)
-    return loads, stores
 
 
 class TorchLayerIntermediate(LayerIntermediate):
@@ -182,7 +171,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         lines: list[tuple[str, str | None]] = []
         for inputs, output, layer in units:
             line = self._get_regular_step(inputs, output, layer)
-            loads, stored = _statement_names(line)
+            loads, stored = statement_names(line)
             external += [n for n in loads - local if n not in external]
             stores += [n for n in stored if n not in local]
             local |= stored
@@ -266,7 +255,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 else f"{mixed_precision_name}.scale({scaled}).backward({backward_kwargs})"
             )
             params = [n for n in info["external"] if n in available]
-            needed = {loss} | set(self.outputs) | _statement_names(backward_line)[0]
+            needed = {loss} | set(self.outputs) | statement_names(backward_line)[0]
             needed |= {n for later in infos[i + 1 :] for n in later["external"]}
             returns = [n for n in info["stores"] if n in needed]
             function_name = f"_flow_{optimizer_name}"
