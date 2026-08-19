@@ -1,0 +1,9 @@
+# Distributed strategy pattern: data parallel. Every device holds a full copy of the parameters and
+# each batch is split across them along its leading dimension, so a batch must be divisible by the
+# number of devices. The pattern is called with device=..., which this preset ignores: it spans the
+# devices itself. Bind devices to use only the first N of them.
+- _obj_
+- _addr_: structcast_model.flax.distributed.FlaxDistributedStrategy
+- _bind_:
+    preset: dp
+    # devices: 4

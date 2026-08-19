@@ -308,6 +308,7 @@ def restore_training_state(
     start_epoch: int,
     logger: Logger,
     optimizer_hashes: Mapping[str, str] | None = None,
+    config_hash: str | None = None,
     is_main: bool = True,
 ) -> int:
     """Load the resumed state into the models and optimizers, and return the epoch to continue at.
@@ -326,6 +327,7 @@ def restore_training_state(
         start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
+        config_hash (str | None): Digest of what this run trains, compared with the saved one.
         is_main (bool): Whether this process prints the override message.
 
     Returns:
@@ -343,6 +345,12 @@ def restore_training_state(
                 "it from the configuration, so the run continues with the new one from the saved step count.",
                 stacklevel=2,
             )
+    if config_hash is not None and meta.get("config_hash", config_hash) != config_hash:
+        warn(
+            "The state was saved from a different model, learner or shape configuration: the arrays it holds "
+            "are restored into whatever the current one built, wherever the two still line up.",
+            stacklevel=2,
+        )
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:
         print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")

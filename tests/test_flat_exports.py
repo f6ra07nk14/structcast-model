@@ -8,14 +8,15 @@ from types import ModuleType
 import pytest
 
 import structcast_model
+import structcast_model.flax
 import structcast_model.loggers
 import structcast_model.torch
 
 
 @pytest.mark.parametrize(
     "package",
-    [structcast_model, structcast_model.loggers, structcast_model.torch],
-    ids=["structcast_model", "loggers", "torch"],
+    [structcast_model, structcast_model.flax, structcast_model.loggers, structcast_model.torch],
+    ids=["structcast_model", "flax", "loggers", "torch"],
 )
 def test_flat_attributes_resolve_to_their_routed_module(package: ModuleType) -> None:
     """Every flat symbol must reach the very object its routed module holds.

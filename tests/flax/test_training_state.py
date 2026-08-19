@@ -234,6 +234,37 @@ def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(
         )
 
 
+def test_a_state_saved_from_another_configuration_warns(
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
+) -> None:
+    """Restoring arrays into another model, learner or shape configuration must be reported.
+
+    The digest is recorded exactly so a resume can say so; a mismatch warns rather than refuses,
+    because restoring what still lines up is how a run is continued with a widened input.
+    """
+    learner = make_learner()
+    state = _saved_state(strategy, learner, config_hash="saved-digest")
+
+    def _restore(config_hash: str) -> None:
+        """Resume the prepared state as a run built from *config_hash* would."""
+        restore_training_state(
+            resume="whatever",
+            strategy=strategy,
+            models=learner.models,
+            learner=learner,
+            start_epoch=1,
+            logger=_StateLogger(state),
+            config_hash=config_hash,
+        )
+
+    with pytest.warns(UserWarning, match="different model, learner or shape configuration"):
+        _restore("rebuilt-digest")
+
+    with catch_warnings():
+        simplefilter("error")
+        _restore("saved-digest")
+
+
 @pytest.mark.parametrize(
     "hashes", [None, {"optimizer": "saved-digest"}], ids=["state-without-hashes", "matching-hashes"]
 )
