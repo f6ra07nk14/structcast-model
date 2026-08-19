@@ -57,11 +57,22 @@ Monitors one criterion for its best value seen so far and notifies its on-best p
 that produced the criterion.
 
 **Distributed strategy**:
-The replaceable unit that decides how models are wrapped, gradient-synchronized, weight-initialized and
-batch-norm-converted across ranks, compiled (where the compile units sit), and turned into checkpointable
-state. Exactly one strategy
+The replaceable unit that decides how models are distributed across devices — wrapped or partitioned,
+gradient-synchronized, weight-initialized, compiled (where the compile units sit) — and turned into
+checkpointable state. Exactly one strategy
 is active per training run; single-device training uses a strategy too, not a special case.
 _Avoid_: dist_fn, wrapper function, backend
+
+**Strategy preset**:
+A named sharding-rule table (`single`, `dp`, `fsdp`) selecting how a distributed strategy partitions
+parameters, optimizer state, and batches across the devices of one host.
+_Avoid_: ZeRO stage, parallelism mode, sharding config
+
+**State backend**:
+The serialization component behind a Logger's training-state methods: it turns a training state into one
+artifact file and back into host-memory state. Each framework supplies one; loggers default to the torch
+backend.
+_Avoid_: serializer, checkpoint writer
 
 **Training state**:
 The checkpoint artifact produced at epoch end — model weights, optimizer states, gradient-scaler states, and
