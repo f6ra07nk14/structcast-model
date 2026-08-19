@@ -580,3 +580,17 @@ def test_flax_learner_forwards_extra_keywords_to_the_update() -> None:
     script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
 
     assert "optimizers['optimizer'].update(model, _grads, value=loss)" in script
+
+
+def test_the_learner_builder_never_uses_the_zero_argument_super() -> None:
+    """The builder is a `slots=True` dataclass, which rebuilds the class after its methods are compiled.
+
+    Below Python 3.12.4 -- the project floor is 3.11 -- the `__class__` cell those methods close over
+    still points at the discarded class, so a zero-argument `super()` raises
+    `TypeError: super(type, obj): obj must be an instance or subtype of type` and every generated
+    learner fails. The CI interpreters that carry the fix cannot see it, so the shape is asserted
+    instead of the behavior.
+    """
+    for name, member in vars(FlaxLearnerBuilder).items():
+        code = getattr(member, "__code__", None)
+        assert code is None or "__class__" not in code.co_freevars, name

@@ -481,7 +481,10 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
                 f'Duplicate variable name "{container}" for the module container of optimizer "{opt_name}" '
                 "found in the learner flow: rename the layer that already uses it."
             )
-        return super()._build_segment(imports, module, learner, opt_name, naming, layers, others)
+        # Named base rather than a zero-argument `super()`: `slots=True` rebuilds the class, and on
+        # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
+        # discarded one, so `super()` raises "obj must be an instance or subtype of type" here.
+        return BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
 
     def _get_optimizer(
         self,
