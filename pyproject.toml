@@ -81,7 +81,7 @@ ptflops = ["ptflops>=0.7.5"]
 calflops = ["calflops>=0.3.2", "transformers[torch]>=4.56.1"]
 flops = ["structcast-model[ptflops,calflops]"]
 mlflow = ["mlflow>=3.10.0"]
-wandb = ["wandb>=0.19"]
+wandb = ["wandb>=0.24.0"]
 
 [tool.uv]
 conflicts = [
