@@ -1,26 +1,16 @@
 """Logger recording a training run to MLflow."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
 from structcast_model.loggers.base import Logger, _epoch_metrics, _local_training_state
-
-if TYPE_CHECKING:
-    import mlflow.pytorch as mlflow_pytorch
-
-    import torch
-else:
-    from structcast.utils.lazy_import import LazyModuleImporter
-
-    # `mlflow.pytorch` imports torch at its top level, so it is bound lazily as well: importing it
-    # eagerly would drag torch into every process that merely imports this module.
-    mlflow_pytorch = LazyModuleImporter("mlflow.pytorch")
-    torch = LazyModuleImporter("torch")
+from structcast_model.loggers.state_backends import StateBackend, TorchStateBackend
 
 with try_import() as _imports:
     import mlflow
@@ -36,6 +26,9 @@ class MLflowLogger(Logger):
 
     experiment: str
     """The experiment the run is recorded under."""
+
+    state_backend: StateBackend = field(default_factory=TorchStateBackend)
+    """The format training states are written and read in; the torch one unless a run asks otherwise."""
 
     def __post_init__(self) -> None:
         """Fail with an explanatory error when mlflow is not installed."""
@@ -73,8 +66,13 @@ class MLflowLogger(Logger):
         mlflow.log_metrics(dict(metrics), step=step)
 
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
-        """Log a state dictionary under the given artifact name."""
-        mlflow_pytorch.log_state_dict(dict(states), name)
+        """Log a state dictionary as one artifact file, named after the backend's format.
+
+        The artifact is `<name><suffix>`, not the directory `mlflow.pytorch` used to write: one
+        format for both backends, and the fetch path below still accepts the old layout.
+        """
+        with TemporaryDirectory() as directory:
+            self.log_artifact(str(self.state_backend.save(states, Path(directory), name)))
 
     def fetch_training_state(self, reference: str) -> dict[str, Any]:
         """Load a saved training state from an MLflow `runs:/` URI or a local path.
@@ -92,14 +90,22 @@ class MLflowLogger(Logger):
         if reference.startswith("runs:/"):
             path = Path(mlflow.artifacts.download_artifacts(artifact_uri=reference))
             if path.is_dir():
-                # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
-                states = sorted(path.glob("*.pth"))
-                if not states:
-                    raise ValueError(f'No "*.pth" training state found in the downloaded MLflow artifact "{path}".')
-                path = states[0]
-            # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
-            return torch.load(path, map_location="cpu", weights_only=True)
-        return _local_training_state(reference, 'a "runs:/<run_id>/<artifact>" URI')
+                # A directory artifact is what `mlflow.pytorch.log_state_dict` used to write, and
+                # what a backend saving a directory would write next: take this backend's format
+                # first, then the torch-flavored `state_dict.pth` of the runs recorded before.
+                states = sorted(path.glob(f"*{self.state_backend.suffix}"))
+                if states:
+                    return self.state_backend.load(states[0])
+                legacy = sorted(path.glob("*.pth"))
+                if not legacy:
+                    raise ValueError(
+                        f'No "*{self.state_backend.suffix}" or legacy "*.pth" training state found in the '
+                        f'downloaded MLflow artifact "{path}".'
+                    )
+                # `*.pth` is a torch pickle whatever this logger's backend is, so it is read as one.
+                return TorchStateBackend().load(legacy[0])
+            return self.state_backend.load(path)
+        return _local_training_state(reference, 'a "runs:/<run_id>/<artifact>" URI', self.state_backend)
 
     def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""

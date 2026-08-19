@@ -7,13 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 from typing_extensions import Protocol, runtime_checkable
 
 from structcast_model.base_trainer import BaseInfo, BaseTrainer
-
-if TYPE_CHECKING:
-    import torch
-else:
-    from structcast.utils.lazy_import import LazyModuleImporter
-
-    torch = LazyModuleImporter("torch")
+from structcast_model.loggers.state_backends import StateBackend
 
 
 @runtime_checkable
@@ -109,15 +103,14 @@ def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
     return {**learner.learning_rates, **getattr(learner, "weight_decays", {}), **info.logs()}
 
 
-def _local_training_state(reference: str, expected_form: str) -> dict[str, Any]:
+def _local_training_state(reference: str, expected_form: str, backend: StateBackend) -> dict[str, Any]:
     """Load a training state from an existing local path, naming the logger's accepted forms otherwise."""
     path = Path(reference)
     if not path.exists():
         raise ValueError(
             f'Cannot fetch a training state from "{reference}": expected {expected_form} or an existing local path.'
         )
-    # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
-    return torch.load(path, map_location="cpu", weights_only=True)
+    return backend.load(path)
 
 
 # `_epoch_metrics` and `_local_training_state` are listed because the LazySelectedImporter tail below

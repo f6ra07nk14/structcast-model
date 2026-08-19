@@ -1,7 +1,7 @@
 """Logger recording a training run to Weights & Biases."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
@@ -11,13 +11,7 @@ from structcast.utils.lazy_import import try_import
 
 from structcast_model.base_trainer import BaseInfo
 from structcast_model.loggers.base import Logger, _epoch_metrics, _local_training_state
-
-if TYPE_CHECKING:
-    import torch
-else:
-    from structcast.utils.lazy_import import LazyModuleImporter
-
-    torch = LazyModuleImporter("torch")
+from structcast_model.loggers.state_backends import StateBackend, TorchStateBackend
 
 with try_import() as _imports:
     import wandb
@@ -40,6 +34,9 @@ class WandbLogger(Logger):
 
     experiment: str
     """The project the run is recorded under."""
+
+    state_backend: StateBackend = field(default_factory=TorchStateBackend)
+    """The format training states are written and read in; the torch one unless a run asks otherwise."""
 
     def __post_init__(self) -> None:
         """Fail with an explanatory error when wandb is not installed."""
@@ -75,8 +72,8 @@ class WandbLogger(Logger):
         wandb.log(dict(metrics), step=step)
 
     def log_state_dict(self, states: Mapping[str, Any], name: str) -> None:
-        """Save a state dictionary into the run directory."""
-        torch.save(dict(states), _active_run_dir() / f"{name}.pt")
+        """Save a state dictionary into the run directory, in the backend's format."""
+        self.state_backend.save(states, _active_run_dir(), name)
 
     def fetch_training_state(self, reference: str) -> dict[str, Any]:
         """Load a saved training state from a `wandb://` reference or a local path.
@@ -96,9 +93,10 @@ class WandbLogger(Logger):
             with TemporaryDirectory() as directory:
                 wandb.Api().run(f"{entity}/{project}/{run_id}").file(filename).download(root=directory, replace=True)
                 # The download is deleted with the temporary directory, so it is read inside the block.
-                # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
-                return torch.load(Path(directory) / filename, map_location="cpu", weights_only=True)
-        return _local_training_state(reference, 'a "wandb://<entity>/<project>/<run_id>/<file>" reference')
+                return self.state_backend.load(Path(directory) / filename)
+        return _local_training_state(
+            reference, 'a "wandb://<entity>/<project>/<run_id>/<file>" reference', self.state_backend
+        )
 
     def on_epoch_end(self, info: BaseInfo) -> None:
         """Log the criteria and learning rates of the finished epoch."""

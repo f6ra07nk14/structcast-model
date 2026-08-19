@@ -2,12 +2,25 @@
 
 from typing import TYPE_CHECKING
 
-__all__ = ["Logger", "MLflowLogger", "NullLogger", "WandbLogger", "base", "mlflow", "wandb"]
+__all__ = [
+    "FlaxStateBackend",
+    "Logger",
+    "MLflowLogger",
+    "NullLogger",
+    "StateBackend",
+    "TorchStateBackend",
+    "WandbLogger",
+    "base",
+    "mlflow",
+    "state_backends",
+    "wandb",
+]
 
 if TYPE_CHECKING:
-    from structcast_model.loggers import base, mlflow, wandb
+    from structcast_model.loggers import base, mlflow, state_backends, wandb
     from structcast_model.loggers.base import Logger, NullLogger
     from structcast_model.loggers.mlflow import MLflowLogger
+    from structcast_model.loggers.state_backends import FlaxStateBackend, StateBackend, TorchStateBackend
     from structcast_model.loggers.wandb import WandbLogger
 else:
     import sys
@@ -18,6 +31,7 @@ else:
     import_structure = {
         "base": ["Logger", "NullLogger"],
         "mlflow": ["MLflowLogger"],
+        "state_backends": ["FlaxStateBackend", "StateBackend", "TorchStateBackend"],
         "wandb": ["WandbLogger"],
     }
     sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

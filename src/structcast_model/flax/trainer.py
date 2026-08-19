@@ -1,10 +1,11 @@
 """Trainer helpers for Flax models."""
 
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self, cast
+from warnings import warn
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +17,15 @@ from pydantic import TypeAdapter, ValidationError
 from typing_extensions import Protocol, runtime_checkable
 
 from flax import nnx
-from structcast_model.base_trainer import BaseInfo, BaseTrainer
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
+
+if TYPE_CHECKING:
+    # Only for the annotations: `flax.distributed` imports this module, so importing it back here
+    # at runtime would close the cycle.
+    from structcast_model.flax.distributed import FlaxDistributedStrategy
 
 DTYPES = {
     "float32": jax.numpy.float32,
@@ -208,14 +215,151 @@ class FlaxTrainer(BaseTrainer[nnx.Module]):
     """
 
 
+@dataclass(kw_only=True, slots=True)
+class FlaxBestCriterion(BestCriterion[nnx.Module]):
+    """A callback tracking the best value of a criterion during training or validation for Flax models.
+
+    The twin of `structcast_model.torch.trainer.TorchBestCriterion`, duplicated rather than shared
+    because importing either module imports its framework.
+    """
+
+    @classmethod
+    def from_criteria(
+        cls,
+        higher_criteria: Sequence[str],
+        lower_criteria: Sequence[str],
+        save_criteria: Collection[str],
+        logger: Logger,
+        strategy: "FlaxDistributedStrategy",
+    ) -> list[Self]:
+        """Build one monitor per criterion, each logging its best value through *logger*.
+
+        Criteria named in *save_criteria* also save the model states that reached the best value,
+        produced through *strategy*.
+        """
+        monitors: list[Self] = []
+        for target in higher_criteria:
+            best = cls(target=target, mode="max")
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
+            monitors.append(best)
+        for target in lower_criteria:
+            best = cls(target=target, mode="min")
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
+            monitors.append(best)
+        return monitors
+
+
+@dataclass(kw_only=True, slots=True)
+class _BestLogger:
+    """Log the best value of a criterion, and save the models that reached it when asked to."""
+
+    logger: Logger
+    """The logger the best values and model states are written through."""
+
+    save: bool
+    """Whether to also save the model states that reached the best value."""
+
+    strategy: "FlaxDistributedStrategy"
+    """The strategy producing the model states to save."""
+
+    def on_best(self, info: BaseInfo[nnx.Module], best: BestCriterion[nnx.Module]) -> None:
+        """Log the best value, and save the states of the info's models when this epoch reached it."""
+        name = f"best_{best.target}"
+        self.logger.log_metric(name, best.value, step=info.epoch)
+        if self.save and info.step == best.step:
+            self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
+
+
+@dataclass(kw_only=True, slots=True)
+class FlaxTrainingStateSaver:
+    """Callback saving models, optimizers and loop counters through a logger.
+
+    The twin of `structcast_model.torch.trainer.TrainingStateSaver`, minus the gradient scalers Flax
+    has none of; the payload keeps their (always empty) slot so both frameworks resume from the same
+    shape (`docs/adr/0015`).
+    """
+
+    logger: Logger
+    """The logger the training-state artifacts are written through."""
+
+    strategy: "FlaxDistributedStrategy"
+    """The strategy producing the model and optimizer states to save."""
+
+    extra_meta: Mapping[str, Any] = field(default_factory=dict)
+    """Run facts the loop does not know, recorded next to the counters: seed, configuration and
+    optimizer hashes, which the resume path compares against the rebuilt configuration."""
+
+    def on_epoch_end(self, info: BaseInfo[nnx.Module]) -> None:
+        """Save the full training state of the finished epoch, so a run can be resumed from it."""
+        learner = cast("FlaxTrainer", info).learner
+        states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
+        states.setdefault("optimizers", {})
+        states["grad_scalers"] = {}
+        states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update, **dict(self.extra_meta)}
+        self.logger.log_state_dict(states, "training_state")
+
+
+def restore_training_state(
+    *,
+    resume: str,
+    strategy: "FlaxDistributedStrategy",
+    models: Mapping[str, nnx.Module],
+    learner: Any,
+    start_epoch: int,
+    logger: Logger,
+    optimizer_hashes: Mapping[str, str] | None = None,
+    is_main: bool = True,
+) -> int:
+    """Load the resumed state into the models and optimizers, and return the epoch to continue at.
+
+    The saved epoch wins over *start_epoch*, as in the torch loader (`docs/adr/0005`). *optimizer_hashes*
+    are the hashes of the optimizer patterns the current configuration rebuilt: optax builds `tx`
+    from configuration and the state restore cannot see it, so a schedule swapped between save and
+    resume would silently continue the new schedule from the old count. A mismatch warns rather than
+    refuses -- extending a schedule or lowering the rate of a fine-tune is legitimate.
+
+    Args:
+        resume (str): The training state reference, in whatever form *logger* accepts.
+        strategy (FlaxDistributedStrategy): The strategy placing the restored arrays.
+        models (Mapping[str, nnx.Module]): The live models to restore into.
+        learner (Any): The learner owning the optimizers to restore into.
+        start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
+        logger (Logger): The logger the state is fetched through.
+        optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
+        is_main (bool): Whether this process prints the override message.
+
+    Returns:
+        int: The epoch to continue at: the saved one plus one.
+    """
+    state = strategy.load_state_dict(
+        models, learner.optimizers, learner.optimizer_models, logger.fetch_training_state(resume)
+    )
+    meta = state["meta"]
+    saved_hashes = meta.get("optimizer_hashes", {})
+    for segment, digest in (optimizer_hashes or {}).items():
+        if segment in saved_hashes and saved_hashes[segment] != digest:
+            warn(
+                f'The optimizer of segment "{segment}" is not the one the state was saved with: optax rebuilds '
+                "it from the configuration, so the run continues with the new one from the saved step count.",
+                stacklevel=2,
+            )
+    resumed_epoch = int(meta["epoch"]) + 1
+    if start_epoch != 1 and is_main:
+        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+    return resumed_epoch
+
+
 __all__ = [
+    "FlaxBestCriterion",
     "FlaxTracker",
     "FlaxTrainer",
+    "FlaxTrainingStateSaver",
     "TensorInitializer",
     "create_jax_inputs",
     "get_jax_device",
     "get_jax_devices",
     "resolve_input_shapes",
+    "restore_training_state",
 ]
 
 

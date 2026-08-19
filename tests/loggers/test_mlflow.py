@@ -10,6 +10,7 @@ import pytest
 
 from structcast_model.loggers.base import Logger
 from structcast_model.loggers.mlflow import MLflowLogger
+from structcast_model.loggers.state_backends import FlaxStateBackend
 from structcast_model.torch.trainer import TorchTrainer
 import torch
 
@@ -48,7 +49,8 @@ def test_mlflow_logger_stores_dicts_states_and_files_as_artifacts(mlflow_store: 
         logger.log_artifact(str(artifact))
         logger.log_state_dict({"weight": torch.zeros(2)}, "training_state")
     names = {item.path for item in mlflow_store.artifacts.list_artifacts(run_id=run_id)}
-    assert {"arguments.yaml", "config.yaml", "training_state"} <= names
+    # One artifact file named after the backend's format, where `mlflow.pytorch` wrote a directory.
+    assert {"arguments.yaml", "config.yaml", "training_state.pt"} <= names
 
 
 def test_mlflow_logger_fetches_a_training_state_from_a_run_uri(mlflow_store: Any) -> None:
@@ -56,8 +58,24 @@ def test_mlflow_logger_fetches_a_training_state_from_a_run_uri(mlflow_store: Any
     with MLflowLogger(experiment="phase-two") as logger:
         run_id = mlflow_store.active_run().info.run_id
         logger.log_state_dict({"weight": torch.zeros(2)}, "training_state")
-    state = MLflowLogger(experiment="phase-two").fetch_training_state(f"runs:/{run_id}/training_state")
+    state = MLflowLogger(experiment="phase-two").fetch_training_state(f"runs:/{run_id}/training_state.pt")
     assert state["weight"].tolist() == [0.0, 0.0]
+
+
+def test_mlflow_logger_reads_the_legacy_torch_state_directory(mlflow_store: Any, tmp_path: Path) -> None:
+    """A checkpoint from before the backend seam must still resume.
+
+    Those runs wrote `state_dict.pth` into a directory artifact, and a `--resume` pointing at one
+    keeps working whatever format this run's own backend writes.
+    """
+    legacy = tmp_path / "state_dict.pth"
+    torch.save({"weight": torch.ones(2)}, legacy)
+    with MLflowLogger(experiment="phase-two"):
+        run_id = mlflow_store.active_run().info.run_id
+        mlflow_store.log_artifact(str(legacy), artifact_path="training_state")
+
+    logger = MLflowLogger(experiment="phase-two", state_backend=FlaxStateBackend())
+    assert logger.fetch_training_state(f"runs:/{run_id}/training_state")["weight"].tolist() == [1.0, 1.0]
 
 
 def test_mlflow_logger_fetches_a_training_state_from_a_local_path(tmp_path: Path) -> None:

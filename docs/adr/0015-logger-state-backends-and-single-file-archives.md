@@ -11,8 +11,9 @@ verbatim).
 The invariant both backends preserve is the existing torch contract: **fetch returns host-memory state; the
 strategy owns device placement** (`map_location="cpu"` today). The Flax backend therefore:
 
-- saves with orbax (`CheckpointManager` v0 API + `ocp.args.Composite`: model states, optimizer states, and a
-  JSON `meta` item) into a temporary directory, waits for the async commit, then packs **one** `.tar.gz` — so
+- saves with orbax (the synchronous `ocp.Checkpointer(ocp.CompositeCheckpointHandler())` + `ocp.args.Composite`:
+  model states, optimizer states, and a JSON `meta` item — no step directories to strip, and the checkpoint is
+  committed by the time the context manager exits) into a temporary directory, then packs **one** `.tar.gz` — so
   the wandb single-file run-dir flow, the `wandb://…/<file>` and `runs:/…` reference formats, and
   `TrainingStateSaver`/`_BestLogger` all survive unchanged;
 - loads by extracting with `tarfile.extractall(filter="data")` and restoring to host numpy (no sharding

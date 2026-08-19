@@ -782,14 +782,14 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     assert run.data.metrics["val_loss"] == pytest.approx(0.3)
     assert run.data.metrics["best_acc"] == pytest.approx(0.9)
     artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)]
-    assert {"training_state", "best_acc", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
+    # The state backend writes one artifact file per state, where `mlflow.pytorch` wrote a directory.
+    assert {"training_state.pt", "best_acc.pt", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
 
 
 def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
     """--resume must continue at the epoch after the saved one instead of training the run again."""
     _invoke_train(tmp_path, epochs=2)
-    # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
-    (state,) = (tmp_path / "mlruns").rglob("training_state/state_dict.pth")
+    (state,) = (tmp_path / "mlruns").rglob("training_state.pt")
     _invoke_train(tmp_path, epochs=3, resume=str(state))
     runs = mlflow.search_runs(experiment_names=["test-e2e"], output_format="list")
     assert len(runs) == 2
