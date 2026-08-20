@@ -35,10 +35,11 @@ no `learning_rate` kwarg is identifiable (positional, renamed) are left alone an
 generation-time warning naming the fix.
 
 At run time `structcast_model.flax.optimizers.get_learning_rate` reads
-`optax.tree_utils.tree_get(nnx.as_pure(optimizer.opt_state), "learning_rate", filtering=<numeric leaves>)` —
+`optax.tree_utils.tree_get(unwrap_variables(optimizer.opt_state), "learning_rate", filtering=<numeric leaves>)` —
 the filter is required because a scheduled inject state carries a second `learning_rate` entry under
 `hyperparams_states`, and the nnx `OptArray` wrappers defeat type-based filtering unless the state is made pure
-first. The generated `_training_step` calls it inside the trace (the walk runs at trace time, compiles to an
+first; `unwrap_variables` is the local stand-in for `nnx.as_pure`, whose whole body is that one tree walk. The
+generated `_training_step` calls it inside the trace (the walk runs at trace time, compiles to an
 array reference), returns the values through an auxiliary output, and the `learning_rates` property converts the
 stashed arrays lazily so the host sync lands on the epoch-end read, not on the step path.
 
@@ -64,4 +65,7 @@ the accumulated gradients — the same semantics as the emitted torch `if __need
   which kind the YAML used.
 - `nnx.Optimizer.update()` return values and the `graph=` kwarg are never used, and generated code always
   passes `deterministic`/`use_running_average` explicitly — the emitted source stays valid across the whole
-  supported flax range (floored at 0.12.7, where `nnx.as_pure` first appears) without version branches.
+  supported flax range without version branches. The range is floored at 0.12.6: `nnx.as_pure` only appears in
+  0.12.7 (0.12.6 calls it `nnx.pure`), so its body — one `jax.tree.map` replacing `Variable` leaves with
+  `get_raw_value()` — is vendored as `structcast_model.flax.optimizers.unwrap_variables` instead of branching on
+  the flax version. `tox -e flax-floor` runs the Flax suite against 0.12.6 to keep the floor honest.

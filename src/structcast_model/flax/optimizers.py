@@ -11,6 +11,32 @@ import optax
 from flax import nnx
 
 
+def unwrap_variables(tree: Any) -> Any:
+    """Return the tree with every `flax.nnx.Variable` leaf replaced by the value it holds.
+
+    This is `nnx.as_pure` written out by hand, because the supported flax floor, 0.12.6, still calls
+    that function `nnx.pure` -- the rename landed in 0.12.7. Walking the tree here is what keeps one
+    code path across the whole supported range instead of a version branch at every call site.
+
+    Args:
+        tree (Any): The pytree to strip, typically an optimizer state.
+
+    Returns:
+        Any: A new pytree of the same structure whose Variable leaves are their inner values.
+
+    Example:
+        >>> from flax import nnx
+        >>> from structcast_model.flax.optimizers import unwrap_variables
+        >>> unwrap_variables({"kernel": nnx.Param(1.0)})
+        {'kernel': 1.0}
+    """
+    return jax.tree.map(
+        lambda leaf: unwrap_variables(leaf.get_raw_value()) if isinstance(leaf, nnx.Variable) else leaf,
+        tree,
+        is_leaf=lambda leaf: isinstance(leaf, nnx.Variable),
+    )
+
+
 def get_learning_rate(optimizer: Any) -> jax.Array:
     """Return the learning rate the optimizer state currently reports.
 
@@ -31,10 +57,10 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     """
     try:
         rate = optax.tree_utils.tree_get(
-            # The nnx `OptArray` wrappers defeat the filter unless the state is made pure first, and
-            # the filter itself is required because a scheduled inject state carries a second
+            # The nnx `OptArray` wrappers defeat the filter unless the state is unwrapped first,
+            # and the filter itself is required because a scheduled inject state carries a second
             # `learning_rate` entry (its schedule state) under `hyperparams_states`.
-            nnx.as_pure(optimizer.opt_state),
+            unwrap_variables(optimizer.opt_state),
             "learning_rate",
             default=None,
             filtering=lambda _, value: isinstance(value, (jax.Array, float)),
@@ -75,7 +101,7 @@ def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     return mask
 
 
-__all__ = ["get_learning_rate", "no_weight_decay_mask"]
+__all__ = ["get_learning_rate", "no_weight_decay_mask", "unwrap_variables"]
 
 
 if not TYPE_CHECKING:

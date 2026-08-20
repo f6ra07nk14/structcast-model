@@ -625,9 +625,11 @@ provider = TimmDataProvider(training=training_wrapper, validation=validation_wra
 
 ## API Reference: `flax/optimizers.py`
 
-[`src/structcast_model/flax/optimizers.py`](src/structcast_model/flax/optimizers.py) holds the two optimizer helpers a Flax learner template and its generated class use. Both are re-exported from `structcast_model.flax`.
+[`src/structcast_model/flax/optimizers.py`](src/structcast_model/flax/optimizers.py) holds the optimizer helpers a Flax learner template and its generated class use. All three are re-exported from `structcast_model.flax`.
 
 **`get_learning_rate(optimizer)`** — Returns the learning rate an `nnx.Optimizer`'s state currently reports, as a float32 scalar. Optax stores no rate of its own — a constant lives in the update closure, and a schedule leaves only its step count behind — so the rate is readable only when the transformation was built through [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams), which is why `FlaxLearnerBuilder` wraps the factory carrying `learning_rate` in it ([`docs/adr/0013`](docs/adr/0013-flax-optimizers-are-dsl-built-nnx-optimizers.md)). The walk is a pure pytree traversal, so calling it inside a traced training step compiles to a reference to the state array rather than to a host read. The result is NaN when the chain injects no rate at all, or several of them, since neither case names a single rate to report.
+
+**`unwrap_variables(tree)`** — Returns the pytree with every `flax.nnx.Variable` leaf replaced by the value it holds, so a state can be filtered or serialized by value. It is `nnx.as_pure` written out by hand: the supported flax floor, 0.12.6, still calls that function `nnx.pure`, and one walk here keeps a single code path across the whole supported range.
 
 **`no_weight_decay_mask(*regexes)`** — Returns the mask callable `optax.adamw(mask=...)` and `optax.masked` consume: it maps a parameter tree to a same-structure tree of booleans, `False` where the leaf's dotted path (`"encoder.bias"`) matches any of the regexes. The match is a search, not an anchor, so a plain `"bias"` exempts every bias in the tree.
 

@@ -86,6 +86,7 @@ import json, sys
 import jax, optax
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.optimizers import unwrap_variables
 
 strategy = FlaxDistributedStrategy(preset=sys.argv[1], min_size=2**20)
 # 1024x512 floats are 2 MiB and divide by four; the 1023-row kernel does not divide; the wide
@@ -107,7 +108,7 @@ batch = strategy.shard_batch({"x": jax.numpy.ones((8, 1024)), "y": jax.numpy.one
 print(json.dumps({
     "mesh": strategy.mesh.size,
     "params": specs(nnx.to_pure_dict(nnx.state(models, nnx.Param))),
-    "optimizer": specs(nnx.as_pure(optimizer.opt_state)[0].mu),
+    "optimizer": specs(unwrap_variables(optimizer.opt_state)[0].mu),
     "batch": {k: str(v.sharding.spec) for k, v in batch.items()},
 }))
 """
@@ -151,6 +152,7 @@ import json, pickle, sys
 import jax, jax.numpy as jnp, optax
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.optimizers import unwrap_variables
 
 class Model(nnx.Module):
     def __init__(self, seed):
@@ -175,7 +177,7 @@ def fingerprint(model, optimizer):
         # so the run's next draw comes from the stream the saved run was on.
         "key": jax.random.key_data(model.dropout.rngs.key[...]).tolist(),
         "typed_key": bool(jnp.issubdtype(model.dropout.rngs.key[...].dtype, jax.dtypes.prng_key)),
-        "opt_state": [jnp.asarray(v).tolist() for v in jax.tree.leaves(nnx.as_pure(optimizer.opt_state))],
+        "opt_state": [jnp.asarray(v).tolist() for v in jax.tree.leaves(unwrap_variables(optimizer.opt_state))],
         "step": int(jnp.asarray(nnx.state(optimizer).step[...])),
         "kernel_spec": str(kernel.sharding.spec),
         "kernel_devices": kernel.sharding.num_devices,

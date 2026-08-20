@@ -23,12 +23,13 @@ __all__ = [
     "resolve_input_shapes",
     "restore_training_state",
     "trainer",
+    "unwrap_variables",
 ]
 
 if TYPE_CHECKING:
     from structcast_model.flax import distributed, layers, optimizers, trainer
     from structcast_model.flax.distributed import AXIS, PRESET_RULES, TACTICS, FlaxDistributedStrategy
-    from structcast_model.flax.optimizers import get_learning_rate, no_weight_decay_mask
+    from structcast_model.flax.optimizers import get_learning_rate, no_weight_decay_mask, unwrap_variables
     from structcast_model.flax.trainer import (
         FlaxBestCriterion,
         FlaxTracker,
@@ -53,7 +54,7 @@ else:
     import_structure = {
         "distributed": ["AXIS", "PRESET_RULES", "TACTICS", "FlaxDistributedStrategy"],
         "layers": [],
-        "optimizers": ["get_learning_rate", "no_weight_decay_mask"],
+        "optimizers": ["get_learning_rate", "no_weight_decay_mask", "unwrap_variables"],
         "trainer": [
             "FlaxBestCriterion",
             "FlaxTracker",
