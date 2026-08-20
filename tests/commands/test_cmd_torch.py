@@ -894,8 +894,8 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
     fake = _FakeWandb(tmp_path / "wandb_run")
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
-    # The fixture publishes the fake through `loggers.wandb`, the attribute the command reads, so the
-    # run exercises the real `scm_loggers` chained access rather than a stand-in for it.
+    # The fixture publishes the fake through `loggers.WandbLogger`, the attribute the command reads,
+    # so the run exercises the real `scm_loggers` flat access rather than a stand-in for it.
     wandb_logger_with(fake)
     _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
     assert fake.projects == ["test-e2e"]

@@ -443,10 +443,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     print(f"Validation dataset size: {provider.validation_steps} steps.")
     # Built before the resume, which fetches the state through it. Only the experiment name is stored
     # here: the run itself starts in __enter__.
-    logger_type = scm_loggers.mlflow.MLflowLogger if logger_name == "mlflow" else scm_loggers.wandb.WandbLogger
-    logger: scm_loggers.base.Logger = logger_type(
-        experiment=experiment, state_backend=scm_loggers.state_backends.FlaxStateBackend()
-    )
+    logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+    logger: scm_loggers.Logger = logger_type(experiment=experiment, state_backend=scm_loggers.FlaxStateBackend())
     optimizer_hashes = _optimizer_hashes(learner)
     if resume is not None:
         start_epoch = flax_trainer.restore_training_state(

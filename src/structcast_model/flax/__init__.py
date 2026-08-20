@@ -13,16 +13,13 @@ __all__ = [
     "FlaxTrainingStateSaver",
     "TensorInitializer",
     "create_jax_inputs",
-    "distributed",
     "get_jax_device",
     "get_jax_devices",
     "get_learning_rate",
     "layers",
     "no_weight_decay_mask",
-    "optimizers",
     "resolve_input_shapes",
     "restore_training_state",
-    "trainer",
     "unwrap_variables",
 ]
 
