@@ -1,6 +1,7 @@
 """Builder for Keras models."""
 
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
@@ -114,9 +115,25 @@ class KerasLearnerBehavior(LearnerBehavior):
     The shared behavior minus `EXTRA`: a Keras optimizer applies gradients through
     `optimizer.apply(gradients, variables)`, which takes nothing else, so the field is rejected
     rather than silently dropped. There is no `CLIP` field either -- clipping is a keyword of the
-    Keras optimizer (`clipnorm` / `global_clipnorm`), so it belongs in `OPTIMIZER` and the inherited
-    `extra="forbid"` rejects a `CLIP` key by construction (`docs/adr/0016`).
+    Keras optimizer (`clipnorm` / `clipvalue` / `global_clipnorm`), so it belongs in `OPTIMIZER`
+    (`docs/adr/0016`) and `_reject_clip` says so, rather than leaving the inherited `extra="forbid"`
+    to report a `CLIP` key as one more unpermitted extra input.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_clip(cls, data: Any) -> Any:
+        """Point a `CLIP` key at the Keras optimizer keyword that replaces it.
+
+        Before, not after: `extra="forbid"` rejects the key first, and its generic "Extra inputs are
+        not permitted" says nothing about where clipping went on this backend.
+        """
+        if isinstance(data, Mapping) and "CLIP" in data:
+            raise SpecError(
+                "CLIP has no Keras equivalent: a Keras optimizer clips its own gradients, so configure clipnorm, "
+                "clipvalue or global_clipnorm in the OPTIMIZER pattern instead of adding a CLIP step."
+            )
+        return data
 
     @field_validator("EXTRA", mode="after")
     @classmethod
@@ -184,7 +201,7 @@ class KerasOptimizerSegment(OptimizerSegment):
     """One optimizer step of a Keras learner flow, carrying the digest of the pattern that built it."""
 
     optimizer_hash: str
-    """The digest of the segment's `OPTIMIZER` pattern, emitted as `__optimizer_hashes__`."""
+    """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES`."""
 
 
 class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
@@ -353,11 +370,11 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
 # Read by the training CLI after this module is imported and before the class below is
 # instantiated: the `keras.mixed_precision` global policy has to be in place before the models the
 # learner receives are built (`docs/adr/0016`).
-__mixed_precision__ = {self.mixed_precision!r}
-__mixed_precision_type__ = {self.mixed_precision_type!r}
+MIXED_PRECISION = {self.mixed_precision!r}
+MIXED_PRECISION_TYPE = {self.mixed_precision_type!r}
 # Read by the training CLI when a run resumes: the digest of each segment's OPTIMIZER pattern, so a
 # state saved under another optimizer is reported instead of silently continued (`docs/adr/0015`).
-__optimizer_hashes__ = {{{hashes}}}
+OPTIMIZER_HASHES = {{{hashes}}}
 
 
 class {self.classname}:

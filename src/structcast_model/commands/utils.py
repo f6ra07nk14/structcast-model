@@ -1,5 +1,8 @@
 """Utility functions for the commands package."""
 
+from collections.abc import Mapping
+from hashlib import sha256
+from json import dumps
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.base import load_yaml_from_string
@@ -134,6 +137,37 @@ def get_module_outputs(module: Any, default: list[str] | None, name: str) -> lis
     )
 
 
+def config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
+    """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
+
+    Recorded in the saved training state so a resumed run can be told apart from the configuration it
+    was saved from. The optimizers are not part of it: they are hashed separately, by the builder
+    that emits them, and reported per segment as `optimizer_hashes`.
+
+    Args:
+        model_patterns (list[dict]): The patterns the run's models are built from.
+        learner_pattern (Any): The pattern the run's learner is built from.
+        shapes (Mapping[str, Any]): The input shapes the models are traced with.
+
+    Returns:
+        str: The hexadecimal digest of the three together.
+    """
+    payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
+    return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def strategy_parser(value: str) -> Any:
+    """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one.
+
+    Args:
+        value (str): The option's raw value.
+
+    Returns:
+        Any: The preset name, or the parsed pattern.
+    """
+    return value if value.isidentifier() else path_or_any_parser(value)
+
+
 def instantiate_object(raw: Any) -> Any:
     """Instantiate an object from a raw pattern using the structcast instantiator.
 
@@ -148,11 +182,13 @@ def instantiate_object(raw: Any) -> Any:
 
 __all__ = [
     "bool_or_path_or_dict_parser",
+    "config_hash",
     "dict_parser",
     "get_module_outputs",
     "instantiate_object",
     "path_or_any_parser",
     "reduce_dict",
+    "strategy_parser",
     "tensor_shape_parser",
 ]
 

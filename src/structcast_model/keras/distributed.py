@@ -137,7 +137,7 @@ class KerasDistributedStrategy:
     _backend: str = field(default="", init=False, repr=False)
     _rules: tuple[tuple[Pattern[str], str], ...] = field(default=(), init=False, repr=False)
     _distribution: Any = field(default=None, init=False, repr=False)
-    _replicas: Any = field(default=None, init=False, repr=False)
+    _mirrored: Any = field(default=None, init=False, repr=False)
     _scope: Any = field(default=None, init=False, repr=False)
     _rank: int = field(default=0, init=False, repr=False)
     _world_size: int = field(default=1, init=False, repr=False)
@@ -209,8 +209,8 @@ class KerasDistributedStrategy:
         """How many replicas the run is spread over, whichever mechanism spreads it."""
         if self._distribution is not None:
             return int(self._distribution.num_model_replicas)
-        if self._replicas is not None:
-            return int(self._replicas.num_replicas_in_sync)
+        if self._mirrored is not None:
+            return int(self._mirrored.num_replicas_in_sync)
         return self._world_size
 
     @contextmanager
@@ -239,11 +239,11 @@ class KerasDistributedStrategy:
             return
         import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
-        self._replicas = tf.distribute.MirroredStrategy(devices=self._device_names())
+        self._mirrored = tf.distribute.MirroredStrategy(devices=self._device_names())
         # The scope object is held, not dropped: it owns the variable-creator scope it entered, and
         # letting it be collected tears that down early -- after which the models are built as plain,
         # unmirrored variables and the first step fails inside `strategy.run`.
-        self._scope = self._replicas.scope()
+        self._scope = self._mirrored.scope()
         with self._scope:
             yield
 
@@ -287,16 +287,16 @@ class KerasDistributedStrategy:
         - torch runs the step as it is -- the loader owns the rank's slice of the data -- and
           all-reduces the criteria, since each rank only ever saw its own slice.
 
-        The *gradients* are each backend's own business, and the two multi-device backends do not
-        agree: `DistributedDataParallel` averages them across ranks, while the Keras TensorFlow
-        optimizer sums the per-replica gradients (`_all_reduce_sum_gradients`, the behaviour of
-        `Model.fit` under a strategy too), so a TensorFlow `dp` run takes steps as many times larger
-        as it has replicas unless the learner's loss is scaled for it. Reproducing `fit` was
-        preferred over inventing a third convention.
+        The *gradients* are made to agree here: `dp` means the mean of the per-replica gradients on
+        every backend, which JAX gets from the sharded step and torch from
+        `DistributedDataParallel`. TensorFlow gets it from the scaling below, because the Keras
+        TensorFlow optimizer all-reduces the per-replica gradients with `ReduceOp.SUM`
+        (`_all_reduce_sum_gradients`, the behaviour of `Model.fit` under a strategy too) and an
+        unscaled run would therefore take a step as many times larger as it has replicas.
         """
         if self.preset == "single":
             return
-        if self._replicas is not None:
+        if self._mirrored is not None:
             # The adapter traced each step into a `tf.function`, and a graph applying an optimizer is
             # a synchronization point TensorFlow refuses to nest inside `strategy.run`. The traced
             # steps are therefore unwrapped back to the Python functions they were built from, and
@@ -307,6 +307,14 @@ class KerasDistributedStrategy:
                 traced = getattr(learner, name)
                 if hasattr(traced, "python_function"):
                     setattr(learner, name, traced.python_function)
+            # The loss, not the gradients: it is the one value the strategy can reach from out here,
+            # the segment's flow being what the adapter differentiates, and dividing it by the
+            # replica count turns the optimizer's SUM all-reduce into the mean of the per-replica
+            # gradients. The criteria the flow reports beside it are untouched, and still reduced
+            # with `ReduceOp.MEAN` below. `_segments` is the generated learner's, as `prepare`
+            # already treats it: a hand-written learner has none and scales its own loss.
+            for segment in getattr(learner, "_segments", ()):
+                segment.flow = _mean_flow(segment.flow, self.replicas)
         for name in ("training_step", "inference_step"):
             setattr(learner, name, self._replicated(getattr(learner, name)))
 
@@ -340,7 +348,7 @@ class KerasDistributedStrategy:
         Raises:
             ValueError: if an entry has no leading dimension, or one the replica count does not divide.
         """
-        if self._distribution is None and self._replicas is None:
+        if self._distribution is None and self._mirrored is None:
             # torch and `single`: on torch the loader hands each rank its own slice, exactly as the
             # torch training path's `DistributedSampler` does -- a strategy that split the batch here
             # would hand every rank the same data and quietly train on a fraction of the dataset.
@@ -404,7 +412,7 @@ class KerasDistributedStrategy:
 
     def _replicated(self, step: Any) -> Any:
         """Wrap one learner step so it runs across the replicas and reports reduced criteria."""
-        if self._replicas is not None:
+        if self._mirrored is not None:
             import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
             # One `tf.function` around the whole replicated call, which is what makes it legal at
@@ -413,9 +421,9 @@ class KerasDistributedStrategy:
             # `strategy.run` unless the run itself is being traced.
             @tf.function
             def replicated(batch: Mapping[str, Any]) -> dict[str, Any]:
-                criteria = self._replicas.run(step, kwargs=batch)
+                criteria = self._mirrored.run(step, kwargs=batch)
                 return {
-                    name: self._replicas.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
+                    name: self._mirrored.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
                     for name, value in criteria.items()
                 }
 
@@ -451,7 +459,7 @@ class KerasDistributedStrategy:
         if self._distribution is not None:
             return keras.distribution.distribute_tensor(tensor, self._distribution.get_data_layout(shape))
         per_replica = shape[0] // self.replicas
-        return self._replicas.experimental_distribute_values_from_function(
+        return self._mirrored.experimental_distribute_values_from_function(
             lambda context: tensor[
                 context.replica_id_in_sync_group * per_replica : (context.replica_id_in_sync_group + 1) * per_replica
             ]
@@ -540,6 +548,16 @@ class KerasDistributedStrategy:
     def _is_gpu(self) -> bool:
         """Whether the run is on accelerators, which decides the torch process-group backend."""
         return self._device_type != "cpu"
+
+
+def _mean_flow(flow: Any, replicas: int) -> Any:
+    """Return *flow* with the loss it hands the tape divided by *replicas*, its criteria untouched."""
+
+    def mean(batch: Mapping[str, Any]) -> tuple[Any, dict[str, Any]]:
+        loss, criteria = flow(batch)
+        return loss / replicas, criteria
+
+    return mean
 
 
 def _wrap_ddp(model: Any) -> Any:

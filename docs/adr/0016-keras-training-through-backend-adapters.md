@@ -54,3 +54,8 @@ reuse savings.
   adapter (or the distributed strategy driving it) before they reach the tracker — the tracker
   itself never all-reduces, unlike its torch twin, and a distributed cell that skips this reduction
   must fail its strategy tests rather than silently log per-replica values.
+- The `dp` preset applies the *mean* of the per-replica gradients on every backend, so a run's step
+  size does not depend on how many devices it was given. JAX gets that from the sharded step and
+  torch from `DistributedDataParallel`; the Keras TensorFlow optimizer all-reduces with
+  `ReduceOp.SUM`, so the strategy divides each segment's loss by the replica count before the
+  adapter differentiates it.

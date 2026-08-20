@@ -178,8 +178,8 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     assert result.exit_code == 0, result.output
     module = _load(out, "generated_keras_learner")
     assert hasattr(module, "MyLearner")
-    assert module.__mixed_precision__ is False
-    assert module.__mixed_precision_type__ is None
+    assert module.MIXED_PRECISION is False
+    assert module.MIXED_PRECISION_TYPE is None
     # The parameter reached the template: Keras accumulates inside the optimizer.
     assert "optimizer.gradient_accumulation_steps = 3" in out.read_text()
 
@@ -384,7 +384,7 @@ def test_train_records_the_backend_that_wrote_the_state(
     # pattern each segment was built from -- the learner rebuilds the optimizer, so a swapped
     # schedule is only visible through the digest the generated learner emits.
     assert len(meta["config_hash"]) == 64
-    assert meta["optimizer_hashes"] == {"optimizer": _learner_module(patterns).__optimizer_hashes__["optimizer"]}
+    assert meta["optimizer_hashes"] == {"optimizer": _learner_module(patterns).OPTIMIZER_HASHES["optimizer"]}
     assert state["grad_scalers"] == {}
     # Both halves travel, each under the name the run gave it and the paths Keras gave its
     # variables -- which the layer counter of the process decides, so only the leaves are asserted.

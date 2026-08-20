@@ -3,8 +3,6 @@
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from hashlib import sha256
-from json import dumps
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -59,11 +57,12 @@ from structcast_model.commands.shared_args import (
 )
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    config_hash,
     dict_parser,
     get_module_outputs,
     instantiate_object,
-    path_or_any_parser,
     reduce_dict,
+    strategy_parser,
 )
 
 if TYPE_CHECKING:
@@ -232,17 +231,6 @@ def _compile_parser(value: str) -> dict[str, Any] | None:
     return bool_or_path_or_dict_parser(value) or {}
 
 
-def _config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
-    """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
-
-    Recorded in the saved training state so a resumed run can be told apart from the configuration it
-    was saved from. The optimizers are not part of it: they are hashed separately, by the builder
-    that emits them, and reported per segment as `optimizer_hashes`.
-    """
-    payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
-    return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
 
@@ -263,11 +251,6 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "flax_distributed.Fl
         preset = cast('Literal["single", "dp", "fsdp"]', strategy)
         return flax_distributed.FlaxDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
-
-
-def _strategy_parser(value: str) -> Any:
-    """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one."""
-    return value if value.isidentifier() else path_or_any_parser(value)
 
 
 @dataclass(frozen=True)
@@ -378,7 +361,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     strategy_pattern: Any = Option(
         "single",
         "--strategy",
-        parser=_strategy_parser,
+        parser=strategy_parser,
         help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
         'every device, parameters replicated) or "fsdp" (the batch split and the parameters sharded too). '
         + object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
@@ -411,7 +394,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             )
         models[model_name] = factory(rngs=rngs)
     input_shapes = flax_trainer.resolve_input_shapes(models, reduce_dict(shapes)) or {}
-    config_hash = _config_hash(model_patterns, learner_pattern, input_shapes)
+    config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
     # Before the learner: an optimizer inherits the sharding of the parameters it is built over, and
     # the learner's inference views are taken from the models as they are when it is constructed.
     models = strategy.wrap(models)
@@ -457,7 +440,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             start_epoch=start_epoch,
             logger=logger,
             optimizer_hashes=optimizer_hashes,
-            config_hash=config_hash,
+            config_hash=config_digest,
         )
     trainer_type = flax_trainer.FlaxTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(
@@ -476,7 +459,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     saver = flax_trainer.FlaxTrainingStateSaver(
         logger=logger,
         strategy=strategy,
-        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": dict(optimizer_hashes)},
+        extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
     )
     bests = flax_trainer.FlaxBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy

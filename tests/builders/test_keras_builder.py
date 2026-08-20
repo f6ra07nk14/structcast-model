@@ -3,7 +3,6 @@
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
 import pytest
 from structcast.core.exceptions import SpecError
 
@@ -294,18 +293,18 @@ def test_keras_learner_never_sets_the_global_mixed_precision_policy() -> None:
 @pytest.mark.parametrize(
     ("raw_fields", "expected"),
     [
-        ({}, "__mixed_precision__ = False\n__mixed_precision_type__ = None"),
+        ({}, "MIXED_PRECISION = False\nMIXED_PRECISION_TYPE = None"),
         (
             {"MIXED_PRECISION": True, "MIXED_PRECISION_TYPE": "bfloat16"},
-            "__mixed_precision__ = True\n__mixed_precision_type__ = 'bfloat16'",
+            "MIXED_PRECISION = True\nMIXED_PRECISION_TYPE = 'bfloat16'",
         ),
         (
             {"MIXED_PRECISION": {"initial_scale": 128.0}, "MIXED_PRECISION_TYPE": "float16"},
-            "__mixed_precision__ = {'initial_scale': 128.0}\n__mixed_precision_type__ = 'float16'",
+            "MIXED_PRECISION = {'initial_scale': 128.0}\nMIXED_PRECISION_TYPE = 'float16'",
         ),
         (
             {"MIXED_PRECISION": {}, "MIXED_PRECISION_TYPE": "float16"},
-            "__mixed_precision__ = {}\n__mixed_precision_type__ = 'float16'",
+            "MIXED_PRECISION = {}\nMIXED_PRECISION_TYPE = 'float16'",
         ),
     ],
     ids=["disabled", "enabled", "keyword-arguments", "empty-keyword-arguments"],
@@ -316,9 +315,9 @@ def test_keras_learner_declares_its_mixed_precision_next_to_the_class(
     """The training CLI reads the policy off the module before it instantiates the class.
 
     It cannot ask the learner: the policy has to be set before the models the learner is built over
-    exist, so it has to be readable from the imported module alone -- as the torch learner's
-    `__grad_scaler_creator__` is. An empty mapping is emitted as it was written, because it enables
-    the policy here as it does in the adapter: only `False` disables it.
+    exist, so it has to be readable from the imported module alone -- as the flax learner's
+    `OPTIMIZER_HASHES` is, whose naming these follow. An empty mapping is emitted as it was written,
+    because it enables the policy here as it does in the adapter: only `False` disables it.
     """
     script = _built({**load_any(LEARNER_YAML), **raw_fields})
 
@@ -327,16 +326,22 @@ def test_keras_learner_declares_its_mixed_precision_next_to_the_class(
 
 
 def test_keras_learner_schema_rejects_the_torch_only_clip_field() -> None:
-    """Clipping is a keyword of the Keras optimizer, so a CLIP key would be dropped without a word.
+    """Clipping is a keyword of the Keras optimizer, so a CLIP key must be sent to the OPTIMIZER.
 
-    Nothing rejects it explicitly: the shared schema's `extra="forbid"` is the whole mechanism, and
-    this test is what keeps the Keras behavior bound to the base one (`docs/adr/0012`).
+    Rejecting it is not enough: the inherited `extra="forbid"` already does that, with a generic
+    "Extra inputs are not permitted" that leaves a reader porting a torch learner with no idea where
+    clipping went on this backend. The message therefore has to name the substitute keywords.
     """
     raw = load_any(LEARNER_YAML)
     raw["LEARNERS"][0]["CLIP"] = {"_obj_": [["_addr_", "keras.utils.clip_by_norm"]]}
 
-    with pytest.raises(ValidationError, match="CLIP"):
+    with pytest.raises(SpecError, match="CLIP has no Keras equivalent") as error:
         KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+    message = str(error.value)
+    assert "OPTIMIZER" in message
+    for keyword in ("clipnorm", "clipvalue", "global_clipnorm"):
+        assert keyword in message
 
 
 def test_keras_learner_schema_rejects_extra_backward_arguments() -> None:

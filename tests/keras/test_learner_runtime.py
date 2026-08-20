@@ -19,9 +19,9 @@ import numpy as np
 import pytest
 
 import keras
-from structcast_model.base_trainer import Learner
+from structcast_model.base_trainer import BaseInfo, Learner, SimpleDataProvider
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
-from structcast_model.keras.trainer import initial_model
+from structcast_model.keras.trainer import KerasTracker, KerasTrainer, initial_model
 from structcast_model.utils.base import load_any
 from tests import FIXTURES_DIR
 
@@ -78,6 +78,22 @@ def _values(variables: Any) -> list[np.ndarray]:
 def _moved(before: list[np.ndarray], after: list[np.ndarray]) -> float:
     """Return the largest absolute change between two reads of the same variables."""
     return max(float(np.abs(a - b).max()) for a, b in zip(before, after, strict=True))
+
+
+class _MovementRecorder:
+    """Records, per training step the trainer runs, whether the watched variables moved."""
+
+    def __init__(self, variables: Any) -> None:
+        """Read the values the first step is compared against."""
+        self.variables = variables
+        self.previous = _values(variables)
+        self.moved: list[bool] = []
+
+    def on_training_step_end(self, info: BaseInfo) -> None:
+        """Record whether the step that just ended moved the variables."""
+        current = _values(self.variables)
+        self.moved.append(_moved(self.previous, current) > 0.0)
+        self.previous = current
 
 
 def _sgd_step(model: Any, learning_rate: float) -> tuple[np.ndarray, np.ndarray]:
@@ -161,6 +177,52 @@ def test_accumulated_gradients_reach_the_optimizer_and_delay_the_update(tmp_path
     learner.training_step(**BATCH)
 
     assert _moved(before, _values(model.trainable_variables)) > 0.0
+
+
+def test_accumulated_gradients_gate_the_variables_but_not_the_update_counter(tmp_path: Path) -> None:
+    """Driven by the trainer, `ACCUMULATE_GRADIENTS: 2` moves the variables on every second step only.
+
+    The counter is the documented divergence (`docs/adr/0016`): the gate belongs to the Keras
+    optimizer, so `update()` stays true and `BaseInfo.update` counts steps rather than optimizer
+    applications -- 4 over an epoch of 4 steps, where the torch and flax learners would report 2.
+    Re-deriving the gate in the learner to make the counters agree is exactly what the ADR refuses,
+    so this pins both halves at once: the real gate is the optimizer's, the counter is not it.
+    """
+    model = _models(tmp_path)[0]
+    learner = _learner_type(tmp_path, name="gated", parameters={"DEFAULT": {"accumulate_gradients": 2}})(model)
+    recorder = _MovementRecorder(model.trainable_variables)
+    trainer = KerasTrainer(
+        learner=learner,
+        tracker=KerasTracker.from_criteria(["loss"]),
+        data=SimpleDataProvider(training_dataset=[BATCH] * 4),
+        callbacks=[recorder],
+    )
+
+    trainer.fit(epochs=1)
+
+    assert recorder.moved == [False, True, False, True]
+    assert trainer.update == 4
+
+
+def test_the_optimizer_pattern_carries_the_clipping_that_replaces_clip(tmp_path: Path) -> None:
+    """A Keras optimizer clips its own gradients, which is why the learner schema rejects `CLIP`.
+
+    The rejection only helps if the substitute it names actually arrives: the OPTIMIZER pattern is
+    emitted as written, so a builder that reformatted its keyword arguments would drop the clipping
+    silently and the guidance would send readers to a dead end (`docs/adr/0016`).
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"] = [
+        "_obj_",
+        {"_addr_": "keras.optimizers.SGD"},
+        {"_call_": {"learning_rate": 0.1, "global_clipnorm": 1.0}},
+    ]
+    KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()(tmp_path / "clipped.py")
+    model = _models(tmp_path)[0]
+
+    learner = _load(tmp_path / "clipped.py", "clipped_learner").Learner(model)
+
+    assert learner.optimizers["optimizer"].global_clipnorm == pytest.approx(1.0)
 
 
 def test_float16_mixed_precision_wraps_every_optimizer_and_still_trains(tmp_path: Path) -> None:

@@ -2,9 +2,7 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
-from hashlib import sha256
 import json
-from json import dumps
 import os
 from pathlib import Path
 import sys
@@ -50,11 +48,12 @@ from structcast_model.commands.shared_args import (
 )
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    config_hash,
     dict_parser,
     get_module_outputs,
     instantiate_object,
-    path_or_any_parser,
     reduce_dict,
+    strategy_parser,
 )
 
 if TYPE_CHECKING:
@@ -247,28 +246,17 @@ def _mixed_precision_policy(factory: Any) -> str | None:
     and gets no policy.
     """
     namespace = getattr(getattr(factory, "__init__", None), "__globals__", {})
-    raw = namespace.get("__mixed_precision__")
+    raw = namespace.get("MIXED_PRECISION")
     # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
     # included, so that a run is not loss-scaled by the adapter while computing in float32.
     enabled = raw if isinstance(raw, bool) else isinstance(raw, Mapping)
     if not enabled:
         return None
-    return f"mixed_{namespace['__mixed_precision_type__']}"
-
-
-def _config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
-    """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
-
-    Recorded in the saved training state so a resumed run can be told apart from the configuration it
-    was saved from, exactly as `cmd_flax` records it. The optimizers are not part of it: they are
-    hashed separately, by the builder that emits them, and reported per segment.
-    """
-    payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
-    return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    return f"mixed_{namespace['MIXED_PRECISION_TYPE']}"
 
 
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
-    """Return the `__optimizer_hashes__` the learner's own module declares, empty for anything else.
+    """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
 
     Read off the globals the learner's methods were defined in, as `_mixed_precision_policy` reads
     the mixed precision constants: a generated learner is loaded from a file, so its module never
@@ -276,7 +264,7 @@ def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     missing.
     """
     namespace = getattr(type(learner).__init__, "__globals__", {})
-    return cast(Mapping[str, str], namespace.get("__optimizer_hashes__") or {})
+    return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
 
 
 def _resolve_strategy(strategy: Any, device: str | None) -> "keras_distributed.KerasDistributedStrategy":
@@ -287,11 +275,6 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "keras_distributed.K
         preset = cast('Literal["single", "dp", "fsdp"]', strategy)
         return keras_distributed.KerasDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
-
-
-def _strategy_parser(value: str) -> Any:
-    """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one."""
-    return value if value.isidentifier() else path_or_any_parser(value)
 
 
 @app.command()
@@ -347,7 +330,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     strategy_pattern: Any = Option(
         "single",
         "--strategy",
-        parser=_strategy_parser,
+        parser=strategy_parser,
         help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
         'the replicas, variables replicated) or "fsdp" (the batch split and the variables sharded too). Each '
         "preset runs on the mechanism its Keras backend actually has -- keras.distribution on jax, "
@@ -398,7 +381,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
     # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
     input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
-    config_hash = _config_hash(model_patterns, learner_pattern, input_shapes)
+    config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
     # After the learner: the steps this rewires are the ones the backend adapter built in its
     # constructor, and each one runs the replicas itself rather than being traced into a scope.
     strategy.wrap_steps(learner)
@@ -427,7 +410,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             start_epoch=start_epoch,
             logger=logger,
             optimizer_hashes=optimizer_hashes,
-            config_hash=config_hash,
+            config_hash=config_digest,
             is_main=strategy.is_main,
         )
     trainer_type = keras_trainer.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
@@ -447,7 +430,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     saver = keras_trainer.KerasTrainingStateSaver(
         logger=logger,
         strategy=strategy,
-        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": dict(optimizer_hashes)},
+        extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
     )
     bests = keras_trainer.KerasBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy

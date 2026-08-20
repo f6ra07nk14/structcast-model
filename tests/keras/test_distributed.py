@@ -305,8 +305,8 @@ def load(path, name):
     spec.loader.exec_module(module)
     return module
 
-directory = sys.argv[1]
-strategy = KerasDistributedStrategy(preset="dp")
+directory, preset = sys.argv[1], sys.argv[2]
+strategy = KerasDistributedStrategy(preset=preset)
 # Before the models: MirroredStrategy mirrors only the variables created inside its scope.
 with strategy.activate():
     keras.utils.set_random_seed(0)
@@ -314,11 +314,12 @@ with strategy.activate():
     learner = load(directory + "/learner.py", "generated_learner").Learner(model=model)
 strategy.wrap_steps(learner)
 
+# The same batch either way: whole on one device, split two rows per replica under "dp".
 x = np.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.5], [-1.0, 1.0, 0.0, 1.0]], "f4")
 y = np.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]], "float32")
 kernel = np.asarray(keras.ops.convert_to_numpy(model.variables[0].value))
 bias = np.asarray(keras.ops.convert_to_numpy(model.variables[1].value))
-losses = [float(keras.ops.convert_to_numpy(learner.training_step(x=x, y=y)["loss"])) for _ in range(2)]
+losses = [float(keras.ops.convert_to_numpy(learner.training_step(x=x, y=y)["loss"])) for _ in range(3)]
 print(json.dumps({
     "replicas": strategy.replicas,
     "mirrored": type(model.variables[0].value).__name__,
@@ -327,25 +328,42 @@ print(json.dumps({
     # first step has to report if the two replicas' criteria were reduced rather than picked from.
     "expected": float(np.mean((x @ kernel + bias - y) ** 2)),
     "inference": float(keras.ops.convert_to_numpy(learner.inference_step(x=x, y=y)["loss"])),
+    "kernel": np.asarray(keras.ops.convert_to_numpy(model.variables[0].value)).tolist(),
 }))
 """
 
 
-def test_the_tensorflow_dp_preset_trains_under_mirrored_strategy(tmp_path: Path, generated: Path) -> None:
+@pytest.fixture(scope="module")
+def tensorflow_reference(tmp_path_factory: pytest.TempPathFactory, generated: Path) -> dict[str, Any]:
+    """Run the same three steps on one TensorFlow device, as the yardstick `dp` must match."""
+    directory = tmp_path_factory.mktemp("tensorflow_reference")
+    return _run(TENSORFLOW_SCRIPT, directory, str(generated), "single", backend="tensorflow")
+
+
+def test_the_tensorflow_dp_preset_trains_under_mirrored_strategy(
+    tmp_path: Path, generated: Path, tensorflow_reference: dict[str, Any]
+) -> None:
     """Two mirrored replicas train, and what they report is one reduced number.
 
     `MirroredStrategy.run` hands back a per-replica value, which the tracker would turn into a
     meaningless average of one replica's slice -- or fail on outright. The first step's loss is
     therefore compared with the whole batch's error, computed from the initial weights with numpy:
     a value reduced with `ReduceOp.MEAN` matches it, a single replica's half does not.
+
+    The remaining steps are compared with the same batch trained whole on one device, exactly as the
+    JAX presets are: `dp` means the mean of the per-replica gradients on every backend, and the
+    Keras TensorFlow optimizer all-reduces them with `ReduceOp.SUM` -- so without the strategy's
+    scaling this run would take steps twice the size and diverge from the reference by the second.
     """
-    result = _run(TENSORFLOW_SCRIPT, tmp_path, str(generated), backend="tensorflow")
+    result = _run(TENSORFLOW_SCRIPT, tmp_path, str(generated), "dp", backend="tensorflow")
 
     assert result["replicas"] == 2
     assert result["mirrored"] == "MirroredVariable"
     assert result["losses"][0] == pytest.approx(result["expected"], rel=1e-5)
     assert result["losses"][1] < result["losses"][0]
     assert result["inference"] < result["losses"][0]
+    assert result["losses"] == pytest.approx(tensorflow_reference["losses"], rel=1e-5)
+    assert np.allclose(result["kernel"], tensorflow_reference["kernel"], rtol=1e-5)
 
 
 TENSORFLOW_CLI_SCRIPT = """
