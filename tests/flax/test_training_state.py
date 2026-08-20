@@ -202,22 +202,23 @@ def test_restoring_continues_the_run_the_saved_state_left_off(
 
 
 def test_the_saved_epoch_overrides_start_epoch_and_says_so(
-    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy, capsys: pytest.CaptureFixture[str]
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Resuming into a different epoch silently would misalign every schedule the run reports."""
     learner = make_learner()
 
-    epoch = restore_training_state(
-        resume="whatever",
-        strategy=strategy,
-        models=learner.models,
-        learner=learner,
-        start_epoch=9,
-        logger=_StateLogger(_saved_state(strategy, learner)),
-    )
+    with caplog.at_level(logging.INFO, logger="structcast_model.flax.trainer"):
+        epoch = restore_training_state(
+            resume="whatever",
+            strategy=strategy,
+            models=learner.models,
+            learner=learner,
+            start_epoch=9,
+            logger=_StateLogger(_saved_state(strategy, learner)),
+        )
 
     assert epoch == 5
-    assert "Ignoring --start-epoch 9" in capsys.readouterr().out
+    assert "Ignoring --start-epoch 9" in caplog.text
 
 
 def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(

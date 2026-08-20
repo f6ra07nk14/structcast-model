@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Iterator
 from functools import partial
 import logging
 from typing import Any
@@ -11,10 +12,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from structcast_model.base_trainer import EVENTS, BaseInfo, SimpleDataProvider
+from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider
 from structcast_model.flax.trainer import (
     FlaxTracker,
     FlaxTrainer,
+    ShardedDataset,
     create_jax_inputs,
     get_jax_device,
     get_jax_devices,
@@ -258,3 +260,63 @@ def test_get_jax_device_invalid_raises() -> None:
     """get_jax_device raises ValueError for a non-existent device string."""
     with pytest.raises(ValueError, match="not available"):
         get_jax_device("nonexistent:99")
+
+
+# ---------------------------------------------------------------------------
+# ShardedDataset
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStrategy:
+    """A strategy stub whose `shard_batch` records what it placed and hands the batch back."""
+
+    def __init__(self) -> None:
+        """Start with nothing placed."""
+        self.placed: list[dict[str, Any]] = []
+
+    def shard_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Record *batch* as placed and return it unchanged."""
+        self.placed.append(batch)
+        return batch
+
+
+class _EpochDataset:
+    """A list-backed dataset that also reacts to `on_epoch_begin`, as a reshuffling sampler does."""
+
+    def __init__(self, batches: list[dict[str, Any]]) -> None:
+        """Yield *batches*, recording every epoch it is told about."""
+        self.batches = batches
+        self.epochs: list[int] = []
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """Yield every batch of one epoch."""
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        """Return the number of batches in one epoch."""
+        return len(self.batches)
+
+    def on_epoch_begin(self, info: BaseInfo[Any]) -> None:
+        """Record the epoch that is about to start."""
+        self.epochs.append(info.epoch)
+
+
+def test_sharded_dataset_places_every_epoch_and_keeps_the_dataset_visible_to_the_trainer() -> None:
+    """The wrapper sits between the loader and the trainer, so it must stay invisible to both.
+
+    A run reads it once per epoch, so an iterator consumed by the first epoch would starve every
+    later one; the size is the provider's step count, which must stay the wrapped dataset's; and the
+    trainer picks an event's participants with `isinstance` against a runtime-checkable protocol,
+    which looks attributes up statically -- a `__getattr__` forward would hide the dataset's hooks.
+    """
+    strategy = _RecordingStrategy()
+    dataset = _EpochDataset([{"x": 1}, {"x": 2}])
+
+    sharded = ShardedDataset(dataset, strategy)
+
+    assert len(sharded) == 2
+    assert [batch for _ in range(2) for batch in sharded] == [{"x": 1}, {"x": 2}, {"x": 1}, {"x": 2}]
+    assert strategy.placed == [{"x": 1}, {"x": 2}, {"x": 1}, {"x": 2}]
+    assert isinstance(sharded, OnEpochBegin)
+    sharded.on_epoch_begin(BaseInfo(epoch=3))
+    assert dataset.epochs == [3]

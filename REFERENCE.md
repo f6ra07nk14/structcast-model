@@ -650,6 +650,8 @@ no_weight_decay_mask(r"\.bias$")({"layer": {"kernel": 1.0, "bias": 2.0}})
 
 **`resolve_input_shapes(model, shapes=None)`** — The shared helper from `structcast_model.utils.base`, re-exported here: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (merged across a model mapping), otherwise `None`.
 
+**`ShardedDataset(dataset, strategy)`** — Frozen dataclass wrapping a dataset -- an iterable of batches, or a callable returning one -- so that every batch it yields is placed across *strategy*'s mesh as it is read; `len()` counts an epoch through the wrapped dataset and places nothing. The wrapped dataset's event methods are copied onto the instance in `__post_init__` rather than forwarded from `__getattr__`, because the trainer picks an event's participants with `isinstance` against a runtime-checkable protocol, and that check looks attributes up statically. `scm flax train` builds one per split and hands both to its data provider.
+
 **`FlaxTracker`** — Running mean of the criteria of one training or validation split. It sums on device as plain JAX arrays and returns Python floats — the contract `BaseTrainer.tracker`, the epoch history, the `BestCriterion` comparison, and `log_metric` all consume — reading the host once per step with a single `jax.device_get`. It implements `on_training_begin` and `on_validation_begin`, which reset the sums, so training and validation values never mix. Unlike `TorchTracker` there is no all-reduce: JAX is single-controller, so a criterion computed from a sharded batch is already the global value.
 
 ```python
@@ -668,7 +670,7 @@ saver = FlaxTrainingStateSaver(logger=logger, strategy=strategy, extra_meta={"se
 trainer = FlaxTrainer(learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
-**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, optimizer_hashes=None, config_hash=None, is_main=True)`** — Fetches the state through *logger*, loads it into the live models and optimizers through *strategy*, and returns the epoch to continue at: the saved one plus one, which overrides *start_epoch* with a printed message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). Optax rebuilds its transformation from configuration and the restore cannot see it, so a changed optimizer or a changed configuration warns rather than refuses — extending a schedule or lowering the rate of a fine-tune is legitimate.
+**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, optimizer_hashes=None, config_hash=None, is_main=True)`** — Fetches the state through *logger*, loads it into the live models and optimizers through *strategy*, and returns the epoch to continue at: the saved one plus one, which overrides *start_epoch* with a logged message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). Optax rebuilds its transformation from configuration and the restore cannot see it, so a changed optimizer or a changed configuration warns rather than refuses — extending a schedule or lowering the rate of a fine-tune is legitimate.
 
 ---
 
