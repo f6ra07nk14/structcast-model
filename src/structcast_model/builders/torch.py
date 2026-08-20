@@ -313,6 +313,18 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         return f"""\
 class {self.classname}:
+    \"\"\"Learner generated from a PyTorch learner template.
+
+    The models arrive as constructor arguments, and each optimizer segment's pure computation becomes a
+    `_flow_<optimizer>` closure bound as the attributes `flow_functions` names; a trainer that compiles them
+    rebinds each attribute to its compiled wrapper, so backward, clipping and stepping stay eager here.
+    `training_step` runs backward every call -- dividing the loss by the accumulation divisor inside the
+    backward expression -- and gates clipping, the optimizer step, `zero_grad()` and, under mixed precision,
+    the gradient scaler's unscale and update behind the `need_update` flag `update(step)` sets on the host,
+    while `inference_step` runs under `torch.no_grad()`. `outputs` names the criteria the steps return, and
+    `models`, `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`, `weight_decays` and
+    `param_group_names` expose what a trainer reads off the learner.
+    \"\"\"
 
     def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
