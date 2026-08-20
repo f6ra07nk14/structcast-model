@@ -9,6 +9,11 @@
 # Build (from the repository root):
 #   docker build -f docker/train.dockerfile -t structcast-model-train .
 #
+# The Flax/JAX variant swaps the framework extra (uv marks the torch and jax extras as
+# conflicting, so each framework gets its own image):
+#   docker build -f docker/train.dockerfile --build-arg FRAMEWORK_EXTRA=jax-cu12 \
+#     -t structcast-model-train-jax .
+#
 # Run (DGX quickstart + NCCL container guidance; keep the stack ulimit numeric — an unlimited
 # stack paradoxically shrinks NCCL's background-thread stacks and crashes communicator setup):
 #   docker run --rm -it --gpus '"device=0,1,2,3"' \
@@ -34,10 +39,11 @@ ENV UV_CACHE_DIR=/app/.cache/uv
 
 # Install dependencies only (no project): torch cu130 wheels, experiment tracking, and the dev
 # group for running the test suite on the GPUs.
+ARG FRAMEWORK_EXTRA=torch-cu130
 RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=README.md,target=README.md \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --dev --extra torch-cu130 --extra mlflow
+    uv sync --frozen --no-install-project --dev --extra ${FRAMEWORK_EXTRA} --extra mlflow
 
 ENV PATH="/app/.venv/bin:${PATH}"
 ENV PYTHONPATH=/workspace/src
