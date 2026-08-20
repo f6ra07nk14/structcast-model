@@ -1,6 +1,7 @@
 """Trainer helpers for Keras models."""
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import ml_dtypes
@@ -12,6 +13,7 @@ from pydantic import TypeAdapter, ValidationError
 from typing_extensions import Protocol, runtime_checkable
 
 import keras
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
@@ -165,7 +167,110 @@ def get_keras_device(device: str | None = None) -> str:
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
+@dataclass(kw_only=True, slots=True)
+class KerasTracker:
+    """Running mean of the criteria of one training or validation split.
+
+    The sums stay device-side tensors, so accumulating a step is one backend `add` on whichever
+    backend `keras.ops` dispatches to. The means come back as Python floats, not tensors:
+    `BaseTrainer.tracker` is typed `Callable[..., dict[str, float]]` and everything downstream --
+    the epoch history, the `BestCriterion` comparison against a float infinity, and the loggers'
+    `log_metric(value: float)` -- consumes that contract, as the torch tracker's `.item()` does.
+    `keras.ops.convert_to_numpy` is the backend-neutral host read, and it lands inside the region
+    `BaseTrainer.train` times, where the torch loop blocks on `torch.cuda.synchronize()` for the
+    same reason.
+
+    Unlike the torch tracker there is no all-reduce: a distributed step's criteria are reduced by
+    the backend adapter that ran the step, so what reaches this tracker is already one value
+    (`docs/adr/0016`).
+
+    Example:
+        >>> import keras
+        >>> from structcast_model.keras.trainer import KerasTracker
+        >>> tracker = KerasTracker.from_criteria(["loss"])
+        >>> tracker(loss=keras.ops.convert_to_tensor(1.0))
+        {'loss': 1.0}
+        >>> tracker(loss=keras.ops.convert_to_tensor(3.0))
+        {'loss': 2.0}
+        >>> tracker.reset()
+        >>> tracker.logs()
+        {}
+    """
+
+    criteria: tuple[str, ...]
+    """Names of the criteria to track; a step must report every one of them."""
+
+    sums: dict[str, Any] = field(init=False)
+    """Device-side sum of each criterion over the steps seen since the last reset."""
+
+    count: int = field(default=0, init=False)
+    """Number of steps summed since the last reset."""
+
+    def __post_init__(self) -> None:
+        """Start every criterion at a zero sum."""
+        self.reset()
+
+    def reset(self) -> None:
+        """Zero the sums and the step count."""
+        # float32 whatever the criteria are: a run under a float16 or bfloat16 policy would
+        # otherwise accumulate an epoch of steps in the reduced type and lose the small ones.
+        self.sums = {criterion: keras.ops.zeros((), dtype="float32") for criterion in self.criteria}
+        self.count = 0
+
+    def on_training_begin(self, info: BaseInfo[Any]) -> None:
+        """Reset the tracker so an epoch's training averages start empty."""
+        self.reset()
+
+    def on_validation_begin(self, info: BaseInfo[Any]) -> None:
+        """Reset the tracker so validation averages do not carry training values."""
+        self.reset()
+
+    def __call__(self, **criteria: Any) -> dict[str, float]:
+        """Add one step's criteria to the sums and return the running means."""
+        for criterion in self.criteria:
+            self.sums[criterion] = keras.ops.add(self.sums[criterion], criteria[criterion])
+        self.count += 1
+        return self.logs()
+
+    def logs(self) -> dict[str, float]:
+        """Return the running mean of each criterion, or an empty mapping before the first step."""
+        if not self.count:
+            return {}
+        return {name: float(keras.ops.convert_to_numpy(total)) / self.count for name, total in self.sums.items()}
+
+    @classmethod
+    def from_criteria(cls, outputs: Iterable[str]) -> "KerasTracker":
+        """Create a tracker for the named criteria, mirroring `TorchTracker.from_criteria`."""
+        return cls(criteria=tuple(outputs))
+
+
+@dataclass(kw_only=True)
+class KerasTrainer(BaseTrainer[Any]):
+    """Trainer for Keras models.
+
+    `BaseTrainer.sync` stays the inherited no-op: `KerasTracker.logs` converts the criteria to
+    NumPy on every step, which already waits for the step's computation on every backend, and the
+    device a run uses is chosen by the backend adapter, not by a trainer field.
+
+    The model type stays `Any`: keras ships no py.typed, so `keras.Model` is `Any` to a type
+    checker anyway.
+    """
+
+
+@dataclass(kw_only=True, slots=True)
+class KerasBestCriterion(BestCriterion[Any]):
+    """A callback tracking the best value of a criterion during training or validation for Keras models.
+
+    The twin of `structcast_model.torch.trainer.TorchBestCriterion`, duplicated rather than shared
+    because importing either module imports its framework. The `from_criteria` builder of the twins
+    also saves the best states, which needs the Keras state strategy, so it arrives with it.
+    """
+
+
 __all__ = [
+    "KerasBestCriterion",
+    "KerasTracker",
+    "KerasTrainer",
     "TensorInitializer",
     "create_keras_inputs",
     "create_numpy_inputs",
