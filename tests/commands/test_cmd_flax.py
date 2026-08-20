@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
 import json
+import logging
 from math import isfinite
 from pathlib import Path
 import subprocess
@@ -502,7 +503,7 @@ def test_train_resumes_from_a_saved_training_state(
 
 
 def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
-    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """A resumed run rebuilds `tx` from the configuration, and a changed schedule must be reported.
 
@@ -518,7 +519,7 @@ def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
     FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "faster_learner.py")
     rebuilt = (patterns[0], f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'faster_learner.py'}}}]")
 
-    with pytest.warns(UserWarning, match='optimizer of segment "optimizer" is not the one the state was saved with'):
+    with caplog.at_level(logging.WARNING):
         _train(
             cli_runner,
             rebuilt,
@@ -527,6 +528,8 @@ def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
             epochs=2,
             extra=["--resume", str(state)],
         )
+
+    assert 'optimizer of segment "optimizer" is not the one the state was saved with' in caplog.text
 
 
 # ---------------------------------------------------------------------------

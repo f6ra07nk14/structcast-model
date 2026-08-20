@@ -4,8 +4,8 @@ from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
+from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self, cast
-from warnings import warn
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     # Only for the annotations: `flax.distributed` imports this module, so importing it back here
     # at runtime would close the cycle.
     from structcast_model.flax.distributed import FlaxDistributedStrategy
+
+# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named `logger`.
+_logger = getLogger(__name__)
 
 DTYPES = {
     "float32": jax.numpy.float32,
@@ -340,16 +343,15 @@ def restore_training_state(
     saved_hashes = meta.get("optimizer_hashes", {})
     for segment, digest in (optimizer_hashes or {}).items():
         if segment in saved_hashes and saved_hashes[segment] != digest:
-            warn(
-                f'The optimizer of segment "{segment}" is not the one the state was saved with: optax rebuilds '
+            _logger.warning(
+                'The optimizer of segment "%s" is not the one the state was saved with: optax rebuilds '
                 "it from the configuration, so the run continues with the new one from the saved step count.",
-                stacklevel=2,
+                segment,
             )
     if config_hash is not None and meta.get("config_hash", config_hash) != config_hash:
-        warn(
+        _logger.warning(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
-            "are restored into whatever the current one built, wherever the two still line up.",
-            stacklevel=2,
+            "are restored into whatever the current one built, wherever the two still line up."
         )
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:

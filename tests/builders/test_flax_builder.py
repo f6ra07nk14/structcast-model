@@ -1,6 +1,7 @@
 """API-level tests for flax builder classes."""
 
 from collections import defaultdict
+import logging
 from pathlib import Path
 from re import findall, search
 from typing import Any
@@ -459,14 +460,15 @@ def test_flax_learner_keeps_a_hand_bound_wrt() -> None:
     assert "wrt=flax.nnx.Param, **_kw0))(model)" in script
 
 
-def test_flax_learner_warns_when_the_learning_rate_cannot_be_reported() -> None:
+def test_flax_learner_warns_when_the_learning_rate_cannot_be_reported(caplog: pytest.LogCaptureFixture) -> None:
     """A rate the rewrite cannot find is reported as NaN for the whole run, which has to be said out loud."""
     raw = load_any(LEARNER_YAML)
     raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]
 
-    with pytest.warns(UserWarning, match="reports no learning rate"):
+    with caplog.at_level(logging.WARNING):
         script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
 
+    assert "reports no learning rate" in caplog.text
     assert "inject_hyperparams" not in script
 
 

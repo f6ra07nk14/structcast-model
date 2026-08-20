@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from importlib.util import module_from_spec, spec_from_file_location
+import logging
 from pathlib import Path
 from typing import Any
-from warnings import catch_warnings, simplefilter
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +47,15 @@ def _clear_mesh() -> Any:
     """
     yield
     jax.set_mesh(None)
+
+
+def _logged_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the warnings this package logged, ignoring whatever jax, optax or mlflow logged."""
+    return [
+        record.message
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and record.name.startswith("structcast_model")
+    ]
 
 
 def _load(path: Path, name: str) -> Any:
@@ -212,7 +221,7 @@ def test_the_saved_epoch_overrides_start_epoch_and_says_so(
 
 
 def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(
-    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A rebuilt optimizer must be reported, not accepted in silence.
 
@@ -222,7 +231,7 @@ def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(
     learner = make_learner()
     state = _saved_state(strategy, learner, optimizer_hashes={"optimizer": "saved-digest"})
 
-    with pytest.warns(UserWarning, match='segment "optimizer"'):
+    with caplog.at_level(logging.WARNING):
         restore_training_state(
             resume="whatever",
             strategy=strategy,
@@ -233,9 +242,11 @@ def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(
             optimizer_hashes={"optimizer": "rebuilt-digest"},
         )
 
+    assert 'segment "optimizer"' in caplog.text
+
 
 def test_a_state_saved_from_another_configuration_warns(
-    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Restoring arrays into another model, learner or shape configuration must be reported.
 
@@ -257,26 +268,32 @@ def test_a_state_saved_from_another_configuration_warns(
             config_hash=config_hash,
         )
 
-    with pytest.warns(UserWarning, match="different model, learner or shape configuration"):
+    with caplog.at_level(logging.WARNING):
         _restore("rebuilt-digest")
 
-    with catch_warnings():
-        simplefilter("error")
+    assert "different model, learner or shape configuration" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
         _restore("saved-digest")
+
+    assert _logged_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
     "hashes", [None, {"optimizer": "saved-digest"}], ids=["state-without-hashes", "matching-hashes"]
 )
 def test_an_unchanged_optimizer_resumes_without_a_warning(
-    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy, hashes: dict[str, str] | None
+    make_learner: Callable[..., Any],
+    strategy: FlaxDistributedStrategy,
+    hashes: dict[str, str] | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """States written before the hashes existed, and runs that changed nothing, must stay quiet."""
     learner = make_learner()
     state = _saved_state(strategy, learner, **({} if hashes is None else {"optimizer_hashes": hashes}))
 
-    with catch_warnings():
-        simplefilter("error")
+    with caplog.at_level(logging.WARNING):
         restore_training_state(
             resume="whatever",
             strategy=strategy,
@@ -286,3 +303,5 @@ def test_an_unchanged_optimizer_resumes_without_a_warning(
             logger=_StateLogger(state),
             optimizer_hashes={"optimizer": "saved-digest"},
         )
+
+    assert _logged_warnings(caplog) == []
