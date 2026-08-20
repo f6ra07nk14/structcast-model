@@ -41,7 +41,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from structcast_model.torch import distributed, layers, optimizers, trainer, types, utils
+    from structcast_model.torch import layers
     from structcast_model.torch.distributed import (
         DistributedDataParallelStrategy,
         DistributedStrategy,

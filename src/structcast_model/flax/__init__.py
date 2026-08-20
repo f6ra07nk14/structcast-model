@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from structcast_model.flax import distributed, layers, optimizers, trainer
+    from structcast_model.flax import layers
     from structcast_model.flax.distributed import AXIS, PRESET_RULES, TACTICS, FlaxDistributedStrategy
     from structcast_model.flax.optimizers import get_learning_rate, no_weight_decay_mask, unwrap_variables
     from structcast_model.flax.trainer import (

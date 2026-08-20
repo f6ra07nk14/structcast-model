@@ -17,7 +17,6 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from structcast_model.loggers import base, mlflow, state_backends, wandb
     from structcast_model.loggers.base import Logger, NullLogger
     from structcast_model.loggers.mlflow import MLflowLogger
     from structcast_model.loggers.state_backends import FlaxStateBackend, StateBackend, TorchStateBackend
