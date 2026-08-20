@@ -101,8 +101,7 @@ train_device = Option(
     help='Device the run is checked against, named as returned by "keras.distribution.list_devices()", e.g. '
     '"cpu:0" or "gpu:0"; an unavailable name aborts and the first listed device is used when omitted. It places '
     "nothing: which devices a Keras backend computes on is the backend's own choice (restrict it with "
-    "CUDA_VISIBLE_DEVICES), so the name is validated and recorded with the run. Spanning several devices is a "
-    "distributed strategy, which this command does not have yet.",
+    "CUDA_VISIBLE_DEVICES), so the name is validated and recorded with the run.",
 )
 backend_option = Option(
     ...,

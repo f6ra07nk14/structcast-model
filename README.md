@@ -2,7 +2,7 @@
 
 StructCast-Model is a configuration-driven toolkit that generates [PyTorch](https://pytorch.org/), [Flax (JAX)](https://flax.readthedocs.io/en/stable/), and [Keras](https://keras.io/) models — plus PyTorch training workflows — from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
 
-Model code generation, training workflow generation and the full training CLI are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`); Keras training is single-device only, pending distribution and resume (see [Roadmap](#roadmap)).
+Model code generation, training workflow generation and the full training CLI are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`); a Keras run names the backend it executes on with `--backend`.
 
 ## Table of Contents
 
@@ -28,6 +28,7 @@ Model code generation, training workflow generation and the full training CLI ar
         - [Dataset Configuration](#dataset-configuration)
         - [Distributed Training Notes](#distributed-training-notes)
     - [7. Train a Flax Model](#7-train-a-flax-model)
+    - [8. Train a Keras Model](#8-train-a-keras-model)
   - [Training Loop Anatomy](#training-loop-anatomy)
   - [Configuration Examples](#configuration-examples)
     - [PyTorch](#pytorch)
@@ -130,7 +131,8 @@ structcast-model/
 │   │   ├── models/        # Flax model architecture templates
 │   │   └── strategies/    # device-mesh strategy patterns for `scm flax train`
 │   └── keras/
-│       └── models/        # Keras model architecture templates
+│       ├── models/        # Keras model architecture templates
+│       └── strategies/    # distributed strategy patterns for `scm keras train`
 ├── examples/
 │   └── torch/         # runnable training tutorial and optimizer compositions
 ├── src/structcast_model/
@@ -138,7 +140,7 @@ structcast-model/
 │   ├── commands/      # Typer CLI entry points
 │   ├── torch/         # trainer, layers, optimizer helpers
 │   ├── flax/          # trainer, distributed strategy, layers, optimizer helpers
-│   ├── keras/         # Keras layers and inference utilities
+│   ├── keras/         # trainer, backend adapters, distributed strategy, layers
 │   ├── loggers/       # experiment-tracking loggers and training-state backends
 │   ├── utils/         # shared helpers
 │   └── base_trainer.py
@@ -152,12 +154,12 @@ The main package areas are:
 - **`commands/`** — Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)) with `torch`, `flax`, and `keras` sub-commands.
 - **`torch/`** — Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers.
 - **`flax/`** — Runtime for Flax runs: the trainer and its tracker, the device-mesh strategy, optimizer-state helpers, Flax-specific layers (e.g. `GlobalResponseNorm`), and JAX inference helpers.
-- **`keras/`** — Keras-specific layers (e.g. `GlobalResponseNormalization`) and backend-agnostic inference helpers.
+- **`keras/`** — Runtime for Keras runs: the trainer and its tracker, the per-backend adapters the training step runs through, the distributed strategy, Keras-specific layers (e.g. `GlobalResponseNormalization`), and backend-agnostic inference helpers.
 - **`loggers/`** — The MLflow and Weights & Biases loggers owning a run, and the state backends deciding what a saved training state looks like on disk.
 - **`cfg/torch/`** — Declarative source of truth: YAML templates for PyTorch models, learners, datasets, and runtime presets.
 - **`examples/torch/`** — Runnable example code: a programmatic training tutorial, and optimizer + scheduler compositions that templates reference by file path.
 - **`cfg/flax/`** — YAML templates for Flax models, learners, and device-mesh strategies.
-- **`cfg/keras/`** — YAML templates for Keras model architectures.
+- **`cfg/keras/`** — YAML templates for Keras models and distributed strategies.
 
 ## Core Workflow
 
@@ -333,6 +335,14 @@ scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 > ```
 >
 > It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys: `CLIP` and `MIXED_PRECISION` are rejected, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER` and precision is a model-construction property. `ACCUMULATE_GRADIENTS` stays. The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol and adds `outputs` and `flow_functions` — the module-level step functions a trainer compiles — but no `grad_scalers`, `weight_decays`, or `param_group_names`.
+
+> **Keras** — `scm keras create learner` generates a backend-neutral learner class from the same schema:
+>
+> ```bash
+> scm keras create learner learner.yaml -o learner.py
+> ```
+>
+> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options, and no `--backend`: nothing it runs imports Keras, so the generated file is the same on all three backends and the backend is chosen when it is trained. `CLIP` is rejected — clipping is a keyword argument of the Keras optimizer written inside `OPTIMIZER` — while `ACCUMULATE_GRADIENTS` stays and `MIXED_PRECISION` turns on a global [`keras.mixed_precision`](https://keras.io/api/mixed_precision/) policy of `MIXED_PRECISION_TYPE` (`float16` loss-scales the optimizer, `bfloat16` does not). The [Keras configuration example](#keras) below shows the shape of a template.
 
 ### 4. Inspect FLOPs and Parameters
 
@@ -632,6 +642,45 @@ What the command does internally:
 6. Creates the `FlaxTrainer` with a `FlaxTracker` over the criterion names, then appends a `ProgressBar` (a `Printer` under `--ci`), the logger, a `FlaxTrainingStateSaver`, and one `FlaxBestCriterion` per monitored criterion — and prints the resulting routing.
 7. Runs `fit()` inside the logger's run context, recording the metrics, the arguments, the per-epoch training state, and the best checkpoints.
 
+### 8. Train a Keras Model
+
+`scm keras train` is the Keras counterpart of `scm torch train`. It reuses the same trainer, callbacks, and loggers, and differs where Keras differs: the run names the backend it executes on, and what a strategy can do follows from that choice.
+
+```bash
+# 1. Generate the model and the learner classes
+scm keras create model cfg/keras/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm keras create learner learner.yaml -o learner.py
+
+# 2. Train
+scm keras train \
+    'model: [_obj_, {_addr_: Model, _file_: model.py}, _call_]' \
+    --backend jax \
+    -s 'image: [224, 224, 3]' \
+    -L '[_obj_, {_addr_: Learner, _file_: learner.py}]' \
+    -e 5 \
+    --training-dataset '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: train}}]' \
+    -V '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: validation}}]' \
+    -f 1 \
+    -LC ce_loss \
+    -LC val_ce_loss \
+    -HC acc1 \
+    -HC val_acc1 \
+    -SC val_acc1 \
+    --strategy cfg/keras/strategies/dp.yaml \
+    --logger mlflow \
+    -E Test
+```
+
+As with Flax, the repository ships no Keras dataset template — `my_data.py` stands for your own code, and any iterable of `{input_name: array}` batches works.
+
+Where it differs from `scm torch train`:
+
+- `--backend`: required, `tensorflow`, `jax`, or `torch`. Keras resolves its backend once, while it is first imported, so the command sets `KERAS_BACKEND` before importing anything that would; if Keras is already running on another backend it refuses rather than pretending to switch
+- `-s/--shape`: channel-last, and used to trace each model into existence; when omitted, every model is traced with the `INPUT_SHAPES` it declares itself
+- `--strategy`: the preset name `single`, `dp`, or `fsdp`, or an object pattern — the templates under [`cfg/keras/strategies/`](cfg/keras/strategies/) bind the remaining knobs. `dp` runs on each backend's own data parallelism (`keras.distribution` on JAX, `tf.distribute.MirroredStrategy` on TensorFlow, `DistributedDataParallel` under `torchrun` on torch), while `fsdp` is refused anywhere but JAX instead of silently replicating
+- `-d/--device`: named as `keras.distribution.list_devices()` spells it (`cpu:0`, `gpu:0`, …), it places nothing — which devices a backend computes on is the backend's own choice (restrict it with `CUDA_VISIBLE_DEVICES`) — so the name is validated and recorded with the run
+- training states are saved as `training_state.npz`, tagged with the backend that wrote them: `--resume` continues at the saved epoch plus one and refuses a state written on another backend, since normalization statistics and RNG trajectories are not verified equivalent across backends
+
 ## Training Loop Anatomy
 
 Whether it is built by the CLI or by hand, a training run is the same five objects handed to a trainer at construction:
@@ -812,6 +861,39 @@ _obj_:
 - runs on any [Keras backend](https://keras.io/getting_started/#configuring-your-backend) (JAX, PyTorch, or TensorFlow)
 - uses `keras.layers.Add` for residual connections instead of `"eval: inp + feat"` expressions
 
+**Learner templates** — The repository ships no Keras learner template yet; the schema is the shared one, written against Keras objects. A single-segment learner over a model taking `x` and returning `y`, against a label `target`, is:
+
+```yaml
+INPUTS: [x, target]
+OUTPUTS: [loss]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: loss
+    TRAINABLE_LAYERS: [model]
+    OPTIMIZER: [_obj_, {_addr_: keras.optimizers.SGD}, {_call_: {learning_rate: 0.1}}]
+    FLOW:
+      - INPUTS: x
+        OUTPUTS: {prediction: y}
+        NAME: model
+      - INPUTS: {y_true: target, y_pred: prediction}
+        OUTPUTS: errors
+        NAME: mse
+        LAYER: [_obj_, {_addr_: keras.losses.mean_squared_error}]
+      - ["eval: keras.ops.mean(errors)", loss, null]
+    INFERENCE_FLOW:
+      - INPUTS: x
+        OUTPUTS: {prediction: y}
+        NAME: model
+      - [{y_true: target, y_pred: prediction}, errors, mse]
+      - ["eval: keras.ops.mean(errors)", loss, null]
+```
+
+The model step is written in the mapping form, as in the Flax template above, because `scm keras create model` returns the outputs as a dict by default: `OUTPUTS: {prediction: y}` binds the model's `y` output to `prediction`. A model generated with `--no-structured-output` returns the value positionally and takes the short form `- [x, prediction, model]` instead.
+
+The `OPTIMIZER` pattern builds a [`keras.optimizers.Optimizer`](https://keras.io/api/optimizers/) — gradient clipping is one of its keyword arguments, which is why there is no `CLIP` key — and the criteria are `"eval: ..."` expressions over the model output, written with [`keras.ops`](https://keras.io/api/ops/) so the same template runs on every backend.
+
+**[`cfg/keras/strategies/`](cfg/keras/strategies/)** — Object patterns for `--strategy`, binding a `KerasDistributedStrategy` preset: [`dp.yaml`](cfg/keras/strategies/dp.yaml) replicates the variables and splits each batch across the replicas, [`fsdp.yaml`](cfg/keras/strategies/fsdp.yaml) additionally shards the variables along their leading dimension, leaving the ones the device count cannot divide replicated — and is available on the JAX backend alone.
+
 ## Development
 
 Set up the development environment with:
@@ -883,4 +965,4 @@ The following breaking changes were introduced by the learner-template restructu
 - [x] JAX (Flax) model construction from YAML configuration files
 - [x] JAX (Flax) training workflow generation from YAML configuration files
 - [x] Keras model construction from YAML configuration files
-- [x] Keras training workflow generation from YAML configuration files (single-device; distribution and resume pending)
+- [x] Keras training workflow generation from YAML configuration files
