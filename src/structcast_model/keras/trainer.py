@@ -3,6 +3,7 @@
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self, cast
+from warnings import warn
 
 import ml_dtypes
 import numpy as np
@@ -304,6 +305,127 @@ def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] 
     }
 
 
+def apply_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any], states: Mapping[str, Any]) -> None:
+    """Assign a state :func:`collect_state_dict` produced back into live variables, by path.
+
+    The inverse of the read, and the only writer: every variable of every named model and optimizer
+    is looked up under the segments of its own `variable.path` and assigned the saved value. Nothing
+    is created, so the optimizers must already be built -- the backend adapter builds them while the
+    learner is constructed, before a resume can reach them.
+
+    Args:
+        models (Mapping[str, Any]): The live models to restore into, by name.
+        optimizers (Mapping[str, Any]): The live optimizers to restore into, by name.
+        states (Mapping[str, Any]): A payload holding the `models` and `optimizers` halves.
+
+    Raises:
+        ValueError: If the state holds no entry for a live model, optimizer or variable.
+    """
+    for kind, live in (("model", models), ("optimizer", optimizers)):
+        saved = states.get(f"{kind}s", {})
+        for name, holder in live.items():
+            if name not in saved:
+                raise ValueError(
+                    f'The training state carries no {kind} named "{name}", only {sorted(saved)}: it was saved '
+                    "from a different configuration."
+                )
+            _assign_variable_tree(holder.variables, saved[name], f'{kind} "{name}"')
+
+
+def _assign_variable_tree(variables: Iterable[Any], tree: Mapping[str, Any], owner: str) -> None:
+    """Assign each variable the value nested under the segments of its path.
+
+    Raises:
+        ValueError: If the tree holds no value for one of the variables.
+    """
+    for variable in variables:
+        branch: Any = tree
+        for part in variable.path.split("/"):
+            if not isinstance(branch, Mapping) or part not in branch:
+                raise ValueError(
+                    f'The training state holds no value for {owner} variable "{variable.path}": it was saved '
+                    "from a different configuration."
+                )
+            branch = branch[part]
+        variable.assign(branch)
+
+
+def restore_training_state(
+    *,
+    resume: str,
+    strategy: Any,
+    models: Mapping[str, Any],
+    learner: Any,
+    start_epoch: int,
+    logger: Logger,
+    optimizer_hashes: Mapping[str, str] | None = None,
+    config_hash: str | None = None,
+    is_main: bool = True,
+) -> int:
+    """Load the resumed state into the models and optimizers, and return the epoch to continue at.
+
+    The saved epoch wins over *start_epoch*, as in the torch and Flax loaders (`docs/adr/0005`).
+    Three things are checked against the state, and only one of them refuses the run:
+
+    - The Keras backend it was written on. Normalization statistics and RNG trajectories are not
+      verified equivalent across backends, so a state from another one is refused rather than
+      silently continued (`docs/adr/0016`). It is checked before anything is assigned, so a refused
+      resume leaves the freshly built run untouched.
+    - The optimizer patterns, which the learner rebuilt from configuration: a schedule swapped
+      between save and resume would continue the new schedule from the old step count. That warns
+      rather than refuses -- extending a schedule or lowering a fine-tune's rate is legitimate.
+    - The configuration digest of what the run trains, which warns for the same reason.
+
+    Args:
+        resume (str): The training state reference, in whatever form *logger* accepts.
+        strategy (Any): The strategy loading the state into the live variables.
+        models (Mapping[str, Any]): The live models to restore into.
+        learner (Any): The learner owning the optimizers to restore into.
+        start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
+        logger (Logger): The logger the state is fetched through.
+        optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
+        config_hash (str | None): Digest of what this run trains, compared with the saved one.
+        is_main (bool): Whether this process prints the override message.
+
+    Returns:
+        int: The epoch to continue at: the saved one plus one.
+
+    Raises:
+        ValueError: If the state was saved on another Keras backend.
+    """
+    saved = logger.fetch_training_state(resume)
+    backend = keras.backend.backend()
+    written = (saved or {}).get("meta", {}).get("backend")
+    if written is not None and written != backend:
+        raise ValueError(
+            f'The training state was saved on the "{written}" Keras backend and this run is on "{backend}". '
+            "Normalization statistics and RNG trajectories are not verified equivalent across the Keras "
+            f"backends, so the run would silently continue from something else: resume it with --backend "
+            f"{written}, or start it from scratch."
+        )
+    state = strategy.load_state_dict(models, learner.optimizers, learner.optimizer_models, saved)
+    meta = state["meta"]
+    saved_hashes = meta.get("optimizer_hashes", {})
+    for segment, digest in (optimizer_hashes or {}).items():
+        if segment in saved_hashes and saved_hashes[segment] != digest:
+            warn(
+                f'The optimizer of segment "{segment}" is not the one the state was saved with: the learner '
+                "rebuilds it from the configuration, so the run continues with the new one from the saved "
+                "step count.",
+                stacklevel=2,
+            )
+    if config_hash is not None and meta.get("config_hash", config_hash) != config_hash:
+        warn(
+            "The state was saved from a different model, learner or shape configuration: the arrays it holds "
+            "are restored into whatever the current one built, wherever the two still line up.",
+            stacklevel=2,
+        )
+    resumed_epoch = int(meta["epoch"]) + 1
+    if start_epoch != 1 and is_main:
+        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+    return resumed_epoch
+
+
 def _variable_tree(variables: Iterable[Any]) -> dict[str, Any]:
     """Nest the host-side value of each variable under the segments of its path."""
     tree: dict[str, Any] = {}
@@ -312,7 +434,14 @@ def _variable_tree(variables: Iterable[Any]) -> dict[str, Any]:
         branch = tree
         for part in parents:
             branch = branch.setdefault(part, {})
-        branch[leaf] = np.asarray(keras.ops.convert_to_numpy(variable.value))
+        value = variable.value
+        # Through `read_value` where the backend variable has one: under `tf.distribute` an
+        # optimizer counter is a `MirroredVariable` aggregated ONLY_FIRST_REPLICA, which refuses to
+        # become an array at all ("object __array__ method not producing an array") and hands back
+        # its primary copy through this call. A plain TensorFlow variable reads the same way, and
+        # the JAX and torch backends have no such method.
+        raw = value.read_value() if hasattr(value, "read_value") else value
+        branch[leaf] = np.asarray(keras.ops.convert_to_numpy(raw))
     return tree
 
 
@@ -331,19 +460,21 @@ class KerasBestCriterion(BestCriterion[Any]):
         lower_criteria: Sequence[str],
         save_criteria: Collection[str],
         logger: Logger,
+        strategy: Any,
     ) -> list[Self]:
         """Build one monitor per criterion, each logging its best value through *logger*.
 
-        Criteria named in *save_criteria* also save the model states that reached the best value.
+        Criteria named in *save_criteria* also save the model states that reached the best value,
+        produced through *strategy*.
         """
         monitors: list[Self] = []
         for target in higher_criteria:
             best = cls(target=target, mode="max")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         for target in lower_criteria:
             best = cls(target=target, mode="min")
-            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria, strategy=strategy))
             monitors.append(best)
         return monitors
 
@@ -358,6 +489,9 @@ class _BestLogger:
     save: bool
     """Whether to also save the model states that reached the best value."""
 
+    strategy: Any
+    """The strategy producing the model states to save."""
+
     def on_best(self, info: BaseInfo[Any], best: BestCriterion[Any]) -> None:
         """Log the best value, and save the states of the info's models when this epoch reached it."""
         name = f"best_{best.target}"
@@ -365,7 +499,7 @@ class _BestLogger:
         if self.save and info.step == best.step:
             # The models alone, as the torch and flax twins save: best-value weights are for
             # inference, so they carry no optimizer state, no counters and no wrapper key.
-            self.logger.log_state_dict(collect_state_dict(dict(info.models))["models"], name)
+            self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -381,13 +515,16 @@ class KerasTrainingStateSaver:
     logger: Logger
     """The logger the training-state artifacts are written through."""
 
+    strategy: Any
+    """The strategy producing the model and optimizer states to save."""
+
     extra_meta: Mapping[str, Any] = field(default_factory=dict)
     """Run facts the loop does not know, recorded next to the counters, e.g. the run seed."""
 
     def on_epoch_end(self, info: BaseInfo[Any]) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("KerasTrainer", info).learner
-        states = collect_state_dict(dict(info.models), learner.optimizers)
+        states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states["grad_scalers"] = {}
         states["meta"] = {
             "epoch": info.epoch,
@@ -407,12 +544,14 @@ __all__ = [
     "KerasTrainer",
     "KerasTrainingStateSaver",
     "TensorInitializer",
+    "apply_state_dict",
     "collect_state_dict",
     "create_keras_inputs",
     "create_numpy_inputs",
     "get_keras_device",
     "initial_model",
     "resolve_input_shapes",
+    "restore_training_state",
 ]
 
 

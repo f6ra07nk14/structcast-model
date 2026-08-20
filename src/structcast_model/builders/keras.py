@@ -1,5 +1,6 @@
 """Builder for Keras models."""
 
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
@@ -7,12 +8,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 from pydantic import field_validator, model_validator
 from structcast.core.exceptions import SpecError
 
+from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.base import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
     LearnerIntermediate,
     OptimizerSegment,
+    optimizer_hash,
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import statement_names, stored_names
@@ -176,7 +179,15 @@ class KerasTemplateLearner(Template[KerasUserDefinedLearner]):
     target_type: ClassVar[type[KerasUserDefinedLearner]] = KerasUserDefinedLearner
 
 
-class KerasLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
+@dataclass(kw_only=True, slots=True)
+class KerasOptimizerSegment(OptimizerSegment):
+    """One optimizer step of a Keras learner flow, carrying the digest of the pattern that built it."""
+
+    optimizer_hash: str
+    """The digest of the segment's `OPTIMIZER` pattern, emitted as `__optimizer_hashes__`."""
+
+
+class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     """Intermediate representation of a Keras learner.
 
     Every backend-specific mechanic -- how the loss is differentiated, how the optimizer is applied,
@@ -203,9 +214,9 @@ class KerasLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
     """Default imports for Keras learners; the generated learner calls these directly."""
 
     @cached_property
-    def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], OptimizerSegment]]:
+    def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], KerasOptimizerSegment]]:
         """Split the training flow into the (flow steps, optimizer segment) pairs to emit in order."""
-        segments: list[tuple[list[tuple[str, str, str | None]], OptimizerSegment]] = []
+        segments: list[tuple[list[tuple[str, str, str | None]], KerasOptimizerSegment]] = []
         units: list[tuple[str, str, str | None]] = []
         for unit in self.flow:
             if isinstance(unit, OptimizerSegment):
@@ -337,12 +348,16 @@ class KerasLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
         body.append(f"self.inputs = {self.inputs}")
         body.append(f"self.outputs = {self.outputs}")
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
+        hashes = ", ".join(f"{s.optimizer!r}: {s.optimizer_hash!r}" for _, s in self._segments)
         return f"""\
 # Read by the training CLI after this module is imported and before the class below is
 # instantiated: the `keras.mixed_precision` global policy has to be in place before the models the
 # learner receives are built (`docs/adr/0016`).
 __mixed_precision__ = {self.mixed_precision!r}
 __mixed_precision_type__ = {self.mixed_precision_type!r}
+# Read by the training CLI when a run resumes: the digest of each segment's OPTIMIZER pattern, so a
+# state saved under another optimizer is reported instead of silently continued (`docs/adr/0015`).
+__optimizer_hashes__ = {{{hashes}}}
 
 
 class {self.classname}:
@@ -397,6 +412,10 @@ class {self.classname}:
         return {{{optimizer_models}}}
 
     @property
+    def flow_functions(self):
+        return {{"_training_step": self._training_step, "_inference_step": self._inference_step}}
+
+    @property
     def learning_rates(self):
         return {{k: float(keras.ops.convert_to_numpy(v.learning_rate)) for k, v in self._optimizers.items()}}
 """
@@ -419,6 +438,28 @@ class KerasLearnerBuilder(BaseLearnerBuilder[KerasLearnerIntermediate]):
         """Get the framework-specific fields of the built learner intermediate."""
         return {"mixed_precision": module.MIXED_PRECISION, "mixed_precision_type": module.MIXED_PRECISION_TYPE}
 
+    def _build_segment(  # noqa: PLR0913, PLR0917  # The base signature, narrowed to the Keras schema.
+        self,
+        imports: defaultdict[str, set[str | None]],
+        module: Any,
+        learner: LearnerBehavior,
+        opt_name: str,
+        naming: AutoName,
+        layers: dict[str, LayerIntermediate | str],
+        others: dict[str, str],
+    ) -> KerasOptimizerSegment:
+        """Build the segment, recording the digest of the optimizer pattern it was built from."""
+        # Named base rather than a zero-argument `super()`: `slots=True` rebuilds the class, and on
+        # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
+        # discarded one, so `super()` raises here, exactly as in the Flax builder.
+        base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
+        return KerasOptimizerSegment(
+            loss=base.loss,
+            optimizer=base.optimizer,
+            trainable_layers=base.trainable_layers,
+            optimizer_hash=optimizer_hash(learner.OPTIMIZER),
+        )
+
 
 __all__ = [
     "KerasBuilder",
@@ -426,6 +467,7 @@ __all__ = [
     "KerasLearnerBehavior",
     "KerasLearnerBuilder",
     "KerasLearnerIntermediate",
+    "KerasOptimizerSegment",
     "KerasTemplateLearner",
     "KerasUserDefinedLearner",
 ]

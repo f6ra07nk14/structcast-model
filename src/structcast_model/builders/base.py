@@ -119,6 +119,27 @@ def _hash(raw: Any) -> str:
     return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
 
 
+def optimizer_hash(optimizer: ObjectPattern) -> str:
+    """Return the digest identifying one `OPTIMIZER` pattern, as it was written.
+
+    Recorded in the generated learner and in the training state so a resume can report an optimizer
+    that was rebuilt from a different configuration (`docs/adr/0015`): the learner builds the
+    optimizer from the pattern and the restored state cannot see it, so a swapped schedule would
+    otherwise continue silently from the old step count. Framework-neutral -- it hashes the
+    validated pattern and nothing else -- so the Flax and Keras builders emit comparable digests;
+    on the Flax side the pattern is hashed before `inject_learning_rate` rewrites it, so turning the
+    injection on or off never moves the digest.
+
+    Args:
+        optimizer (ObjectPattern): The validated `OPTIMIZER` pattern of one learner behavior.
+
+    Returns:
+        str: The hex SHA-256 of the pattern's canonical JSON dump.
+    """
+    dumped = optimizer.model_dump(by_alias=True)
+    return sha256(json_dumps(dumped, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 _input_shapes_adapter = TypeAdapter(dict[str, TensorSpecTree])
 """Adapter dumping `INPUT_SHAPES` back to the plain nested data emitted in the generated script."""
 
@@ -712,6 +733,7 @@ __all__ = [
     "LayerIntermediate",
     "LearnerIntermediate",
     "OptimizerSegment",
+    "optimizer_hash",
 ]
 
 if not TYPE_CHECKING:

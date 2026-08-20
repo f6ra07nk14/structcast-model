@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from importlib.util import module_from_spec, spec_from_file_location
 import inspect
 from math import isfinite
@@ -264,7 +265,13 @@ def _train(
     extra: list[str] | None = None,
     shape: str | None = "x: [4]",
 ) -> Any:
-    """Run `train` over the generated fixture, recording to an MLflow store under *tmp_path*."""
+    """Run `train` over the generated fixture, recording to an MLflow store under *tmp_path*.
+
+    The Keras session is cleared first, because a run is a fresh process everywhere but here: layer
+    names carry a per-process counter, and a state saved by one run only restores into another whose
+    variables are named the same way.
+    """
+    keras.backend.clear_session()
     mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
     model_pattern, learner_pattern = patterns
     result = cli_runner.invoke(
@@ -340,6 +347,11 @@ def test_train_records_the_shapes_the_models_declared_when_none_are_given(
     assert load_any(arguments)["shapes"] == {"x": [4]}
 
 
+def _learner_module(patterns: tuple[str, str]) -> ModuleType:
+    """Load the generated learner module the *patterns* fixture wrote, to read its constants."""
+    return _load(Path(patterns[1].split("_file_: ", 1)[1].rstrip("}]")), "generated_learner_constants")
+
+
 def _leaf_names(tree: Any) -> list[str]:
     """Return the name of every array in a path-keyed state tree, whatever Keras named the layers."""
     names: list[str] = []
@@ -360,7 +372,19 @@ def test_train_records_the_backend_that_wrote_the_state(
 
     (saved,) = (tmp_path / "mlruns").rglob("training_state.npz")
     state = KerasStateBackend().load(saved)
-    assert state["meta"] == {"epoch": 1, "step": 3, "update": 3, "backend": BACKEND, "seed": 42}
+    meta = state["meta"]
+    assert {key: meta[key] for key in ("epoch", "step", "update", "backend", "seed")} == {
+        "epoch": 1,
+        "step": 3,
+        "update": 3,
+        "backend": BACKEND,
+        "seed": 42,
+    }
+    # The two digests a resume compares against: the configuration the run trains, and the optimizer
+    # pattern each segment was built from -- the learner rebuilds the optimizer, so a swapped
+    # schedule is only visible through the digest the generated learner emits.
+    assert len(meta["config_hash"]) == 64
+    assert meta["optimizer_hashes"] == {"optimizer": _learner_module(patterns).__optimizer_hashes__["optimizer"]}
     assert state["grad_scalers"] == {}
     # Both halves travel, each under the name the run gave it and the paths Keras gave its
     # variables -- which the layer counter of the process decides, so only the leaves are asserted.
@@ -488,3 +512,154 @@ def test_train_starts_keras_on_the_backend_the_flag_names(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().endswith("jax jax")
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — distributed strategy and resume
+# ---------------------------------------------------------------------------
+
+
+def _train_error(cli_runner: CliRunner, arguments: Sequence[str]) -> BaseException:
+    """Invoke `train` with *arguments* and return the exception it failed with."""
+    result = cli_runner.invoke(app, ["train", *arguments])
+    assert result.exit_code != 0
+    assert result.exception is not None, result.output
+    return result.exception
+
+
+def test_train_accepts_the_single_strategy_preset(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """The default preset must go through the strategy, not around it, or nothing else would."""
+    _train(cli_runner, patterns, tmp_path, experiment="keras-single", epochs=1, extra=["--strategy", "single"])
+
+    (run,) = mlflow.search_runs(experiment_names=["keras-single"], output_format="list")
+    assert isfinite(run.data.metrics["loss"])
+
+
+@pytest.mark.skipif(
+    BACKEND == "torch", reason="torch data parallelism needs a launcher-provided process group; refused below."
+)
+def test_train_accepts_a_strategy_pattern(tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
+    """--strategy also takes a path to an object pattern, here the shipped data-parallel template.
+
+    On this lane's backend the template spans whatever single device the session has, so the run is
+    a one-replica data-parallel run: what is under test is that the pattern is resolved, activated
+    and trained through -- the per-backend mechanics have their own tests.
+    """
+    strategy = str(CFG_DIR / "keras" / "strategies" / "dp.yaml")
+    _train(cli_runner, patterns, tmp_path, experiment="keras-dp", epochs=1, extra=["--strategy", strategy])
+
+    (run,) = mlflow.search_runs(experiment_names=["keras-dp"], output_format="list")
+    assert isfinite(run.data.metrics["loss"])
+
+
+@pytest.mark.skipif(BACKEND == "jax", reason="fsdp is supported on the jax backend.")
+def test_train_refuses_the_fsdp_preset_on_a_backend_that_cannot_shard(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """The rejected cells must stop the command, with the reason, before it trains anything."""
+    model_pattern, learner_pattern = patterns
+    error = _train_error(
+        cli_runner,
+        [
+            model_pattern,
+            "--backend",
+            BACKEND,
+            "--shape",
+            "x: [4]",
+            "--learner",
+            learner_pattern,
+            "--training-dataset",
+            DATASET,
+            "--strategy",
+            "fsdp",
+        ],
+    )
+
+    assert isinstance(error, ValueError)
+    assert 'The "fsdp" preset is not available' in str(error)
+
+
+@pytest.mark.skipif(BACKEND != "torch", reason="Only the torch backend takes its ranks from a process group.")
+def test_train_refuses_the_dp_preset_without_a_process_group(cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
+    """On torch the replicas are ranks, not devices, so a run outside a group has none to spread over.
+
+    Training the whole batch on this one process instead would look like a successful data-parallel
+    run while delivering none of it, so the command stops and names the launcher it needs.
+    """
+    error = _train_error(
+        cli_runner,
+        [
+            patterns[0],
+            "--backend",
+            BACKEND,
+            "--shape",
+            "x: [4]",
+            "--learner",
+            patterns[1],
+            "--training-dataset",
+            DATASET,
+            "--strategy",
+            str(CFG_DIR / "keras" / "strategies" / "dp.yaml"),
+        ],
+    )
+
+    assert isinstance(error, RuntimeError)
+    assert "launch the command with torchrun" in str(error)
+
+
+def test_train_resumes_from_a_saved_training_state(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """--resume continues at the epoch after the saved one, with the state the first run left."""
+    _train(cli_runner, patterns, tmp_path, experiment="keras-resume", epochs=2)
+    (state,) = (tmp_path / "mlruns").rglob("training_state.npz")
+
+    result = _train(
+        cli_runner,
+        patterns,
+        tmp_path,
+        experiment="keras-resume",
+        epochs=3,
+        extra=["--resume", str(state), "--start-epoch", "2"],
+    )
+
+    assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in result.output
+    first, resumed = mlflow.search_runs(experiment_names=["keras-resume"], output_format="list")[::-1]
+    history = MlflowClient().get_metric_history(resumed.info.run_id, "loss")
+    assert [metric.step for metric in history] == [3]
+    # Training continued from the restored weights rather than from a fresh initialization.
+    assert history[0].value < first.data.metrics["loss"]
+
+
+def test_train_refuses_a_state_written_on_another_keras_backend(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """A resume across backends is refused by the command, not only by the loader in isolation."""
+    _train(cli_runner, patterns, tmp_path, experiment="keras-foreign", epochs=1)
+    (saved,) = (tmp_path / "mlruns").rglob("training_state.npz")
+    backend = KerasStateBackend()
+    state = backend.load(saved)
+    state["meta"]["backend"] = "jax" if BACKEND != "jax" else "torch"
+    backend.save(state, tmp_path, "foreign")
+
+    error = _train_error(
+        cli_runner,
+        [
+            patterns[0],
+            "--backend",
+            BACKEND,
+            "--shape",
+            "x: [4]",
+            "--learner",
+            patterns[1],
+            "--training-dataset",
+            DATASET,
+            "--resume",
+            str(tmp_path / "foreign.npz"),
+        ],
+    )
+
+    assert isinstance(error, ValueError)
+    assert "Keras backend" in str(error)

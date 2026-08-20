@@ -2,12 +2,14 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
+from hashlib import sha256
 import json
+from json import dumps
 import os
 from pathlib import Path
 import sys
 from time import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
@@ -16,6 +18,7 @@ from typer import Argument, Option, Typer
 from structcast_model import loggers as scm_loggers
 from structcast_model.base_trainer import Printer, ProgressBar, SimpleDataProvider
 from structcast_model.commands.shared_args import (
+    PATH_FORM_HELP,
     batch_size,
     ci,
     epochs,
@@ -30,6 +33,7 @@ from structcast_model.commands.shared_args import (
     model_pattern,
     object_pattern_help,
     output_script_path,
+    resume_option,
     save_criteria,
     seed_option,
     shapes_help,
@@ -49,6 +53,7 @@ from structcast_model.commands.utils import (
     dict_parser,
     get_module_outputs,
     instantiate_object,
+    path_or_any_parser,
     reduce_dict,
 )
 
@@ -58,7 +63,7 @@ if TYPE_CHECKING:
 
     import keras
     from structcast_model.builders import keras as keras_builder
-    from structcast_model.keras import trainer as keras_trainer
+    from structcast_model.keras import distributed as keras_distributed, trainer as keras_trainer
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -67,6 +72,7 @@ else:
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
     keras_builder = LazyModuleImporter("structcast_model.builders.keras")
+    keras_distributed = LazyModuleImporter("structcast_model.keras.distributed")
     keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
     torch = LazyModuleImporter("torch")
 
@@ -251,6 +257,44 @@ def _mixed_precision_policy(factory: Any) -> str | None:
     return f"mixed_{namespace['__mixed_precision_type__']}"
 
 
+def _config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
+    """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
+
+    Recorded in the saved training state so a resumed run can be told apart from the configuration it
+    was saved from, exactly as `cmd_flax` records it. The optimizers are not part of it: they are
+    hashed separately, by the builder that emits them, and reported per segment.
+    """
+    payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
+    return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
+    """Return the `__optimizer_hashes__` the learner's own module declares, empty for anything else.
+
+    Read off the globals the learner's methods were defined in, as `_mixed_precision_policy` reads
+    the mixed precision constants: a generated learner is loaded from a file, so its module never
+    lands in `sys.modules`. A hand-written learner declares none, and the resume check skips what is
+    missing.
+    """
+    namespace = getattr(type(learner).__init__, "__globals__", {})
+    return cast(Mapping[str, str], namespace.get("__optimizer_hashes__") or {})
+
+
+def _resolve_strategy(strategy: Any, device: str | None) -> "keras_distributed.KerasDistributedStrategy":
+    """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
+    if isinstance(strategy, str):
+        # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
+        # active backend supports, and rejects the rest with the reason -- which is the error to read.
+        preset = cast('Literal["single", "dp", "fsdp"]', strategy)
+        return keras_distributed.KerasDistributedStrategy(preset=preset, device=device)
+    return instantiate_object(strategy)(device=device)
+
+
+def _strategy_parser(value: str) -> Any:
+    """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one."""
+    return value if value.isidentifier() else path_or_any_parser(value)
+
+
 @app.command()
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
@@ -276,8 +320,16 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     ),
     epochs: int = epochs,
     start_epoch: int = start_epoch,
+    resume: str | None = resume_option(
+        "Restores models and optimizers, and continues from the saved epoch. The state carries the Keras backend "
+        "it was written on and a resume onto another one is refused: normalization statistics and RNG "
+        "trajectories are not verified equivalent across backends.",
+        "data-order or RNG",
+    ),
     training_dataset_pattern: Any = training_dataset_option(
-        " Every batch it yields is passed to the Learner as it is; the backend adapter moves it to the device."
+        " Every batch it yields is passed to the Learner as it is; a multi-device strategy places it across the "
+        "replicas first, so each entry needs a leading dimension the replica count divides -- except on the "
+        "torch backend, where the loader hands each rank its own slice."
     ),
     validation_dataset_pattern: Any | None = validation_dataset_pattern,
     validation_frequency: int = validation_frequency,
@@ -293,6 +345,20 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     log_arguments: list[dict] | None = log_arguments,
     log_artifacts: list[Path] | None = log_artifacts,
     ci: bool = ci,
+    strategy_pattern: Any = Option(
+        "single",
+        "--strategy",
+        parser=_strategy_parser,
+        help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
+        'the replicas, variables replicated) or "fsdp" (the batch split and the variables sharded too). Each '
+        "preset runs on the mechanism its Keras backend actually has -- keras.distribution on jax, "
+        "tf.distribute.MirroredStrategy on tensorflow, DistributedDataParallel on torch -- and fsdp is available "
+        "on jax alone; the other two cells are refused with the reason. "
+        + object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
+        + PATH_FORM_HELP
+        + " The factory is called with the resolved device; the templates under cfg/keras/strategies bind the "
+        "remaining knobs.",
+    ),
 ) -> None:
     """Train Keras models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
@@ -308,22 +374,35 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
         print(f'Setting the global mixed precision policy to "{policy}"...')
         keras.mixed_precision.set_global_policy(policy)
+    strategy = _resolve_strategy(strategy_pattern, device)
     models: OrderedDict[str, Any] = OrderedDict()
     declared: dict[str, Any] = {}
-    for raw in model_patterns:
-        if len(raw) != 1:
-            raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
-        model_name, pattern = next(iter(raw.items()))
-        built = instantiate_object(pattern)
-        # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
-        # which carries none of the layer's attributes, so the shapes it was traced with would be
-        # unrecoverable afterwards and the run would record none.
-        declared.update(keras_trainer.resolve_input_shapes(built) or {})
-        models[model_name] = keras_trainer.initial_model(built, reduce_dict(shapes))
+    # Everything a run allocates is built inside the activation: a JAX variable reads the active
+    # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
+    # -- the models above all, and the optimizers the learner builds against their variables.
+    with strategy.activate():
+        for raw in model_patterns:
+            if len(raw) != 1:
+                raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+            model_name, pattern = next(iter(raw.items()))
+            built = instantiate_object(pattern)
+            # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
+            # which carries none of the layer's attributes, so the shapes it was traced with would be
+            # unrecoverable afterwards and the run would record none.
+            declared.update(keras_trainer.resolve_input_shapes(built) or {})
+            models[model_name] = keras_trainer.initial_model(built, reduce_dict(shapes))
+        strategy.sync_initial_weights(models)
+        # Before the learner: it captures the model objects it is handed, and its optimizers are
+        # built against their variables while it is constructed.
+        models = strategy.wrap(models)
+        learner = factory(**models)
     # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
     # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
     input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
-    learner = factory(**models)
+    config_hash = _config_hash(model_patterns, learner_pattern, input_shapes)
+    # After the learner: the steps this rewires are the ones the backend adapter built in its
+    # constructor, and each one runs the replicas itself rather than being traced into a scope.
+    strategy.wrap_steps(learner)
     outputs = get_module_outputs(learner, learner_outputs, "learner")
     provider = SimpleDataProvider(
         training_dataset=instantiate_object(training_dataset_pattern),
@@ -339,6 +418,19 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     logger: scm_loggers.base.Logger = logger_type(
         experiment=experiment, state_backend=scm_loggers.state_backends.KerasStateBackend()
     )
+    optimizer_hashes = _optimizer_hashes(learner)
+    if resume is not None:
+        start_epoch = keras_trainer.restore_training_state(
+            resume=resume,
+            strategy=strategy,
+            models=models,
+            learner=learner,
+            start_epoch=start_epoch,
+            logger=logger,
+            optimizer_hashes=optimizer_hashes,
+            config_hash=config_hash,
+            is_main=strategy.is_main,
+        )
     trainer_type = keras_trainer.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(
         learner=learner, tracker=keras_trainer.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
@@ -353,9 +445,13 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
         )
     )
-    saver = keras_trainer.KerasTrainingStateSaver(logger=logger, extra_meta={"seed": seed})
+    saver = keras_trainer.KerasTrainingStateSaver(
+        logger=logger,
+        strategy=strategy,
+        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": dict(optimizer_hashes)},
+    )
     bests = keras_trainer.KerasBestCriterion.from_criteria(
-        higher_criteria, lower_criteria, save_criteria, logger=logger
+        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     trainer.callbacks = [display, logger, saver, *bests]
     arguments = {
@@ -365,12 +461,15 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "shapes": input_shapes,
         "backend": backend,
         "device": device,
+        "strategy": strategy_pattern,
+        "replicas": strategy.replicas,
         "mixed_precision_policy": policy,
         "learner": learner_pattern,
         "learner_outputs": outputs,
         "trainer": trainer_pattern,
         "epochs": epochs,
         "start_epoch": start_epoch,
+        "resume": resume,
         "training_dataset": training_dataset_pattern,
         "validation_dataset": validation_dataset_pattern,
         "validation_frequency": validation_frequency,

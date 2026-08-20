@@ -1,0 +1,15 @@
+# Distributed strategy pattern: fully sharded data parallel, on the jax Keras backend alone -- the
+# tensorflow and torch cells are refused at construction with the reason (docs/adr/0016). The batch is
+# split as under "dp" and the variables are sharded along their leading dimension too, so each device
+# stores a slice of them. A variable with fewer than two dimensions, or one whose leading dimension the
+# device count does not divide, stays replicated: that leaves every bias and normalization statistic
+# whole. The pattern is called with device=...; bind rules to replace the preset's
+# (variable-path regex, tactic) table, first match wins.
+- _obj_
+- _addr_: structcast_model.keras.distributed.KerasDistributedStrategy
+- _bind_:
+    preset: fsdp
+    # devices: 4
+    # rules:
+    #   - ["^embedding/", replicate]
+    #   - [".*", fsdp]
