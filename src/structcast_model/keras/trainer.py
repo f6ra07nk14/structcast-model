@@ -17,6 +17,15 @@ from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
+if TYPE_CHECKING:
+    import torch
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    # torch is only touched when the active Keras backend is torch (`get_keras_device`); binding it
+    # lazily keeps tensorflow and jax runs from importing it, as in `loggers.state_backends`.
+    torch = LazyModuleImporter("torch")
+
 DTYPES = {
     "float32": np.float32,
     "float16": np.float16,
@@ -156,7 +165,14 @@ def initial_model(model: Any, shapes: Any) -> Any:
 
 def get_keras_device(device: str | None = None) -> str:
     """Get a list of available Keras devices."""
-    devices = keras.distribution.list_devices()
+    if keras.backend.backend() == "torch":
+        # The torch backend ships no distribution hooks (`keras.distribution` functions die on a
+        # None backend module), so the device list comes from torch itself, in the same
+        # "gpu:N" / "cpu:N" spelling the other backends report.
+        devices = [f"gpu:{index}" for index in range(torch.cuda.device_count())]
+        devices.append("cpu:0")
+    else:
+        devices = list(keras.distribution.list_devices())
     if not devices:
         raise ValueError("No Keras devices are available.")
     if device is None:
@@ -228,7 +244,10 @@ class KerasTracker:
     def __call__(self, **criteria: Any) -> dict[str, float]:
         """Add one step's criteria to the sums and return the running means."""
         for criterion in self.criteria:
-            self.sums[criterion] = keras.ops.add(self.sums[criterion], criteria[criterion])
+            # The torch backend hands criteria still attached to the autograd graph; detaching
+            # keeps the epoch sum from retaining every step's graph and lets `logs` reach numpy.
+            value = keras.ops.stop_gradient(criteria[criterion])
+            self.sums[criterion] = keras.ops.add(self.sums[criterion], value)
         self.count += 1
         return self.logs()
 
