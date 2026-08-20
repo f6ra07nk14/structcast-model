@@ -20,6 +20,14 @@ WANDB_LOGGER = "structcast_model.loggers.wandb"
 # Set here rather than in a fixture because the distributed tests spawn workers that inherit it.
 os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
 
+# Keras resolves its backend once, while it is first imported, and never switches afterwards, so the
+# choice has to be made before any keras import reaches the interpreter -- hence in the root conftest,
+# which pytest loads before collecting any test module, rather than in `tests/keras/`: a bare `pytest`
+# run imports `tests/commands/test_cmd_keras.py` first, and by then the backend would already be
+# whatever ~/.keras/keras.json names on the machine. `setdefault` leaves an explicitly requested
+# backend alone, so the same tests can be run against jax or torch by exporting KERAS_BACKEND.
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
 
 @pytest.fixture
 def cli_runner() -> CliRunner:

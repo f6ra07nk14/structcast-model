@@ -1,8 +1,8 @@
 """Trainer helpers for Keras models."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import ml_dtypes
 import numpy as np
@@ -15,6 +15,7 @@ from typing_extensions import Protocol, runtime_checkable
 import keras
 from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
 if TYPE_CHECKING:
@@ -276,21 +277,137 @@ class KerasTrainer(BaseTrainer[Any]):
     """
 
 
+def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Read every model and optimizer variable back to host numpy, keyed by its Keras path.
+
+    Each named model and optimizer becomes a tree nesting its variables under the segments of
+    `variable.path`, so a state is restored by assigning the matching paths back. It is not what
+    `keras.Model.get_state_tree` returns -- that one groups by variable category first
+    (`trainable_variables`, `optimizer_variables`, ...), which is the only shape
+    `keras.Model.set_state_tree` accepts -- because `get_state_tree` reads the optimizer off the
+    model, and a generated learner attaches none: its optimizers belong to the segments the adapter
+    drives.
+
+    This is the one place a run's state is read, so the distributed strategies of P5 rewire state
+    collection here and nowhere else.
+
+    Args:
+        models (Mapping[str, Any]): The models to read, by name.
+        optimizers (Mapping[str, Any] | None): The optimizers to read, by name.
+
+    Returns:
+        dict[str, Any]: The `models` and `optimizers` halves of a training-state payload.
+    """
+    return {
+        "models": {name: _variable_tree(model.variables) for name, model in models.items()},
+        "optimizers": {name: _variable_tree(optimizer.variables) for name, optimizer in (optimizers or {}).items()},
+    }
+
+
+def _variable_tree(variables: Iterable[Any]) -> dict[str, Any]:
+    """Nest the host-side value of each variable under the segments of its path."""
+    tree: dict[str, Any] = {}
+    for variable in variables:
+        *parents, leaf = variable.path.split("/")
+        branch = tree
+        for part in parents:
+            branch = branch.setdefault(part, {})
+        branch[leaf] = np.asarray(keras.ops.convert_to_numpy(variable.value))
+    return tree
+
+
 @dataclass(kw_only=True, slots=True)
 class KerasBestCriterion(BestCriterion[Any]):
     """A callback tracking the best value of a criterion during training or validation for Keras models.
 
     The twin of `structcast_model.torch.trainer.TorchBestCriterion`, duplicated rather than shared
-    because importing either module imports its framework. The `from_criteria` builder of the twins
-    also saves the best states, which needs the Keras state strategy, so it arrives with it.
+    because importing either module imports its framework.
     """
+
+    @classmethod
+    def from_criteria(
+        cls,
+        higher_criteria: Sequence[str],
+        lower_criteria: Sequence[str],
+        save_criteria: Collection[str],
+        logger: Logger,
+    ) -> list[Self]:
+        """Build one monitor per criterion, each logging its best value through *logger*.
+
+        Criteria named in *save_criteria* also save the model states that reached the best value.
+        """
+        monitors: list[Self] = []
+        for target in higher_criteria:
+            best = cls(target=target, mode="max")
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            monitors.append(best)
+        for target in lower_criteria:
+            best = cls(target=target, mode="min")
+            best.callbacks.append(_BestLogger(logger=logger, save=target in save_criteria))
+            monitors.append(best)
+        return monitors
+
+
+@dataclass(kw_only=True, slots=True)
+class _BestLogger:
+    """Log the best value of a criterion, and save the models that reached it when asked to."""
+
+    logger: Logger
+    """The logger the best values and model states are written through."""
+
+    save: bool
+    """Whether to also save the model states that reached the best value."""
+
+    def on_best(self, info: BaseInfo[Any], best: BestCriterion[Any]) -> None:
+        """Log the best value, and save the states of the info's models when this epoch reached it."""
+        name = f"best_{best.target}"
+        self.logger.log_metric(name, best.value, step=info.epoch)
+        if self.save and info.step == best.step:
+            # The models alone, as the torch and flax twins save: best-value weights are for
+            # inference, so they carry no optimizer state, no counters and no wrapper key.
+            self.logger.log_state_dict(collect_state_dict(dict(info.models))["models"], name)
+
+
+@dataclass(kw_only=True, slots=True)
+class KerasTrainingStateSaver:
+    """Callback saving models, optimizers and loop counters through a logger.
+
+    The twin of `structcast_model.torch.trainer.TrainingStateSaver`, minus the gradient scalers:
+    Keras loss scaling lives inside the optimizer, so its state is already in the optimizer's
+    variables, and the payload keeps their (always empty) slot so every framework resumes from the
+    same shape (`docs/adr/0015`).
+    """
+
+    logger: Logger
+    """The logger the training-state artifacts are written through."""
+
+    extra_meta: Mapping[str, Any] = field(default_factory=dict)
+    """Run facts the loop does not know, recorded next to the counters, e.g. the run seed."""
+
+    def on_epoch_end(self, info: BaseInfo[Any]) -> None:
+        """Save the full training state of the finished epoch, so a run can be resumed from it."""
+        learner = cast("KerasTrainer", info).learner
+        states = collect_state_dict(dict(info.models), learner.optimizers)
+        states["grad_scalers"] = {}
+        states["meta"] = {
+            "epoch": info.epoch,
+            "step": info.step,
+            "update": info.update,
+            # Load-bearing: normalization statistics and RNG trajectories are not verified
+            # equivalent across the Keras backends, so a resume refuses a mismatch (`docs/adr/0016`).
+            "backend": keras.backend.backend(),
+            **dict(self.extra_meta),
+        }
+        self.logger.log_state_dict(states, "training_state")
 
 
 __all__ = [
     "KerasBestCriterion",
     "KerasTracker",
     "KerasTrainer",
+    "KerasTrainingStateSaver",
     "TensorInitializer",
+    "collect_state_dict",
     "create_keras_inputs",
     "create_numpy_inputs",
     "get_keras_device",

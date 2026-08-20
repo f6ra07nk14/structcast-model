@@ -34,12 +34,17 @@ reuse savings.
   optimizer in `LossScaleOptimizer` (a dict supplies its kwargs), `bfloat16` does not. The optimizer
   pattern stays a keras-optimizer pattern on every backend, and gradient clipping lives inside it
   (`clipnorm` / `global_clipnorm`), so the keras learner schema has no `CLIP` field.
-- The keras state backend serializes `model.get_state_tree(value_format="numpy_array")` into a
-  single archive — path-keyed and backend-portable — yet resume refuses a backend mismatch:
-  normalization statistics and RNG trajectories are not verified equivalent across backends, and a
-  silently different continuation is worse than a clear error.
+- The keras state backend serializes every model and optimizer variable into a single archive, each
+  nested under the segments of its `variable.path` — backend-portable, and restored by assigning the
+  matching paths back rather than through `keras.Model.set_state_tree`, whose category-keyed shape
+  (`trainable_variables`, `optimizer_variables`, …) does not apply to a learner whose optimizers are
+  not attached to its models. Resume still refuses a backend mismatch: normalization statistics and
+  RNG trajectories are not verified equivalent across backends, and a silently different
+  continuation is worse than a clear error.
 - The CLI resolves `KERAS_BACKEND` before keras imports, with no default backend; a conflict with an
-  already-initialized backend fails loudly.
+  already-initialized backend fails loudly. `scm keras time` is the one exception: it trains nothing
+  and takes no `--backend`, inheriting the ambient one (`~/.keras/keras.json`) and printing which
+  one produced the timing.
 - Gradient accumulation is the keras optimizer's own (`gradient_accumulation_steps`), which owns the
   gate deciding when an update lands, so the generated learner's `update()` returns true every step.
   Under `ACCUMULATE_GRADIENTS` the keras update counter therefore advances per step, not per

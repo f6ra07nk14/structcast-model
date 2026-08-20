@@ -291,6 +291,41 @@ def test_keras_learner_never_sets_the_global_mixed_precision_policy() -> None:
     assert "keras.mixed_precision.Policy" not in script
 
 
+@pytest.mark.parametrize(
+    ("raw_fields", "expected"),
+    [
+        ({}, "__mixed_precision__ = False\n__mixed_precision_type__ = None"),
+        (
+            {"MIXED_PRECISION": True, "MIXED_PRECISION_TYPE": "bfloat16"},
+            "__mixed_precision__ = True\n__mixed_precision_type__ = 'bfloat16'",
+        ),
+        (
+            {"MIXED_PRECISION": {"initial_scale": 128.0}, "MIXED_PRECISION_TYPE": "float16"},
+            "__mixed_precision__ = {'initial_scale': 128.0}\n__mixed_precision_type__ = 'float16'",
+        ),
+        (
+            {"MIXED_PRECISION": {}, "MIXED_PRECISION_TYPE": "float16"},
+            "__mixed_precision__ = {}\n__mixed_precision_type__ = 'float16'",
+        ),
+    ],
+    ids=["disabled", "enabled", "keyword-arguments", "empty-keyword-arguments"],
+)
+def test_keras_learner_declares_its_mixed_precision_next_to_the_class(
+    raw_fields: dict[str, Any], expected: str
+) -> None:
+    """The training CLI reads the policy off the module before it instantiates the class.
+
+    It cannot ask the learner: the policy has to be set before the models the learner is built over
+    exist, so it has to be readable from the imported module alone -- as the torch learner's
+    `__grad_scaler_creator__` is. An empty mapping is emitted as it was written, because it enables
+    the policy here as it does in the adapter: only `False` disables it.
+    """
+    script = _built({**load_any(LEARNER_YAML), **raw_fields})
+
+    assert script.startswith("#")
+    assert expected in script
+
+
 def test_keras_learner_schema_rejects_the_torch_only_clip_field() -> None:
     """Clipping is a keyword of the Keras optimizer, so a CLIP key would be dropped without a word.
 

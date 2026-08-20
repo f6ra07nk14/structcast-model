@@ -2,17 +2,37 @@
 
 from __future__ import annotations
 
+from importlib.util import module_from_spec, spec_from_file_location
 import inspect
+from math import isfinite
+import os
+from pathlib import Path
+import subprocess
+import sys
+from types import ModuleType
 from typing import Any
 
+import mlflow
+from mlflow.tracking import MlflowClient
+import numpy as np
+import pytest
 from typer import Typer
 from typer.testing import CliRunner
 
+import keras
+from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.commands.cmd_keras import app
+from structcast_model.keras.trainer import KerasTrainer
+from structcast_model.loggers.state_backends import KerasStateBackend
+from structcast_model.utils.base import load_any
 from tests import CFG_DIR, FIXTURES_DIR
 
 LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "keras" / "Linear.yaml")
+LEARNER_CFG = FIXTURES_DIR / "cfg" / "keras" / "LinearLearner.yaml"
 MODEL_CFG = str(CFG_DIR / "keras" / "models" / "ConvNeXtV2.yaml")
+
+BACKEND = keras.backend.backend()
+"""The backend this session resolved Keras on; every run below has to be told the same one."""
 
 # ---------------------------------------------------------------------------
 # app structure
@@ -103,11 +123,368 @@ def test_create_model_convnextv2(tmp_path: Any, cli_runner: CliRunner) -> None:
 
 
 def test_time_dense(cli_runner: CliRunner) -> None:
-    """'time' measures inference on a simple keras Dense layer."""
+    """'time' measures inference on a simple keras Dense layer, saying which backend ran it.
+
+    This is the one command that takes no --backend and inherits the ambient one (`docs/adr/0016`),
+    so the number is only attributable if it names the backend that produced it.
+    """
     pattern = "[_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: 2}}]"
     result = cli_runner.invoke(
         app,
         ["time", pattern, "--shape", "inputs: [4]", "--warmup-runs", "1", "--times", "1", "--batch-size", "1"],
     )
     assert result.exit_code == 0, result.output
+    assert f'Timing on the "{BACKEND}" Keras backend' in result.output
     assert "Average inference time" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 'create learner' command
+# ---------------------------------------------------------------------------
+
+
+def _load(path: Path, name: str) -> ModuleType:
+    """Load a generated module by file path, the way a configuration does: not by import name."""
+    spec = spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: CliRunner) -> None:
+    """'create learner' generates a learner module that imports and exposes the named class.
+
+    The mixed-precision constants come with it: the training command reads them off the module
+    before it instantiates the class, because the policy has to be set before the models are built.
+    """
+    out = tmp_path / "my_learner.py"
+    result = cli_runner.invoke(
+        app,
+        [
+            "create",
+            "learner",
+            str(LEARNER_CFG),
+            "--classname",
+            "MyLearner",
+            "--parameter",
+            "DEFAULT: {accumulate_gradients: 3}",
+            "--output",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    module = _load(out, "generated_keras_learner")
+    assert hasattr(module, "MyLearner")
+    assert module.__mixed_precision__ is False
+    assert module.__mixed_precision_type__ is None
+    # The parameter reached the template: Keras accumulates inside the optimizer.
+    assert "optimizer.gradient_accumulation_steps = 3" in out.read_text()
+
+
+def test_create_learner_takes_no_backend_because_it_imports_no_keras(tmp_path: Path) -> None:
+    """Writing a learner script never touches Keras, so the command must not demand a backend.
+
+    A fresh interpreter without KERAS_BACKEND is the only honest check: this session has Keras
+    imported and the variable set long before the test runs, so an accidental keras import here
+    would be invisible.
+    """
+    out = tmp_path / "learner.py"
+    script = (
+        "from typer.testing import CliRunner; from structcast_model.commands.cmd_keras import app; "
+        f"result = CliRunner().invoke(app, ['create', 'learner', {str(LEARNER_CFG)!r}, '--output', {str(out)!r}]); "
+        "import sys; print(result.output, result.exception); "
+        "raise SystemExit(result.exit_code or ('keras' in sys.modules) * 3)"
+    )
+    environment = {key: value for key, value in os.environ.items() if key != "KERAS_BACKEND"}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "class Learner:" in out.read_text()
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — end to end over the generated linear model and learner
+# ---------------------------------------------------------------------------
+
+
+def linear_batches(count: int = 3, size: int = 2) -> list[dict[str, Any]]:
+    """Return a fixed dataset of *count* batches of *size* rows, so criteria depend on the seed alone.
+
+    Public and addressable: the runs build it through an object pattern, as a real dataset is built.
+    """
+    return [
+        {"x": np.full((size, 4), float(index + 1), dtype="float32"), "y": np.zeros((size, 2), dtype="float32")}
+        for index in range(count)
+    ]
+
+
+DATASET = f"[_obj_, {{_addr_: {__name__}.linear_batches}}, _call_]"
+"""Object pattern building the training dataset."""
+
+VALIDATION_DATASET = f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: {{count: 2}}}}]"
+"""Object pattern building a shorter validation dataset."""
+
+POLICIES: list[str] = []
+"""Dtype policies of the models `RecordingTrainer` trained; cleared by the test that reads them."""
+
+
+class RecordingTrainer(KerasTrainer):
+    """A trainer recording the dtype policy the models it is handed were built under."""
+
+    def fit(self, *args: Any, **kwargs: Any) -> Any:
+        """Note what the models compute in, then hand over to the shared loop."""
+        POLICIES.extend(model.dtype_policy.name for model in self.learner.models.values())
+        return super().fit(*args, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def patterns(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, str]:
+    """Return the model and learner patterns of the generated linear fixture, built once."""
+    directory = tmp_path_factory.mktemp("generated")
+    KerasBuilder.from_path(FIXTURES_DIR / "cfg" / "keras" / "Linear.yaml")()(directory / "model.py")
+    KerasLearnerBuilder.from_path(LEARNER_CFG)()(directory / "learner.py")
+    return (
+        f"model: [_obj_, {{_addr_: Model, _file_: {directory / 'model.py'}}}, _call_]",
+        f"[_obj_, {{_addr_: Learner, _file_: {directory / 'learner.py'}}}]",
+    )
+
+
+def _train(
+    cli_runner: CliRunner,
+    patterns: tuple[str, str],
+    tmp_path: Path,
+    *,
+    experiment: str,
+    epochs: int = 2,
+    extra: list[str] | None = None,
+    shape: str | None = "x: [4]",
+) -> Any:
+    """Run `train` over the generated fixture, recording to an MLflow store under *tmp_path*."""
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    model_pattern, learner_pattern = patterns
+    result = cli_runner.invoke(
+        app,
+        [
+            "train",
+            model_pattern,
+            "--backend",
+            BACKEND,
+            *([] if shape is None else ["--shape", shape]),
+            "--learner",
+            learner_pattern,
+            "--training-dataset",
+            DATASET,
+            "--validation-dataset",
+            VALIDATION_DATASET,
+            "--epochs",
+            str(epochs),
+            "--lower-criterion",
+            "loss",
+            "--lower-criterion",
+            "val_loss",
+            "--save-criterion",
+            "val_loss",
+            "--experiment",
+            experiment,
+            "--ci",
+            *(extra or []),
+        ],
+    )
+    assert result.exit_code == 0, f"{result.output}\n{result.exception}"
+    return result
+
+
+def test_train_end_to_end(tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
+    """A full run trains, validates, prints its routed events and records everything it produced."""
+    result = _train(cli_runner, patterns, tmp_path, experiment="keras-e2e")
+    assert "Registered callbacks:" in result.output
+    assert "KerasTrainingStateSaver" in result.output
+    (run,) = mlflow.search_runs(experiment_names=["keras-e2e"], output_format="list")
+    assert isfinite(run.data.metrics["loss"])
+    assert isfinite(run.data.metrics["val_loss"])
+    # The learning rate the generated learner reports, which is where a lost optimizer shows up.
+    assert run.data.metrics["optimizer"] == pytest.approx(0.1)
+    history = MlflowClient().get_metric_history(run.info.run_id, "loss")
+    assert [metric.step for metric in history] == [1, 2]
+    assert history[1].value < history[0].value
+    artifacts = {artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)}
+    assert {"training_state.npz", "best_val_loss.npz", "arguments.yaml"} <= artifacts
+    assert run.data.params["keras_backend"] == BACKEND
+
+
+def test_train_records_the_shapes_the_models_declared_when_none_are_given(
+    tmp_path: Path, cli_runner: CliRunner
+) -> None:
+    """--shape is optional, and the shapes a model declared have to reach the run's arguments anyway.
+
+    A layer's INPUT_SHAPES is what it was traced with, and it does not survive the functional wrap
+    `initial_model` applies -- so read back off the built models it would be lost, and the run would
+    record `shapes: {}` while having been traced with something.
+    """
+    raw = {**load_any(LINEAR_CFG), "INPUT_SHAPES": {"x": [4]}}
+    KerasBuilder(raw=raw, current_path=LINEAR_CFG)()(tmp_path / "model.py")
+    KerasLearnerBuilder.from_path(LEARNER_CFG)()(tmp_path / "learner.py")
+    patterns = (
+        f"model: [_obj_, {{_addr_: Model, _file_: {tmp_path / 'model.py'}}}, _call_]",
+        f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'learner.py'}}}]",
+    )
+
+    _train(cli_runner, patterns, tmp_path, experiment="keras-declared-shapes", epochs=1, shape=None)
+
+    (arguments,) = (tmp_path / "mlruns").rglob("arguments.yaml")
+    assert load_any(arguments)["shapes"] == {"x": [4]}
+
+
+def _leaf_names(tree: Any) -> list[str]:
+    """Return the name of every array in a path-keyed state tree, whatever Keras named the layers."""
+    names: list[str] = []
+    for key, value in tree.items():
+        names.extend(_leaf_names(value) if isinstance(value, dict) else [key])
+    return names
+
+
+def test_train_records_the_backend_that_wrote_the_state(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """The saved state names its Keras backend, which is what a resume refuses a mismatch on.
+
+    Nothing else in the archive identifies it -- the arrays are backend-portable -- so a state saved
+    without the field would resume silently on a backend whose statistics and RNG stream differ.
+    """
+    _train(cli_runner, patterns, tmp_path, experiment="keras-state", epochs=1)
+
+    (saved,) = (tmp_path / "mlruns").rglob("training_state.npz")
+    state = KerasStateBackend().load(saved)
+    assert state["meta"] == {"epoch": 1, "step": 3, "update": 3, "backend": BACKEND, "seed": 42}
+    assert state["grad_scalers"] == {}
+    # Both halves travel, each under the name the run gave it and the paths Keras gave its
+    # variables -- which the layer counter of the process decides, so only the leaves are asserted.
+    assert sorted(_leaf_names(state["models"]["model"])) == ["bias", "kernel"]
+    assert sorted(_leaf_names(state["optimizers"]["optimizer"])) == ["iteration", "learning_rate"]
+
+
+def test_train_without_a_backend_names_both_ways_to_give_one(cli_runner: CliRunner) -> None:
+    """There is no default backend, and the error has to say what to do about it.
+
+    Keras would otherwise silently take the backend from ~/.keras/keras.json, deciding what the run
+    computes on by a file nobody looked at.
+    """
+    result = cli_runner.invoke(app, ["train", "--help"], env={"KERAS_BACKEND": None})
+    assert "KERAS_BACKEND" in result.output
+
+    result = cli_runner.invoke(app, ["train", "model: {}"], env={"KERAS_BACKEND": None})
+
+    assert result.exit_code == 2
+    assert "--backend" in result.output
+    assert "KERAS_BACKEND" in result.output
+
+
+def test_train_refuses_a_backend_other_than_the_one_keras_already_runs(tmp_path: Path) -> None:
+    """Keras resolves its backend once, at import: asking for another one has to fail, not be ignored.
+
+    It has to fail on the already-imported Keras, before KERAS_BACKEND is set to a value that can
+    never take effect -- a variable left pointing at a backend the process does not run is what any
+    later reader, the run's own record included, would believe. Hence the assertions on the message
+    of that first check and on the variable the failed command left behind.
+
+    Only a fresh interpreter can exercise it -- this session imported Keras long before the test --
+    so the check runs in a subprocess whose KERAS_BACKEND is pinned to the session's backend and
+    whose command asks for a different one.
+    """
+    other = "jax" if BACKEND != "jax" else "tensorflow"
+    script = (
+        "import keras, os; from typer.testing import CliRunner; "
+        "from structcast_model.commands.cmd_keras import app; "
+        "result = CliRunner().invoke(app, ['train', 'model: [_obj_, {_addr_: builtins.dict}, _call_]', "
+        f"'--backend', {other!r}, '--learner', '[_obj_, {{_addr_: builtins.dict}}]', "
+        "'--training-dataset', '[_obj_, {_addr_: builtins.list}, _call_]']); "
+        "print(type(result.exception).__name__, result.exception); "
+        "print('KERAS_BACKEND=' + os.environ['KERAS_BACKEND'])"
+    )
+    environment = {**os.environ, "KERAS_BACKEND": BACKEND}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ValueError" in result.stdout
+    assert BACKEND in result.stdout
+    assert other in result.stdout
+    assert "already running on" in result.stdout
+    assert "fresh process" in result.stdout
+    assert f"KERAS_BACKEND={BACKEND}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mixed_precision", "precision_type", "policy"),
+    [(True, "bfloat16", "mixed_bfloat16"), ({}, "float16", "mixed_float16")],
+    ids=["enabled", "empty-keyword-arguments"],
+)
+def test_train_sets_the_global_mixed_precision_policy_before_it_builds_the_models(
+    tmp_path: Path, cli_runner: CliRunner, mixed_precision: Any, precision_type: str, policy: str
+) -> None:
+    """A learner declaring MIXED_PRECISION trains under the policy it names.
+
+    The generated learner deliberately does not set it (`docs/adr/0016`): it receives models that
+    are already built, and a policy set then would apply to nothing while looking like it had. So
+    the models' own dtype policy -- not the global one, which any later call could have set -- is
+    what proves the CLI set it at the only moment that works.
+
+    An empty mapping is a mapping, and the adapter reads it as enabled -- it wraps every optimizer
+    in a `LossScaleOptimizer` -- so a CLI that read it as disabled would loss-scale the gradients of
+    a float32 model, with nothing to say so.
+    """
+    POLICIES.clear()
+    raw = {**load_any(LEARNER_CFG), "MIXED_PRECISION": mixed_precision, "MIXED_PRECISION_TYPE": precision_type}
+    KerasBuilder.from_path(FIXTURES_DIR / "cfg" / "keras" / "Linear.yaml")()(tmp_path / "model.py")
+    KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_CFG))()(tmp_path / "learner.py")
+    patterns = (
+        f"model: [_obj_, {{_addr_: Model, _file_: {tmp_path / 'model.py'}}}, _call_]",
+        f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'learner.py'}}}]",
+    )
+    try:
+        _train(
+            cli_runner,
+            patterns,
+            tmp_path,
+            experiment=f"keras-mixed-{precision_type}",
+            epochs=1,
+            extra=["--trainer", f"[_obj_, {{_addr_: {__name__}.RecordingTrainer}}]"],
+        )
+    finally:
+        # The policy is process-wide state the run leaves behind.
+        keras.mixed_precision.set_global_policy("float32")
+
+    assert POLICIES == [policy]
+
+
+def test_train_starts_keras_on_the_backend_the_flag_names(tmp_path: Path) -> None:
+    """The flag has to reach `KERAS_BACKEND` before anything imports Keras, not after.
+
+    Set afterwards it would be ignored -- Keras reads the variable once -- and the run would train
+    on whatever ~/.keras/keras.json happens to name while reporting the requested backend. The
+    subprocess starts without KERAS_BACKEND so the flag is the only thing that can decide it, and
+    the command is left to fail on its placeholder patterns afterwards: the import is what is under
+    test.
+    """
+    script = (
+        "from typer.testing import CliRunner; from structcast_model.commands.cmd_keras import app; "
+        "CliRunner().invoke(app, ['train', 'model: [_obj_, {_addr_: builtins.dict}, _call_]', "
+        "'--backend', 'jax', '--learner', '[_obj_, {_addr_: builtins.dict}]', "
+        "'--training-dataset', '[_obj_, {_addr_: builtins.list}, _call_]']); "
+        "import os, sys; print(sys.modules['keras'].backend.backend(), os.environ['KERAS_BACKEND'])"
+    )
+    environment = {key: value for key, value in os.environ.items() if key != "KERAS_BACKEND"}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("jax jax")

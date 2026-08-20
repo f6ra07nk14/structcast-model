@@ -338,6 +338,13 @@ class KerasLearnerIntermediate(LearnerIntermediate[OptimizerSegment]):
         body.append(f"self.outputs = {self.outputs}")
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
         return f"""\
+# Read by the training CLI after this module is imported and before the class below is
+# instantiated: the `keras.mixed_precision` global policy has to be in place before the models the
+# learner receives are built (`docs/adr/0016`).
+__mixed_precision__ = {self.mixed_precision!r}
+__mixed_precision_type__ = {self.mixed_precision_type!r}
+
+
 class {self.classname}:
     \"\"\"Learner generated from a Keras learner template.
 

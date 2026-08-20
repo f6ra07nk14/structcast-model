@@ -243,7 +243,7 @@ training_mode = Option(
 )
 
 
-# The `train` options torch and flax spell identically; keras has no `train` command yet.
+# The `train` options torch, flax and keras spell identically.
 learner_pattern = Option(
     ...,
     "--learner",

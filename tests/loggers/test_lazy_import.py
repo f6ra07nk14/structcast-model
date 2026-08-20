@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
-FRAMEWORKS = ("torch", "jax", "flax", "orbax")
+FRAMEWORKS = ("torch", "jax", "flax", "orbax", "keras", "tensorflow")
 """The frameworks a logger may serialize with, none of which importing one may pull in."""
 
 REPORT = (
@@ -35,7 +35,7 @@ def test_importing_the_loggers_does_not_import_a_framework() -> None:
         "import structcast_model.loggers.base, structcast_model.loggers.mlflow, "
         "structcast_model.loggers.state_backends, structcast_model.loggers.wandb; "
         "import structcast_model.loggers as pkg; pkg.Logger; pkg.NullLogger; "
-        "pkg.StateBackend; pkg.TorchStateBackend; pkg.FlaxStateBackend; " + REPORT
+        "pkg.StateBackend; pkg.TorchStateBackend; pkg.FlaxStateBackend; pkg.KerasStateBackend; " + REPORT
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

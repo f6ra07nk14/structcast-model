@@ -1,23 +1,53 @@
 """Keras related commands for the StructCast Model CLI application."""
 
+from collections import OrderedDict
+from collections.abc import Mapping
+import json
+import os
+from pathlib import Path
+import sys
 from time import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
+# A package shim routing to lazy submodules, so importing it pulls in no framework, as in cmd_flax.
+from structcast_model import loggers as scm_loggers
+from structcast_model.base_trainer import Printer, ProgressBar, SimpleDataProvider
 from structcast_model.commands.shared_args import (
     batch_size,
+    ci,
+    epochs,
+    experiment,
+    higher_criteria,
+    learner_outputs,
+    learner_pattern,
+    log_arguments,
+    log_artifacts,
+    logger_name,
+    lower_criteria,
     model_pattern,
+    object_pattern_help,
     output_script_path,
+    save_criteria,
+    seed_option,
     shapes_help,
     shapes_option,
+    start_epoch,
     template_param_option,
     times,
+    trainer_option,
+    training_dataset_option,
     training_mode,
+    validation_dataset_pattern,
+    validation_frequency,
     warmup_runs,
 )
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    dict_parser,
+    get_module_outputs,
     instantiate_object,
     reduce_dict,
 )
@@ -58,6 +88,24 @@ device = Option(
     "the inputs; the Keras backend decides where the computation runs. The name only changes how the timing loop "
     'synchronizes on the torch backend, where a name containing "gpu" selects a CUDA sync.',
 )
+train_device = Option(
+    None,
+    "--device",
+    "-d",
+    help='Device the run is checked against, named as returned by "keras.distribution.list_devices()", e.g. '
+    '"cpu:0" or "gpu:0"; an unavailable name aborts and the first listed device is used when omitted. It places '
+    "nothing: which devices a Keras backend computes on is the backend's own choice (restrict it with "
+    "CUDA_VISIBLE_DEVICES), so the name is validated and recorded with the run. Spanning several devices is a "
+    "distributed strategy, which this command does not have yet.",
+)
+backend_option = Option(
+    ...,
+    "--backend",
+    envvar="KERAS_BACKEND",
+    help="Keras backend the run executes on. Keras resolves it once, while it is first imported, so the command "
+    "sets it before importing Keras and fails when a different one is already live. There is no default: the "
+    "backend decides what a run computes on, so it is stated rather than inherited from ~/.keras/keras.json.",
+)
 compile_pattern: dict[str, Any] | None = Option(
     None,
     "--compile",
@@ -95,6 +143,22 @@ def create_model(
     )(output)
 
 
+@creator.command(name="learner")
+def create_learner(
+    cfg_path: str = Argument(..., help="Path to the learner configuration file."),
+    output: str | None = output_script_path,
+    parameters: list[dict] | None = template_param,
+    classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
+) -> None:
+    """Create a Keras learner class from the given configuration file and parameters.
+
+    The generated learner is backend-neutral -- it names no backend and imports no framework beyond
+    `keras` -- and this command only writes it, so it takes no --backend.
+    """
+    builder = keras_builder.KerasLearnerBuilder.from_path(cfg_path)
+    builder(parameters=reduce_dict(parameters), classname=classname)(output)
+
+
 def _get_sync_fn(device: str) -> Any:
     """Return a synchronization function appropriate for the current Keras backend."""
     backend = keras.backend.backend()
@@ -118,6 +182,9 @@ def measure_inference_time(
 ) -> None:
     """Measure the average inference time of a Keras model."""
     device = keras_trainer.get_keras_device(device)
+    # Unlike `train`, this command takes no --backend and inherits the ambient one (`docs/adr/0016`),
+    # so it says which one produced the number: the backend decides what actually executes.
+    print(f'Timing on the "{keras.backend.backend()}" Keras backend, device "{device}".')
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
     shapes = keras_trainer.resolve_input_shapes(model, shapes)
@@ -144,6 +211,192 @@ def measure_inference_time(
         elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
     print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
+
+
+def _activate_backend(backend: str) -> None:
+    """Bind the Keras backend for this process, before anything imports Keras.
+
+    Keras reads `KERAS_BACKEND` once, while it is first imported, and never switches afterwards: a
+    command that set the variable after the import would run on the old backend while reporting the
+    requested one. Both checks exist because there are two ways to get there -- Keras already
+    imported by the caller, and Keras importing something else than the variable asked for.
+    """
+    imported = sys.modules.get("keras")
+    if imported is not None and (active := imported.backend.backend()) != backend:
+        raise ValueError(
+            f'Keras is already running on the "{active}" backend, so --backend {backend} cannot take effect: '
+            "the backend is resolved once, when Keras is first imported. Run the command in a fresh process."
+        )
+    os.environ["KERAS_BACKEND"] = backend
+    # The first attribute access is what imports Keras, hence after the assignment above.
+    if (active := keras.backend.backend()) != backend:
+        raise ValueError(f'Keras started on the "{active}" backend instead of the requested "{backend}".')
+
+
+def _mixed_precision_policy(factory: Any) -> str | None:
+    """Return the global policy the generated learner's module asks for, or None for a plain run.
+
+    A generated learner class is loaded from a file rather than imported by name, so its module
+    never lands in `sys.modules`: the globals its methods were defined in are the only handle on the
+    constants next to it, as in `cmd_flax._optimizer_hashes`. A hand-written learner declares none
+    and gets no policy.
+    """
+    namespace = getattr(getattr(factory, "__init__", None), "__globals__", {})
+    raw = namespace.get("__mixed_precision__")
+    # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
+    # included, so that a run is not loss-scaled by the adapter while computing in float32.
+    enabled = raw if isinstance(raw, bool) else isinstance(raw, Mapping)
+    if not enabled:
+        return None
+    return f"mixed_{namespace['__mixed_precision_type__']}"
+
+
+@app.command()
+def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
+    model_patterns: list[dict] = Argument(
+        parser=dict_parser,
+        help=object_pattern_help("the model", "MyModel", keyed=True)
+        + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
+        "inline; a file path is not accepted here. A pattern building a layer is traced into a model with the "
+        "run's shapes before the Learner is built, because a Keras layer owns no variables until it is. The names "
+        "are passed to the --learner factory as keyword arguments.",
+    ),
+    backend: Literal["tensorflow", "jax", "torch"] = backend_option,
+    shapes: list[dict] | None = shapes_option(
+        shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+        + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
+        "twice keeps only the last occurrence. When omitted, each model is traced with the INPUT_SHAPES it "
+        "declares itself; given, the same shapes are used for every model."
+    ),
+    device: str | None = train_device,
+    learner_pattern: Any = learner_pattern,
+    learner_outputs: list[str] | None = learner_outputs,
+    trainer_pattern: Any | None = trainer_option(
+        "trainer(learner=..., tracker=..., data=..., callbacks=[])", "KerasTrainer"
+    ),
+    epochs: int = epochs,
+    start_epoch: int = start_epoch,
+    training_dataset_pattern: Any = training_dataset_option(
+        " Every batch it yields is passed to the Learner as it is; the backend adapter moves it to the device."
+    ),
+    validation_dataset_pattern: Any | None = validation_dataset_pattern,
+    validation_frequency: int = validation_frequency,
+    lower_criteria: list[str] = lower_criteria,
+    higher_criteria: list[str] = higher_criteria,
+    save_criteria: list[str] = save_criteria,
+    seed: int = seed_option(
+        ' It is applied with "keras.utils.set_random_seed" before the models are built, which seeds Python, NumPy '
+        "and the active backend, so it decides both the model initialization and every random draw a step makes."
+    ),
+    experiment: str = experiment,
+    logger_name: Literal["mlflow", "wandb"] = logger_name,
+    log_arguments: list[dict] | None = log_arguments,
+    log_artifacts: list[Path] | None = log_artifacts,
+    ci: bool = ci,
+) -> None:
+    """Train Keras models with a Learner, recording the run to an experiment-tracking service."""
+    if not model_patterns:
+        raise ValueError("At least one model pattern must be provided.")
+    _activate_backend(backend)
+    device = keras_trainer.get_keras_device(device)
+    keras.utils.set_random_seed(seed)
+    # Resolved before the models: the class itself is what carries the policy the models are built
+    # under, and instantiating it needs them.
+    factory = instantiate_object(learner_pattern)
+    if (policy := _mixed_precision_policy(factory)) is not None:
+        # A policy only reaches the layers built after it is set, and the learner receives models
+        # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
+        print(f'Setting the global mixed precision policy to "{policy}"...')
+        keras.mixed_precision.set_global_policy(policy)
+    models: OrderedDict[str, Any] = OrderedDict()
+    declared: dict[str, Any] = {}
+    for raw in model_patterns:
+        if len(raw) != 1:
+            raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+        model_name, pattern = next(iter(raw.items()))
+        built = instantiate_object(pattern)
+        # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
+        # which carries none of the layer's attributes, so the shapes it was traced with would be
+        # unrecoverable afterwards and the run would record none.
+        declared.update(keras_trainer.resolve_input_shapes(built) or {})
+        models[model_name] = keras_trainer.initial_model(built, reduce_dict(shapes))
+    # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
+    # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
+    input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
+    learner = factory(**models)
+    outputs = get_module_outputs(learner, learner_outputs, "learner")
+    provider = SimpleDataProvider(
+        training_dataset=instantiate_object(training_dataset_pattern),
+        validation_dataset=(
+            None if validation_dataset_pattern is None else instantiate_object(validation_dataset_pattern)
+        ),
+    )
+    print("Count the dataset sizes...")
+    print(f"Training dataset size: {provider.steps_per_epoch} steps.")
+    print(f"Validation dataset size: {provider.validation_steps} steps.")
+    # Only the experiment name is stored here: the run itself starts in __enter__.
+    logger_type = scm_loggers.mlflow.MLflowLogger if logger_name == "mlflow" else scm_loggers.wandb.WandbLogger
+    logger: scm_loggers.base.Logger = logger_type(
+        experiment=experiment, state_backend=scm_loggers.state_backends.KerasStateBackend()
+    )
+    trainer_type = keras_trainer.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer = trainer_type(
+        learner=learner, tracker=keras_trainer.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
+    )
+    display = (
+        Printer()
+        if ci
+        else ProgressBar(
+            steps_per_epoch=provider.steps_per_epoch,
+            validation_steps=provider.validation_steps,
+            training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
+            validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
+        )
+    )
+    saver = keras_trainer.KerasTrainingStateSaver(logger=logger, extra_meta={"seed": seed})
+    bests = keras_trainer.KerasBestCriterion.from_criteria(
+        higher_criteria, lower_criteria, save_criteria, logger=logger
+    )
+    trainer.callbacks = [display, logger, saver, *bests]
+    arguments = {
+        **reduce_dict(log_arguments),
+        "models": model_patterns,
+        "parameters": {name: model.count_params() for name, model in models.items()},
+        "shapes": input_shapes,
+        "backend": backend,
+        "device": device,
+        "mixed_precision_policy": policy,
+        "learner": learner_pattern,
+        "learner_outputs": outputs,
+        "trainer": trainer_pattern,
+        "epochs": epochs,
+        "start_epoch": start_epoch,
+        "training_dataset": training_dataset_pattern,
+        "validation_dataset": validation_dataset_pattern,
+        "validation_frequency": validation_frequency,
+        "lower_criteria": lower_criteria,
+        "higher_criteria": higher_criteria,
+        "save_criteria": save_criteria,
+        "seed": seed,
+        "experiment": experiment,
+        "logger": logger_name,
+        "ci": ci,
+    }
+    with logger:
+        logger.log_params(
+            {
+                "keras_version": keras.__version__,
+                "keras_backend": backend,
+                "epochs": epochs,
+                "steps_per_epoch": provider.steps_per_epoch,
+                "validation_steps": provider.validation_steps,
+            }
+        )
+        logger.log_dict(arguments, "arguments.yaml")
+        for artifact in log_artifacts or []:
+            logger.log_artifact(str(artifact))
+        print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
+        trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
 
 
 __all__ = ["app"]

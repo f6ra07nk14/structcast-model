@@ -2,7 +2,7 @@
 
 StructCast-Model is a configuration-driven toolkit that generates [PyTorch](https://pytorch.org/), [Flax (JAX)](https://flax.readthedocs.io/en/stable/), and [Keras](https://keras.io/) models — plus PyTorch training workflows — from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
 
-Model code generation is available for all three frameworks. Training workflow generation and the full training CLI are available for PyTorch (`scm torch train`) and Flax (`scm flax train`); Keras training support is planned (see [Roadmap](#roadmap)).
+Model code generation, training workflow generation and the full training CLI are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`); Keras training is single-device only, pending distribution and resume (see [Roadmap](#roadmap)).
 
 ## Table of Contents
 
@@ -41,7 +41,7 @@ Model code generation is available for all three frameworks. Training workflow g
 ## What This Project Does
 
 - **Generate model code** — Produce PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html), Flax [`nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html), and Keras [`Layer`](https://keras.io/api/layers/base_layer/) classes from YAML layer templates.
-- **Generate training code** — Produce learner classes — the object owning the models, the optimizers, and the training and inference steps — from YAML templates (PyTorch and Flax).
+- **Generate training code** — Produce learner classes — the object owning the models, the optimizers, and the training and inference steps — from YAML templates (PyTorch, Flax and Keras).
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
@@ -165,10 +165,10 @@ The repository follows a repeatable workflow:
 
 1. **Write or reuse** YAML templates under `cfg/[torch/flax/keras]/`.
 2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
-3. **Generate** Python source files for the model (and, for PyTorch and Flax, the learner) using `scm [torch/flax/keras] create`.
+3. **Generate** Python source files for the model and the learner using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
 5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
-6. *(PyTorch and Flax)* **Train** through `scm torch train` or `scm flax train`, which wires together datasets, models, the learner, the device placement, and the experiment logger.
+6. **Train** through `scm torch train`, `scm flax train` or `scm keras train`, which wires together datasets, models, the learner, the device placement, and the experiment logger.
 
 ```text
 YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
@@ -883,4 +883,4 @@ The following breaking changes were introduced by the learner-template restructu
 - [x] JAX (Flax) model construction from YAML configuration files
 - [x] JAX (Flax) training workflow generation from YAML configuration files
 - [x] Keras model construction from YAML configuration files
-- [ ] Keras training workflow generation from YAML configuration files
+- [x] Keras training workflow generation from YAML configuration files (single-device; distribution and resume pending)
