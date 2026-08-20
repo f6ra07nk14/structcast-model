@@ -14,6 +14,7 @@ independent of the lane they are collected in.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import os
 from pathlib import Path
@@ -145,7 +146,7 @@ def test_a_device_count_outside_the_available_range_is_refused() -> None:
 def test_the_single_preset_touches_nothing() -> None:
     """Single-device training must stay the plain path: nothing activated, nothing wrapped or placed."""
     strategy = KerasDistributedStrategy()
-    models = {"model": object()}
+    models: OrderedDict[str, Any] = OrderedDict(model=object())
     batch = {"x": [[1.0, 2.0]], "y": [[3.0]]}
 
     with strategy.activate():
