@@ -12,7 +12,7 @@ Every ``state_dict``/``load_state_dict`` implementation routes through
 """
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
@@ -162,11 +162,6 @@ class DistributedStrategy(Protocol):
     objects handed to ``__init__``. ``sync_initial_weights`` must run before ``wrap`` so all
     implementations broadcast plain tensors.
     """
-
-    @property
-    def grad_scaler_creator(self) -> Callable[..., Any]:
-        """Callable creating gradient scalers for fp16 learners built under this strategy."""
-        ...
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap the models for this strategy and return the wrapped mapping."""
@@ -409,8 +404,6 @@ class SingleDeviceStrategy(_CompileMixin, _StateDictMixin):
     local_rank: int = 0
     """Local rank; unused on a single device, accepted for a uniform constructor."""
 
-    grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
-
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Return the models unchanged."""
         return models
@@ -508,8 +501,6 @@ class DistributedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDict
 
     sync_batchnorm: bool = True
     """Whether to convert ``BatchNorm`` layers to ``SyncBatchNorm`` before wrapping; a no-op on CPU."""
-
-    grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap every model in DDP. ``device_ids`` must be ``None`` on CPU, where passing one raises."""
@@ -649,8 +640,6 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
 
     sync_batchnorm: bool = True
     """Whether to convert ``BatchNorm`` layers to ``SyncBatchNorm`` before sharding; a no-op on CPU."""
-
-    grad_scaler_creator: Callable[..., Any] = torch.amp.GradScaler
 
     _broadcast_on_load = True
     _mesh: Any = field(default=None, init=False, repr=False)

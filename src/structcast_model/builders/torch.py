@@ -304,7 +304,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         )
         flow_names = [f"_flow_{n}" for n in self.optimizers] + ["_flow_inference"]
         flow_functions_repr = ", ".join(f'"{n}": self.{n}' for n in flow_names)
-        scaler_param = "__grad_scaler_creator__=torch.amp.GradScaler, " if self.mixed_precision_scales else ""
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
@@ -326,7 +325,7 @@ class {self.classname}:
     `param_group_names` expose what a trainer reads off the learner.
     \"\"\"
 
-    def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
+    def __init__(self, {self._learner_models}, **kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
         {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
@@ -450,7 +449,7 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
             mixed_precision = {}
         imports["torch.amp"].add(None)
         repr_mp_kw = "".join(f", {k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
-        return f"__grad_scaler_creator__(device=device_type{repr_mp_kw})", "GradScaler"
+        return f"torch.amp.GradScaler(device=device_type{repr_mp_kw})", "GradScaler"
 
     def _get_optimizer(
         self,

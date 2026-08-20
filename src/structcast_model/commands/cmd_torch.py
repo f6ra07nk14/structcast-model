@@ -2,7 +2,6 @@
 
 from collections import OrderedDict
 from functools import partial
-import inspect
 from pathlib import Path
 import random
 from time import time
@@ -324,16 +323,7 @@ def _assemble_learner(
         models = OrderedDict((n, strategy.compile(m, compile_kw)) for n, m in models.items())
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
-        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
-        # its models as **kwargs would otherwise record the creator as one more model.
-        try:
-            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
-        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
-            takes_scaler_creator = False
-        if takes_scaler_creator:
-            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
-        else:
-            learner = factory(**models)
+        learner = factory(**models)
         learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
         tracker = scm_torch.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed

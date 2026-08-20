@@ -257,12 +257,6 @@ def test_wrap_returns_the_same_model_objects() -> None:
     assert wrapped["model"].fc is model.fc
 
 
-def test_the_grad_scaler_creator_refuses_to_build_a_scaler() -> None:
-    """Returning None would fail later, wherever the learner calls it; this fails where it is asked for."""
-    with pytest.raises(RuntimeError, match="does not use gradient scalers"):
-        FlaxDistributedStrategy().grad_scaler_creator()
-
-
 def test_shard_batch_commits_every_entry_to_the_mesh() -> None:
     """Uncommitted inputs would place the step's computation by chance, not by the mesh."""
     strategy = FlaxDistributedStrategy()

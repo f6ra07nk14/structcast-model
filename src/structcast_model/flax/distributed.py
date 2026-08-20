@@ -8,10 +8,10 @@ construction, before the models are built, because eager sharding reads it there
 """
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from re import Pattern, compile as re_compile
-from typing import TYPE_CHECKING, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -33,18 +33,6 @@ PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
 
 TACTICS = ("replicate", "fsdp")
 """The tactics a rule may name: keep the parameter on every device, or shard it across the mesh."""
-
-
-def _no_grad_scaler(*args: Any, **kwargs: Any) -> NoReturn:
-    """Refuse to build a gradient scaler.
-
-    Returned instead of `None` so that a learner generated for fp16 fails where it asks for a scaler
-    rather than where the `None` is later called.
-
-    Raises:
-        RuntimeError: always.
-    """
-    raise RuntimeError("Flax training does not use gradient scalers.")
 
 
 def _to_host(value: Any) -> Any:
@@ -149,11 +137,6 @@ class FlaxDistributedStrategy:
     def mesh(self) -> Any:
         """The mesh this strategy activated, e.g. for placing a batch or reading its size."""
         return self._mesh
-
-    @property
-    def grad_scaler_creator(self) -> Callable[..., Any]:
-        """A callable that refuses to build a gradient scaler; bf16 needs none and fp16 has no scaler here."""
-        return _no_grad_scaler
 
     def wrap(self, models: "OrderedDict[str, nnx.Module]") -> "OrderedDict[str, nnx.Module]":
         """Place every parameter on the sharding its rule asks for, and return the same models.

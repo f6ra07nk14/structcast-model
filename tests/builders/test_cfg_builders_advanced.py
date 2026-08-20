@@ -88,10 +88,10 @@ def test_learner_script_contains_autocast() -> None:
 
 
 def test_learner_script_contains_grad_scaler() -> None:
-    """fp16 scripts build the scaler through the injectable creator, on the training device."""
+    """fp16 scripts construct the scaler directly, on the training device rather than the cuda default."""
     script = fp16_builder()().scripts[0]
-    assert "__grad_scaler_creator__=torch.amp.GradScaler" in script
-    assert "__grad_scaler_creator__(device=device_type" in script
+    assert "torch.amp.GradScaler(device=device_type" in script
+    assert "__grad_scaler_creator__" not in script
 
 
 def test_learner_bfloat16_script_has_no_grad_scaler() -> None:

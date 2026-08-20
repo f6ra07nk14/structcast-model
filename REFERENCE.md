@@ -268,13 +268,13 @@ INPUTS: []                # auto-inferred from LEARNERS[*].FLOW
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
-**`MIXED_PRECISION`** *(torch only, `TorchUserDefinedLearner`)* — Controls gradient scaling, which only counteracts float16 underflow. The scaler is built through the learner's injectable `__grad_scaler_creator__` argument, which defaults to `torch.amp.GradScaler` and is called with the training `device`.
+**`MIXED_PRECISION`** *(torch only, `TorchUserDefinedLearner`)* — Controls gradient scaling, which only counteracts float16 underflow. The generated learner constructs a `torch.amp.GradScaler` directly, on the training `device`.
 
 | Value             | Behavior                                                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `false` (default) | No `GradScaler` is created. Autocast still runs when `MIXED_PRECISION_TYPE` is set — this is the bfloat16 path, which needs no scaler.        |
 | `true`            | Gradient scaling enabled with default `GradScaler` settings; requires `MIXED_PRECISION_TYPE: float16`.                                        |
-| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to the scaler creator. Requires `MIXED_PRECISION_TYPE: float16`.         |
+| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler`. Requires `MIXED_PRECISION_TYPE: float16`.    |
 
 ```yaml
 MIXED_PRECISION:
@@ -683,7 +683,6 @@ Fields: `preset` (`"single"`, `"dp"`, or `"fsdp"`, default `"single"`), `device`
 Members:
 
 - `mesh` (property) — the activated mesh, for placing a batch or reading its size
-- `grad_scaler_creator` (property) — a callable that raises: bfloat16 needs no scaler and there is no float16 one here, so a learner asking for one fails where it asks rather than where the result is called
 - `wrap(models)` — places every parameter on the sharding its first matching rule asks for and returns the same models. Nothing is wrapped: sharding is a property of the arrays, so the module objects and the step closures capturing them survive, and an optimizer built afterwards inherits the shardings for its own state
 - `sync_initial_weights(models)` — a no-op: JAX is single-controller, so one process initializes every device
 - `compile(module, compile_kw)` — `nnx.jit(module, **compile_kw)`, or *module* unchanged when *compile_kw* is `None`; the caller owns which arguments are static and which are donated. `scm flax train` compiles the learner's steps through this seam by default, which is where the Flax CLI differs from `scm torch train`, whose `--compile` is off unless given
