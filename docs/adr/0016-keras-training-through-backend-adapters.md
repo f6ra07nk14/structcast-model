@@ -40,6 +40,11 @@ reuse savings.
   silently different continuation is worse than a clear error.
 - The CLI resolves `KERAS_BACKEND` before keras imports, with no default backend; a conflict with an
   already-initialized backend fails loudly.
+- Gradient accumulation is the keras optimizer's own (`gradient_accumulation_steps`), which owns the
+  gate deciding when an update lands, so the generated learner's `update()` returns true every step.
+  Under `ACCUMULATE_GRADIENTS` the keras update counter therefore advances per step, not per
+  optimizer application, unlike its torch and flax twins; re-deriving the gate in the learner would
+  be a second implementation free to drift from the optimizer's real apply phase.
 - Criteria returned by a training or inference step are reduced across replicas by the backend
   adapter (or the distributed strategy driving it) before they reach the tracker — the tracker
   itself never all-reduces, unlike its torch twin, and a distributed cell that skips this reduction

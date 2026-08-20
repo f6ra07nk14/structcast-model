@@ -1,12 +1,19 @@
 """API-level tests for keras builder classes."""
 
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
 import pytest
+from structcast.core.exceptions import SpecError
 
 from structcast_model.builders.keras import (
     KerasBuilder,
     KerasLayerIntermediate,
+    KerasLearnerBuilder,
 )
-from tests import CFG_DIR
+from structcast_model.utils.base import load_any
+from tests import CFG_DIR, FIXTURES_DIR
 
 
 def test_keras_layer_intermediate_generates_call_method_without_inference_flow() -> None:
@@ -146,3 +153,266 @@ def test_keras_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> N
     assert "stem" in built.layers
     assert any("downsample" in k for k in built.layers)
     assert len(built.scripts) > 0
+
+
+LEARNER_YAML = FIXTURES_DIR / "cfg" / "keras" / "LinearLearner.yaml"
+SEGMENTS_YAML = FIXTURES_DIR / "cfg" / "keras" / "TwoSegmentLearner.yaml"
+
+
+def _learner_script(path: Path, parameters: dict[str, dict[str, Any]] | None = None) -> str:
+    """Build a learner from a configuration file and return the script holding its class."""
+    return KerasLearnerBuilder.from_path(path)(parameters=parameters).scripts[-1]
+
+
+def _built(raw: dict[str, Any], path: Path = LEARNER_YAML) -> str:
+    """Build a learner from raw configuration data, as a modified fixture."""
+    return KerasLearnerBuilder(raw=raw, current_path=str(path))().scripts[-1]
+
+
+def test_keras_learner_emits_one_flow_method_per_segment() -> None:
+    """Each segment is one `keras.ops` function the adapter calls with the batch alone.
+
+    Nothing in it may name a backend: the same method has to differentiate under `tf.GradientTape`,
+    under `jax.value_and_grad` and under torch autograd.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "def _flow_optimizer_ab(self, batch):" in script
+    assert "        x = batch['x']" in script
+    assert "        out_a = self.a(x, training=True)" in script
+    assert "        return loss_ab, {'loss_ab': loss_ab}" in script
+    assert "def _flow_optimizer_c(self, batch):" in script
+    assert "        return loss_c, {'loss_c': loss_c}" in script
+    assert "def _flow_inference(self, batch):" in script
+    assert "        out_c = self.c(x, training=False)" in script
+    for backend in ("import tensorflow", "import jax", "import torch", "keras.backend.backend()"):
+        assert backend not in script
+
+
+def test_keras_learner_prepares_the_segments_before_it_builds_the_steps() -> None:
+    """The order is the adapter's contract, and only JAX fails loudly when it is wrong.
+
+    `prepare` builds every optimizer against its variables; TensorFlow and torch would happily build
+    one inside the compiled step instead, so a learner that compiled first would only break on JAX.
+    The optimizers are read back off the segments afterwards for the same reason: `prepare` replaces
+    the optimizer of a segment it wraps for loss scaling.
+    """
+    script = _learner_script(LEARNER_YAML)
+
+    prepare = script.index("adapter.prepare(self._segments")
+    assert script.index("adapter = select_backend_adapter()") < prepare
+    assert prepare < script.index("self._optimizers = {segment.name: segment.optimizer")
+    assert script.index("self._optimizers = {segment.name") < script.index("adapter.build_train_step(self._segments)")
+    assert "self._inference_step = adapter.build_inference_step(self._flow_inference, models=[self.model])" in script
+
+
+def test_keras_learner_hands_each_segment_the_variables_of_the_models_it_owns() -> None:
+    """The segment's variable list is what the optimizer updates, so it must be exactly the owned ones.
+
+    A list gathered from every model would let one optimizer train what another owns, silently and
+    at the wrong learning rate.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "variables=[v for m in (self.a, self.b,) for v in m.trainable_variables]," in script
+    assert "variables=list(self.c.trainable_variables)," in script
+    assert "models=[self.a, self.b]," in script
+    assert "return {'optimizer_ab': ['a', 'b'], 'optimizer_c': ['c']}" in script
+
+
+def test_keras_learner_runs_a_model_another_segment_owns_in_inference_mode() -> None:
+    """A model a segment only reads must not update its normalization statistics there.
+
+    That is what the torch learner's `eval()` does for the same case; in Keras the mode is an
+    argument of the call, so it has to be emitted per segment.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].insert(0, ["x", "read_a", "a"])
+
+    script = _built(raw, SEGMENTS_YAML)
+
+    assert "        read_a = self.a(x, training=False)" in script
+    assert "        out_c = self.c(x, training=True)" in script
+
+
+def test_keras_learner_maps_accumulate_gradients_onto_the_optimizer() -> None:
+    """Keras accumulates inside the optimizer, so the learner's own gate stays trivially true.
+
+    `gradient_accumulation_steps` buffers the gradients and applies their mean on every Nth
+    `apply`, which is why the generated `update` may report every step as an update: the optimizer,
+    not the learner, decides when the variables move.
+    """
+    script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
+
+    assert "optimizer.gradient_accumulation_steps = 3" in script
+    assert "def update(self, step: int) -> bool:\n        return True" in script
+
+
+def test_keras_learner_leaves_a_window_of_one_to_the_plain_optimizer() -> None:
+    """`ACCUMULATE_GRADIENTS: 1` updates every step, which is what an unset window already does.
+
+    Keras refuses `gradient_accumulation_steps=1` outright, so emitting it would turn a harmless
+    configuration into a crash at construction.
+    """
+    script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 1}})
+
+    assert "optimizer.gradient_accumulation_steps = " not in script
+
+
+@pytest.mark.parametrize(
+    ("mixed_precision", "expected"),
+    [
+        (True, "mixed_precision=True, mixed_precision_type='float16'"),
+        ({"initial_scale": 128.0}, "mixed_precision={'initial_scale': 128.0}, mixed_precision_type='float16'"),
+    ],
+    ids=["enabled", "keyword-arguments"],
+)
+def test_keras_learner_forwards_the_mixed_precision_fields_to_the_adapter(mixed_precision: Any, expected: str) -> None:
+    """Loss scaling is the adapter's to apply, and a dict carries the wrapper's keyword arguments."""
+    raw = {**load_any(LEARNER_YAML), "MIXED_PRECISION": mixed_precision, "MIXED_PRECISION_TYPE": "float16"}
+
+    script = _built(raw)
+
+    assert f"adapter.prepare(self._segments, {expected})" in script
+
+
+def test_keras_learner_never_sets_the_global_mixed_precision_policy() -> None:
+    """The policy has to be in place before the models are built, which is before this learner exists.
+
+    A learner that set it would apply it to nothing -- the models it receives are already built --
+    while looking like it had (`docs/adr/0016`).
+    """
+    raw = {**load_any(LEARNER_YAML), "MIXED_PRECISION": True, "MIXED_PRECISION_TYPE": "bfloat16"}
+
+    script = _built(raw)
+
+    assert "mixed_precision_type='bfloat16'" in script
+    assert "set_global_policy" not in script
+    assert "keras.mixed_precision.Policy" not in script
+
+
+def test_keras_learner_schema_rejects_the_torch_only_clip_field() -> None:
+    """Clipping is a keyword of the Keras optimizer, so a CLIP key would be dropped without a word.
+
+    Nothing rejects it explicitly: the shared schema's `extra="forbid"` is the whole mechanism, and
+    this test is what keeps the Keras behavior bound to the base one (`docs/adr/0012`).
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["CLIP"] = {"_obj_": [["_addr_", "keras.utils.clip_by_norm"]]}
+
+    with pytest.raises(ValidationError, match="CLIP"):
+        KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_keras_learner_schema_rejects_extra_backward_arguments() -> None:
+    """`optimizer.apply(gradients, variables)` takes nothing else, so EXTRA has nowhere to go.
+
+    Accepting and ignoring it is exactly the silent fallback issue #21 bans: the run would train
+    without whatever the user asked for.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["EXTRA"] = {"value": "eval: loss"}
+
+    with pytest.raises(SpecError, match="EXTRA has no Keras equivalent"):
+        KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+@pytest.mark.parametrize(
+    ("mixed_precision", "mixed_precision_type", "message"),
+    [
+        (True, None, "no default element type"),
+        (False, "float16", "alone it would be dropped"),
+    ],
+    ids=["without-a-type", "type-alone"],
+)
+def test_keras_learner_schema_rejects_half_a_mixed_precision_configuration(
+    mixed_precision: Any, mixed_precision_type: str | None, message: str
+) -> None:
+    """Either field alone is a setting that would silently do nothing.
+
+    `MIXED_PRECISION` picks the policy the CLI sets and cannot guess its element type; the type
+    without it names a policy nobody would ever set.
+    """
+    raw = {
+        **load_any(LEARNER_YAML),
+        "MIXED_PRECISION": mixed_precision,
+        "MIXED_PRECISION_TYPE": mixed_precision_type,
+    }
+
+    with pytest.raises(SpecError, match=message):
+        KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_keras_learner_schema_rejects_loss_scale_kwargs_under_a_bfloat16_policy() -> None:
+    """A dict `MIXED_PRECISION` carries `LossScaleOptimizer` kwargs, which only float16 ever wraps.
+
+    Under bfloat16 the adapter never builds a `LossScaleOptimizer`, so the kwargs would be read by
+    nobody and the run would train unscaled without a word about the discarded configuration.
+    """
+    raw = {
+        **load_any(LEARNER_YAML),
+        "MIXED_PRECISION": {"initial_scale": 1024.0},
+        "MIXED_PRECISION_TYPE": "bfloat16",
+    }
+
+    with pytest.raises(SpecError, match="only a float16 policy wraps the optimizers in"):
+        KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_keras_learner_rejects_an_optimizer_named_inference() -> None:
+    """Every segment emits `_flow_<optimizer>`, and the learner already defines `_flow_inference`.
+
+    Python keeps the last definition of a duplicated method name, so the generated class would run
+    one of the two flows in place of the other with nothing in the script hinting at the swap.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["NAME"] = "inference"
+
+    with pytest.raises(SpecError, match='An optimizer named "inference"'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+def test_keras_learner_rejects_two_segments_reporting_the_same_criterion() -> None:
+    """The training step merges its segments' criteria last-wins, so a clash loses one of them.
+
+    The adapter only sees the names at run time and cannot tell a clash from an intended overwrite,
+    which makes distinct names the generator's job (`docs/adr/0016`).
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].append(["eval: keras.ops.mean(errors_c)", "loss_ab", None])
+
+    with pytest.raises(SpecError, match='Criterion "loss_ab" is computed by both'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+def test_keras_learner_rejects_a_segment_that_reads_what_another_segment_computes() -> None:
+    """A segment is one function the adapter calls with the batch alone: nothing else is in scope.
+
+    The generated code would be valid Python raising `NameError` on the first batch, long after the
+    script was written, so the flow is refused while it is still being generated.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].insert(0, ["eval: out_a * 2.0", "doubled", None])
+
+    with pytest.raises(SpecError, match='reads "out_a" before its own FLOW stores it'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+def test_keras_learner_imports_only_keras_and_the_adapter_helpers() -> None:
+    """The generated learner calls the two adapter entry points and `keras.ops`, and nothing else."""
+    imports = KerasLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
+
+    assert imports["keras"] == {None}
+    assert imports["structcast_model.keras.adapters"] == {"AdapterSegment", "select_backend_adapter"}
+
+
+def test_keras_learner_scripts_are_byte_identical_across_builds() -> None:
+    """The same template must render the same script every time, in every process.
+
+    A name derived from `id()` or from set iteration order would produce phantom diffs for committed
+    scripts and defeat any "already generated" check.
+    """
+    assert _learner_script(SEGMENTS_YAML) == _learner_script(SEGMENTS_YAML)

@@ -26,6 +26,11 @@ def statement_names(line: str) -> tuple[set[str], set[str]]:
     return loads, stores
 
 
+def stored_names(output: str) -> list[str]:
+    """Return the variable names one flow step assigns, unpacking the `(a, b)` form of a multi-output step."""
+    return [name.strip() for name in output.strip("()").split(",") if name.strip()]
+
+
 def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
     """Resolve the object pattern to a string representation and collect the required imports.
 
@@ -161,7 +166,7 @@ def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variab
     return _getter(spec, variable)
 
 
-__all__ = ["resolve_getter", "resolve_object", "statement_names"]
+__all__ = ["resolve_getter", "resolve_object", "statement_names", "stored_names"]
 
 if not TYPE_CHECKING:
     import sys

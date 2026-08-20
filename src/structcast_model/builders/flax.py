@@ -22,7 +22,7 @@ from structcast_model.builders.base import (
     OptimizerSegment,
 )
 from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
-from structcast_model.builders.utils import resolve_object, statement_names
+from structcast_model.builders.utils import resolve_object, statement_names, stored_names
 from structcast_model.utils.base import unique
 
 
@@ -244,11 +244,6 @@ def _container(trainable_layers: list[str]) -> str:
     return f"_seg_{'_'.join(trainable_layers)}"
 
 
-def _stored(output: str) -> list[str]:
-    """Return the variable names one flow step assigns, unpacking the `(a, b)` form of a multi-output step."""
-    return [name.strip() for name in output.strip("()").split(",") if name.strip()]
-
-
 @dataclass(kw_only=True, slots=True)
 class FlaxOptimizerSegment(OptimizerSegment):
     """One optimizer step of a Flax learner flow, carrying the digest of the pattern that built it."""
@@ -322,7 +317,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             parameters = [container, *unique([L for _, _, L in units if L in self.models and L not in owned])]
             body = [f"{', '.join(owned)} = {container}"] if len(owned) > 1 else []
             body += [self._get_regular_step(i, o, L) for i, o, L in units]
-            stores = unique([name for _, output, _ in units for name in _stored(output)])
+            stores = unique([name for _, output, _ in units for name in stored_names(output)])
             bound, external = set(parameters), set[str]()
             deferred = set(stores) - bound
             for line in body:
