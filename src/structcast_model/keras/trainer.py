@@ -170,9 +170,10 @@ class KerasTracker:
     `BaseTrainer.train` times, where the torch loop blocks on `torch.cuda.synchronize()` for the
     same reason.
 
-    Unlike the torch tracker there is no all-reduce: a distributed step's criteria are reduced by
-    the backend adapter that ran the step, so what reaches this tracker is already one value
-    (`docs/adr/0016`).
+    Unlike the torch tracker there is no all-reduce: a distributed step's criteria are reduced
+    before they get here — by the distributed strategy's step wrapper on the tensorflow and torch
+    backends, and by XLA's global reduction of sharded arrays on jax — so what reaches this tracker
+    is already one value (`docs/adr/0016`).
 
     Example:
         >>> import keras
