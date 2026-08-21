@@ -21,24 +21,20 @@ __all__ = [
     "TensorFlowAdapter",
     "TensorInitializer",
     "TorchAdapter",
-    "adapters",
     "apply_state_dict",
     "collect_state_dict",
     "create_keras_inputs",
     "create_numpy_inputs",
-    "distributed",
     "get_keras_device",
     "initial_model",
     "layers",
     "resolve_input_shapes",
     "restore_training_state",
     "select_backend_adapter",
-    "trainer",
-    "utils",
 ]
 
 if TYPE_CHECKING:
-    from structcast_model.keras import adapters, distributed, layers, trainer, utils
+    from structcast_model.keras import layers
     from structcast_model.keras.adapters import (
         AdapterSegment,
         BackendAdapter,
