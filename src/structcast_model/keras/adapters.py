@@ -9,9 +9,9 @@ Gradient accumulation is deliberately absent: `keras.optimizers.Optimizer` takes
 three backends, so it belongs in the optimizer pattern exactly as `clipnorm` does, not in a step
 callable that would need its own buffers, its own gate and its own per-backend carrying.
 
-Each adapter imports its framework inside the method that needs it: only the active backend's
-framework is guaranteed to be installed, so a module-level import would break every other backend
-at import time.
+Each backend's framework is bound lazily at module level: only the active backend's framework is
+guaranteed to be installed, so the binding resolves on first attribute access inside an adapter,
+never at import time.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -24,6 +24,20 @@ from typing import TYPE_CHECKING, Any
 from typing_extensions import Protocol, runtime_checkable
 
 import keras
+
+if TYPE_CHECKING:
+    import jax
+    import tensorflow as tf
+
+    import torch
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    # An inactive backend's framework may not be installed, so each one is bound lazily and only
+    # resolved by the adapter the active backend selects, as in `loggers.state_backends`.
+    jax = LazyModuleImporter("jax")
+    tf = LazyModuleImporter("tensorflow")
+    torch = LazyModuleImporter("torch")
 
 Flow = Callable[[Mapping[str, Any]], tuple[Any, dict[str, Any]]]
 """A training flow: it takes the batch and returns the loss to differentiate and the criteria.
@@ -162,7 +176,6 @@ class TensorFlowAdapter(_Adapter):
 
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Trace one `tf.function` running every segment's tape, gradients and update."""
-        import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
         def step(batch: Mapping[str, Any]) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
@@ -181,8 +194,6 @@ class TensorFlowAdapter(_Adapter):
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
         """Trace the inference flow into one `tf.function`, reading its variables from the closure."""
-        import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
         return tf.function(flow)
 
 
@@ -202,8 +213,6 @@ class JaxAdapter(_Adapter):
 
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Compile one `jax.jit` step threading trainable, state and optimizer values through."""
-        import jax  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
         segments = list(segments)
         owned = {id(variable) for segment in segments for variable in segment.variables}
         state_variables = _state_variables(segments, owned)
@@ -285,8 +294,6 @@ class JaxAdapter(_Adapter):
         seeds -- stays as the training step left it. Without the models there is nothing to thread,
         so the flow runs eagerly rather than freezing at its first weights.
         """
-        import jax  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
         variables = [variable for model in models for variable in model.variables]
         if not variables:
             return flow
@@ -316,7 +323,6 @@ class TorchAdapter(_Adapter):
 
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Build the step reading each segment's gradients off its own variables."""
-        import torch  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
         def step(batch: Mapping[str, Any]) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
@@ -338,8 +344,6 @@ class TorchAdapter(_Adapter):
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
         """Run the inference flow with autograd disabled, reading its variables from the closure."""
-        import torch  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
         inference: InferenceFlow = torch.no_grad()(flow)
         return inference
 

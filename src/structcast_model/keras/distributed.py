@@ -32,6 +32,20 @@ from typing import TYPE_CHECKING, Any, Literal
 import keras
 from structcast_model.keras.utils import apply_state_dict, collect_state_dict, get_keras_device
 
+if TYPE_CHECKING:
+    import tensorflow as tf
+
+    import torch
+    import torch.distributed as dist
+else:
+    from structcast.utils.lazy_import import LazyModuleImporter
+
+    # An inactive backend's framework may not be installed, so each one is bound lazily and only
+    # resolved inside the preset paths the active backend can reach, as in `loggers.state_backends`.
+    tf = LazyModuleImporter("tensorflow")
+    torch = LazyModuleImporter("torch")
+    dist = LazyModuleImporter("torch.distributed")
+
 AXIS = "batch"
 """The single mesh axis every preset builds: batches split along it, FSDP shards along it.
 
@@ -237,7 +251,6 @@ class KerasDistributedStrategy:
             self._activate_torch()
             yield
             return
-        import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
         self._mirrored = tf.distribute.MirroredStrategy(devices=self._device_names())
         # The scope object is held, not dropped: it owns the variable-creator scope it entered, and
@@ -267,7 +280,6 @@ class KerasDistributedStrategy:
         """
         if self._backend != "torch" or self.preset == "single":
             return
-        import torch.distributed as dist  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
         for model in models.values():
             for variable in model.variables:
@@ -413,8 +425,6 @@ class KerasDistributedStrategy:
     def _replicated(self, step: Any) -> Any:
         """Wrap one learner step so it runs across the replicas and reports reduced criteria."""
         if self._mirrored is not None:
-            import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
             # One `tf.function` around the whole replicated call, which is what makes it legal at
             # all: the adapter already traced the step, and a `tf.function` containing an optimizer
             # application is a synchronization point TensorFlow refuses to nest inside
@@ -440,8 +450,6 @@ class KerasDistributedStrategy:
             return jax_step
 
         def torch_step(**batch: Any) -> dict[str, Any]:
-            import torch  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-            import torch.distributed as dist  # noqa: PLC0415  # Same.
 
             criteria = {}
             for name, value in step(**batch).items():
@@ -479,9 +487,6 @@ class KerasDistributedStrategy:
         Raises:
             RuntimeError: if no process group is available, so the run has no ranks to spread over.
         """
-        import torch  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-        import torch.distributed as dist  # noqa: PLC0415  # Same.
-
         if not dist.is_initialized():
             if not dist.is_torchelastic_launched():
                 raise RuntimeError(
@@ -509,7 +514,6 @@ class KerasDistributedStrategy:
         """
         if self._backend != "torch" or self.preset == "single" or self._world_size == 1:
             return
-        import torch.distributed as dist  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
         for model in models.values():
             for variable in model.variables:
@@ -532,8 +536,6 @@ class KerasDistributedStrategy:
         With *limit* false, every device the backend exposes, before `devices` cuts the list down.
         """
         if self._backend == "tensorflow":
-            import tensorflow as tf  # noqa: PLC0415  # An inactive backend's framework may not be installed.
-
             names = [device.name for device in tf.config.list_logical_devices(self._device_type.upper())]
         else:
             names = [name for name in keras.distribution.list_devices() if name.startswith(self._device_type)]
@@ -569,7 +571,6 @@ def _wrap_ddp(model: Any) -> Any:
     model, so the wrapper is what the learner calls -- which is what arms the gradient all-reduce,
     since DDP only prepares the backward pass from inside its own forward.
     """
-    import torch  # noqa: PLC0415  # An inactive backend's framework may not be installed.
 
     class _KerasDistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
         """A `DistributedDataParallel` forwarding the Keras half of the surface to the model."""
