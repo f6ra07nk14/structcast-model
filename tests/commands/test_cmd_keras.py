@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 import inspect
 from math import isfinite
@@ -23,6 +24,7 @@ from typer.testing import CliRunner
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.commands.cmd_keras import app
+from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.keras.trainer import KerasTrainer
 from structcast_model.loggers.state_backends import KerasStateBackend
 from structcast_model.utils.base import load_any
@@ -233,14 +235,34 @@ VALIDATION_DATASET = f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: 
 POLICIES: list[str] = []
 """Dtype policies of the models `RecordingTrainer` trained; cleared by the test that reads them."""
 
+CALLBACKS: list[str] = []
+"""Callback types `RecordingTrainer` was wired with; cleared by the test that reads them."""
+
 
 class RecordingTrainer(KerasTrainer):
-    """A trainer recording the dtype policy the models it is handed were built under."""
+    """A trainer recording what it was handed: the models' dtype policy, and its own callbacks."""
 
     def fit(self, *args: Any, **kwargs: Any) -> Any:
-        """Note what the models compute in, then hand over to the shared loop."""
+        """Note what the models compute in and what was wired in, then hand over to the shared loop."""
         POLICIES.extend(model.dtype_policy.name for model in self.learner.models.values())
+        CALLBACKS.extend(type(callback).__name__ for callback in self.callbacks)
         return super().fit(*args, **kwargs)
+
+
+@dataclass(kw_only=True)
+class NonMainStrategy(KerasDistributedStrategy):
+    """A strategy reporting a non-zero rank, as every torchrun worker but the first does.
+
+    The rank is the one fact a worker differs by, so it is the only thing overridden: the state
+    collection the saver drives stays the real strategy's, which is what makes the run reach the
+    callbacks at all. Reaching a real second process would need a launcher, which a unit test has
+    no business starting.
+    """
+
+    def __post_init__(self) -> None:
+        """Validate the preset as the real strategy does, then take a worker's rank."""
+        super().__post_init__()
+        self._rank = 1
 
 
 @pytest.fixture(scope="module")
@@ -514,6 +536,95 @@ def test_train_starts_keras_on_the_backend_the_flag_names(tmp_path: Path) -> Non
     assert result.stdout.strip().endswith("jax jax")
 
 
+def test_train_caps_the_jax_memory_fraction_before_it_imports_keras(tmp_path: Path) -> None:
+    """XLA reads its share of the GPU once, while JAX starts, so the cap has to be set before that.
+
+    Set afterwards it would be ignored and the run would take XLA's default share of every device
+    while reporting the cap it was given. The subprocess starts without either variable, so what it
+    prints was written by the command, and it is left to fail on its placeholder patterns
+    afterwards: the environment it prepared before importing Keras is what is under test.
+    """
+    script = (
+        "from typer.testing import CliRunner; from structcast_model.commands.cmd_keras import app; "
+        "CliRunner().invoke(app, ['train', 'model: [_obj_, {_addr_: builtins.dict}, _call_]', "
+        "'--backend', 'jax', '--gpu-memory-fraction', '0.25', "
+        "'--learner', '[_obj_, {_addr_: builtins.dict}]', "
+        "'--training-dataset', '[_obj_, {_addr_: builtins.list}, _call_]']); "
+        "import os, sys; print(os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'], "
+        "os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'], sys.modules['keras'].backend.backend())"
+    )
+    scrubbed = {"KERAS_BACKEND", "XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE"}
+    environment = {key: value for key, value in os.environ.items() if key not in scrubbed}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("0.25 false jax")
+
+
+def test_train_asks_tensorflow_for_growth_because_it_has_no_fraction(tmp_path: Path) -> None:
+    """TensorFlow has no fraction cap, so the option must not pretend it applied one.
+
+    Growth on demand is the nearest thing it has -- the run takes what it uses instead of the whole
+    device -- and it is read while TensorFlow starts, so it goes in before the import like the JAX
+    one. A fraction variable TensorFlow never reads would leave the cap silently unapplied, so the
+    subprocess also reports that none was written.
+    """
+    script = (
+        "from typer.testing import CliRunner; from structcast_model.commands.cmd_keras import app; "
+        "CliRunner().invoke(app, ['train', 'model: [_obj_, {_addr_: builtins.dict}, _call_]', "
+        "'--backend', 'tensorflow', '--gpu-memory-fraction', '0.25', "
+        "'--learner', '[_obj_, {_addr_: builtins.dict}]', "
+        "'--training-dataset', '[_obj_, {_addr_: builtins.list}, _call_]']); "
+        "import os, sys; print(os.environ['TF_FORCE_GPU_ALLOW_GROWTH'], "
+        "'XLA_PYTHON_CLIENT_MEM_FRACTION' in os.environ, sys.modules['keras'].backend.backend())"
+    )
+    scrubbed = {"KERAS_BACKEND", "TF_FORCE_GPU_ALLOW_GROWTH", "XLA_PYTHON_CLIENT_MEM_FRACTION"}
+    environment = {key: value for key, value in os.environ.items() if key not in scrubbed}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("true False tensorflow")
+
+
+def test_train_caps_the_torch_backend_on_every_visible_device(tmp_path: Path) -> None:
+    """The torch backend has no environment variable for this, so the cap is one call per device.
+
+    It also has to come after the import, `torch.cuda` being what applies it. A cap put on device 0
+    alone would leave every other rank of a torchrun launch uncapped, which is the whole point of
+    asking for a fraction on a shared machine. The subprocess stands in for the GPUs this machine
+    may not have -- the calls are what is under test, not CUDA -- and the command is left to fail on
+    its placeholder patterns afterwards.
+    """
+    script = (
+        "import torch; "
+        "torch.cuda.is_available = lambda: True; "
+        "torch.cuda.device_count = lambda: 2; "
+        "capped = []; "
+        "torch.cuda.set_per_process_memory_fraction = lambda fraction, device: capped.append((fraction, device)); "
+        "from typer.testing import CliRunner; from structcast_model.commands.cmd_keras import app; "
+        "CliRunner().invoke(app, ['train', 'model: [_obj_, {_addr_: builtins.dict}, _call_]', "
+        "'--backend', 'torch', '--gpu-memory-fraction', '0.5', "
+        "'--learner', '[_obj_, {_addr_: builtins.dict}]', "
+        "'--training-dataset', '[_obj_, {_addr_: builtins.list}, _call_]']); "
+        # Printed after the invoke: the runner captures whatever the command writes to stdout.
+        "print('capped', capped)"
+    )
+    environment = {key: value for key, value in os.environ.items() if key != "KERAS_BACKEND"}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, env=environment
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("capped [(0.5, 0), (0.5, 1)]")
+
+
 # ---------------------------------------------------------------------------
 # 'train' command — distributed strategy and resume
 # ---------------------------------------------------------------------------
@@ -552,6 +663,64 @@ def test_train_accepts_a_strategy_pattern(tmp_path: Path, cli_runner: CliRunner,
 
     (run,) = mlflow.search_runs(experiment_names=["keras-dp"], output_format="list")
     assert isfinite(run.data.metrics["loss"])
+
+
+def test_train_refuses_a_memory_fraction_outside_the_unit_interval(
+    cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """A fraction above 1 or at 0 caps nothing and would be applied as if it did."""
+    error = _train_error(
+        cli_runner,
+        [
+            patterns[0],
+            "--backend",
+            BACKEND,
+            "--shape",
+            "x: [4]",
+            "--learner",
+            patterns[1],
+            "--training-dataset",
+            DATASET,
+            "--gpu-memory-fraction",
+            "1.5",
+        ],
+    )
+
+    assert isinstance(error, ValueError)
+    assert "must be in (0, 1]" in str(error)
+
+
+def test_train_leaves_the_run_and_the_display_to_the_main_rank(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """Under torchrun every rank runs this command, and only the first may own the run.
+
+    A worker that built a real logger would open a tracking run of its own and write its own
+    checkpoint next to the first rank's, which is what a multi-rank run on real hardware showed; a
+    worker that kept the display would print a second progress bar over it. The saver and the
+    best-criterion monitors stay on every rank, as they do in `scm torch train`: they read the state
+    through the strategy, and their writes land in the null logger. See `docs/adr/0005`.
+    """
+    CALLBACKS.clear()
+
+    result = _train(
+        cli_runner,
+        patterns,
+        tmp_path,
+        experiment="keras-worker",
+        epochs=1,
+        extra=[
+            "--strategy",
+            f"[_obj_, {{_addr_: {__name__}.NonMainStrategy}}]",
+            "--trainer",
+            f"[_obj_, {{_addr_: {__name__}.RecordingTrainer}}]",
+        ],
+    )
+
+    assert CALLBACKS == ["NullLogger", "KerasTrainingStateSaver", "KerasBestCriterion", "KerasBestCriterion"]
+    assert mlflow.get_experiment_by_name("keras-worker") is None
+    assert "Registered callbacks:" not in result.output
+    assert "Training dataset size:" not in result.output
 
 
 @pytest.mark.skipif(BACKEND == "jax", reason="fsdp is supported on the jax backend.")

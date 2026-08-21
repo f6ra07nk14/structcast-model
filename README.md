@@ -681,6 +681,8 @@ Where it differs from `scm torch train`:
 - `-d/--device`: named as `keras.distribution.list_devices()` spells it (`cpu:0`, `gpu:0`, …), it places nothing — which devices a backend computes on is the backend's own choice (restrict it with `CUDA_VISIBLE_DEVICES`) — so the name is validated and recorded with the run
 - training states are saved as `training_state.npz`, tagged with the backend that wrote them: `--resume` continues at the saved epoch plus one and refuses a state written on another backend, since normalization statistics and RNG trajectories are not verified equivalent across backends
 
+> **TensorFlow backend on GPU** — as with the JAX backend, you may need to set `LD_LIBRARY_PATH` to include the NVIDIA shared libraries from your virtual environment (`.venv/lib/python3.*/site-packages/nvidia/*/lib`). Without it TensorFlow logs `Cannot dlopen some GPU libraries`, falls back to the CPU and the run still reports success — at CPU speed. The tell is the device list: `keras.distribution.list_devices()` names `cpu:0` alone, and `-d gpu:0` aborts with that list instead of training.
+
 ## Training Loop Anatomy
 
 Whether it is built by the CLI or by hand, a training run is the same five objects handed to a trainer at construction:

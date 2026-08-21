@@ -62,7 +62,11 @@ if TYPE_CHECKING:
 
     import keras
     from structcast_model.builders import keras as keras_builder
-    from structcast_model.keras import distributed as keras_distributed, trainer as keras_trainer
+    from structcast_model.keras import (
+        distributed as keras_distributed,
+        trainer as keras_trainer,
+        utils as keras_utils,
+    )
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -73,6 +77,7 @@ else:
     keras_builder = LazyModuleImporter("structcast_model.builders.keras")
     keras_distributed = LazyModuleImporter("structcast_model.keras.distributed")
     keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
+    keras_utils = LazyModuleImporter("structcast_model.keras.utils")
     torch = LazyModuleImporter("torch")
 
 
@@ -185,7 +190,7 @@ def measure_inference_time(
     batch_size: int = batch_size,
 ) -> None:
     """Measure the average inference time of a Keras model."""
-    device = keras_trainer.get_keras_device(device)
+    device = keras_utils.get_keras_device(device)
     # Unlike `train`, this command takes no --backend and inherits the ambient one (`docs/adr/0016`),
     # so it says which one produced the number: the backend decides what actually executes.
     print(f'Timing on the "{keras.backend.backend()}" Keras backend, device "{device}".')
@@ -237,6 +242,42 @@ def _activate_backend(backend: str) -> None:
         raise ValueError(f'Keras started on the "{active}" backend instead of the requested "{backend}".')
 
 
+def _cap_gpu_memory(backend: str, fraction: float | None) -> None:
+    """Ask *backend* to keep to *fraction* of each GPU, before anything imports Keras.
+
+    Only JAX takes an actual fraction: XLA sizes its device allocation by it. TensorFlow has no
+    fraction knob at all, so the honest stand-in is growth on demand -- the run then takes what it
+    uses instead of the whole device, which caps nothing but leaves room next to it. The torch
+    backend has neither, and is capped through the API in :func:`_cap_torch_gpu_memory` instead.
+
+    Raises:
+        ValueError: If the fraction is not greater than 0 and at most 1.
+    """
+    if fraction is None:
+        return
+    if not 0 < fraction <= 1:
+        raise ValueError(f"--gpu-memory-fraction must be in (0, 1]. Got: {fraction}.")
+    if backend == "jax":
+        # Preallocation is turned off alongside the fraction so the share is taken as the run needs
+        # it; `setdefault`, because an operator who set the variable deliberately keeps their choice.
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(fraction)
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    elif backend == "tensorflow":
+        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
+
+def _cap_torch_gpu_memory(backend: str, fraction: float | None) -> None:
+    """Cap every visible CUDA device at *fraction* of its memory, after Keras imported torch.
+
+    The torch backend has no environment variable for this, so the cap is an API call and it has to
+    come after the import: `torch.cuda` is what applies it, per device.
+    """
+    if fraction is None or backend != "torch" or not torch.cuda.is_available():
+        return
+    for index in range(torch.cuda.device_count()):
+        torch.cuda.set_per_process_memory_fraction(fraction, index)
+
+
 def _mixed_precision_policy(factory: Any) -> str | None:
     """Return the global policy the generated learner's module asks for, or None for a plain run.
 
@@ -277,6 +318,58 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "keras_distributed.K
     return instantiate_object(strategy)(device=device)
 
 
+def _build_logger(logger_name: str, experiment: str, is_main: bool) -> "scm_loggers.Logger":
+    """Return the run's logger: the real one on the main rank, a null one on every other.
+
+    Only the experiment name is stored here, so the run itself starts in `__enter__`. Under a
+    torchrun launch every rank reaches this, and only the main one may own the run: the others would
+    otherwise each open their own and write their own checkpoint next to it (`docs/adr/0005`).
+    """
+    if not is_main:
+        return scm_loggers.NullLogger()
+    logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+    return logger_type(experiment=experiment, state_backend=scm_loggers.KerasStateBackend())
+
+
+def _build_callbacks(
+    *,
+    trainer: Any,
+    provider: SimpleDataProvider,
+    strategy: "keras_distributed.KerasDistributedStrategy",
+    outputs: list[str],
+    higher_criteria: list[str],
+    lower_criteria: list[str],
+    save_criteria: list[str],
+    logger: "scm_loggers.Logger",
+    ci: bool,
+    extra_meta: Mapping[str, Any],
+) -> None:
+    """Install the logger and the saver/best/display callbacks on the trainer.
+
+    The twin of `cmd_torch._build_callbacks`: the saver and the best-criterion monitors are built on
+    every rank -- they read the state through the strategy -- and only the main rank holds a real
+    logger, so only it writes anything. The display is the main rank's alone, one per run
+    (`docs/adr/0005`).
+    """
+    saver = keras_trainer.KerasTrainingStateSaver(logger=logger, strategy=strategy, extra_meta=extra_meta)
+    bests = keras_trainer.KerasBestCriterion.from_criteria(
+        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
+    )
+    display: list[Any] = []
+    if strategy.is_main:
+        display.append(
+            Printer()
+            if ci
+            else ProgressBar(
+                steps_per_epoch=provider.steps_per_epoch,
+                validation_steps=provider.validation_steps,
+                training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
+                validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
+            )
+        )
+    trainer.callbacks = [*display, logger, saver, *bests]
+
+
 @app.command()
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
@@ -295,6 +388,16 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "declares itself; given, the same shapes are used for every model."
     ),
     device: str | None = train_device,
+    gpu_memory_fraction: float | None = Option(
+        None,
+        "--gpu-memory-fraction",
+        envvar="XLA_PYTHON_CLIENT_MEM_FRACTION",
+        help="Share of each GPU's memory the run may take, greater than 0 and at most 1. What it can mean follows "
+        "the backend: jax is capped through XLA_PYTHON_CLIENT_MEM_FRACTION (preallocation turned off with it), "
+        "torch through torch.cuda.set_per_process_memory_fraction on every visible device, and tensorflow has no "
+        "fraction knob at all -- it is only switched to growth on demand (TF_FORCE_GPU_ALLOW_GROWTH), which caps "
+        "nothing but stops the run from taking the whole device up front. Uncapped when omitted.",
+    ),
     learner_pattern: Any = learner_pattern,
     learner_outputs: list[str] | None = learner_outputs,
     trainer_pattern: Any | None = trainer_option(
@@ -345,8 +448,12 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train Keras models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
+    # Before the activation below, which is what imports Keras: the variables it writes are read
+    # once, while the backend's framework starts up. The torch cap is an API call, so it waits.
+    _cap_gpu_memory(backend, gpu_memory_fraction)
     _activate_backend(backend)
-    device = keras_trainer.get_keras_device(device)
+    _cap_torch_gpu_memory(backend, gpu_memory_fraction)
+    device = keras_utils.get_keras_device(device)
     keras.utils.set_random_seed(seed)
     # Resolved before the models: the class itself is what carries the policy the models are built
     # under, and instantiating it needs them.
@@ -392,14 +499,11 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             None if validation_dataset_pattern is None else instantiate_object(validation_dataset_pattern)
         ),
     )
-    print("Count the dataset sizes...")
-    print(f"Training dataset size: {provider.steps_per_epoch} steps.")
-    print(f"Validation dataset size: {provider.validation_steps} steps.")
-    # Only the experiment name is stored here: the run itself starts in __enter__.
-    logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
-    logger: scm_loggers.Logger = logger_type(
-        experiment=experiment, state_backend=scm_loggers.KerasStateBackend()
-    )
+    if strategy.is_main:
+        print("Count the dataset sizes...")
+        print(f"Training dataset size: {provider.steps_per_epoch} steps.")
+        print(f"Validation dataset size: {provider.validation_steps} steps.")
+    logger = _build_logger(logger_name, experiment, strategy.is_main)
     optimizer_hashes = _optimizer_hashes(learner)
     if resume is not None:
         start_epoch = keras_trainer.restore_training_state(
@@ -417,25 +521,18 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     trainer = trainer_type(
         learner=learner, tracker=keras_trainer.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
     )
-    display = (
-        Printer()
-        if ci
-        else ProgressBar(
-            steps_per_epoch=provider.steps_per_epoch,
-            validation_steps=provider.validation_steps,
-            training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
-            validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
-        )
-    )
-    saver = keras_trainer.KerasTrainingStateSaver(
-        logger=logger,
+    _build_callbacks(
+        trainer=trainer,
+        provider=provider,
         strategy=strategy,
+        outputs=outputs,
+        higher_criteria=higher_criteria,
+        lower_criteria=lower_criteria,
+        save_criteria=save_criteria,
+        logger=logger,
+        ci=ci,
         extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
     )
-    bests = keras_trainer.KerasBestCriterion.from_criteria(
-        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
-    )
-    trainer.callbacks = [display, logger, saver, *bests]
     arguments = {
         **reduce_dict(log_arguments),
         "models": model_patterns,
@@ -443,6 +540,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "shapes": input_shapes,
         "backend": backend,
         "device": device,
+        "gpu_memory_fraction": gpu_memory_fraction,
         "strategy": strategy_pattern,
         "replicas": strategy.replicas,
         "mixed_precision_policy": policy,
@@ -476,7 +574,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         logger.log_dict(arguments, "arguments.yaml")
         for artifact in log_artifacts or []:
             logger.log_artifact(str(artifact))
-        print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
+        if strategy.is_main:
+            print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
         trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
 
 
