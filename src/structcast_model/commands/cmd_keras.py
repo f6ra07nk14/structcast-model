@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# `scm` and `scm_loggers` are package shims routing to lazy submodules, so importing them pulls in
-# no framework, as in cmd_flax.
+# `scm`, `scm_keras` and `scm_loggers` are package shims routing to lazy submodules, so importing
+# them pulls in no framework, as in cmd_flax.
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
@@ -25,6 +25,7 @@ from structcast_model.commands.utils import (
     reduce_dict,
     strategy_parser,
 )
+import structcast_model.keras as scm_keras
 import structcast_model.loggers as scm_loggers
 
 if TYPE_CHECKING:
@@ -33,11 +34,6 @@ if TYPE_CHECKING:
 
     import keras
     from structcast_model.builders import keras as keras_builder
-    from structcast_model.keras import (
-        distributed as keras_distributed,
-        trainer as keras_trainer,
-        utils as keras_utils,
-    )
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -46,9 +42,6 @@ else:
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
     keras_builder = LazyModuleImporter("structcast_model.builders.keras")
-    keras_distributed = LazyModuleImporter("structcast_model.keras.distributed")
-    keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
-    keras_utils = LazyModuleImporter("structcast_model.keras.utils")
     torch = LazyModuleImporter("torch")
 
 
@@ -162,14 +155,14 @@ def measure_inference_time(
     batch_size: int = scm_args.batch_size,
 ) -> None:
     """Measure the average inference time of a Keras model."""
-    device = keras_utils.get_keras_device(device)
+    device = scm_keras.get_keras_device(device)
     # Unlike `train`, this command takes no --backend and inherits the ambient one (`docs/adr/0016`),
     # so it says which one produced the number: the backend decides what actually executes.
     print(f'Timing on the "{keras.backend.backend()}" Keras backend, device "{device}".')
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
-    shapes = keras_trainer.resolve_input_shapes(model, shapes)
-    model = keras_trainer.initial_model(model, shapes)
+    shapes = scm_keras.resolve_input_shapes(model, shapes)
+    model = scm_keras.initial_model(model, shapes)
     if compile_pattern is None:
         print("Skipping compilation...")
     else:
@@ -178,7 +171,7 @@ def measure_inference_time(
     sync = _get_sync_fn(device)
 
     def _measure_single_run() -> float:
-        inputs = keras_trainer.create_numpy_inputs(shapes, batch_size=batch_size)
+        inputs = scm_keras.create_numpy_inputs(shapes, batch_size=batch_size)
         start_time = time()
         sync(model(inputs, training=training_mode))
         return time() - start_time
@@ -280,13 +273,13 @@ def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
 
 
-def _resolve_strategy(strategy: Any, device: str | None) -> "keras_distributed.KerasDistributedStrategy":
+def _resolve_strategy(strategy: Any, device: str | None) -> "scm_keras.KerasDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
         # active backend supports, and rejects the rest with the reason -- which is the error to read.
         preset = cast('Literal["single", "dp", "fsdp"]', strategy)
-        return keras_distributed.KerasDistributedStrategy(preset=preset, device=device)
+        return scm_keras.KerasDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
 
 
@@ -307,7 +300,7 @@ def _build_callbacks(
     *,
     trainer: Any,
     provider: "scm.SimpleDataProvider",
-    strategy: "keras_distributed.KerasDistributedStrategy",
+    strategy: "scm_keras.KerasDistributedStrategy",
     outputs: list[str],
     higher_criteria: list[str],
     lower_criteria: list[str],
@@ -323,8 +316,8 @@ def _build_callbacks(
     logger, so only it writes anything. The display is the main rank's alone, one per run
     (`docs/adr/0005`).
     """
-    saver = keras_trainer.KerasTrainingStateSaver(logger=logger, strategy=strategy, extra_meta=extra_meta)
-    bests = keras_trainer.KerasBestCriterion.from_criteria(
+    saver = scm_keras.KerasTrainingStateSaver(logger=logger, strategy=strategy, extra_meta=extra_meta)
+    bests = scm_keras.KerasBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     display: list[Any] = []
@@ -425,7 +418,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     _cap_gpu_memory(backend, gpu_memory_fraction)
     _activate_backend(backend)
     _cap_torch_gpu_memory(backend, gpu_memory_fraction)
-    device = keras_utils.get_keras_device(device)
+    device = scm_keras.get_keras_device(device)
     keras.utils.set_random_seed(seed)
     # Resolved before the models: the class itself is what carries the policy the models are built
     # under, and instantiating it needs them.
@@ -450,8 +443,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
             # which carries none of the layer's attributes, so the shapes it was traced with would be
             # unrecoverable afterwards and the run would record none.
-            declared.update(keras_trainer.resolve_input_shapes(built) or {})
-            models[model_name] = keras_trainer.initial_model(built, reduce_dict(shapes))
+            declared.update(scm_keras.resolve_input_shapes(built) or {})
+            models[model_name] = scm_keras.initial_model(built, reduce_dict(shapes))
         strategy.sync_initial_weights(models)
         # Before the learner: it captures the model objects it is handed, and its optimizers are
         # built against their variables while it is constructed.
@@ -478,7 +471,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     logger = _build_logger(logger_name, experiment, strategy.is_main)
     optimizer_hashes = _optimizer_hashes(learner)
     if resume is not None:
-        start_epoch = keras_trainer.restore_training_state(
+        start_epoch = scm_keras.restore_training_state(
             resume=resume,
             strategy=strategy,
             models=models,
@@ -489,9 +482,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             config_hash=config_digest,
             is_main=strategy.is_main,
         )
-    trainer_type = keras_trainer.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer_type = scm_keras.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(
-        learner=learner, tracker=keras_trainer.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
+        learner=learner, tracker=scm_keras.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
     )
     _build_callbacks(
         trainer=trainer,
