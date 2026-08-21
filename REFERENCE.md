@@ -91,6 +91,7 @@ femto:
 **`_jinja_yaml_`** — Embeds an inline Jinja template that is rendered and merged back into the surrounding YAML. The rendered result must itself be valid YAML. `_jinja_yaml_` blocks are evaluated with the currently active template variables and can emit any number of sibling YAML keys or list entries.
 
 ```yaml
+# From a torch learner template — ACCUMULATE_GRADIENTS is a torch-only key (see the learner schema).
 _jinja_yaml_: |-
   {% if accumulate_gradients is none %}
   ACCUMULATE_GRADIENTS: null
@@ -291,11 +292,39 @@ MIXED_PRECISION:
 MIXED_PRECISION_TYPE: bfloat16
 ```
 
-**`ACCUMULATE_GRADIENTS`** — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches, and the generated `update(step)` returns `True` only on those steps — which is what makes the trainer fire `on_update` once per update rather than once per step.
+**`ACCUMULATE_GRADIENTS`** *(torch only, `TorchUserDefinedLearner`)* — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, each loss is divided by `n` before `backward()`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches, and the generated `update(step)` returns `True` only on those steps — which is what makes the trainer fire `on_update` once per update rather than once per step.
 
 ```yaml
 ACCUMULATE_GRADIENTS: null   # disabled
 ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
+```
+
+The Keras and Flax schemas carry no such field: each backend declares the accumulation window through the mechanism its framework already owns, inside the `OPTIMIZER` pattern, and the generated `update()` gates on it — so the trainer's update counter tracks real optimizer applies (see [`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md)).
+
+In Keras the window is the optimizer's own `gradient_accumulation_steps` keyword argument. The generated `update()` reads the optimizer's step counter to predict whether the step about to run lands an apply, which keeps the gate in phase even when a float16 `LossScaleOptimizer` skips a step. All optimizers of a learner must share the same window — the generated `__init__` raises a `ValueError` otherwise.
+
+```yaml
+OPTIMIZER:
+  - _obj_
+  - _addr_: keras.optimizers.SGD
+  - _call_:
+      learning_rate: 0.1
+      gradient_accumulation_steps: 4
+```
+
+In Flax the window is an [`optax.MultiSteps`](https://optax.readthedocs.io/) wrapping the entry's `tx`. The builder statically parses the wrapper and bakes its window into `update()` as a compile-time constant, so `every_k_schedule` must be an int literal (a callable is a `SpecError`), `should_skip_update_fn` is rejected (`SpecError`), and every entry of a learner must declare the same window — an entry without `MultiSteps` counts as 1 (`SpecError` at build time). `MultiSteps` accumulates in float32 by default, which doubles accumulator memory against bfloat16 parameters; pass `accumulator_dtype` when that matters.
+
+```yaml
+OPTIMIZER:
+  - _obj_
+  - _addr_: flax.nnx.Optimizer
+  - _bind_:
+      tx:
+        - _obj_
+        - _addr_: optax.MultiSteps
+        - _call_:
+            opt: [_obj_, {_addr_: optax.sgd}, {_call_: {learning_rate: 0.1}}]
+            every_k_schedule: 4
 ```
 
 #### `LEARNERS`

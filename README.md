@@ -316,7 +316,7 @@ The generated class manages:
 - optimizer construction via StructCast patterns, including file-addressed optimizer + scheduler compositions such as [`examples/torch/optimizers.py`](examples/torch/optimizers.py)
 - optional gradient scaler creation (`MIXED_PRECISION`)
 - optional gradient clipping (`CLIP`)
-- optional gradient accumulation (`ACCUMULATE_GRADIENTS`)
+- optional gradient accumulation (`ACCUMULATE_GRADIENTS`, a torch-only key — see [`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md))
 - optimizer stepping, zeroing, and automatic train/eval mode switching
 - learning-rate and parameter-group inspection helpers
 
@@ -334,7 +334,7 @@ scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 > scm flax create learner cfg/flax/learners/ConvNeXtV2.yaml -o learner.py
 > ```
 >
-> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys: `CLIP` and `MIXED_PRECISION` are rejected, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER` and precision is a model-construction property. `ACCUMULATE_GRADIENTS` stays. The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol and adds `outputs` and `flow_functions` — the module-level step functions a trainer compiles — but no `grad_scalers`, `weight_decays`, or `param_group_names`.
+> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys: `CLIP` and `MIXED_PRECISION` are rejected, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER` and precision is a model-construction property. `ACCUMULATE_GRADIENTS` is rejected too: gradient accumulation is an `optax.MultiSteps` wrapper in that same chain, which the builder statically parses so the generated `update()` bakes its window as a compile-time gate ([`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md)). The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol and adds `outputs` and `flow_functions` — the module-level step functions a trainer compiles — but no `grad_scalers`, `weight_decays`, or `param_group_names`.
 
 > **Keras** — `scm keras create learner` generates a backend-neutral learner class from the same schema:
 >
@@ -342,7 +342,7 @@ scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 > scm keras create learner learner.yaml -o learner.py
 > ```
 >
-> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options, and no `--backend`: nothing it runs imports Keras, so the generated file is the same on all three backends and the backend is chosen when it is trained. `CLIP` is rejected — clipping is a keyword argument of the Keras optimizer written inside `OPTIMIZER` — while `ACCUMULATE_GRADIENTS` stays and `MIXED_PRECISION` turns on a global [`keras.mixed_precision`](https://keras.io/api/mixed_precision/) policy of `MIXED_PRECISION_TYPE` (`float16` loss-scales the optimizer, `bfloat16` does not). The [Keras configuration example](#keras) below shows the shape of a template.
+> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options, and no `--backend`: nothing it runs imports Keras, so the generated file is the same on all three backends and the backend is chosen when it is trained. `CLIP` and `ACCUMULATE_GRADIENTS` are rejected — clipping and gradient accumulation are both keyword arguments of the Keras optimizer written inside `OPTIMIZER`; accumulation is `gradient_accumulation_steps`, whose window the generated `update()` reads back from the optimizer's own step counter so the update count tracks real applies ([`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md)) — while `MIXED_PRECISION` turns on a global [`keras.mixed_precision`](https://keras.io/api/mixed_precision/) policy of `MIXED_PRECISION_TYPE` (`float16` loss-scales the optimizer, `bfloat16` does not). The [Keras configuration example](#keras) below shows the shape of a template.
 
 ### 4. Inspect FLOPs and Parameters
 
@@ -636,7 +636,7 @@ What the command does internally:
 
 1. Builds the strategy **first**: constructing it activates its device mesh process-wide, so every array allocated afterwards lands on it.
 2. Builds the run's `nnx.Rngs` from `--seed`, calls each model factory with it, then hands the models to `strategy.wrap(...)`, which places every parameter on the sharding its rule asks for. The learner is built from the placed models, so its optimizers inherit those shardings and its inference views share their arrays.
-3. Compiles the learner's `flow_functions` unless `--compile none`: `_training_step` takes the contract arguments (`need_update` static; the models, the optimizers, and the gradient accumulator donated), every other flow takes only the extra arguments given.
+3. Compiles the learner's `flow_functions` unless `--compile none`: `_training_step` takes the contract arguments (the models and the optimizers donated — gradient accumulation lives inside the optimizer state, so it travels with them and needs no static gate), every other flow takes only the extra arguments given.
 4. Instantiates the datasets, wraps each one so every batch is placed across the mesh on the way out, and composes them into a `SimpleDataProvider`.
 5. Builds the logger with a `FlaxStateBackend`, and restores `--resume` through it before the loop starts, continuing at the saved epoch plus one.
 6. Creates the `FlaxTrainer` with a `FlaxTracker` over the criterion names, then appends a `ProgressBar` (a `Printer` under `--ci`), the logger, a `FlaxTrainingStateSaver`, and one `FlaxBestCriterion` per monitored criterion — and prints the resulting routing.
