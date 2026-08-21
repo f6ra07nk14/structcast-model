@@ -66,7 +66,7 @@ What happens:
 scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
 ```
 
-Losses and metrics are declared inline in the learner's `FLOW`, so there is no separate loss or metric command. The learner template supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`. This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
+Losses and metrics are declared inline in the learner's `FLOW`, so there is no separate loss or metric command. The learner template supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP` (torch only, added by `TorchLearnerBehavior`). This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
 
 ```bash
 scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
@@ -432,10 +432,10 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 The repository operates as a two-phase system:
 
 1. **Generation phase**: YAML templates under `cfg/[torch/flax/keras]/` are transformed into Python modules through framework-specific builders (`TorchBuilder`, `FlaxBuilder`, `KerasBuilder`).
-2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm torch train` (training, PyTorch only).
+2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm [torch/flax] train` (training).
 
 Both phases are optional for training: any object implementing the `Learner` protocol can be handed to `TorchTrainer` directly, as `examples/torch/simple_training.py` shows.
 
-Model code generation is available for all three frameworks. Training workflow generation and `scm torch train` are currently PyTorch-only; Flax and Keras training support is planned.
+Model code generation is available for all three frameworks, and training workflow generation for PyTorch (`scm torch train`) and Flax (`scm flax train`); Keras training support is planned.
 
 If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, inference benchmarking, or the training command, this skill is the correct reference.

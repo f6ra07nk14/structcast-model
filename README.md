@@ -2,7 +2,7 @@
 
 StructCast-Model is a configuration-driven toolkit that generates [PyTorch](https://pytorch.org/), [Flax (JAX)](https://flax.readthedocs.io/en/stable/), and [Keras](https://keras.io/) models — plus PyTorch training workflows — from YAML templates. Built on top of [StructCast](https://github.com/f6ra07nk14/structcast), it lets you describe model architecture, optimizer logic, dataset configuration, and training orchestration declaratively — then generates runnable Python code from those descriptions.
 
-Model code generation is available for all three frameworks. Training workflow generation and the full training CLI (`scm torch train`) are currently PyTorch-only; Flax and Keras training support is planned (see [Roadmap](#roadmap)).
+Model code generation is available for all three frameworks. Training workflow generation and the full training CLI are available for PyTorch (`scm torch train`) and Flax (`scm flax train`); Keras training support is planned (see [Roadmap](#roadmap)).
 
 ## Table of Contents
 
@@ -27,6 +27,7 @@ Model code generation is available for all three frameworks. Training workflow g
         - [Multi-Node Training](#multi-node-training)
         - [Dataset Configuration](#dataset-configuration)
         - [Distributed Training Notes](#distributed-training-notes)
+    - [7. Train a Flax Model](#7-train-a-flax-model)
   - [Training Loop Anatomy](#training-loop-anatomy)
   - [Configuration Examples](#configuration-examples)
     - [PyTorch](#pytorch)
@@ -40,11 +41,11 @@ Model code generation is available for all three frameworks. Training workflow g
 ## What This Project Does
 
 - **Generate model code** — Produce PyTorch [`nn.Module`](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html), Flax [`nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html), and Keras [`Layer`](https://keras.io/api/layers/base_layer/) classes from YAML layer templates.
-- **Generate training code** — Produce learner classes — the object owning the models, the optimizers, and the training and inference steps — from YAML templates (PyTorch only).
+- **Generate training code** — Produce learner classes — the object owning the models, the optimizers, and the training and inference steps — from YAML templates (PyTorch and Flax).
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
-- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) or [Weights & Biases](https://docs.wandb.ai/) experiment logging.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) or [Weights & Biases](https://docs.wandb.ai/) experiment logging — or Flax training on a JAX device mesh with [`nnx.jit`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) compilation and the same loggers.
 - **Train programmatically** — Use the same trainer directly from Python, without any YAML. See [`examples/`](examples/) for a runnable tutorial.
 
 ## Installation
@@ -125,7 +126,9 @@ structcast-model/
 │   │   ├── models/        # model architecture templates
 │   │   └── others/        # dataset, compile options, and other templates
 │   ├── flax/
-│   │   └── models/        # Flax model architecture templates
+│   │   ├── learners/      # Flax learner, optimizer, and criterion templates
+│   │   ├── models/        # Flax model architecture templates
+│   │   └── strategies/    # device-mesh strategy patterns for `scm flax train`
 │   └── keras/
 │       └── models/        # Keras model architecture templates
 ├── examples/
@@ -134,8 +137,9 @@ structcast-model/
 │   ├── builders/      # generic and framework-specific code generators
 │   ├── commands/      # Typer CLI entry points
 │   ├── torch/         # trainer, layers, optimizer helpers
-│   ├── flax/          # Flax layers and inference utilities
+│   ├── flax/          # trainer, distributed strategy, layers, optimizer helpers
 │   ├── keras/         # Keras layers and inference utilities
+│   ├── loggers/       # experiment-tracking loggers and training-state backends
 │   ├── utils/         # shared helpers
 │   └── base_trainer.py
 ├── tests/             # CLI, builder, trainer, and layer tests
@@ -147,11 +151,12 @@ The main package areas are:
 - **`builders/`** — Converts validated YAML templates into intermediate representations, then renders Python source code for PyTorch, Flax, and Keras.
 - **`commands/`** — Exposes the `scm` CLI (built with [Typer](https://typer.tiangolo.com/)) with `torch`, `flax`, and `keras` sub-commands.
 - **`torch/`** — Runtime utilities used by the CLI and available for direct Python usage — training steps, trackers, timm wrappers, optimizer helpers.
-- **`flax/`** — Flax-specific layers (e.g. `GlobalResponseNorm`) and JAX inference helpers.
+- **`flax/`** — Runtime for Flax runs: the trainer and its tracker, the device-mesh strategy, optimizer-state helpers, Flax-specific layers (e.g. `GlobalResponseNorm`), and JAX inference helpers.
 - **`keras/`** — Keras-specific layers (e.g. `GlobalResponseNormalization`) and backend-agnostic inference helpers.
+- **`loggers/`** — The MLflow and Weights & Biases loggers owning a run, and the state backends deciding what a saved training state looks like on disk.
 - **`cfg/torch/`** — Declarative source of truth: YAML templates for PyTorch models, learners, datasets, and runtime presets.
 - **`examples/torch/`** — Runnable example code: a programmatic training tutorial, and optimizer + scheduler compositions that templates reference by file path.
-- **`cfg/flax/`** — YAML templates for Flax model architectures.
+- **`cfg/flax/`** — YAML templates for Flax models, learners, and device-mesh strategies.
 - **`cfg/keras/`** — YAML templates for Keras model architectures.
 
 ## Core Workflow
@@ -160,10 +165,10 @@ The repository follows a repeatable workflow:
 
 1. **Write or reuse** YAML templates under `cfg/[torch/flax/keras]/`.
 2. **Render** templates with `scm format` and `-p/--parameter` overrides to produce concrete configuration files.
-3. **Generate** Python source files for the model (and, for PyTorch, the learner) using `scm [torch/flax/keras] create`.
+3. **Generate** Python source files for the model (and, for PyTorch and Flax, the learner) using `scm [torch/flax/keras] create`.
 4. **Instantiate** those generated modules at runtime through StructCast object patterns (see [StructCast Pattern Basics](#structcast-pattern-basics)).
 5. **Benchmark** inference latency with `scm [torch/flax/keras] time`.
-6. *(PyTorch only)* **Train** through `scm torch train`, which wires together datasets, models, the learner, AMP, and the experiment logger.
+6. *(PyTorch and Flax)* **Train** through `scm torch train` or `scm flax train`, which wires together datasets, models, the learner, the device placement, and the experiment logger.
 
 ```text
 YAML templates  --->  scm format / scm [torch/flax/keras] create  --->  Generated .py files
@@ -172,7 +177,7 @@ StructCast patterns  <--------------------------------------------------------+
        |
        v
 scm [torch/flax/keras] time  --->  Inference benchmarks
-scm torch train              --->  MLflow / wandb logs + model checkpoints
+scm [torch/flax] train       --->  MLflow / wandb logs + model checkpoints
 ```
 
 ## StructCast Pattern Basics
@@ -320,6 +325,14 @@ For example, a CycleGAN learner template defines three `LEARNERS` entries — on
 ```bash
 scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 ```
+
+> **Flax** — `scm flax create learner` reads a template under [`cfg/flax/learners/`](cfg/flax/learners/) and generates the Flax counterpart:
+>
+> ```bash
+> scm flax create learner cfg/flax/learners/ConvNeXtV2.yaml -o learner.py
+> ```
+>
+> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys: `CLIP` and `MIXED_PRECISION` are rejected, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER` and precision is a model-construction property. `ACCUMULATE_GRADIENTS` stays. The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol and adds `outputs` and `flow_functions` — the module-level step functions a trainer compiles — but no `grad_scalers`, `weight_decays`, or `param_group_names`.
 
 ### 4. Inspect FLOPs and Parameters
 
@@ -568,6 +581,57 @@ scm format cfg/torch/others/default_timm.yaml \
 - **`torch.compile` and the strategy** — with `--compile`, the strategy decides where its compile units sit: the model root in place by default, the matched `shard_modules` blocks under per-block FSDP2 — always **before** wrapping, so the strategy wrapper stays outermost. The learner's generated `_flow_*` functions compile on a single device only (distributed wrappers graph-break inside them); the eager step methods are never compiled.
 - **Checkpoint saving** — State dicts are produced through [`torch.distributed.checkpoint.state_dict`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html), so the keys are wrapper-free for raw, compiled, DDP, and FSDP2 models alike. Producing them is a collective that runs on every rank; only rank 0 writes them to the experiment tracking service. `--resume` loads the same training state on all ranks.
 
+### 7. Train a Flax Model
+
+`scm flax train` is the Flax (JAX) counterpart of `scm torch train`. It reuses the same trainer, callbacks, and loggers, and differs where JAX differs: one process drives every device of the host, so there is no launcher and no rank — `--strategy` names the device mesh instead.
+
+```bash
+# 1. Generate the model and the learner classes
+scm flax create model cfg/flax/models/ConvNeXtV2.yaml -p 'DEFAULT: {backbone: femto}' -o model.py
+scm flax create learner cfg/flax/learners/ConvNeXtV2.yaml -o learner.py
+
+# 2. Train
+scm flax train \
+    'model: [_obj_, {_addr_: model.Model, _file_: model.py}]' \
+    -s 'image: [224, 224, 3]' \
+    -L '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
+    -e 5 \
+    --training-dataset '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: train}}]' \
+    -V '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: validation}}]' \
+    -f 1 \
+    -LC ce_loss \
+    -LC val_ce_loss \
+    -HC acc1 \
+    -HC val_acc1 \
+    -SC val_acc1 \
+    --strategy cfg/flax/strategies/dp.yaml \
+    --logger mlflow \
+    -E Test
+```
+
+The repository ships no Flax dataset template — `my_data.py` above stands for your own code. Any iterable of `{input_name: array}` batches works, as long as the names match the learner's `INPUTS` (`image` and `label` for the template above).
+
+Where it differs from `scm torch train`:
+
+- positional model patterns resolve to the model **class, not an instance**: the command calls each one with the run's `nnx.Rngs` as `rngs=...`, built from `--seed`, so the pattern carries no `_call_` entry
+- `-s/--shape`: channel-last, and nothing is allocated from it — a Flax module builds its parameters in its constructor, so the shapes only identify the run's configuration and default to the models' `INPUT_SHAPES`
+- `-c/--compile`: wraps the learner's generated step functions in [`nnx.jit`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) and is **on by default**, unlike `scm torch train`'s `--compile`, which is off unless given. Pass `--compile none` to run them eagerly, or a dict of extra `nnx.jit` keyword arguments; what is static and what is donated is the generated step's contract and cannot be overridden
+- `--strategy`: the preset name `single`, `dp`, or `fsdp`, or an object pattern — the templates under [`cfg/flax/strategies/`](cfg/flax/strategies/) bind the remaining knobs. Every batch is placed across the mesh before it reaches the learner, so each entry needs a leading dimension the mesh size divides
+- `-d/--device`: names the device of the `single` preset only (`cpu:0`, `gpu:0`, …); the multi-device presets span the devices themselves
+- `--matmul-precision`: sets `jax_default_matmul_precision` and defaults to `high`
+- there is no `--dist-backend`, `--dist-url`, or `-I/--initializer`, and no gradient-scaler options: `FlaxDistributedStrategy` refuses to build a scaler
+- training states are saved as `training_state.tar.gz` — an [orbax](https://orbax.readthedocs.io/) checkpoint packed into one archive — instead of the torch `.pt` file, and `--resume` reads that format back
+
+What the command does internally:
+
+1. Builds the strategy **first**: constructing it activates its device mesh process-wide, so every array allocated afterwards lands on it.
+2. Builds the run's `nnx.Rngs` from `--seed`, calls each model factory with it, then hands the models to `strategy.wrap(...)`, which places every parameter on the sharding its rule asks for. The learner is built from the placed models, so its optimizers inherit those shardings and its inference views share their arrays.
+3. Compiles the learner's `flow_functions` unless `--compile none`: `_training_step` takes the contract arguments (`need_update` static; the models, the optimizers, and the gradient accumulator donated), every other flow takes only the extra arguments given.
+4. Instantiates the datasets, wraps each one so every batch is placed across the mesh on the way out, and composes them into a `SimpleDataProvider`.
+5. Builds the logger with a `FlaxStateBackend`, and restores `--resume` through it before the loop starts, continuing at the saved epoch plus one.
+6. Creates the `FlaxTrainer` with a `FlaxTracker` over the criterion names, then appends a `ProgressBar` (a `Printer` under `--ci`), the logger, a `FlaxTrainingStateSaver`, and one `FlaxBestCriterion` per monitored criterion — and prints the resulting routing.
+7. Runs `fit()` inside the logger's run context, recording the metrics, the arguments, the per-epoch training state, and the best checkpoints.
+
 ## Training Loop Anatomy
 
 Whether it is built by the CLI or by hand, a training run is the same five objects handed to a trainer at construction:
@@ -735,6 +799,10 @@ _obj_:
 - `__call__` propagates a `training` flag to sub-modules
 - layer APIs differ (e.g., `flax.nnx.Conv` instead of `torch.nn.LazyConv2d`)
 
+**[`cfg/flax/learners/ConvNeXtV2.yaml`](cfg/flax/learners/ConvNeXtV2.yaml)** — The learner for that model. Its single `LEARNERS` entry builds an `nnx.Optimizer` over an `optax.chain` of `clip_by_global_norm` and `adamw`, masked by [`no_weight_decay_mask`](src/structcast_model/flax/optimizers.py) so biases and normalization scales are exempt from weight decay. There is no `CLIP` and no `MIXED_PRECISION` key — clipping is a stage of the chain — and the criteria are `"eval: ..."` expressions over the model output.
+
+**[`cfg/flax/strategies/`](cfg/flax/strategies/)** — Object patterns for `--strategy`, binding a `FlaxDistributedStrategy` preset: [`dp.yaml`](cfg/flax/strategies/dp.yaml) replicates the parameters and splits each batch across the devices, [`fsdp.yaml`](cfg/flax/strategies/fsdp.yaml) additionally shards parameters along their leading dimension, leaving the ones below `min_size` bytes replicated.
+
 ### Keras
 
 **[`cfg/keras/models/ConvNeXtV2.yaml`](cfg/keras/models/ConvNeXtV2.yaml)** — Generates a [Keras `Layer`](https://keras.io/api/layers/base_layer/) equivalent of the ConvNeXtV2 model. Shares the same backbone parameter groups and uses [`GlobalResponseNormalization`](src/structcast_model/keras/layers/grn.py) as a custom Keras layer. Key differences:
@@ -813,6 +881,6 @@ The following breaking changes were introduced by the learner-template restructu
 - [x] PyTorch model construction from YAML configuration files
 - [x] PyTorch training workflow generation from YAML configuration files
 - [x] JAX (Flax) model construction from YAML configuration files
-- [ ] JAX (Flax) training workflow generation from YAML configuration files
+- [x] JAX (Flax) training workflow generation from YAML configuration files
 - [x] Keras model construction from YAML configuration files
 - [ ] Keras training workflow generation from YAML configuration files

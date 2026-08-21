@@ -1,0 +1,58 @@
+# Two-segment Flax learner over three copies of "tests/fixtures/cfg/flax/Linear.yaml".
+# The first optimizer owns two models, so it is built against a "flax.nnx.List" container; the second
+# owns one. Nothing is shared between the segments, and the two learning rates differ, so a runtime
+# test can assert that each optimizer moves only the parameters it owns, by its own rate.
+PARAMETERS:
+  DEFAULT:
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+INPUTS: [x, y]
+OUTPUTS: [loss_ab, loss_c]
+LEARNERS:
+  - NAME: optimizer_ab
+    LOSS: loss_ab
+    TRAINABLE_LAYERS: [a, b]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _bind_:
+          tx: [_obj_, {_addr_: optax.sgd}, {_call_: {learning_rate: 0.1}}]
+    FLOW:
+      - [x, out_a, a]
+      - [x, out_b, b]
+      - INPUTS: {predictions: out_a, targets: y}
+        OUTPUTS: errors_a
+        NAME: mse
+        LAYER: [_obj_, {_addr_: optax.squared_error}]
+      - [{predictions: out_b, targets: y}, errors_b, mse]
+      - ["eval: errors_a.mean() + errors_b.mean()", loss_ab, null]
+    INFERENCE_FLOW:
+      - [x, out_a, a]
+      - [x, out_b, b]
+      - [{predictions: out_a, targets: y}, errors_a, mse]
+      - [{predictions: out_b, targets: y}, errors_b, mse]
+      - ["eval: errors_a.mean() + errors_b.mean()", loss_ab, null]
+  - NAME: optimizer_c
+    LOSS: loss_c
+    TRAINABLE_LAYERS: [c]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _bind_:
+          tx: [_obj_, {_addr_: optax.sgd}, {_call_: {learning_rate: 0.01}}]
+    FLOW:
+      - [x, out_c, c]
+      - [{predictions: out_c, targets: y}, errors_c, mse]
+      - ["eval: errors_c.mean()", loss_c, null]
+    INFERENCE_FLOW:
+      - [x, out_c, c]
+      - [{predictions: out_c, targets: y}, errors_c, mse]
+      - ["eval: errors_c.mean()", loss_c, null]
+LOSSES: []
+MODELS: []

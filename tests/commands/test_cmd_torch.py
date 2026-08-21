@@ -24,7 +24,7 @@ from typer.testing import CliRunner
 
 from structcast_model.base_trainer import BaseInfo
 from structcast_model.commands.cmd_torch import app
-from structcast_model.commands.utils import instantiate_object
+from structcast_model.commands.utils import get_module_outputs as _get_module_outputs, instantiate_object
 from structcast_model.torch.trainer import TorchTrainer
 from tests import CFG_DIR, FIXTURES_DIR
 import torch
@@ -43,7 +43,6 @@ assert _FIRST_CALLBACK is not None, "cmd_torch registers every command with a ca
 _CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
 
 
@@ -782,14 +781,14 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     assert run.data.metrics["val_loss"] == pytest.approx(0.3)
     assert run.data.metrics["best_acc"] == pytest.approx(0.9)
     artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)]
-    assert {"training_state", "best_acc", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
+    # The state backend writes one artifact file per state, where `mlflow.pytorch` wrote a directory.
+    assert {"training_state.pt", "best_acc.pt", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
 
 
 def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
     """--resume must continue at the epoch after the saved one instead of training the run again."""
     _invoke_train(tmp_path, epochs=2)
-    # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
-    (state,) = (tmp_path / "mlruns").rglob("training_state/state_dict.pth")
+    (state,) = (tmp_path / "mlruns").rglob("training_state.pt")
     _invoke_train(tmp_path, epochs=3, resume=str(state))
     runs = mlflow.search_runs(experiment_names=["test-e2e"], output_format="list")
     assert len(runs) == 2
@@ -895,8 +894,8 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
     fake = _FakeWandb(tmp_path / "wandb_run")
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
-    # The fixture publishes the fake through `loggers.wandb`, the attribute the command reads, so the
-    # run exercises the real `scm_loggers` chained access rather than a stand-in for it.
+    # The fixture publishes the fake through `loggers.WandbLogger`, the attribute the command reads,
+    # so the run exercises the real `scm_loggers` flat access rather than a stand-in for it.
     wandb_logger_with(fake)
     _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
     assert fake.projects == ["test-e2e"]

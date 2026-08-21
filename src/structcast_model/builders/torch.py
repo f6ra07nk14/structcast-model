@@ -1,30 +1,25 @@
 """Builder for PyTorch models."""
 
-import ast
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
+from pydantic import model_validator
+from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 
+from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.base import (
     BaseLearnerBuilder,
     BaseModelBuilder,
     LayerIntermediate,
     LearnerIntermediate,
+    OptimizerSegment,
 )
-from structcast_model.builders.utils import resolve_getter, resolve_object
-
-
-def _statement_names(line: str) -> tuple[set[str], set[str]]:
-    """Return the (loaded, stored) variable names of one generated statement."""
-    loads: set[str] = set()
-    stores: set[str] = set()
-    for node in ast.walk(ast.parse(line.strip())):
-        if isinstance(node, ast.Name):
-            (stores if isinstance(node.ctx, ast.Store) else loads).add(node.id)
-    return loads, stores
+from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
+from structcast_model.builders.utils import resolve_getter, resolve_object, statement_names
+from structcast_model.utils.base import to_snake, unique
 
 
 class TorchLayerIntermediate(LayerIntermediate):
@@ -75,8 +70,64 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
     user_defined_layer_type: ClassVar[type[TorchLayerIntermediate]] = TorchLayerIntermediate
 
 
-class TorchLearnerIntermediate(LearnerIntermediate):
+class TorchLearnerBehavior(LearnerBehavior):
+    """Learner behavior configuration for PyTorch."""
+
+    CLIP: ObjectPattern | None = None
+    """Gradient clipping configuration, which can be an instance of the gradient clipping configuration
+    or a pattern to instantiate the gradient clipping configuration."""
+
+
+class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
+    """User defined learner configuration for PyTorch."""
+
+    MIXED_PRECISION: bool | dict[str, Any] = False
+    """Whether to use mixed precision during backward pass.
+
+    If the value is a dictionary, it will be used as the keyword arguments for configuring mixed precision context.
+    """
+
+    MIXED_PRECISION_TYPE: Literal["bfloat16", "float16"] | None = None
+    """The mixed precision type to use during backward pass when mixed precision is enabled."""
+
+    @model_validator(mode="after")
+    def _validate_mixed_precision(self) -> Self:
+        """Validate the mixed precision configuration.
+
+        MIXED_PRECISION enables gradient scaling, which only counteracts float16 underflow;
+        MIXED_PRECISION_TYPE alone configures autocast and is valid without a scaler.
+        """
+        enabled = bool(self.MIXED_PRECISION) if isinstance(self.MIXED_PRECISION, bool) else True
+        if enabled and self.MIXED_PRECISION_TYPE != "float16":
+            raise SpecError(
+                "MIXED_PRECISION enables gradient scaling, which only applies to float16: set "
+                "MIXED_PRECISION_TYPE: float16, or disable MIXED_PRECISION (bfloat16 autocast needs no scaler)."
+            )
+        return self
+
+
+class TorchTemplateLearner(Template[TorchUserDefinedLearner]):
+    """Template for PyTorch user-defined learners."""
+
+    target_type: ClassVar[type[TorchUserDefinedLearner]] = TorchUserDefinedLearner
+
+
+@dataclass(kw_only=True, slots=True)
+class TorchOptimizerSegment(OptimizerSegment):
+    """One optimizer step of a PyTorch learner flow."""
+
+    clip: str | None
+    """The variable name of the gradient clipping callable, or `None` if gradients are not clipped."""
+
+    scaler: str | None
+    """The variable name of the gradient scaler, or `None` if gradients are not scaled."""
+
+
+class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
     """Intermediate representation of a PyTorch learner."""
+
+    mixed_precision_type: str | None
+    """The mixed precision type for the learner, or `None` if mixed precision is not used."""
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
@@ -90,6 +141,11 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         "structcast_model.torch.distributed": {"sync_gate"},
     }
     """Default imports for PyTorch learners; the generated steps and properties call these directly."""
+
+    @cached_property
+    def mixed_precision_scales(self) -> list[str]:
+        """Get the mixed precision scales used in the layer."""
+        return unique([u.scaler for u in self.flow if isinstance(u, TorchOptimizerSegment) and u.scaler])
 
     def _with_autocast(self, flow: list[str]) -> list[str]:
         if not (self.mixed_precision_type and flow):
@@ -115,7 +171,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         lines: list[tuple[str, str | None]] = []
         for inputs, output, layer in units:
             line = self._get_regular_step(inputs, output, layer)
-            loads, stored = _statement_names(line)
+            loads, stored = statement_names(line)
             external += [n for n in loads - local if n not in external]
             stores += [n for n in stored if n not in local]
             local |= stored
@@ -169,14 +225,14 @@ class TorchLearnerIntermediate(LearnerIntermediate):
                 return f"{layers[0]}.parameters()"
             return f"(p for m in ({', '.join(f'{L}' for L in layers)}) for p in m.parameters())"
 
-        segments: list[tuple[list[tuple[str, str, str | None]], tuple]] = []
+        segments: list[tuple[list[tuple[str, str, str | None]], TorchOptimizerSegment]] = []
         units: list[tuple[str, str, str | None]] = []
         for unit in self.flow:
-            if len(unit) == 3:
-                units.append(unit)
-            else:
+            if isinstance(unit, TorchOptimizerSegment):
                 segments.append((units, unit))
                 units = []
+            else:
+                units.append(unit)
         infos = [self._analyze_segment(seg_units) for seg_units, _ in segments]
 
         available = set(self.inputs)
@@ -187,7 +243,9 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         # `others` the step body reads off `self`, so the body lines stay plain local-variable code.
         used: list[str] = list(self.models)
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
-            loss, backward_kwargs, optimizer_name, clip_name, mixed_precision_name, trainable_layers = opt_unit
+            loss, backward_kwargs = opt_unit.loss, opt_unit.backward_kwargs
+            optimizer_name, clip_name, mixed_precision_name = opt_unit.optimizer, opt_unit.clip, opt_unit.scaler
+            trainable_layers = opt_unit.trainable_layers
             used += [n for n in (optimizer_name, clip_name, mixed_precision_name) if n and n not in used]
             # Scale inside the backward expression so the reported loss keeps its unscaled value.
             scaled = f"({loss} / {self.accumulate_gradients})" if self.accumulate_gradients else loss
@@ -197,7 +255,7 @@ class TorchLearnerIntermediate(LearnerIntermediate):
                 else f"{mixed_precision_name}.scale({scaled}).backward({backward_kwargs})"
             )
             params = [n for n in info["external"] if n in available]
-            needed = {loss} | set(self.outputs) | _statement_names(backward_line)[0]
+            needed = {loss} | set(self.outputs) | statement_names(backward_line)[0]
             needed |= {n for later in infos[i + 1 :] for n in later["external"]}
             returns = [n for n in info["stores"] if n in needed]
             function_name = f"_flow_{optimizer_name}"
@@ -241,10 +299,11 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         models_repr = ", ".join([f'"{m}": self.{m}' for m in self.models])
         opts_repr = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
         grad_scalers_repr = ", ".join([f'"{n}": self.{n}' for n in self.mixed_precision_scales])
-        optimizer_models_repr = ", ".join(f'"{u[2]}": {u[5]!r}' for u in self.flow if len(u) == 6)
+        optimizer_models_repr = ", ".join(
+            f'"{u.optimizer}": {u.trainable_layers!r}' for u in self.flow if isinstance(u, TorchOptimizerSegment)
+        )
         flow_names = [f"_flow_{n}" for n in self.optimizers] + ["_flow_inference"]
         flow_functions_repr = ", ".join(f'"{n}": self.{n}' for n in flow_names)
-        scaler_param = "__grad_scaler_creator__=torch.amp.GradScaler, " if self.mixed_precision_scales else ""
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
@@ -253,8 +312,20 @@ class TorchLearnerIntermediate(LearnerIntermediate):
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         return f"""\
 class {self.classname}:
+    \"\"\"Learner generated from a PyTorch learner template.
 
-    def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
+    The models arrive as constructor arguments, and each optimizer segment's pure computation becomes a
+    `_flow_<optimizer>` closure bound as the attributes `flow_functions` names; a trainer that compiles them
+    rebinds each attribute to its compiled wrapper, so backward, clipping and stepping stay eager here.
+    `training_step` runs backward every call -- dividing the loss by the accumulation divisor inside the
+    backward expression -- and gates clipping, the optimizer step, `zero_grad()` and, under mixed precision,
+    the gradient scaler's unscale and update behind the `need_update` flag `update(step)` sets on the host,
+    while `inference_step` runs under `torch.no_grad()`. `outputs` names the criteria the steps return, and
+    `models`, `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`, `weight_decays` and
+    `param_group_names` expose what a trainer reads off the learner.
+    \"\"\"
+
+    def __init__(self, {self._learner_models}, **kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
         {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
@@ -320,6 +391,46 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
 
     user_defined_learner_layer_type: ClassVar[type[TorchLearnerIntermediate]] = TorchLearnerIntermediate
     layer_builder_type: ClassVar[type[TorchBuilder]] = TorchBuilder
+    template_type: ClassVar[type[TorchTemplateLearner]] = TorchTemplateLearner
+
+    def _build_segment(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        module: TorchUserDefinedLearner,
+        learner: LearnerBehavior,
+        opt_name: str,
+        naming: AutoName,
+        layers: dict[str, LayerIntermediate | str],
+        others: dict[str, str],
+    ) -> TorchOptimizerSegment:
+        """Build the optimizer segment, registering the gradient clipper and scaler it needs."""
+        # `learner` arrives through the base hook signature; `template_type` guarantees the torch schema.
+        clip = cast(TorchLearnerBehavior, learner).CLIP
+        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION, module.MIXED_PRECISION_TYPE)
+        clip_name: str | None = None
+        if clip:
+            clip_inst, clip_cls = resolve_object(imports, clip)
+            if (clip_name := naming(f"{opt_name}_{to_snake(clip_cls)}")) in layers or clip_name in others:
+                raise SpecError(f'Duplicate variable name "{clip_name}" for clip found in the learner flow.')
+            others[clip_name] = clip_inst
+        amp_name: str | None = None
+        if amp_cls is not None:
+            if (amp_name := naming(f"{opt_name}_{to_snake(amp_cls)}")) in layers or amp_name in others:
+                raise SpecError(
+                    f'Duplicate variable name "{amp_name}" for mixed precision instance found in the learner flow.'
+                )
+            others[amp_name] = amp_inst
+        return TorchOptimizerSegment(
+            loss=learner.LOSS,
+            optimizer=opt_name,
+            trainable_layers=learner.TRAINABLE_LAYERS,
+            clip=clip_name,
+            scaler=amp_name,
+        )
+
+    def _intermediate_fields(self, module: TorchUserDefinedLearner) -> dict[str, Any]:
+        """Get the framework-specific fields of the built learner intermediate."""
+        return {"mixed_precision_type": module.MIXED_PRECISION_TYPE}
 
     def _get_mixed_precision(
         self,
@@ -338,7 +449,7 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
             mixed_precision = {}
         imports["torch.amp"].add(None)
         repr_mp_kw = "".join(f", {k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
-        return f"__grad_scaler_creator__(device=device_type{repr_mp_kw})", "GradScaler"
+        return f"torch.amp.GradScaler(device=device_type{repr_mp_kw})", "GradScaler"
 
     def _get_optimizer(
         self,
@@ -350,7 +461,16 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         return f"{opt_inst}(get_named_parameters([{', '.join(trainable_layers)}]))", opt_cls
 
 
-__all__ = ["TorchBuilder", "TorchLayerIntermediate", "TorchLearnerBuilder", "TorchLearnerIntermediate"]
+__all__ = [
+    "TorchBuilder",
+    "TorchLayerIntermediate",
+    "TorchLearnerBehavior",
+    "TorchLearnerBuilder",
+    "TorchLearnerIntermediate",
+    "TorchOptimizerSegment",
+    "TorchTemplateLearner",
+    "TorchUserDefinedLearner",
+]
 
 
 if not TYPE_CHECKING:

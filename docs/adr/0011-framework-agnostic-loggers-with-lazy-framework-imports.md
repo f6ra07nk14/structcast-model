@@ -34,8 +34,8 @@ because `_class_to_module` is a dict comprehension and keeps the last writer. He
 `torch/distributed.py`, not to `torch/trainer.py`, while `CriteriaTracker`, defined inside the submodule-only
 `torch/layers/` subpackage, routes through the `torch/trainer.py` that re-exports it. Consumers then
 hold one lazy binding per package instead of one per module — `commands/cmd_torch.py` drops five
-`LazyModuleImporter` bindings for `scm_loggers` and `scm_torch`, reached by chained access
-(`scm_loggers.base.Logger`, `scm_torch.trainer.TorchTrainer`). The two handles are plain imports of
+`LazyModuleImporter` bindings for `scm_loggers` and `scm_torch`, reached by flat access
+(`scm_loggers.Logger`, `scm_torch.TorchTrainer`). The two handles are plain imports of
 the package shims — wrapping a shim in `LazyModuleImporter` does not work, because its first access
 copies the shim's still-unresolved submodule slots (`None`) into the wrapper's `__dict__`, so every
 later access returns `None`.

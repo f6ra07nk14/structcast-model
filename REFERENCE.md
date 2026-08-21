@@ -24,8 +24,13 @@
   - [API Reference: `trainer.py`](#api-reference-trainerpy)
     - [Utility functions](#utility-functions-1)
     - [Tracking and orchestration](#tracking-and-orchestration)
+  - [API Reference: `optimizers.py`](#api-reference-optimizerspy)
     - [Loggers](#loggers)
+    - [State backends](#state-backends)
     - [timm integrations](#timm-integrations)
+  - [API Reference: `flax/optimizers.py`](#api-reference-flaxoptimizerspy)
+  - [API Reference: `flax/trainer.py`](#api-reference-flaxtrainerpy)
+  - [API Reference: `flax/distributed.py`](#api-reference-flaxdistributedpy)
 
 ---
 
@@ -248,6 +253,8 @@ present:
 
 The following keys appear in learner configuration files such as [`cfg/torch/learners/ConvNeXtV2.yaml`](cfg/torch/learners/ConvNeXtV2.yaml) and [`cfg/torch/learners/CycleGAN.yaml`](cfg/torch/learners/CycleGAN.yaml). `scm torch create learner` turns them into a class implementing the `Learner` protocol.
 
+The schema splits in two (see [`docs/adr/0012`](docs/adr/0012-framework-neutral-learner-schema-with-torch-extensions.md)): [`builders/schema.py`](src/structcast_model/builders/schema.py) owns the framework-neutral `UserDefinedLearner` and `LearnerBehavior`, and [`builders/torch.py`](src/structcast_model/builders/torch.py) adds the torch-only keys as `TorchUserDefinedLearner` and `TorchLearnerBehavior`, reached through the `TorchTemplateLearner` the torch builder validates against. `scm flax create learner` validates the same file against the neutral classes, which forbid unknown fields, so the keys marked *(torch only)* below are rejected there.
+
 **`IMPORTS`** — Same format as in the model schema. Injects additional Python imports into the generated learner file.
 
 ```yaml
@@ -261,13 +268,13 @@ INPUTS: []                # auto-inferred from LEARNERS[*].FLOW
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
-**`MIXED_PRECISION`** — Controls gradient scaling, which only counteracts float16 underflow. The scaler is built through the learner's injectable `__grad_scaler_creator__` argument, which defaults to `torch.amp.GradScaler` and is called with the training `device`.
+**`MIXED_PRECISION`** *(torch only, `TorchUserDefinedLearner`)* — Controls gradient scaling, which only counteracts float16 underflow. The generated learner constructs a `torch.amp.GradScaler` directly, on the training `device`.
 
 | Value             | Behavior                                                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `false` (default) | No `GradScaler` is created. Autocast still runs when `MIXED_PRECISION_TYPE` is set — this is the bfloat16 path, which needs no scaler.        |
 | `true`            | Gradient scaling enabled with default `GradScaler` settings; requires `MIXED_PRECISION_TYPE: float16`.                                        |
-| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to the scaler creator. Requires `MIXED_PRECISION_TYPE: float16`.         |
+| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler`. Requires `MIXED_PRECISION_TYPE: float16`.    |
 
 ```yaml
 MIXED_PRECISION:
@@ -278,7 +285,7 @@ MIXED_PRECISION:
   enabled: True
 ```
 
-**`MIXED_PRECISION_TYPE`** — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. It is valid on its own — `MIXED_PRECISION: false` with `MIXED_PRECISION_TYPE: bfloat16` is autocast without a scaler. Enabling `MIXED_PRECISION` with anything other than `float16` raises a `SpecError` at build time, because gradient scaling only applies to float16.
+**`MIXED_PRECISION_TYPE`** *(torch only, `TorchUserDefinedLearner`)* — The dtype forwarded to `torch.autocast` when mixed precision is enabled. Accepts `"bfloat16"` or `"float16"`. It is valid on its own — `MIXED_PRECISION: false` with `MIXED_PRECISION_TYPE: bfloat16` is autocast without a scaler. Enabling `MIXED_PRECISION` with anything other than `float16` raises a `SpecError` at build time, because gradient scaling only applies to float16.
 
 ```yaml
 MIXED_PRECISION_TYPE: bfloat16
@@ -293,7 +300,7 @@ ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
 
 #### `LEARNERS`
 
-An ordered list of `LearnerBehavior` entries. Each entry defines one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
+An ordered list of `TorchLearnerBehavior` entries (`LearnerBehavior` for the other frameworks). Each entry defines one loss to differentiate, one optimizer to update, and its own execution graph. Multiple entries enable multi-optimizer training (e.g., GAN-style training where generator and discriminator optimizers are stepped independently).
 
 During code generation, a mode preset runs before each entry's flow segment: the entry's trainable layers are set to training mode and every other model to eval mode. Nothing restores modes after the optimizer step — a later entry's preset (or nothing, for the last entry) is what changes them next.
 
@@ -345,7 +352,7 @@ TRAINABLE_LAYERS: [] # auto-inferred
 
 #### `LEARNERS` Entry Keys
 
-Each entry in `LEARNERS` is a `LearnerBehavior` with the following fields:
+Each entry in `LEARNERS` is a `TorchLearnerBehavior` with the following fields:
 
 - **`NAME`** (`str`): Optional identifier for this entry. Used as the generated attribute name for the optimizer, and as its key in the learner's `optimizers` property. Must be a valid Python identifier.
 - **`LOSS`** (`str`): The loss key (produced by the `FLOW`) that this entry differentiates.
@@ -353,7 +360,7 @@ Each entry in `LEARNERS` is a `LearnerBehavior` with the following fields:
 - **`FLOW`** (`list`): Training-time execution graph for this entry. Uses the same entry format as model `FLOW` (see [`FLOW` Entry Format](#flow-entry-format)), plus support for `"eval: ..."` expressions and inline layer instantiation via StructCast patterns.
 - **`INFERENCE_FLOW`** (`list`): Optional inference-time execution graph. When absent, `FLOW` is used for inference as well.
 - **`OPTIMIZER`** (StructCast pattern): A StructCast `ObjectPattern` that constructs the optimizer, called with the named parameters of `TRAINABLE_LAYERS`. It may address `structcast_model.torch.optimizers.create_opt` directly, or an optimizer + scheduler composition loaded from a file with `_file_` — see [`examples/torch/optimizers.py`](examples/torch/optimizers.py). Such a composition implements the event protocols itself, so the trainer steps its schedule when it scans the learner's `optimizers`.
-- **`CLIP`** (StructCast pattern or `null`): Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `TRAINABLE_LAYERS`. Set to `null` to disable gradient clipping.
+- **`CLIP`** (StructCast pattern or `null`) *(torch only, `TorchLearnerBehavior`)*: Optional gradient-clipping callable. When non-null, the pattern is bound once and called before each optimizer step with the parameters identified by `TRAINABLE_LAYERS`. Set to `null` to disable gradient clipping.
 - **`EXTRA`** (`dict`): Extra keyword arguments forwarded to the optimizer or the update logic in general. Default is `{}`.
 
 ```yaml
@@ -484,8 +491,8 @@ history = trainer.fit(epochs=10)
 
 ```python
 class SaveCheckpoint:
-    def on_best(self, info: BaseInfo, best: BestCriterion) -> None:
-        ...  # log or save by best.value / best.step
+    def on_best(self, info: BaseInfo, best: BestCriterion) -> None: ...  # log or save by best.value / best.step
+
 
 checkpoint = BestCriterion(target="val_acc1", mode="max", callbacks=[SaveCheckpoint()])
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[checkpoint])
@@ -579,6 +586,16 @@ with MLflowLogger(experiment="my-experiment") as logger:
 
 `MLflowLogger` needs the `mlflow` extra, `WandbLogger` the `wandb` extra; each module imports its backend at import time and raises a descriptive `ImportError` from the constructor when it is missing.
 
+### State backends
+
+**`StateBackend`** (`structcast_model.loggers.state_backends`) — The protocol deciding what a saved training state looks like on disk: a `suffix`, `save(states, directory, name)` returning the written path, and `load(path)`. Both loggers take one as a `state_backend` field, defaulting to `TorchStateBackend`; `scm flax train` passes a `FlaxStateBackend` instead. A backend returns state in host memory only — numpy arrays or CPU tensors, never device-resident state — because placing it is the distributed strategy's job, which is what keeps a checkpoint independent of the topology that wrote it ([`docs/adr/0015`](docs/adr/0015-logger-state-backends-and-single-file-archives.md)).
+
+**`TorchStateBackend`** — One `torch.save` pickle, suffix `.pt`, the format every torch run has used. `load` reads it with `map_location="cpu"` and `weights_only=True`, because the reference is user input and an unpickled checkpoint executes code.
+
+**`FlaxStateBackend`** — An [orbax](https://orbax.readthedocs.io/) composite checkpoint packed into one gzipped tar, suffix `.tar.gz`, because orbax writes a directory while every transport around the loggers carries a file. Each top-level entry becomes one orbax item: array trees through the standard handler, JSON-serializable entries (`meta`, and the always-empty `grad_scalers`) as plain JSON. `load` extracts with the stdlib `filter="data"` guard — and refuses outright on an interpreter older than Python 3.11.4, which has no extraction filters — then restores without naming a target or a sharding, so a state saved on four devices comes back on any topology.
+
+`MLflowLogger.log_state_dict` writes the artifact as `<name><suffix>`, a single file, where `mlflow.pytorch.log_state_dict` used to write a directory. `fetch_training_state` still reads that older layout: a downloaded artifact directory is searched for the active backend's suffix first, then for a legacy `*.pth`, which is read as a torch pickle whatever the logger's backend is.
+
 ### timm integrations
 
 These are example code in [`examples/torch/data.py`](examples/torch/data.py), not package API: the CLI knows nothing about timm and loads them from a configuration by file path (`_addr_` plus `_file_`), the same way the optimizer compositions are loaded.
@@ -603,3 +620,75 @@ The dataset template at [`cfg/torch/others/default_timm.yaml`](cfg/torch/others/
 ```python
 provider = TimmDataProvider(training=training_wrapper, validation=validation_wrapper)
 ```
+
+---
+
+## API Reference: `flax/optimizers.py`
+
+[`src/structcast_model/flax/optimizers.py`](src/structcast_model/flax/optimizers.py) holds the optimizer helpers a Flax learner template and its generated class use. All three are re-exported from `structcast_model.flax`.
+
+**`get_learning_rate(optimizer)`** — Returns the learning rate an `nnx.Optimizer`'s state currently reports, as a float32 scalar. Optax stores no rate of its own — a constant lives in the update closure, and a schedule leaves only its step count behind — so the rate is readable only when the transformation was built through [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams), which is why `FlaxLearnerBuilder` wraps the factory carrying `learning_rate` in it ([`docs/adr/0013`](docs/adr/0013-flax-optimizers-are-dsl-built-nnx-optimizers.md)). The walk is a pure pytree traversal, so calling it inside a traced training step compiles to a reference to the state array rather than to a host read. The result is NaN when the chain injects no rate at all, or several of them, since neither case names a single rate to report.
+
+**`unwrap_variables(tree)`** — Returns the pytree with every `flax.nnx.Variable` leaf replaced by the value it holds, so a state can be filtered or serialized by value. It is `nnx.as_pure` written out by hand: the supported flax floor, 0.12.6, still calls that function `nnx.pure`, and one walk here keeps a single code path across the whole supported range.
+
+**`no_weight_decay_mask(*regexes)`** — Returns the mask callable `optax.adamw(mask=...)` and `optax.masked` consume: it maps a parameter tree to a same-structure tree of booleans, `False` where the leaf's dotted path (`"encoder.bias"`) matches any of the regexes. The match is a search, not an anchor, so a plain `"bias"` exempts every bias in the tree.
+
+```python
+no_weight_decay_mask(r"\.bias$")({"layer": {"kernel": 1.0, "bias": 2.0}})
+# {'layer': {'bias': False, 'kernel': True}}
+```
+
+---
+
+## API Reference: `flax/trainer.py`
+
+[`src/structcast_model/flax/trainer.py`](src/structcast_model/flax/trainer.py) is the Flax runtime layer: the dummy-input and device helpers `scm flax time` uses, plus the tracker, the trainer, and the checkpointing callbacks of a `scm flax train` run. The strategy those callbacks produce their states through is [`FlaxDistributedStrategy`](#api-reference-flaxdistributedpy).
+
+**`create_jax_inputs(shape, *, batch_size=1)`** — Creates dummy JAX arrays from a tensor specification, or from a dict or list nesting more of them, using each specification's dtype and initializer. A floating point specification defaults to a uniform random initializer, an integer one to `jax.numpy.zeros`.
+
+**`get_jax_devices()`** and **`get_jax_device(device=None)`** — The available devices as an ordered `{"cpu:0": Device}` mapping, and one looked up by that name; `None` returns the first. An unknown name raises with the available ones listed.
+
+**`resolve_input_shapes(model, shapes=None)`** — The shared helper from `structcast_model.utils.base`, re-exported here: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (merged across a model mapping), otherwise `None`.
+
+**`ShardedDataset(dataset, strategy)`** — Frozen dataclass wrapping a dataset -- an iterable of batches, or a callable returning one -- so that every batch it yields is placed across *strategy*'s mesh as it is read; `len()` counts an epoch through the wrapped dataset and places nothing. The wrapped dataset's event methods are copied onto the instance in `__post_init__` rather than forwarded from `__getattr__`, because the trainer picks an event's participants with `isinstance` against a runtime-checkable protocol, and that check looks attributes up statically. `scm flax train` builds one per split and hands both to its data provider.
+
+**`FlaxTracker`** — Running mean of the criteria of one training or validation split. It sums on device as plain JAX arrays and returns Python floats — the contract `BaseTrainer.tracker`, the epoch history, the `BestCriterion` comparison, and `log_metric` all consume — reading the host once per step with a single `jax.device_get`. It implements `on_training_begin` and `on_validation_begin`, which reset the sums, so training and validation values never mix. Unlike `TorchTracker` there is no all-reduce: JAX is single-controller, so a criterion computed from a sharded batch is already the global value.
+
+```python
+tracker = FlaxTracker.from_criteria(["ce_loss", "acc1"])
+logs = tracker(ce_loss=loss, acc1=acc1)
+```
+
+**`FlaxTrainer`** — `BaseTrainer` specialized to `nnx.Module` models, with nothing added: `sync()` stays the inherited no-op, because `FlaxTracker.logs` already waits for each step's program, and the devices a run uses are the strategy's mesh rather than a trainer field.
+
+**`FlaxBestCriterion`** — `BestCriterion` specialized to `nnx.Module` models, the twin of `TorchBestCriterion`, duplicated rather than shared because importing either module imports its framework. `FlaxBestCriterion.from_criteria(higher_criteria, lower_criteria, save_criteria, logger, strategy)` builds one monitor per criterion — `"max"` mode for the higher list, `"min"` for the lower — each logging its best value through *logger* and, for criteria named in *save_criteria*, saving the model states that reached it as a `best_<criterion>` artifact produced through *strategy*.
+
+**`FlaxTrainingStateSaver`** — Callback saving the training state of each finished epoch through a logger as the `training_state` artifact, so a run can be resumed from it with `--resume`: the model and optimizer states the strategy produces, an always-empty `grad_scalers` slot so both frameworks resume from the same payload shape, and a `meta` mapping of the epoch, step, and update counters plus whatever `extra_meta` the caller adds — the CLI adds the seed, a configuration hash, and the optimizer hashes.
+
+```python
+saver = FlaxTrainingStateSaver(logger=logger, strategy=strategy, extra_meta={"seed": 42})
+trainer = FlaxTrainer(learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
+```
+
+**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, optimizer_hashes=None, config_hash=None, is_main=True)`** — Fetches the state through *logger*, loads it into the live models and optimizers through *strategy*, and returns the epoch to continue at: the saved one plus one, which overrides *start_epoch* with a logged message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). Optax rebuilds its transformation from configuration and the restore cannot see it, so a changed optimizer or a changed configuration warns rather than refuses — extending a schedule or lowering the rate of a fine-tune is legitimate.
+
+---
+
+## API Reference: `flax/distributed.py`
+
+[`src/structcast_model/flax/distributed.py`](src/structcast_model/flax/distributed.py) holds the single strategy class a Flax run trains through. JAX expresses single-device, data-parallel, and fully-sharded execution with the same mechanism — a device mesh plus a `PartitionSpec` per array — so there is one class here instead of the three torch has, and what distinguishes the modes is a preset naming the mesh to build and the rules deciding each parameter's spec ([`docs/adr/0014`](docs/adr/0014-flax-strategies-are-spec-presets-on-an-explicit-mesh.md)).
+
+**`FlaxDistributedStrategy`** — Satisfies the torch `DistributedStrategy` protocol structurally, so the trainer and the checkpointing callbacks treat both backends alike. Constructing it activates its mesh process-wide (`jax.set_mesh` takes effect at `__init__`), which is what makes models built afterwards land on it — so `scm flax train` builds it before anything else.
+
+Fields: `preset` (`"single"`, `"dp"`, or `"fsdp"`, default `"single"`), `device` (the device the `single` preset runs on, e.g. `"cpu:0"`; the first available one by default), `devices` (how many devices `dp` and `fsdp` span; every available one by default), `rules` (ordered `(parameter-path regex, tactic)` pairs replacing the preset's table), and `min_size` (parameters smaller than this many bytes stay replicated, default 1 MiB).
+
+Members:
+
+- `mesh` (property) — the activated mesh, for placing a batch or reading its size
+- `wrap(models)` — places every parameter on the sharding its first matching rule asks for and returns the same models. Nothing is wrapped: sharding is a property of the arrays, so the module objects and the step closures capturing them survive, and an optimizer built afterwards inherits the shardings for its own state
+- `sync_initial_weights(models)` — a no-op: JAX is single-controller, so one process initializes every device
+- `compile(module, compile_kw)` — `nnx.jit(module, **compile_kw)`, or *module* unchanged when *compile_kw* is `None`; the caller owns which arguments are static and which are donated. `scm flax train` compiles the learner's steps through this seam by default, which is where the Flax CLI differs from `scm torch train`, whose `--compile` is off unless given
+- `shard_batch(batch)` — splits a batch across the mesh along its leading dimension and commits it to the devices, raising when an entry has no leading dimension or one the mesh size does not divide
+- `state_dict(models, optimizers=None, optimizer_models=None)` and `load_state_dict(models, optimizers, optimizer_models, state)` — the full state (parameters, batch statistics, and RNG state) to and from host memory, keyed by model and by optimizer name. A typed RNG key travels as its raw key data and is rewrapped on the way back, and a restored leaf takes the dtype and the sharding of the live array it replaces — which is what makes a state saved on four devices load onto one. *optimizer_models* is accepted for protocol compatibility and unused: nnx optimizer state is already keyed by parameter path
+
+Module constants: `AXIS` (`"data"`, the single mesh axis every preset builds), `TACTICS` (`"replicate"` and `"fsdp"`, the tactics a rule may name), and `PRESET_RULES` (each preset's ordered rule table). The `fsdp` tactic only ever splits a parameter's leading dimension — sharding any other one puts the parameter's own axis on the axis the batch is already split along — and falls back to replication for a parameter with fewer than two dimensions, one below `min_size`, or one whose leading dimension the mesh size does not divide.

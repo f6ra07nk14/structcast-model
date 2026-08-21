@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import wandb
 
 from structcast_model.loggers.base import Logger
+from structcast_model.loggers.state_backends import FlaxStateBackend
 from structcast_model.loggers.wandb import WandbLogger
 from structcast_model.torch.trainer import TorchTrainer
 import torch
@@ -49,6 +51,26 @@ def test_wandb_logger_run_lifecycle_and_content(wandb_offline: Any, tmp_path: Pa
     assert "epochs: 1" in (run_dir / "arguments.yaml").read_text()
     assert torch.load(run_dir / "training_state.pt", weights_only=True)["weight"].tolist() == [0.0, 0.0]
     assert any(run_dir.rglob("config.yaml"))
+
+
+def test_wandb_logger_round_trips_a_flax_state_through_the_run_directory(wandb_offline: Any) -> None:
+    """Swapping the backend must not disturb the run-directory flow: a Flax state is one file too.
+
+    That single file is what makes the `wandb://<entity>/<project>/<run_id>/<file>` reference and the
+    run-directory sync work unchanged for a framework whose checkpoints are directories.
+    """
+    backend = FlaxStateBackend()
+    states = {"models": {"model": {"kernel": np.ones(2, np.float32)}}, "meta": {"epoch": 1}}
+
+    with WandbLogger(experiment="phase-two", state_backend=backend) as logger:
+        run_dir = Path(wandb_offline.run.dir)
+        logger.log_state_dict(states, "training_state")
+
+    saved = run_dir / "training_state.tar.gz"
+    assert saved.is_file()
+    restored = WandbLogger(experiment="phase-two", state_backend=backend).fetch_training_state(str(saved))
+    assert restored["meta"] == {"epoch": 1}
+    assert restored["models"]["model"]["kernel"].tolist() == [1.0, 1.0]
 
 
 def test_wandb_logger_rejects_file_writes_outside_a_run() -> None:

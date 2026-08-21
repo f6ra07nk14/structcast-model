@@ -25,8 +25,8 @@ help-text builder (`TEMPLATE_PARAM_HELP`, `object_pattern_help`, the shapes/comp
   initializer module, compile API). Drift now has to get past a function signature instead of a
   copy-paste.
 - **Framework-specific semantics stay in `cmd_*.py`.** `--device` means three different things,
-  keras `--compile` is run configuration rather than graph compilation, `matmul_precision` is
-  torch-only; centralizing them would buy no drift protection and cost locality.
+  keras `--compile` is run configuration rather than graph compilation, `--strategy` takes a preset name in
+  flax and only a pattern in torch; centralizing them would buy no drift protection and cost locality.
 
 "One letter, one meaning" is enforced by a test that walks the whole app tree and asserts every
 short flag maps to exactly one long option, so the convention survives the planned keras/flax

@@ -113,6 +113,27 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
     return adapter.dump_python(adapter.validate_python(load_yaml_from_string(value)))
 
 
+def get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
+    """Return output names from a module attribute or the provided default, raising if neither is available.
+
+    Args:
+        module (Any): The module whose ``outputs`` attribute is read when no default is given.
+        default (list[str] | None): Output names given on the command line, which win over the attribute.
+        name (str): How the module is named on the command line, used to name the option in the error.
+
+    Returns:
+        list[str]: The output names.
+    """
+    if default:
+        return default
+    if hasattr(module, "outputs"):
+        return module.outputs
+    raise ValueError(
+        f'Module "{name}" does not have an "outputs" attribute. '
+        f'Please provide default outputs using the "--{name}-outputs" option.'
+    )
+
+
 def instantiate_object(raw: Any) -> Any:
     """Instantiate an object from a raw pattern using the structcast instantiator.
 
@@ -128,6 +149,7 @@ def instantiate_object(raw: Any) -> Any:
 __all__ = [
     "bool_or_path_or_dict_parser",
     "dict_parser",
+    "get_module_outputs",
     "instantiate_object",
     "path_or_any_parser",
     "reduce_dict",

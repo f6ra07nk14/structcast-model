@@ -21,6 +21,7 @@ from structcast_model.builders.schema import (
     resolve_flow,
     resolve_inputs,
 )
+from structcast_model.builders.torch import TorchLearnerBehavior, TorchUserDefinedLearner
 
 TREE: TypeAdapter[TensorSpecTree] = TypeAdapter(TensorSpecTree)
 """Adapter validating a single INPUT_SHAPES entry, the way consumers of the tree do."""
@@ -86,7 +87,7 @@ def test_learner_behavior_extra_kwargs() -> None:
 
 
 def test_learner_behavior_instance_passthrough_and_clip() -> None:
-    """Cover instance passthrough and CLIP field for LearnerBehavior."""
+    """Cover instance passthrough and the torch-only CLIP field for TorchLearnerBehavior."""
     raw = {
         "NAME": "main",
         "LOSS": "ce_loss",
@@ -94,8 +95,8 @@ def test_learner_behavior_instance_passthrough_and_clip() -> None:
         "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.AdamW"]]},
         "CLIP": {"_obj_": [["_addr_", "timm.utils.clip_grad.dispatch_clip_grad"]]},
     }
-    named = LearnerBehavior.model_validate(raw)
-    assert LearnerBehavior.model_validate(named) is named
+    named = TorchLearnerBehavior.model_validate(raw)
+    assert TorchLearnerBehavior.model_validate(named) is named
     assert named.CLIP is not None
     with pytest.raises(ValidationError):
         LearnerBehavior.model_validate(
@@ -119,7 +120,7 @@ def test_user_defined_learner_infers_losses_and_trainable_layers() -> None:
             },
         ],
     }
-    cfg = UserDefinedLearner.model_validate(raw)
+    cfg: UserDefinedLearner[LearnerBehavior] = UserDefinedLearner.model_validate(raw)
     assert cfg.LOSSES == ["loss_a"]
     assert set(cfg.TRAINABLE_LAYERS) == {"model", "aux_model"}
 
@@ -262,7 +263,7 @@ def test_learner_behavior_instance_passthrough() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedLearner – gradient scaling is only valid for float16
+# TorchUserDefinedLearner – gradient scaling is only valid for float16
 # ---------------------------------------------------------------------------
 
 
@@ -284,25 +285,45 @@ def _mixed_precision_learner(mixed_precision: Any, mixed_precision_type: str | N
 def test_user_defined_learner_grad_scaling_with_bfloat16_raises() -> None:
     """A gradient scaler counteracts float16 underflow; pairing it with bfloat16 is a config bug."""
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedLearner.model_validate(_mixed_precision_learner({"enabled": True}, "bfloat16"))
+        TorchUserDefinedLearner.model_validate(_mixed_precision_learner({"enabled": True}, "bfloat16"))
 
 
 def test_user_defined_learner_grad_scaling_requires_a_type() -> None:
     """MIXED_PRECISION without any dtype cannot mean float16 scaling implicitly."""
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedLearner.model_validate(_mixed_precision_learner(True, None))
+        TorchUserDefinedLearner.model_validate(_mixed_precision_learner(True, None))
 
 
 def test_user_defined_learner_bfloat16_autocast_without_scaler_is_valid() -> None:
     """bfloat16 autocast alone needs no scaler and must validate."""
-    learner = UserDefinedLearner.model_validate(_mixed_precision_learner(False, "bfloat16"))
+    learner = TorchUserDefinedLearner.model_validate(_mixed_precision_learner(False, "bfloat16"))
     assert learner.MIXED_PRECISION_TYPE == "bfloat16"
 
 
 def test_user_defined_learner_float16_with_scaler_is_valid() -> None:
     """float16 with gradient scaling is the supported scaler configuration."""
-    learner = UserDefinedLearner.model_validate(_mixed_precision_learner(True, "float16"))
+    learner = TorchUserDefinedLearner.model_validate(_mixed_precision_learner(True, "float16"))
     assert learner.MIXED_PRECISION is True
+
+
+def test_user_defined_learner_rejects_torch_only_fields() -> None:
+    """The shared schema must reject torch-only keys so non-torch YAML cannot silently carry them.
+
+    `extra="forbid"` is the whole rejection mechanism: without it, a Flax learner declaring CLIP or
+    MIXED_PRECISION would validate and the setting would be dropped without a word.
+    """
+    with pytest.raises(ValidationError, match="MIXED_PRECISION"):
+        UserDefinedLearner.model_validate(_mixed_precision_learner(True, "float16"))
+    clip = {"_obj_": [["_addr_", "timm.utils.clip_grad.dispatch_clip_grad"]]}
+    with pytest.raises(ValidationError, match="CLIP"):
+        LearnerBehavior.model_validate(
+            {
+                "LOSS": "ce_loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "torch.optim.SGD"]]},
+                "CLIP": clip,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +389,7 @@ def test_layer_behavior_from_tuple_with_wrong_length_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UserDefinedLearner — mixed precision None branch
+# TorchUserDefinedLearner — mixed precision None branch
 # ---------------------------------------------------------------------------
 
 
@@ -387,7 +408,7 @@ def test_user_defined_learner_mixed_precision_none_raises() -> None:
         "MIXED_PRECISION_TYPE": "float16",
     }
     with pytest.raises((SpecError, ValidationError)):
-        UserDefinedLearner.model_validate(raw)
+        TorchUserDefinedLearner.model_validate(raw)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ StructCast-Model turns YAML templates into executable models and training system
 1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports learner class generation (the object owning the models, the optimizers, and the training and inference steps), including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
 2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
 3. **Inference benchmarking**: Measure model inference time via `scm [torch/flax/keras] time`.
-4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` (PyTorch only; Flax and Keras training is planned).
+4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` or `scm flax train` (Keras training is planned).
 
 ## Repository Map
 
@@ -80,6 +80,7 @@ The following diagram shows how data moves through the system. Use this to under
 ```text
 YAML template in cfg/[torch/flax/keras]/
   |  TemplateLayer / TemplateLearner validation      <- builders/schema.py
+  |  TorchTemplateLearner (torch-only learner keys)  <- builders/torch.py
   v
 Builder intermediate objects
   |  BaseModelBuilder / BaseLearnerBuilder           <- builders/base.py
@@ -88,14 +89,14 @@ Builder intermediate objects
   v
 Generated Python source files
   |  scm [torch/flax/keras] create model
-  |  scm torch create learner (PyTorch only)
+  |  scm [torch/flax] create learner
   v
 StructCast object patterns
   |  _obj_ + _addr_ + _file_ + _call_               <- commands/cmd_{torch,flax,keras}.py
   v
 Live model objects
   |  Inference benchmarking                          <- scm [torch/flax/keras] time
-  |  Training (PyTorch only)                         <- scm torch train
+  |  Training (PyTorch, Flax)                        <- scm [torch/flax] train
   v
 TorchTrainer.fit(...)  (PyTorch training path)
   |  train/evaluate loop + routed callbacks          <- base_trainer.py + torch/trainer.py
@@ -108,7 +109,7 @@ The repository's signature workflow (the "generate-then-reimport" loop) is:
 1. Render specialized YAML from templates with `scm format`.
 2. Generate model Python modules with `scm [torch/flax/keras] create model` (plus `create learner` for PyTorch).
 3. Re-import those modules through StructCast `_file_` patterns at runtime.
-4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm torch train` (PyTorch only).
+4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm [torch/flax] train`.
 
 ## CLI Surface
 
@@ -287,7 +288,7 @@ Important generation details:
 
 - Model code uses `self.<layer_name>` submodules.
 - Inference flow is rendered separately when `INFERENCE_FLOW` is present.
-- Learner code supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`.
+- Learner code supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP` (torch only, added by `TorchLearnerBehavior`).
 - Each entry's trainable layers are set to training mode before its flow executes and set back to eval mode after the optimizer step.
 - Learner code can include gradient accumulation, AMP scaler logic, clipping, optimizer stepping, and optimizer metadata properties.
 - The optimizer pattern receives the named parameters of the entry's trainable layers, so it works with `create_opt` and with file-addressed optimizer compositions alike.
@@ -503,4 +504,4 @@ The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 
 This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the CLI (inference benchmarking or training).
 
-Model generation is available for all three frameworks. Training is currently PyTorch-only; for distributed training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation. The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.
+Model generation is available for all three frameworks and training for PyTorch and Flax; for distributed PyTorch training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation (Flax drives all local devices from one process). The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.

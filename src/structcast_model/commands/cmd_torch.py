@@ -2,7 +2,6 @@
 
 from collections import OrderedDict
 from functools import partial
-import inspect
 from pathlib import Path
 import random
 from time import time
@@ -23,19 +22,39 @@ from structcast_model.base_trainer import (
 from structcast_model.commands.shared_args import (
     PATH_FORM_HELP,
     batch_size,
+    ci,
     compile_option,
+    epochs,
+    experiment,
+    higher_criteria,
+    learner_outputs,
+    learner_pattern,
+    log_arguments,
+    log_artifacts,
+    logger_name,
+    lower_criteria,
+    matmul_precision_option,
     model_pattern,
     object_pattern_help,
     output_script_path,
+    resume_option,
+    save_criteria,
+    seed_option,
     shapes_help,
     shapes_option,
+    start_epoch,
     template_param_option,
     times,
+    trainer_option,
+    training_dataset_option,
     training_mode,
+    validation_dataset_pattern,
+    validation_frequency,
     warmup_runs,
 )
 from structcast_model.commands.utils import (
     dict_parser,
+    get_module_outputs,
     instantiate_object,
     path_or_any_parser,
     reduce_dict,
@@ -81,12 +100,7 @@ shapes = shapes_option(
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
 compile_pattern: dict[str, Any] | None = compile_option("torch.compile")
-matmul_precision: Literal["highest", "high", "medium"] = Option(
-    "high",
-    envvar="MATMUL_PRECISION",
-    help='Precision for float32 matrix multiplications: "highest" keeps full float32, while "high" and "medium" '
-    "trade accuracy for tensor-core speed.",
-)
+matmul_precision: Literal["highest", "high", "medium"] = matmul_precision_option()
 
 
 @creator.command(name="model")
@@ -138,18 +152,6 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
     return res
 
 
-def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
-    """Return output names from a module attribute or the provided default, raising if neither is available."""
-    if default:
-        return default
-    if hasattr(module, "outputs"):
-        return module.outputs
-    raise ValueError(
-        f'Module "{name}" does not have an "outputs" attribute. '
-        f'Please provide default outputs using the "--{name}-outputs" option.'
-    )
-
-
 @app.command(name="time")
 def measure_inference_time(
     model_pattern: Any = model_pattern,
@@ -165,28 +167,26 @@ def measure_inference_time(
     """Measure the average inference time of a PyTorch model."""
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    device = scm_torch.trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     print("Initializing the model...")
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        shapes = scm_torch.trainer.resolve_input_shapes(model, shapes)
-        scm_torch.trainer.initial_model(model, shapes)
+        shapes = scm_torch.resolve_input_shapes(model, shapes)
+        scm_torch.initial_model(model, shapes)
     print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
-    model = scm_torch.distributed.SingleDeviceStrategy(device=device).compile(
-        model, instantiator.instantiate(compile_pattern)
-    )
+    model = scm_torch.SingleDeviceStrategy(device=device).compile(model, instantiator.instantiate(compile_pattern))
     if training_mode:
         model.train()
     else:
         model.eval()
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
-    device_type = scm_torch.trainer.get_torch_device_type(device)
+    device_type = scm_torch.get_torch_device_type(device)
 
     def _measure_single_run() -> float:
         with torch.device(device):
-            inputs = scm_torch.trainer.create_torch_inputs(shapes, batch_size=batch_size)
+            inputs = scm_torch.create_torch_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        with scm_torch.trainer.autocast_inputs(inputs, device_type):
+        with scm_torch.autocast_inputs(inputs, device_type):
             model(**inputs)
         cuda_sync()
         return time() - start_time
@@ -220,11 +220,11 @@ def call_ptflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    device = scm_torch.trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = scm_torch.trainer.initial_model(model, shapes)
-        with scm_torch.trainer.autocast_inputs(inputs, scm_torch.trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.initial_model(model, shapes)
+        with scm_torch.autocast_inputs(inputs, scm_torch.get_torch_device_type(device)):
             flops, params = ptflops.get_model_complexity_info(
                 model=model,
                 input_res=(1,),
@@ -254,11 +254,11 @@ def call_calflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    device = scm_torch.trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = scm_torch.trainer.initial_model(model, shapes)
-        with scm_torch.trainer.autocast_inputs(inputs, scm_torch.trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.initial_model(model, shapes)
+        with scm_torch.autocast_inputs(inputs, scm_torch.get_torch_device_type(device)):
             flops, macs, params = calflops.calculate_flops(
                 model=model,
                 input_shape=None,
@@ -281,13 +281,13 @@ def call_calflops(
 
 def _resolve_strategy(
     strategy_pattern: Any, device: str, local_rank: int, distributed: bool
-) -> "scm_torch.distributed.DistributedStrategy":
+) -> "scm_torch.DistributedStrategy":
     """Resolve the run's strategy: an explicit pattern wins, then DDP when distributed, else single-device."""
     if strategy_pattern is not None:
         return instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
     if distributed:
-        return scm_torch.distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
-    return scm_torch.distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
+        return scm_torch.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
+    return scm_torch.SingleDeviceStrategy(device=device, local_rank=local_rank)
 
 
 def _assemble_learner(
@@ -296,7 +296,7 @@ def _assemble_learner(
     input_shapes: dict[str, Any],
     initializers: dict[str, Any],
     resume: str | None,
-    strategy: "scm_torch.distributed.DistributedStrategy",
+    strategy: "scm_torch.DistributedStrategy",
     compile_kw: dict[str, Any] | None,
     learner_pattern: Any,
     learner_outputs: list[str] | None,
@@ -310,8 +310,8 @@ def _assemble_learner(
     # CPU buffers.
     with torch.device(device):
         models = _instantiate_models(model_patterns)
-        input_shapes = scm_torch.trainer.resolve_input_shapes(models, input_shapes) or {}
-        scm_torch.trainer.initial_model(models, input_shapes)
+        input_shapes = scm_torch.resolve_input_shapes(models, input_shapes) or {}
+        scm_torch.initial_model(models, input_shapes)
         # A resumed run loads its weights later, which would overwrite whatever the initializers and
         # the initial-weight broadcast produce here.
         if is_main and resume is None:
@@ -323,18 +323,9 @@ def _assemble_learner(
         models = OrderedDict((n, strategy.compile(m, compile_kw)) for n, m in models.items())
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
-        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
-        # its models as **kwargs would otherwise record the creator as one more model.
-        try:
-            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
-        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
-            takes_scaler_creator = False
-        if takes_scaler_creator:
-            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
-        else:
-            learner = factory(**models)
-        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-        tracker = scm_torch.trainer.TorchTracker.from_criteria(
+        learner = factory(**models)
+        learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
+        tracker = scm_torch.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
         )
     # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
@@ -350,12 +341,12 @@ def _assemble_learner(
 def _restore_training_state(
     *,
     resume: str,
-    strategy: "scm_torch.distributed.DistributedStrategy",
+    strategy: "scm_torch.DistributedStrategy",
     models: "OrderedDict[str, torch.nn.Module]",
     learner: Any,
     start_epoch: int,
     is_main: bool,
-    logger: "scm_loggers.base.Logger",
+    logger: "scm_loggers.Logger",
 ) -> int:
     """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch.
 
@@ -377,20 +368,20 @@ def _build_callbacks(
     *,
     trainer: Any,
     provider: SimpleDataProvider,
-    strategy: "scm_torch.distributed.DistributedStrategy",
+    strategy: "scm_torch.DistributedStrategy",
     learner_outputs: list[str],
     higher_criteria: list[str],
     lower_criteria: list[str],
     save_criteria: list[str],
-    logger: "scm_loggers.base.Logger",
+    logger: "scm_loggers.Logger",
     ci: bool,
     is_main: bool,
 ) -> None:
     """Install the logger and the saver/best/display callbacks on the trainer."""
     # The saver and the best-criterion monitors run collectives, so they are built on every rank;
     # only rank 0 holds a real logger and writes anything. See ADR-0005.
-    saver = scm_torch.trainer.TrainingStateSaver(logger=logger, strategy=strategy)
-    bests = scm_torch.trainer.TorchBestCriterion.from_criteria(
+    saver = scm_torch.TrainingStateSaver(logger=logger, strategy=strategy)
+    bests = scm_torch.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     display: list[Any] = []
@@ -439,140 +430,30 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "-d",
         help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
     ),
-    learner_pattern: Any = Option(
-        ...,
-        "--learner",
-        "-L",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the learner class", "MyLearner")
-        + PATH_FORM_HELP
-        + " The factory is called with one keyword argument per positional model pattern, so its parameter names "
-        "must match those model names.",
-    ),
-    learner_outputs: list[str] | None = Option(
-        None,
-        "--learner-outputs",
-        "-LO",
-        help="Criterion names the Learner's steps produce; they build the tracker and the progress-bar rows. "
-        "Overrides the names the Learner declares itself, and is required when it declares none. Give the "
-        'unprefixed names: the criterion options then take "loss" for the training criterion and "val_loss" for '
-        "the validation one.",
-    ),
+    learner_pattern: Any = learner_pattern,
+    learner_outputs: list[str] | None = learner_outputs,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    trainer_pattern: Any | None = Option(
-        None,
-        "--trainer",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the trainer", "MyTrainer", call=False)
-        + PATH_FORM_HELP
-        + " The pattern must build a callable accepted as trainer(device=..., learner=..., tracker=..., data=..., "
-        "callbacks=[]) whose result exposes training_prefix, validation_prefix, callbacks, describe() and "
-        "fit(epochs, start_epoch, validation_frequency); subclassing TorchTrainer is the intended way.",
+    trainer_pattern: Any | None = trainer_option(
+        "trainer(device=..., learner=..., tracker=..., data=..., callbacks=[])", "TorchTrainer"
     ),
-    epochs: int = Option(
-        1,
-        "--epochs",
-        "-e",
-        help="Epoch number to train up to, inclusive: training runs from --start-epoch (or the resumed epoch) "
-        "through this number, so it is a count only when starting at epoch 1 and must not be smaller than the "
-        "starting epoch. A resumed run must set it above the epoch stored in the resumed state.",
+    epochs: int = epochs,
+    start_epoch: int = start_epoch,
+    resume: str | None = resume_option(
+        "Restores models, optimizers, grad scalers, and continues from the saved epoch.", "data-order, sampler or RNG"
     ),
-    start_epoch: int = Option(
-        1,
-        help="First epoch number to run, 1-based and at most --epochs. It only offsets the loop counter; no data "
-        "is skipped. Ignored when --resume is given, which continues at the epoch stored in the resumed state "
-        "plus one.",
-    ),
-    resume: str | None = Option(
-        None,
-        "--resume",
-        help="Training state to resume from, in a form the active --logger understands: a local path always "
-        "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
-        "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
-        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch. Resume is exact "
-        "only at epoch boundaries: the saved state carries the epoch, step and update counters but no data-order, "
-        "sampler or RNG state, so the resumed epoch restarts from the beginning of the dataset.",
-    ),
-    training_dataset_pattern: Any = Option(
-        ...,
-        "--training-dataset",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the training dataset", "MyDataset") + PATH_FORM_HELP,
-    ),
-    validation_dataset_pattern: Any | None = Option(
-        None,
-        "--validation-dataset",
-        "-V",
-        parser=path_or_any_parser,
-        help=object_pattern_help("the validation dataset", "MyDataset") + PATH_FORM_HELP,
-    ),
-    validation_frequency: int = Option(
-        1,
-        "--validation-frequency",
-        "-f",
-        help="Run validation every N epochs; must be at least 1. On epochs where validation does not run, no "
-        '"val_" criterion is produced, so val_-named best and save criteria are only monitored on validated epochs.',
-    ),
-    lower_criteria: list[str] = Option(
-        ...,
-        "--lower-criterion",
-        "-LC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose lower values are better, monitored for their lowest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_loss"). A name no epoch produces is silently never monitored, and omitting the option '
-        "monitors nothing.",
-    ),
-    higher_criteria: list[str] = Option(
-        ...,
-        "--higher-criterion",
-        "-HC",
-        default_factory=list,
-        show_default=False,
-        help="Criterion names whose higher values are better, monitored for their highest value. Name them as they "
-        'appear in the epoch logs: training criteria keep the Learner\'s names, validation criteria carry the "val_" '
-        'prefix (e.g. "val_accuracy"). A name no epoch produces is silently never monitored, and omitting the option '
-        "monitors nothing.",
-    ),
-    save_criteria: list[str] = Option(
-        ...,
-        "--save-criterion",
-        "-SC",
-        default_factory=list,
-        show_default=False,
-        help='Criterion names whose best-scoring model states are saved, as a "best_<criterion>" artifact. Each '
-        "name must also be given to --lower-criterion or --higher-criterion, spelled the same way; a name in "
-        "neither list is silently ignored, and omitting the option saves no best-model artifact.",
-    ),
-    seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
+    training_dataset_pattern: Any = training_dataset_option(),
+    validation_dataset_pattern: Any | None = validation_dataset_pattern,
+    validation_frequency: int = validation_frequency,
+    lower_criteria: list[str] = lower_criteria,
+    higher_criteria: list[str] = higher_criteria,
+    save_criteria: list[str] = save_criteria,
+    seed: int = seed_option(),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
-    experiment: str = Option(
-        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for the logger."
-    ),
-    logger_name: Literal["mlflow", "wandb"] = Option(
-        "mlflow", "--logger", help="Experiment tracking service to record the run to."
-    ),
-    log_arguments: list[dict] | None = Option(
-        None,
-        "--log-arguments",
-        "-K",
-        parser=dict_parser,
-        help='Extra key-value pairs to record in the run\'s "arguments.yaml" artifact, in the format "key: value". '
-        "Repeat the option to add more keys; a key given twice keeps only the last occurrence, and the keys the run "
-        "records itself take precedence over keys of the same name.",
-    ),
-    log_artifacts: list[Path] | None = Option(
-        None,
-        "--log-artifacts",
-        "-A",
-        help="Paths to files to upload as run artifacts. Repeat the option to add more.",
-    ),
-    ci: bool = Option(
-        False,
-        help="Whether to run in CI mode. "
-        "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
-    ),
+    experiment: str = experiment,
+    logger_name: Literal["mlflow", "wandb"] = logger_name,
+    log_arguments: list[dict] | None = log_arguments,
+    log_artifacts: list[Path] | None = log_artifacts,
+    ci: bool = ci,
     dist_backend: str | None = Option(
         None,
         envvar="DIST_BACKEND",
@@ -597,7 +478,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train PyTorch models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    device, global_rank, local_rank, world_size, distributed = scm_torch.distributed.initial_distributed_env(
+    device, global_rank, local_rank, world_size, distributed = scm_torch.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
     torch.backends.cudnn.benchmark = True
@@ -631,10 +512,10 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     # Built before the resume, which fetches the state through it. Only the experiment name is stored
     # here: the run itself starts in __enter__.
     if is_main:
-        logger_type = scm_loggers.mlflow.MLflowLogger if logger_name == "mlflow" else scm_loggers.wandb.WandbLogger
-        logger: scm_loggers.base.Logger = logger_type(experiment=experiment)
+        logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+        logger: scm_loggers.Logger = logger_type(experiment=experiment)
     else:
-        logger = scm_loggers.base.NullLogger()
+        logger = scm_loggers.NullLogger()
     if resume is not None:
         start_epoch = _restore_training_state(
             resume=resume,
@@ -645,7 +526,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             is_main=is_main,
             logger=logger,
         )
-    trainer_type = scm_torch.trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer_type = scm_torch.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
     _build_callbacks(
         trainer=trainer,
