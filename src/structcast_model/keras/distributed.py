@@ -30,7 +30,7 @@ from re import Pattern, compile as re_compile
 from typing import TYPE_CHECKING, Any, Literal
 
 import keras
-from structcast_model.keras.trainer import apply_state_dict, collect_state_dict, get_keras_device
+from structcast_model.keras.utils import apply_state_dict, collect_state_dict, get_keras_device
 
 AXIS = "batch"
 """The single mesh axis every preset builds: batches split along it, FSDP shards along it.

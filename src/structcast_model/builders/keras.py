@@ -16,10 +16,9 @@ from structcast_model.builders.base import (
     LayerIntermediate,
     LearnerIntermediate,
     OptimizerSegment,
-    optimizer_hash,
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
-from structcast_model.builders.utils import statement_names, stored_names
+from structcast_model.builders.utils import optimizer_hash, statement_names, stored_names
 from structcast_model.utils.base import unique
 
 

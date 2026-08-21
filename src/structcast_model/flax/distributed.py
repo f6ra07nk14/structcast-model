@@ -19,7 +19,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 import numpy as np
 
 from flax import nnx
-from structcast_model.flax.trainer import get_jax_device
+from structcast_model.flax.utils import get_jax_device
 
 AXIS = "data"
 """The single mesh axis every preset builds: batches are split along it, FSDP shards along it."""

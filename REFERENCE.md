@@ -642,11 +642,11 @@ no_weight_decay_mask(r"\.bias$")({"layer": {"kernel": 1.0, "bias": 2.0}})
 
 ## API Reference: `flax/trainer.py`
 
-[`src/structcast_model/flax/trainer.py`](src/structcast_model/flax/trainer.py) is the Flax runtime layer: the dummy-input and device helpers `scm flax time` uses, plus the tracker, the trainer, and the checkpointing callbacks of a `scm flax train` run. The strategy those callbacks produce their states through is [`FlaxDistributedStrategy`](#api-reference-flaxdistributedpy).
+[`src/structcast_model/flax/trainer.py`](src/structcast_model/flax/trainer.py) is the Flax runtime layer: the dummy-input helpers `scm flax time` uses, plus the tracker, the trainer, and the checkpointing callbacks of a `scm flax train` run. The strategy those callbacks produce their states through is [`FlaxDistributedStrategy`](#api-reference-flaxdistributedpy).
 
 **`create_jax_inputs(shape, *, batch_size=1)`** — Creates dummy JAX arrays from a tensor specification, or from a dict or list nesting more of them, using each specification's dtype and initializer. A floating point specification defaults to a uniform random initializer, an integer one to `jax.numpy.zeros`.
 
-**`get_jax_devices()`** and **`get_jax_device(device=None)`** — The available devices as an ordered `{"cpu:0": Device}` mapping, and one looked up by that name; `None` returns the first. An unknown name raises with the available ones listed.
+**`get_jax_devices()`** and **`get_jax_device(device=None)`** (in [`flax/utils.py`](src/structcast_model/flax/utils.py)) — The available devices as an ordered `{"cpu:0": Device}` mapping, and one looked up by that name; `None` returns the first. An unknown name raises with the available ones listed.
 
 **`resolve_input_shapes(model, shapes=None)`** — The shared helper from `structcast_model.utils.base`, re-exported here: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (merged across a model mapping), otherwise `None`.
 

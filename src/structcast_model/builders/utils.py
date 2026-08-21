@@ -2,6 +2,8 @@
 
 import ast
 from collections import defaultdict
+from hashlib import sha256
+from json import dumps as json_dumps
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -125,6 +127,27 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
     return _resolve(pattern), (classes[0] if classes else "_Class")
 
 
+def optimizer_hash(optimizer: ObjectPattern) -> str:
+    """Return the digest identifying one `OPTIMIZER` pattern, as it was written.
+
+    Recorded in the generated learner and in the training state so a resume can report an optimizer
+    that was rebuilt from a different configuration (`docs/adr/0015`): the learner builds the
+    optimizer from the pattern and the restored state cannot see it, so a swapped schedule would
+    otherwise continue silently from the old step count. Framework-neutral -- it hashes the
+    validated pattern and nothing else -- so the Flax and Keras builders emit comparable digests;
+    on the Flax side the pattern is hashed before `inject_learning_rate` rewrites it, so turning the
+    injection on or off never moves the digest.
+
+    Args:
+        optimizer (ObjectPattern): The validated `OPTIMIZER` pattern of one learner behavior.
+
+    Returns:
+        str: The hex SHA-256 of the pattern's canonical JSON dump.
+    """
+    dumped = optimizer.model_dump(by_alias=True)
+    return sha256(json_dumps(dumped, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variable: str | None = None) -> str:
     """Resolve the given specification to a string representation and collect the required imports if applicable.
 
@@ -166,7 +189,7 @@ def resolve_getter(imports: defaultdict[str, set[str | None]], spec: Any, variab
     return _getter(spec, variable)
 
 
-__all__ = ["resolve_getter", "resolve_object", "statement_names", "stored_names"]
+__all__ = ["optimizer_hash", "resolve_getter", "resolve_object", "statement_names", "stored_names"]
 
 if not TYPE_CHECKING:
     import sys

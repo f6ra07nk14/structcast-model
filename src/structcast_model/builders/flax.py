@@ -18,12 +18,16 @@ from structcast_model.builders.base import (
     LayerIntermediate,
     LearnerIntermediate,
     OptimizerSegment,
+)
+from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
+from structcast_model.builders.utils import (
     # Framework-neutral and shared with the Keras builder, re-exported here because a caller reading
     # a learner's `OPTIMIZER_HASHES` reaches for it next to the builder that emitted them.
     optimizer_hash,
+    resolve_object,
+    statement_names,
+    stored_names,
 )
-from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
-from structcast_model.builders.utils import resolve_object, statement_names, stored_names
 from structcast_model.utils.base import unique
 
 logger = getLogger(__name__)

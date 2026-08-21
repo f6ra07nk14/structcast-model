@@ -18,9 +18,9 @@ from structcast_model.keras.trainer import (
     KerasTrainer,
     create_keras_inputs,
     create_numpy_inputs,
-    get_keras_device,
     initial_model,
 )
+from structcast_model.keras.utils import get_keras_device
 
 
 def test_create_numpy_inputs_from_int_tuple_returns_array() -> None:
