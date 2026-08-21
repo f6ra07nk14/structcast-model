@@ -2,8 +2,8 @@
 
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self, cast
-from warnings import warn
 
 import ml_dtypes
 import numpy as np
@@ -19,6 +19,10 @@ from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
+
+# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named
+# `logger`, as in the flax twin.
+_logger = getLogger(__name__)
 
 DTYPES = {
     "float32": np.float32,
@@ -309,21 +313,20 @@ def restore_training_state(
     saved_hashes = meta.get("optimizer_hashes", {})
     for segment, digest in (optimizer_hashes or {}).items():
         if segment in saved_hashes and saved_hashes[segment] != digest:
-            warn(
-                f'The optimizer of segment "{segment}" is not the one the state was saved with: the learner '
+            _logger.warning(
+                'The optimizer of segment "%s" is not the one the state was saved with: the learner '
                 "rebuilds it from the configuration, so the run continues with the new one from the saved "
                 "step count.",
-                stacklevel=2,
+                segment,
             )
     if config_hash is not None and meta.get("config_hash", config_hash) != config_hash:
-        warn(
+        _logger.warning(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
-            "are restored into whatever the current one built, wherever the two still line up.",
-            stacklevel=2,
+            "are restored into whatever the current one built, wherever the two still line up."
         )
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:
-        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+        _logger.info("Ignoring --start-epoch %s: the resumed state continues at epoch %s.", start_epoch, resumed_epoch)
     return resumed_epoch
 
 

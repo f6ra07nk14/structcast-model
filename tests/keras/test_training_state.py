@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from importlib.util import module_from_spec, spec_from_file_location
+import logging
 from pathlib import Path
 from typing import Any
-from warnings import catch_warnings, simplefilter
 
 import numpy as np
 import pytest
@@ -207,15 +207,16 @@ def test_restoring_continues_the_run_the_saved_state_left_off(make_learner: Call
 
 
 def test_the_saved_epoch_overrides_start_epoch_and_says_so(
-    make_learner: Callable[..., Any], capsys: pytest.CaptureFixture[str]
+    make_learner: Callable[..., Any], caplog: pytest.LogCaptureFixture
 ) -> None:
     """Resuming into a different epoch silently would misalign every schedule the run reports."""
     learner = make_learner()
 
-    epoch = _restore(learner, _saved_state(learner), start_epoch=9)
+    with caplog.at_level(logging.INFO, logger="structcast_model.keras.trainer"):
+        epoch = _restore(learner, _saved_state(learner), start_epoch=9)
 
     assert epoch == 5
-    assert "Ignoring --start-epoch 9" in capsys.readouterr().out
+    assert "Ignoring --start-epoch 9" in caplog.text
 
 
 def test_a_state_written_on_another_keras_backend_is_refused(make_learner: Callable[..., Any]) -> None:
@@ -241,7 +242,9 @@ def test_a_state_written_on_another_keras_backend_is_refused(make_learner: Calla
     assert np.array_equal(keras.ops.convert_to_numpy(learner.models["model"].variables[0].value), original)
 
 
-def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(make_learner: Callable[..., Any]) -> None:
+def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(
+    make_learner: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
     """A rebuilt optimizer must be reported, not accepted in silence.
 
     The learner rebuilds its optimizer from the configuration, so a swapped schedule restores
@@ -251,36 +254,41 @@ def test_an_optimizer_rebuilt_differently_warns_naming_the_segment(make_learner:
     learner = make_learner()
     state = _saved_state(learner, optimizer_hashes={"optimizer": "saved-digest"})
 
-    with pytest.warns(UserWarning, match='segment "optimizer"'):
+    with caplog.at_level(logging.WARNING, logger="structcast_model.keras.trainer"):
         _restore(learner, state, optimizer_hashes={"optimizer": "rebuilt-digest"})
+    assert 'segment "optimizer"' in caplog.text
 
 
-def test_a_state_saved_from_another_configuration_warns(make_learner: Callable[..., Any]) -> None:
+def test_a_state_saved_from_another_configuration_warns(
+    make_learner: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
     """Restoring arrays into another model, learner or shape configuration must be reported."""
     learner = make_learner()
     state = _saved_state(learner, config_hash="saved-digest")
 
-    with pytest.warns(UserWarning, match="different model, learner or shape configuration"):
+    with caplog.at_level(logging.WARNING, logger="structcast_model.keras.trainer"):
         _restore(learner, state, config_hash="rebuilt-digest")
+    assert "different model, learner or shape configuration" in caplog.text
 
-    with catch_warnings():
-        simplefilter("error")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="structcast_model.keras.trainer"):
         _restore(learner, state, config_hash="saved-digest")
+    assert not caplog.records
 
 
 @pytest.mark.parametrize(
     "hashes", [None, {"optimizer": "saved-digest"}], ids=["state-without-hashes", "matching-hashes"]
 )
 def test_an_unchanged_optimizer_resumes_without_a_warning(
-    make_learner: Callable[..., Any], hashes: dict[str, str] | None
+    make_learner: Callable[..., Any], hashes: dict[str, str] | None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """States written before the hashes existed, and runs that changed nothing, must stay quiet."""
     learner = make_learner()
     state = _saved_state(learner, **({} if hashes is None else {"optimizer_hashes": hashes}))
 
-    with catch_warnings():
-        simplefilter("error")
+    with caplog.at_level(logging.WARNING, logger="structcast_model.keras.trainer"):
         _restore(learner, state, optimizer_hashes={"optimizer": "saved-digest"})
+    assert not caplog.records
 
 
 def test_a_state_missing_a_live_variable_is_refused(make_learner: Callable[..., Any]) -> None:

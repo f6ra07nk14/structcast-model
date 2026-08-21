@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 import inspect
+import logging
 from math import isfinite
 import os
 from pathlib import Path
@@ -779,22 +780,23 @@ def test_train_refuses_the_dp_preset_without_a_process_group(cli_runner: CliRunn
 
 
 def test_train_resumes_from_a_saved_training_state(
-    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """--resume continues at the epoch after the saved one, with the state the first run left."""
     _train(cli_runner, patterns, tmp_path, experiment="keras-resume", epochs=2)
     (state,) = (tmp_path / "mlruns").rglob("training_state.npz")
 
-    result = _train(
-        cli_runner,
-        patterns,
-        tmp_path,
-        experiment="keras-resume",
-        epochs=3,
-        extra=["--resume", str(state), "--start-epoch", "2"],
-    )
+    with caplog.at_level(logging.INFO, logger="structcast_model.keras.trainer"):
+        _train(
+            cli_runner,
+            patterns,
+            tmp_path,
+            experiment="keras-resume",
+            epochs=3,
+            extra=["--resume", str(state), "--start-epoch", "2"],
+        )
 
-    assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in result.output
+    assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in caplog.text
     first, resumed = mlflow.search_runs(experiment_names=["keras-resume"], output_format="list")[::-1]
     history = MlflowClient().get_metric_history(resumed.info.run_id, "loss")
     assert [metric.step for metric in history] == [3]
