@@ -436,9 +436,12 @@ class LearnerIntermediate(_Intermediate, Generic[OptimizerSegmentT]):
     classname: str
     """The name of the learner class."""
 
-    accumulate_gradients: int | None
+    accumulate_gradients: int | None = None
     """The number of steps to accumulate gradients for before performing an optimizer step,
-    or `None` if not applicable."""
+    or `None` if not applicable.
+
+    Populated only by the torch builder through `_intermediate_fields`: the other backends declare
+    the accumulation window through their optimizer (`docs/adr/0017`)."""
 
     inputs: list[str]
     """The names of the input layers."""
@@ -695,7 +698,6 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
         return self.user_defined_learner_layer_type(
             imports=imports,
             classname=classname,
-            accumulate_gradients=module.ACCUMULATE_GRADIENTS,
             inputs=module.INPUTS,
             outputs=module.OUTPUTS,
             layers=layers,

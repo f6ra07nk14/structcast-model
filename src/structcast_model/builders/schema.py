@@ -9,7 +9,6 @@ from pydantic import (
     AfterValidator,
     Field,
     FilePath,
-    PositiveInt,
     SerializerFunctionWrapHandler,
     TypeAdapter,
     ValidationError,
@@ -449,10 +448,6 @@ class UserDefinedLearner(Serializable, Generic[LearnerBehaviorT]):
 
     LEARNERS: list[LearnerBehaviorT] = Field(default_factory=list, min_length=1)
     """Learner behavior configuration."""
-
-    ACCUMULATE_GRADIENTS: PositiveInt | None = None
-    """Whether to accumulate gradients for multiple steps before updating the parameters,
-    and the number of steps to accumulate for."""
 
     @field_validator("IMPORTS", mode="before")
     @classmethod

@@ -8,6 +8,7 @@ from structcast.core.base import WithExtra
 from structcast.core.exceptions import SpecError
 from structcast.utils.base import register_dir, unregister_dir
 
+from structcast_model.builders.keras import KerasUserDefinedLearner
 from structcast_model.builders.schema import (
     LayerBehavior,
     LearnerBehavior,
@@ -324,6 +325,32 @@ def test_user_defined_learner_rejects_torch_only_fields() -> None:
                 "CLIP": clip,
             }
         )
+
+
+def test_user_defined_learner_rejects_torch_only_accumulate_gradients() -> None:
+    """Keras and flax templates must reject ACCUMULATE_GRADIENTS, which is torch-only now.
+
+    The other backends declare the accumulation window through their optimizer -- keras via the
+    optimizer's `gradient_accumulation_steps` kwarg, flax via `optax.MultiSteps` (docs/adr/0017) --
+    so a template still carrying the key must fail with pydantic's extra-forbidden error instead of
+    validating and silently training without accumulation.
+    """
+    learner = {
+        "LEARNERS": [
+            {
+                "LOSS": "ce_loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": {"_obj_": [["_addr_", "keras.optimizers.SGD"]]},
+                "FLOW": [["x", "ce_loss"]],
+            }
+        ],
+        "ACCUMULATE_GRADIENTS": 2,
+    }
+    # The flax schema is the base UserDefinedLearner; the keras schema subclasses it.
+    with pytest.raises(ValidationError, match="ACCUMULATE_GRADIENTS"):
+        UserDefinedLearner.model_validate(learner)
+    with pytest.raises(ValidationError, match="ACCUMULATE_GRADIENTS"):
+        KerasUserDefinedLearner.model_validate(learner)
 
 
 # ---------------------------------------------------------------------------

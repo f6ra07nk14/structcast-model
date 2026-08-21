@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
-from pydantic import model_validator
+from pydantic import PositiveInt, model_validator
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 
@@ -80,6 +80,15 @@ class TorchLearnerBehavior(LearnerBehavior):
 
 class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
     """User defined learner configuration for PyTorch."""
+
+    ACCUMULATE_GRADIENTS: PositiveInt | None = None
+    """Whether to accumulate gradients for multiple steps before updating the parameters,
+    and the number of steps to accumulate for.
+
+    Torch-only: PyTorch has no native accumulation window, so the generated learner gates the
+    optimizer step itself; the other backends declare the window through their optimizer
+    (`docs/adr/0017`).
+    """
 
     MIXED_PRECISION: bool | dict[str, Any] = False
     """Whether to use mixed precision during backward pass.
@@ -430,7 +439,10 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
 
     def _intermediate_fields(self, module: TorchUserDefinedLearner) -> dict[str, Any]:
         """Get the framework-specific fields of the built learner intermediate."""
-        return {"mixed_precision_type": module.MIXED_PRECISION_TYPE}
+        return {
+            "accumulate_gradients": module.ACCUMULATE_GRADIENTS,
+            "mixed_precision_type": module.MIXED_PRECISION_TYPE,
+        }
 
     def _get_mixed_precision(
         self,
