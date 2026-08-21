@@ -253,24 +253,24 @@ def test_keras_learner_gates_update_on_the_optimizers_own_counter() -> None:
     assert "if len(windows) > 1:" in script
     assert "raise ValueError" in script
     assert "self._counter = inners[0]._iterations" in script
-    assert (
-        "def update(self, step: int) -> bool:\n"
-        # `convert_to_numpy`, not a bare `int()`: under `tf.distribute` the counter's value is a
-        # `MirroredVariable`, which `int()` refuses to read.
-        "        return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in script
-    )
+    assert "def update(self, step: int) -> bool:" in script
+    # `convert_to_numpy`, not a bare `int()`: under `tf.distribute` the counter's value is a
+    # `MirroredVariable`, which `int()` refuses to read.
+    assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in script
 
 
 def test_keras_learner_leaves_a_window_of_one_to_the_plain_optimizer() -> None:
-    """An unset window emits no optimizer keyword and no special-cased gate.
+    """An unset window emits no optimizer keyword and short-circuits the gate.
 
     Keras refuses `gradient_accumulation_steps=1` outright, so nothing may be added to the pattern;
-    the one update formula covers this learner too because the window read falls back to one.
+    the window read falls back to one, and the gate must answer without touching the device
+    counter -- a per-step host sync the unaccumulated learner would otherwise pay for nothing.
     """
     script = _learner_script(LEARNER_YAML)
 
     assert "optimizer = SGD(learning_rate=0.1)" in script
     assert ".gradient_accumulation_steps = " not in script
+    assert "if self._accumulate == 1:\n            return True" in script
     assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in script
 
 

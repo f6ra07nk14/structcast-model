@@ -454,6 +454,18 @@ def test_flax_learner_rejects_a_multi_steps_skip_predicate() -> None:
         FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
 
 
+def test_flax_learner_ignores_an_address_that_merely_ends_in_multi_steps() -> None:
+    """Only an address whose last segment is `MultiSteps` declares a window, not any suffix match."""
+    raw = load_any(LEARNER_YAML)
+    inner = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]
+    lookalike = ["_obj_", {"_addr_": "mylib.NotMultiSteps"}, {"_call_": {"opt": inner, "every_k_schedule": 2}}]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": lookalike}}
+
+    scripts = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+    assert "def update(self, step: int) -> bool:\n        return True" in "".join(scripts)
+
+
 def test_flax_learner_rejects_nested_multi_steps_wrappers() -> None:
     """Two wrappers declare two windows, so the one the gate should bake is ambiguous."""
     raw = load_any(LEARNER_YAML)

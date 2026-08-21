@@ -221,8 +221,10 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
 
 
 def _is_multi_steps(key: Any, value: Any) -> bool:
-    """Report whether one serialized entry is an address naming `MultiSteps`."""
-    return key in ("_addr_", "_file_") and isinstance(value, str) and value.endswith("MultiSteps")
+    """Report whether one serialized entry is an address whose last segment is `MultiSteps`."""
+    if key not in ("_addr_", "_file_") or not isinstance(value, str):
+        return False
+    return value.rpartition(".")[2].rpartition(":")[2] == "MultiSteps"
 
 
 def _names_multi_steps(part: Any) -> bool:
@@ -286,6 +288,8 @@ def _accumulation_window(optimizer: ObjectPattern, opt_name: str) -> int:
             "is ambiguous: keep exactly one."
         )
     positional, keywords = _call_arguments(found[0])
+    # `MultiSteps(opt, every_k_schedule, use_grad_mean, should_skip_update_fn)`: positional index 1
+    # is the window, and a fourth positional can only be the skip predicate.
     if "should_skip_update_fn" in keywords or len(positional) > 3:
         raise SpecError(
             f'Optimizer "{opt_name}" passes should_skip_update_fn to MultiSteps: a skipped update would '

@@ -431,6 +431,10 @@ class {self.classname}:
         return self._inference_step({batch})
 
     def update(self, step: int) -> bool:
+        # A window of one short-circuits: every step applies, and no host read of the device
+        # counter is paid for it.
+        if self._accumulate == 1:
+            return True
         return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0
 
     @property
