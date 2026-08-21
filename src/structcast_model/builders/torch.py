@@ -304,7 +304,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         )
         flow_names = [f"_flow_{n}" for n in self.optimizers] + ["_flow_inference"]
         flow_functions_repr = ", ".join(f'"{n}": self.{n}' for n in flow_names)
-        scaler_param = "__grad_scaler_creator__=torch.amp.GradScaler, " if self.mixed_precision_scales else ""
         need_update = ["return self.need_update"]
         if self.accumulate_gradients:
             need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
@@ -313,8 +312,20 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
         return f"""\
 class {self.classname}:
+    \"\"\"Learner generated from a PyTorch learner template.
 
-    def __init__(self, {self._learner_models}, {scaler_param}**kwargs):
+    The models arrive as constructor arguments, and each optimizer segment's pure computation becomes a
+    `_flow_<optimizer>` closure bound as the attributes `flow_functions` names; a trainer that compiles them
+    rebinds each attribute to its compiled wrapper, so backward, clipping and stepping stay eager here.
+    `training_step` runs backward every call -- dividing the loss by the accumulation divisor inside the
+    backward expression -- and gates clipping, the optimizer step, `zero_grad()` and, under mixed precision,
+    the gradient scaler's unscale and update behind the `need_update` flag `update(step)` sets on the host,
+    while `inference_step` runs under `torch.no_grad()`. `outputs` names the criteria the steps return, and
+    `models`, `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`, `weight_decays` and
+    `param_group_names` expose what a trainer reads off the learner.
+    \"\"\"
+
+    def __init__(self, {self._learner_models}, **kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
         {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
@@ -438,7 +449,7 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
             mixed_precision = {}
         imports["torch.amp"].add(None)
         repr_mp_kw = "".join(f", {k}={resolve_getter(imports, v)}" for k, v in mixed_precision.items())
-        return f"__grad_scaler_creator__(device=device_type{repr_mp_kw})", "GradScaler"
+        return f"torch.amp.GradScaler(device=device_type{repr_mp_kw})", "GradScaler"
 
     def _get_optimizer(
         self,

@@ -1,11 +1,11 @@
 """Trainer helpers for Flax models."""
 
 from collections import OrderedDict
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
+from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self, cast
-from warnings import warn
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +17,15 @@ from pydantic import TypeAdapter, ValidationError
 from typing_extensions import Protocol, runtime_checkable
 
 from flax import nnx
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.base_trainer import (
+    EVENTS,
+    BaseInfo,
+    BaseTrainer,
+    BestCriterion,
+    DatasetLike,
+    get_dataset,
+    get_dataset_size,
+)
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
@@ -26,6 +34,9 @@ if TYPE_CHECKING:
     # Only for the annotations: `flax.distributed` imports this module, so importing it back here
     # at runtime would close the cycle.
     from structcast_model.flax.distributed import FlaxDistributedStrategy
+
+# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named `logger`.
+_logger = getLogger(__name__)
 
 DTYPES = {
     "float32": jax.numpy.float32,
@@ -130,6 +141,41 @@ def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-
         return devices[device]
     devices_str = ", ".join(f"{d!r}" for d in devices)
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
+
+
+@dataclass(frozen=True)
+class ShardedDataset:
+    """A dataset whose batches are placed across the strategy's mesh as they are read.
+
+    Built once per run and handed to the data provider, whose properties must return the same object
+    on every read. Counting an epoch goes to the wrapped dataset, so it places nothing.
+    """
+
+    dataset: DatasetLike | Callable[[], DatasetLike]
+    """The dataset producing the batches."""
+
+    strategy: Any
+    """The strategy whose mesh the batches are placed on."""
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """Yield every batch of one epoch, placed on the mesh."""
+        return (self.strategy.shard_batch(batch) for batch in get_dataset(self.dataset))
+
+    def __len__(self) -> int:
+        """Return the number of batches in one epoch."""
+        return get_dataset_size(self.dataset)
+
+    def __post_init__(self) -> None:
+        """Take over the wrapped dataset's event methods, so the trainer still routes them to it.
+
+        Copied onto the instance rather than forwarded from `__getattr__`: the trainer selects the
+        participants of an event with `isinstance` against a protocol, and a protocol check looks its
+        attributes up statically, which never reaches a `__getattr__`.
+        """
+        for event in EVENTS:
+            method = getattr(self.dataset, event, None)
+            if method is not None:
+                object.__setattr__(self, event, method)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -328,7 +374,7 @@ def restore_training_state(
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
         config_hash (str | None): Digest of what this run trains, compared with the saved one.
-        is_main (bool): Whether this process prints the override message.
+        is_main (bool): Whether this process logs the override message.
 
     Returns:
         int: The epoch to continue at: the saved one plus one.
@@ -340,20 +386,19 @@ def restore_training_state(
     saved_hashes = meta.get("optimizer_hashes", {})
     for segment, digest in (optimizer_hashes or {}).items():
         if segment in saved_hashes and saved_hashes[segment] != digest:
-            warn(
-                f'The optimizer of segment "{segment}" is not the one the state was saved with: optax rebuilds '
+            _logger.warning(
+                'The optimizer of segment "%s" is not the one the state was saved with: optax rebuilds '
                 "it from the configuration, so the run continues with the new one from the saved step count.",
-                stacklevel=2,
+                segment,
             )
     if config_hash is not None and meta.get("config_hash", config_hash) != config_hash:
-        warn(
+        _logger.warning(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
-            "are restored into whatever the current one built, wherever the two still line up.",
-            stacklevel=2,
+            "are restored into whatever the current one built, wherever the two still line up."
         )
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:
-        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
+        _logger.info("Ignoring --start-epoch %s: the resumed state continues at epoch %s.", start_epoch, resumed_epoch)
     return resumed_epoch
 
 
@@ -362,6 +407,7 @@ __all__ = [
     "FlaxTracker",
     "FlaxTrainer",
     "FlaxTrainingStateSaver",
+    "ShardedDataset",
     "TensorInitializer",
     "create_jax_inputs",
     "get_jax_device",

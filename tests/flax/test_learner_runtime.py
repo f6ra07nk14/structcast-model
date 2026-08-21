@@ -6,6 +6,7 @@ what the reported rate is -- is only decided when the emitted code actually runs
 """
 
 from importlib.util import module_from_spec, spec_from_file_location
+import logging
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -214,12 +215,13 @@ def test_learning_rate_is_nan_until_a_step_reports_it(tmp_path: Path) -> None:
     assert learner.learning_rates == {"optimizer": pytest.approx(0.1)}
 
 
-def test_learning_rate_stays_nan_when_the_pattern_hides_it(tmp_path: Path) -> None:
+def test_learning_rate_stays_nan_when_the_pattern_hides_it(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """A positionally passed rate cannot be injected, and NaN is how that is reported at run time."""
     raw = load_any(LEARNER_YAML)
     raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]
-    with pytest.warns(UserWarning, match="reports no learning rate"):
+    with caplog.at_level(logging.WARNING):
         built = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+    assert "reports no learning rate" in caplog.text
     built(tmp_path / "hidden.py")
     learner = _load(tmp_path / "hidden.py", "hidden_learner").Learner(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
 

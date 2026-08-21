@@ -97,7 +97,6 @@ def test_single_device_strategy_satisfies_the_protocol() -> None:
     """All strategies are used through the DistributedStrategy protocol by the CLI."""
     strategy = SingleDeviceStrategy(device="cpu")
     assert isinstance(strategy, DistributedStrategy)
-    assert strategy.grad_scaler_creator is torch.amp.GradScaler
 
 
 def test_single_device_wrap_and_sync_are_no_ops() -> None:

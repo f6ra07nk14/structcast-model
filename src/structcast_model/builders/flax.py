@@ -4,8 +4,8 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
+from logging import getLogger
 from typing import TYPE_CHECKING, Any, ClassVar, cast
-from warnings import warn
 
 from pydantic import ValidationError
 from structcast.core.exceptions import SpecError
@@ -25,6 +25,8 @@ from structcast_model.builders.base import (
 from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
 from structcast_model.builders.utils import resolve_object, statement_names, stored_names
 from structcast_model.utils.base import unique
+
+logger = getLogger(__name__)
 
 
 class FlaxLayerIntermediate(LayerIntermediate):
@@ -509,12 +511,11 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
         """Emit the optimizer expression, applying the pattern to the modules the segment owns."""
         pattern, injected = inject_learning_rate(optimizer)
         if not injected:
-            warn(
-                f"The optimizer of {trainable_layers} reports no learning rate: no single factory call carries a "
+            logger.warning(
+                "The optimizer of %s reports no learning rate: no single factory call carries a "
                 "learning_rate keyword. Pass the rate as a keyword argument, or wrap the factory in "
                 "optax.inject_hyperparams yourself; until then the learner reports NaN.",
-                UserWarning,
-                stacklevel=2,
+                trainable_layers,
             )
         opt_inst, opt_cls = resolve_object(imports, pattern)
         # `nnx.Optimizer` requires `wrt`, and the parameters are the only sensible default.

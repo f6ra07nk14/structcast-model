@@ -268,13 +268,13 @@ INPUTS: []                # auto-inferred from LEARNERS[*].FLOW
 OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B, fake_A, fake_B]
 ```
 
-**`MIXED_PRECISION`** *(torch only, `TorchUserDefinedLearner`)* — Controls gradient scaling, which only counteracts float16 underflow. The scaler is built through the learner's injectable `__grad_scaler_creator__` argument, which defaults to `torch.amp.GradScaler` and is called with the training `device`.
+**`MIXED_PRECISION`** *(torch only, `TorchUserDefinedLearner`)* — Controls gradient scaling, which only counteracts float16 underflow. The generated learner constructs a `torch.amp.GradScaler` directly, on the training `device`.
 
 | Value             | Behavior                                                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `false` (default) | No `GradScaler` is created. Autocast still runs when `MIXED_PRECISION_TYPE` is set — this is the bfloat16 path, which needs no scaler.        |
 | `true`            | Gradient scaling enabled with default `GradScaler` settings; requires `MIXED_PRECISION_TYPE: float16`.                                        |
-| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to the scaler creator. Requires `MIXED_PRECISION_TYPE: float16`.         |
+| `dict`            | Gradient scaling enabled; the dict is forwarded as keyword arguments to `torch.amp.GradScaler`. Requires `MIXED_PRECISION_TYPE: float16`.    |
 
 ```yaml
 MIXED_PRECISION:
@@ -650,6 +650,8 @@ no_weight_decay_mask(r"\.bias$")({"layer": {"kernel": 1.0, "bias": 2.0}})
 
 **`resolve_input_shapes(model, shapes=None)`** — The shared helper from `structcast_model.utils.base`, re-exported here: explicit *shapes* win, otherwise the model's own `INPUT_SHAPES` attribute (merged across a model mapping), otherwise `None`.
 
+**`ShardedDataset(dataset, strategy)`** — Frozen dataclass wrapping a dataset -- an iterable of batches, or a callable returning one -- so that every batch it yields is placed across *strategy*'s mesh as it is read; `len()` counts an epoch through the wrapped dataset and places nothing. The wrapped dataset's event methods are copied onto the instance in `__post_init__` rather than forwarded from `__getattr__`, because the trainer picks an event's participants with `isinstance` against a runtime-checkable protocol, and that check looks attributes up statically. `scm flax train` builds one per split and hands both to its data provider.
+
 **`FlaxTracker`** — Running mean of the criteria of one training or validation split. It sums on device as plain JAX arrays and returns Python floats — the contract `BaseTrainer.tracker`, the epoch history, the `BestCriterion` comparison, and `log_metric` all consume — reading the host once per step with a single `jax.device_get`. It implements `on_training_begin` and `on_validation_begin`, which reset the sums, so training and validation values never mix. Unlike `TorchTracker` there is no all-reduce: JAX is single-controller, so a criterion computed from a sharded batch is already the global value.
 
 ```python
@@ -668,7 +670,7 @@ saver = FlaxTrainingStateSaver(logger=logger, strategy=strategy, extra_meta={"se
 trainer = FlaxTrainer(learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
 
-**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, optimizer_hashes=None, config_hash=None, is_main=True)`** — Fetches the state through *logger*, loads it into the live models and optimizers through *strategy*, and returns the epoch to continue at: the saved one plus one, which overrides *start_epoch* with a printed message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). Optax rebuilds its transformation from configuration and the restore cannot see it, so a changed optimizer or a changed configuration warns rather than refuses — extending a schedule or lowering the rate of a fine-tune is legitimate.
+**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, optimizer_hashes=None, config_hash=None, is_main=True)`** — Fetches the state through *logger*, loads it into the live models and optimizers through *strategy*, and returns the epoch to continue at: the saved one plus one, which overrides *start_epoch* with a logged message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). Optax rebuilds its transformation from configuration and the restore cannot see it, so a changed optimizer or a changed configuration warns rather than refuses — extending a schedule or lowering the rate of a fine-tune is legitimate.
 
 ---
 
@@ -683,7 +685,6 @@ Fields: `preset` (`"single"`, `"dp"`, or `"fsdp"`, default `"single"`), `device`
 Members:
 
 - `mesh` (property) — the activated mesh, for placing a batch or reading its size
-- `grad_scaler_creator` (property) — a callable that raises: bfloat16 needs no scaler and there is no float16 one here, so a learner asking for one fails where it asks rather than where the result is called
 - `wrap(models)` — places every parameter on the sharding its first matching rule asks for and returns the same models. Nothing is wrapped: sharding is a property of the arrays, so the module objects and the step closures capturing them survive, and an optimizer built afterwards inherits the shardings for its own state
 - `sync_initial_weights(models)` — a no-op: JAX is single-controller, so one process initializes every device
 - `compile(module, compile_kw)` — `nnx.jit(module, **compile_kw)`, or *module* unchanged when *compile_kw* is `None`; the caller owns which arguments are static and which are donated. `scm flax train` compiles the learner's steps through this seam by default, which is where the Flax CLI differs from `scm torch train`, whose `--compile` is off unless given

@@ -19,7 +19,6 @@ __all__ = [
     "autocast_inputs",
     "create_opt",
     "create_torch_inputs",
-    "distributed",
     "get_decays",
     "get_learning_rate",
     "get_named_parameters",
@@ -30,18 +29,14 @@ __all__ = [
     "initial_model",
     "layers",
     "matched_shard_modules",
-    "optimizers",
     "resolve_input_shapes",
     "restore_requires_grad",
     "set_lr_scale",
     "sync_gate",
-    "trainer",
-    "types",
-    "utils",
 ]
 
 if TYPE_CHECKING:
-    from structcast_model.torch import distributed, layers, optimizers, trainer, types, utils
+    from structcast_model.torch import layers
     from structcast_model.torch.distributed import (
         DistributedDataParallelStrategy,
         DistributedStrategy,

@@ -1,8 +1,7 @@
 """Flax related commands for the StructCast Model CLI application."""
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -10,19 +9,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# A package shim routing to lazy submodules, so importing it pulls in no framework. Wrapping it in
-# `LazyModuleImporter` would not work: it copies the shim's still unresolved submodule slots, so
-# every access after the first would hand back `None`.
-from structcast_model import loggers as scm_loggers
-from structcast_model.base_trainer import (
-    EVENTS,
-    DatasetLike,
-    Printer,
-    ProgressBar,
-    SimpleDataProvider,
-    get_dataset,
-    get_dataset_size,
-)
+# Both are package shims routing to lazy submodules, so importing them pulls in no framework.
+# Wrapping them in `LazyModuleImporter` would not work: it copies the shim's still unresolved
+# submodule slots, so every access after the first would hand back `None`.
+from structcast_model import flax as scm_flax, loggers as scm_loggers
+from structcast_model.base_trainer import Printer, ProgressBar, SimpleDataProvider
 from structcast_model.commands.shared_args import (
     PATH_FORM_HELP,
     batch_size,
@@ -71,7 +62,6 @@ if TYPE_CHECKING:
 
     from flax import nnx
     from structcast_model.builders import flax as flax_builder
-    from structcast_model.flax import distributed as flax_distributed, trainer as flax_trainer
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
@@ -79,8 +69,6 @@ else:
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     nnx = LazyModuleImporter("flax.nnx")
     flax_builder = LazyModuleImporter("structcast_model.builders.flax")
-    flax_distributed = LazyModuleImporter("structcast_model.flax.distributed")
-    flax_trainer = LazyModuleImporter("structcast_model.flax.trainer")
 
 
 app = Typer(no_args_is_help=True)
@@ -167,7 +155,7 @@ def measure_inference_time(
     batch_size: int = batch_size,
 ) -> None:
     """Measure the average inference time of a Flax model."""
-    jax_device = flax_trainer.get_jax_device(device)
+    jax_device = scm_flax.get_jax_device(device)
     training_mode_kw = (
         {"training": training_mode, "deterministic": not training_mode, "use_running_average": not training_mode}
         if training_mode_kwargs_pattern is None
@@ -175,7 +163,7 @@ def measure_inference_time(
     )
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
-    shapes = flax_trainer.resolve_input_shapes(model, shapes)
+    shapes = scm_flax.resolve_input_shapes(model, shapes)
     model = nnx.view(model, raise_if_not_found=False, **training_mode_kw)
     if compile_pattern is None:
         print("Skipping compilation...")
@@ -184,7 +172,7 @@ def measure_inference_time(
         model = nnx.jit(model, **instantiator.instantiate(compile_pattern))
 
     def _measure_single_run() -> float:
-        inputs = jax.device_put(flax_trainer.create_jax_inputs(shapes, batch_size=batch_size), device=jax_device)
+        inputs = jax.device_put(scm_flax.create_jax_inputs(shapes, batch_size=batch_size), device=jax_device)
         start_time = time()
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), model(**inputs))
         return time() - start_time
@@ -243,49 +231,14 @@ def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
 
 
-def _resolve_strategy(strategy: Any, device: str | None) -> "flax_distributed.FlaxDistributedStrategy":
+def _resolve_strategy(strategy: Any, device: str | None) -> "scm_flax.FlaxDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows and rejects the rest
         # with the names it accepts, which is the error a mistyped preset should read.
         preset = cast('Literal["single", "dp", "fsdp"]', strategy)
-        return flax_distributed.FlaxDistributedStrategy(preset=preset, device=device)
+        return scm_flax.FlaxDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
-
-
-@dataclass(frozen=True)
-class _ShardedDataset:
-    """A dataset whose batches are placed across the strategy's mesh as they are read.
-
-    Built once per run and handed to the data provider, whose properties must return the same object
-    on every read. Counting an epoch goes to the wrapped dataset, so it places nothing.
-    """
-
-    dataset: DatasetLike | Callable[[], DatasetLike]
-    """The dataset producing the batches."""
-
-    strategy: Any
-    """The strategy whose mesh the batches are placed on."""
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        """Yield every batch of one epoch, placed on the mesh."""
-        return (self.strategy.shard_batch(batch) for batch in get_dataset(self.dataset))
-
-    def __len__(self) -> int:
-        """Return the number of batches in one epoch."""
-        return get_dataset_size(self.dataset)
-
-    def __post_init__(self) -> None:
-        """Take over the wrapped dataset's event methods, so the trainer still routes them to it.
-
-        Copied onto the instance rather than forwarded from `__getattr__`: the trainer selects the
-        participants of an event with `isinstance` against a protocol, and a protocol check looks its
-        attributes up statically, which never reaches a `__getattr__`.
-        """
-        for event in EVENTS:
-            method = getattr(self.dataset, event, None)
-            if method is not None:
-                object.__setattr__(self, event, method)
 
 
 @app.command()
@@ -393,7 +346,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
                 'reach it. Drop the "_call_" entry and let the command call the class with rngs.'
             )
         models[model_name] = factory(rngs=rngs)
-    input_shapes = flax_trainer.resolve_input_shapes(models, reduce_dict(shapes)) or {}
+    input_shapes = scm_flax.resolve_input_shapes(models, reduce_dict(shapes)) or {}
     config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
     # Before the learner: an optimizer inherits the sharding of the parameters it is built over, and
     # the learner's inference views are taken from the models as they are when it is constructed.
@@ -414,11 +367,11 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             arguments = {**TRAINING_COMPILE_KW, **extra} if flow_name == "_training_step" else extra
             setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), arguments))
     provider = SimpleDataProvider(
-        training_dataset=_ShardedDataset(instantiate_object(training_dataset_pattern), strategy),
+        training_dataset=scm_flax.ShardedDataset(instantiate_object(training_dataset_pattern), strategy),
         validation_dataset=(
             None
             if validation_dataset_pattern is None
-            else _ShardedDataset(instantiate_object(validation_dataset_pattern), strategy)
+            else scm_flax.ShardedDataset(instantiate_object(validation_dataset_pattern), strategy)
         ),
     )
     print("Count the dataset sizes...")
@@ -426,13 +379,11 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     print(f"Validation dataset size: {provider.validation_steps} steps.")
     # Built before the resume, which fetches the state through it. Only the experiment name is stored
     # here: the run itself starts in __enter__.
-    logger_type = scm_loggers.mlflow.MLflowLogger if logger_name == "mlflow" else scm_loggers.wandb.WandbLogger
-    logger: scm_loggers.base.Logger = logger_type(
-        experiment=experiment, state_backend=scm_loggers.state_backends.FlaxStateBackend()
-    )
+    logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+    logger: scm_loggers.Logger = logger_type(experiment=experiment, state_backend=scm_loggers.FlaxStateBackend())
     optimizer_hashes = _optimizer_hashes(learner)
     if resume is not None:
-        start_epoch = flax_trainer.restore_training_state(
+        start_epoch = scm_flax.restore_training_state(
             resume=resume,
             strategy=strategy,
             models=models,
@@ -442,9 +393,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             optimizer_hashes=optimizer_hashes,
             config_hash=config_digest,
         )
-    trainer_type = flax_trainer.FlaxTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer_type = scm_flax.FlaxTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(
-        learner=learner, tracker=flax_trainer.FlaxTracker.from_criteria(outputs), data=provider, callbacks=[]
+        learner=learner, tracker=scm_flax.FlaxTracker.from_criteria(outputs), data=provider, callbacks=[]
     )
     display = (
         Printer()
@@ -456,12 +407,12 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
         )
     )
-    saver = flax_trainer.FlaxTrainingStateSaver(
+    saver = scm_flax.FlaxTrainingStateSaver(
         logger=logger,
         strategy=strategy,
         extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
     )
-    bests = flax_trainer.FlaxBestCriterion.from_criteria(
+    bests = scm_flax.FlaxBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     trainer.callbacks = [display, logger, saver, *bests]

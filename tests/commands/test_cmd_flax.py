@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
 import json
+import logging
 from math import isfinite
 from pathlib import Path
 import subprocess
@@ -480,20 +481,21 @@ def test_train_with_a_strategy_pattern(tmp_path: Path, cli_runner: CliRunner, pa
 
 
 def test_train_resumes_from_a_saved_training_state(
-    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """--resume continues at the epoch after the saved one, with the state the first run left."""
     _train(cli_runner, patterns, tmp_path, experiment="flax-resume", epochs=2)
     (state,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
-    result = _train(
-        cli_runner,
-        patterns,
-        tmp_path,
-        experiment="flax-resume",
-        epochs=3,
-        extra=["--resume", str(state), "--start-epoch", "2"],
-    )
-    assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in result.output
+    with caplog.at_level(logging.INFO, logger="structcast_model.flax.trainer"):
+        _train(
+            cli_runner,
+            patterns,
+            tmp_path,
+            experiment="flax-resume",
+            epochs=3,
+            extra=["--resume", str(state), "--start-epoch", "2"],
+        )
+    assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in caplog.text
     first, resumed = _runs("flax-resume")
     history = MlflowClient().get_metric_history(resumed.info.run_id, "loss")
     assert [metric.step for metric in history] == [3]
@@ -502,7 +504,7 @@ def test_train_resumes_from_a_saved_training_state(
 
 
 def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
-    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """A resumed run rebuilds `tx` from the configuration, and a changed schedule must be reported.
 
@@ -518,7 +520,7 @@ def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
     FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "faster_learner.py")
     rebuilt = (patterns[0], f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'faster_learner.py'}}}]")
 
-    with pytest.warns(UserWarning, match='optimizer of segment "optimizer" is not the one the state was saved with'):
+    with caplog.at_level(logging.WARNING):
         _train(
             cli_runner,
             rebuilt,
@@ -527,6 +529,8 @@ def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
             epochs=2,
             extra=["--resume", str(state)],
         )
+
+    assert 'optimizer of segment "optimizer" is not the one the state was saved with' in caplog.text
 
 
 # ---------------------------------------------------------------------------

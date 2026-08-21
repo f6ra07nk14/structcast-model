@@ -13,7 +13,7 @@ Short flags follow "one letter, one meaning" across the whole app tree; `tests/c
 enforces it.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from typer import Argument, Option
 
@@ -379,3 +379,10 @@ __all__ = [
     "validation_frequency",
     "warmup_runs",
 ]
+
+if not TYPE_CHECKING:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals())
