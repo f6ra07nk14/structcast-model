@@ -162,15 +162,14 @@ MATMUL_PRECISIONS: Mapping[str, str] = {"highest": "highest", "high": "high", "m
 """JAX spelling of the shared precision names; its lowest float32 setting is named after the dtype."""
 
 TRAINING_COMPILE_KW: Mapping[str, Any] = {
-    "static_argnames": "need_update",
-    "donate_argnames": ("models", "optimizers", "acc_grads"),
+    "donate_argnames": ("models", "optimizers"),
 }
-"""The compilation arguments the generated training step's contract fixes (see `docs/adr/0013`).
+"""The compilation arguments the generated training step's contract fixes (see `docs/adr/0017`).
 
-`need_update` is a Python bool selecting between the accumulating and the updating variant, so it is
-static; the models, the optimizers and the gradient accumulator are rewritten in place every step, so
-their buffers are donated. The batch is never donated, and the inference step -- which runs against
-views sharing the models' arrays -- donates nothing.
+The models and the optimizers are rewritten in place every step, so their buffers are donated;
+gradient accumulation lives inside the optimizer state (`optax.MultiSteps`), so it travels with the
+donated optimizers and the step needs no static gate. The batch is never donated, and the inference
+step -- which runs against views sharing the models' arrays -- donates nothing.
 """
 
 

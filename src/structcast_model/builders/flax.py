@@ -220,12 +220,96 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     return ObjectPattern.model_validate(rewritten), True
 
 
+def _is_multi_steps(key: Any, value: Any) -> bool:
+    """Report whether one serialized entry is an address naming `MultiSteps`."""
+    return key in ("_addr_", "_file_") and isinstance(value, str) and value.endswith("MultiSteps")
+
+
+def _names_multi_steps(part: Any) -> bool:
+    """Report whether one part of a serialized pattern is an address naming `MultiSteps`."""
+    if isinstance(part, dict):
+        return any(_is_multi_steps(key, value) for key, value in part.items())
+    if isinstance(part, (list, tuple)) and part:
+        # Addresses serialize either as `{"_addr_": ...}` or as the `["_addr_", ...]` list form.
+        return any(_is_multi_steps(part[0], value) for value in part[1:])
+    return False
+
+
+def _find_multi_steps(node: Any, found: list[list[Any]]) -> None:
+    """Collect the parts of every `MultiSteps` call nested anywhere under a serialized pattern node."""
+    try:
+        dumped = cast(list[Any], ObjectPattern.model_validate(node).model_dump(by_alias=True))
+    except ValidationError:
+        values = node.values() if isinstance(node, dict) else node if isinstance(node, (list, tuple)) else ()
+        for value in values:
+            _find_multi_steps(value, found)
+        return
+    parts = dumped[1:]
+    if any(_names_multi_steps(part) for part in parts):
+        found.append(parts)
+    for part in parts:
+        _find_multi_steps(part, found)
+
+
+def _call_arguments(parts: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+    """Split the `_call_`/`_bind_` parts of one serialized call into positional and keyword arguments."""
+    positional: list[Any] = []
+    keywords: dict[str, Any] = {}
+    for part in parts:
+        if isinstance(part, dict):
+            for key in ("_call_", "_bind_"):
+                value = part.get(key)
+                if isinstance(value, dict):
+                    keywords |= value
+                elif isinstance(value, (list, tuple)):
+                    positional += value
+        elif isinstance(part, (list, tuple)) and part and part[0] in ("_call_", "_bind_"):
+            positional += part[1:]
+    return positional, keywords
+
+
+def _accumulation_window(optimizer: ObjectPattern, opt_name: str) -> int:
+    """Statically parse the accumulation window one `OPTIMIZER` pattern declares, 1 without one.
+
+    The window is the `every_k_schedule` of the pattern's `optax.MultiSteps` wrapper, and it is baked
+    into the generated `update` as a compile-time constant, so only an int literal can be honored.
+    A skip predicate would let the device counter fall behind that constant, so it is rejected too
+    (see `docs/adr/0017`).
+    """
+    found: list[list[Any]] = []
+    _find_multi_steps(optimizer, found)
+    if not found:
+        return 1
+    if len(found) > 1:
+        raise SpecError(
+            f'Optimizer "{opt_name}" nests {len(found)} MultiSteps wrappers, so its accumulation window '
+            "is ambiguous: keep exactly one."
+        )
+    positional, keywords = _call_arguments(found[0])
+    if "should_skip_update_fn" in keywords or len(positional) > 3:
+        raise SpecError(
+            f'Optimizer "{opt_name}" passes should_skip_update_fn to MultiSteps: a skipped update would '
+            "desynchronize the device counter from the update gate the builder bakes into update()."
+        )
+    window = (
+        keywords["every_k_schedule"]
+        if "every_k_schedule" in keywords
+        else (positional[1] if len(positional) > 1 else None)
+    )
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise SpecError(
+            f'Optimizer "{opt_name}" gives MultiSteps no int literal every_k_schedule: the builder can '
+            "only bake a literal window into the generated update(), not a schedule or callable."
+        )
+    return window
+
+
 def _container(trainable_layers: list[str]) -> str:
     """Return the name of the variable holding the modules one optimizer owns.
 
     A single owned module is passed to `flax.nnx.Optimizer` verbatim; several are wrapped in one
-    persistent `flax.nnx.List` so the optimizer state, the differentiated argument and the
-    accumulated gradients all key off the same module paths.
+    persistent `flax.nnx.List` so the optimizer state and the differentiated argument key off the
+    same module paths.
     """
     if len(trainable_layers) == 1:
         return trainable_layers[0]
@@ -239,14 +323,19 @@ class FlaxOptimizerSegment(OptimizerSegment):
     optimizer_hash: str
     """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES` in the learner."""
 
+    window: int
+    """The accumulation window the pattern's `optax.MultiSteps` declares, 1 without one."""
+
 
 class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     """Intermediate representation of a Flax (nnx) learner.
 
-    The two steps are emitted as module-level functions taking the models, the optimizers and the
-    gradient accumulator as arguments -- never as closures or bound methods -- so that a trainer can
-    wrap them in `flax.nnx.jit` (`need_update` static, the three state arguments donated) and rebind
-    each attribute `flow_functions` names, exactly as the PyTorch learners are compiled. Each segment differentiates
+    The two steps are emitted as module-level functions taking the models and the optimizers as
+    arguments -- never as closures or bound methods -- so that a trainer can wrap them in
+    `flax.nnx.jit` (both state arguments donated) and rebind each attribute `flow_functions` names,
+    exactly as the PyTorch learners are compiled. Gradient accumulation is the optimizer pattern's
+    own `optax.MultiSteps`, statically parsed at build time so the generated `update` bakes its
+    window as a host constant (`docs/adr/0017`). Each segment differentiates
     its own closure with `flax.nnx.value_and_grad`, whose first argument is the container of the
     modules that segment owns; the models it only reads are passed as further, non-differentiated
     arguments. The closure returns as auxiliary output only what the enclosing step reads back --
@@ -341,25 +430,16 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                     f'Optimizer "{segment.optimizer}" cannot be differentiated: its FLOW does not compute its '
                     f'LOSS "{segment.loss}". A Flax segment only differentiates what its own flow computes.'
                 )
-            # Scale inside the differentiated closure so the reported loss keeps its unscaled value.
-            scaled = f"({segment.loss} / {self.accumulate_gradients})" if self.accumulate_gradients else segment.loss
             returns = f"({', '.join(aux)},)"
             lines.append(f"def _flow_{segment.optimizer}({arguments}):")
-            lines += [f"    {line}" for line in [*body, f"return {scaled}, {returns}"]]
+            lines += [f"    {line}" for line in [*body, f"return {segment.loss}, {returns}"]]
             grad = f"flax.nnx.value_and_grad(_flow_{segment.optimizer}, has_aux=True)({arguments})"
             lines.append(f"(_, {returns}), _grads = {grad}")
-            accumulated = f"acc_grads[{segment.optimizer!r}]"
-            if self.accumulate_gradients:
-                lines.append(f"{accumulated} = jax.tree.map(jax.numpy.add, {accumulated}, _grads)")
-                lines.append("if need_update:")
-                lines.append(f"    optimizers[{segment.optimizer!r}].update({container}, {accumulated}{extra})")
-                lines.append(f"    {accumulated} = jax.tree.map(jax.numpy.zeros_like, {accumulated})")
-            else:
-                lines.append(f"optimizers[{segment.optimizer!r}].update({container}, _grads{extra})")
+            lines.append(f"optimizers[{segment.optimizer!r}].update({container}, _grads{extra})")
         # Read at trace time: the walk compiles to a reference to the injected rate, not to a host read.
         rates = ", ".join(f"{name!r}: get_learning_rate(optimizers[{name!r}])" for name in self.optimizers)
         lines.append(f"lrs = {{{rates}}}")
-        lines.append(f"return {self._forward_outputs}, lrs, acc_grads")
+        lines.append(f"return {self._forward_outputs}, lrs")
         return lines
 
     def _get_forward_inference_flow(self) -> list[str]:
@@ -367,6 +447,18 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         lines = [f"{name} = models[{name!r}]" for name in self.models]
         lines += [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
         return [*lines, f"return {self._forward_outputs}"]
+
+    @cached_property
+    def _window(self) -> int:
+        """The accumulation window every segment shares, from the static `MultiSteps` parse."""
+        windows = {segment.window for _, segment in self._segments}
+        if len(windows) > 1:
+            raise SpecError(
+                "One learner, one update window: the optimizers disagree on their MultiSteps windows "
+                f"{sorted(windows)}. Give every segment the same every_k_schedule; a segment without "
+                "MultiSteps counts as 1."
+            )
+        return windows.pop() if windows else 1
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner: its flow layers, the two steps and the learner class."""
@@ -381,14 +473,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             "use_running_average=True) for k, v in self.models.items()}"
         )
         models_repr = ", ".join(f"{m!r}: self._models[{m!r}]" for m in self.models)
-        acc_grads = ", ".join(
-            f"{o!r}: jax.tree.map(jax.numpy.zeros_like, flax.nnx.state({c}, Param))"
-            for o, c in (self._containers.items() if self.accumulate_gradients else {}.items())
-        )
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
-        need_update = ["return self.need_update"]
-        if self.accumulate_gradients:
-            need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0", *need_update]
+        # A pure host formula: `MultiSteps` gates the apply on the device, and this predicts it.
+        gate = f"return (step + 1) % {self._window} == 0" if self._window > 1 else "return True"
         body = [f"{name} = flax.nnx.List([{', '.join(owned)}])" for name, owned in self._module_lists.items()]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
         layers = [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]
@@ -396,7 +483,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         parts = ["\n".join(layers)] if layers else []
         parts.append(f"OPTIMIZER_HASHES: dict[str, str] = {{{hashes}}}")
         parts.append(f"""\
-def _training_step(models, optimizers, acc_grads, need_update, {named}**kwargs):
+def _training_step(models, optimizers, {named}**kwargs):
     {sep.join(self._forward_training_flow)}""")
         parts.append(f"""\
 def _inference_step(models, {named}**kwargs):
@@ -406,29 +493,27 @@ class {self.classname}:
     \"\"\"Learner generated from a Flax (nnx) learner template.
 
     The steps are the module-level `_training_step` and `_inference_step` functions, bound as the
-    attributes `flow_functions` names. A trainer that compiles them wraps those functions --
-    `need_update` static, the models, optimizers and gradient accumulator donated -- and rebinds
-    each attribute to its wrapper; the learner itself is never traced. `outputs` names the criteria
-    the steps return, and `inference_step` runs against inference views of the models.
+    attributes `flow_functions` names. A trainer that compiles them wraps those functions -- the
+    models and optimizers donated -- and rebinds each attribute to its wrapper; the learner itself
+    is never traced. Gradient accumulation, when configured, is the optimizer's own
+    `optax.MultiSteps`, gating on the device; `update` predicts its window as a pure host formula.
+    `outputs` names the criteria the steps return, and `inference_step` runs against inference
+    views of the models.
     \"\"\"
 
     def __init__(self, {self._learner_models}, **kwargs):
         {sep2.join(body)}
         self._models = {{{", ".join(f"{n!r}: {n}" for n in [*self.models, *self._module_lists])}}}
         self._optimizers = {{{", ".join(f"{n!r}: {n}" for n in self.optimizers)}}}
-        self._acc_grads = {{{acc_grads}}}
         self._learning_rates = {{{", ".join(f"{n!r}: float('nan')" for n in self.optimizers)}}}
         self._views = {views}
         self._training_step = _training_step
         self._inference_step = _inference_step
-        self.need_update = True
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
 
     def training_step(self, {inputs}**kwargs):
-        criteria, learning_rates, self._acc_grads = self._training_step(
-            self._models, self._optimizers, self._acc_grads, self.need_update, {passed}**kwargs
-        )
+        criteria, learning_rates = self._training_step(self._models, self._optimizers, {passed}**kwargs)
         self._learning_rates = learning_rates
         return criteria
 
@@ -436,7 +521,7 @@ class {self.classname}:
         return self._inference_step(self._views, {passed}**kwargs)
 
     def update(self, step: int) -> bool:
-        {sep2.join(need_update)}
+        {gate}
 
     @property
     def models(self):
@@ -504,6 +589,8 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             optimizer=base.optimizer,
             trainable_layers=base.trainable_layers,
             optimizer_hash=optimizer_hash(learner.OPTIMIZER),
+            # Parsed from the pattern as written, before `inject_learning_rate` rewrites it.
+            window=_accumulation_window(learner.OPTIMIZER, opt_name),
         )
 
     def _get_optimizer(

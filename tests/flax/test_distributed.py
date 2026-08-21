@@ -119,6 +119,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import jax, jax.numpy as jnp
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.optimizers import unwrap_variables
 
 def load(path, name):
     spec = spec_from_file_location(name, path)
@@ -132,8 +133,7 @@ model = load(directory + "/model.py", "generated_model").Model(rngs=nnx.Rngs(par
 strategy.wrap({"model": model})
 learner = load(directory + "/learner.py", "generated_learner").Learner(model)
 learner._training_step = strategy.compile(
-    learner._training_step,
-    {"static_argnames": "need_update", "donate_argnames": ("models", "optimizers", "acc_grads")},
+    learner._training_step, {"donate_argnames": ("models", "optimizers")}
 )
 x = jnp.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.5], [-1.0, 1.0, 0.0, 1.0]] * 2)
 y = jnp.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]] * 2)
@@ -141,9 +141,9 @@ batch = strategy.shard_batch({"x": x, "y": y})
 
 losses, accumulator = [], []
 for step in range(6):
-    learner.need_update = step % 2 == 1
     losses.append(float(learner.training_step(**batch)["loss"]))
-    accumulator.append([str(v.sharding.spec) for v in jax.tree.leaves(learner._acc_grads["optimizer"])])
+    acc_grads = unwrap_variables(learner.optimizers["optimizer"].opt_state).acc_grads
+    accumulator.append([str(v.sharding.spec) for v in jax.tree.leaves(acc_grads)])
 print(json.dumps({"losses": losses, "accumulator": accumulator}))
 """
 
@@ -370,9 +370,9 @@ def test_a_generated_learner_trains_to_the_same_losses_on_four_devices(preset: s
     """A run must not depend on how many devices it was given, or a sharded run cannot be trusted.
 
     The first step differs in the last bits because the reduction order differs; from the second
-    step on the compiled program is the same one, so the losses are bit-identical. The gradient
-    accumulator's spec has to stay put across the `need_update` flips too: a spec that drifted would
-    retrace the step on every flip.
+    step on the compiled program is the same one, so the losses are bit-identical. The `MultiSteps`
+    accumulator inside the optimizer state has to stay consistently sharded across the six steps
+    too: a spec that drifted would retrace the step mid-run.
     """
     FlaxBuilder.from_path(CFG_DIR / "Linear.yaml")()(tmp_path / "model.py")
     FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(parameters={"DEFAULT": {"accumulate_gradients": 2}})(

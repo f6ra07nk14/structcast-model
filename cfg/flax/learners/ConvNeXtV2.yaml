@@ -11,14 +11,6 @@ PARAMETERS:
     clip_grad_norm: 1.0
     accumulate_gradients: null # set to null or a positive integer
 IMPORTS: {}
-# "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
-# specify the number of steps to accumulate gradients before updating parameters.
-_jinja_yaml_: |-
-  {% if accumulate_gradients is none %}
-  ACCUMULATE_GRADIENTS: null
-  {% else %}
-  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
-  {% endif %}
 INPUTS: [image, label]
 OUTPUTS: [ce_loss, acc1, acc5]
 LEARNERS:
@@ -28,10 +20,14 @@ LEARNERS:
     # Clipping comes first in the chain, so it applies once per update to the accumulated gradients.
     # "no_weight_decay_mask" exempts every bias and normalization scale -- the "kernel" arrays of the
     # convolutions and the two projections of each block are all that is left to decay.
+    # "accumulate_gradients", when set, wraps the whole chain in "optax.MultiSteps": the builder
+    # statically parses that wrapper and bakes its window into the learner's update gate
+    # (see "docs/adr/0017").
     OPTIMIZER:
       - _obj_
       - _addr_: flax.nnx.Optimizer
       - _jinja_yaml_: |-
+          {% if accumulate_gradients is none %}
           - _bind_:
               tx:
                 - _obj_
@@ -51,6 +47,32 @@ LEARNERS:
                             - _call_:
                                 - ^(?:\w+\.)*bias$
                                 - ^(?:\w+\.)*scale$
+          {% else %}
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.MultiSteps
+                - _call_:
+                    opt:
+                      - _obj_
+                      - _addr_: optax.chain
+                      - _call_:
+                          - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                          - - _obj_
+                            - _addr_: optax.adamw
+                            - _call_:
+                                learning_rate: {{lr}}
+                                weight_decay: {{weight_decay}}
+                                b1: 0.9
+                                b2: 0.999
+                                mask:
+                                  - _obj_
+                                  - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                                  - _call_:
+                                      - ^(?:\w+\.)*bias$
+                                      - ^(?:\w+\.)*scale$
+                    every_k_schedule: {{accumulate_gradients}}
+          {% endif %}
     EXTRA: {}
     FLOW:
       - INPUTS: image

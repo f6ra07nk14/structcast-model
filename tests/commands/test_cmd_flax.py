@@ -186,8 +186,11 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     assert result.exit_code == 0, result.output
     module = _load(out, "generated_learner")
     assert hasattr(module, "MyLearner")
-    # The parameter reached the template: accumulation makes the learner update every second step.
-    assert "(step + 1) % 2 == 0" in out.read_text()
+    # The parameter reached the template: the MultiSteps wrapper carries the window on the device,
+    # and the baked host gate agrees with it.
+    text = out.read_text()
+    assert "MultiSteps" in text
+    assert "(step + 1) % 2 == 0" in text
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +519,9 @@ def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(
     _train(cli_runner, patterns, tmp_path, experiment="flax-rebuilt-optimizer", epochs=1)
     (state,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
     raw = load_any(LEARNER_CFG)
-    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"] = 0.2
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {
+        "_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.2}}]}
+    }
     FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "faster_learner.py")
     rebuilt = (patterns[0], f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'faster_learner.py'}}}]")
 
@@ -624,7 +629,7 @@ def test_train_names_the_criteria_from_learner_outputs(
 def test_train_compiles_each_flow_under_its_own_contract(
     tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], recwarn: pytest.WarningsRecorder
 ) -> None:
-    """--compile is what binds the steps, and the training step alone is static-flagged and donated.
+    """--compile is what binds the steps, and the training step alone is donated.
 
     Comparing losses cannot see any of this: an ignored --compile reaches the same numbers eagerly.
     Donating the inference views -- which share their arrays with the models -- or failing to donate
@@ -636,8 +641,7 @@ def test_train_compiles_each_flow_under_its_own_contract(
 
     contracts = dict(COMPILE_CALLS)
     assert contracts["_training_step"] == {
-        "static_argnames": "need_update",
-        "donate_argnames": ("models", "optimizers", "acc_grads"),
+        "donate_argnames": ("models", "optimizers"),
     }
     # Every other flow is an inference one: no static flag, and nothing donated.
     assert [arguments for name, arguments in COMPILE_CALLS if name != "_training_step"] == [{}] * (

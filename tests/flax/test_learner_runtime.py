@@ -109,10 +109,10 @@ def test_training_step_lowers_the_loss_it_reports(tmp_path: Path) -> None:
 
 
 def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> None:
-    """With `ACCUMULATE_GRADIENTS: 3` the parameters may move on every third step and no other.
+    """With a `MultiSteps` window of 3 the parameters may move on every third step and no other.
 
-    The buffer has to hold the sum of the micro-step gradients meanwhile and be zeroed by the
-    update, or the next window would apply the previous one's gradients a second time.
+    The accumulation now lives inside the optimizer state on the device; the generated `update`
+    bakes the same window as a host formula, so the two must agree on which step the apply lands.
     """
     learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
         _model_type(tmp_path)(rngs=nnx.Rngs(0))
@@ -123,12 +123,10 @@ def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> N
     for step in range(3):
         gates.append(learner.update(step))
         learner.training_step(x=X, y=Y)
-        buffered = float(sum(jnp.sum(jnp.abs(leaf)) for leaf in jax.tree.leaves(learner._acc_grads["optimizer"])))
-        if step < 2:
-            assert buffered > 0.0
-            assert all(jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True))
-        else:
-            assert buffered == 0.0
+        moved = not all(
+            jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True)
+        )
+        assert moved == (step == 2)
 
     assert gates == [False, False, True]
     assert not any(jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True))
@@ -218,7 +216,7 @@ def test_learning_rate_is_nan_until_a_step_reports_it(tmp_path: Path) -> None:
 def test_learning_rate_stays_nan_when_the_pattern_hides_it(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """A positionally passed rate cannot be injected, and NaN is how that is reported at run time."""
     raw = load_any(LEARNER_YAML)
-    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]}}
     with caplog.at_level(logging.WARNING):
         built = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
     assert "reports no learning rate" in caplog.text
@@ -261,17 +259,18 @@ def test_a_value_no_later_code_reads_never_leaves_the_differentiated_closure(tmp
     ],
     ids=["one-segment", "two-segments"],
 )
-def test_compiled_training_step_settles_at_one_variant_per_gate(
+def test_compiled_training_step_never_retraces_across_the_window(
     tmp_path: Path, path: Path, models: int, accumulate: int, rates: dict[str, Any]
 ) -> None:
-    """The step is compilable at the seam the learner exposes, and `need_update` is static.
+    """The step is compilable at the seam the learner exposes, and one trace covers the whole run.
 
-    Two variants -- accumulate and apply -- is the whole cost: once both are compiled, further steps
-    must add no trace, which is what a traced (rather than static) gate would break. The seam is the
-    one the trainers already use: every key of `flow_functions` is an attribute holding the current
-    implementation, so compiling is `setattr(learner, name, compile(getattr(learner, name)))`.
-    Donating the three state arguments has to be safe there, on every segment count -- a buffer the
-    caller still holds would make XLA warn and silently copy instead.
+    The accumulation gate lives in the `MultiSteps` state on the device, so no flag flips between
+    the accumulating and the applying step: a second trace would mean the window leaked back into
+    the step's signature. The seam is the one the trainers already use: every key of
+    `flow_functions` is an attribute holding the current implementation, so compiling is
+    `setattr(learner, name, compile(getattr(learner, name)))`. Donating the two state arguments has
+    to be safe there, on every segment count -- a buffer the caller still holds would make XLA warn
+    and silently copy instead.
     """
     model_type = _model_type(tmp_path)
     learner = _learner_type(tmp_path, path, parameters={"DEFAULT": {"accumulate_gradients": accumulate}})(
@@ -280,16 +279,16 @@ def test_compiled_training_step_settles_at_one_variant_per_gate(
     step = learner._training_step
     traces: list[bool] = []
 
-    def counted(models: Any, optimizers: Any, acc_grads: Any, need_update: bool, **kwargs: Any) -> Any:
+    def counted(models: Any, optimizers: Any, **kwargs: Any) -> Any:
         """Record one entry per trace: the body of a compiled function runs only when it is traced."""
-        traces.append(need_update)
-        return step(models, optimizers, acc_grads, need_update, **kwargs)
+        traces.append(True)
+        return step(models, optimizers, **kwargs)
 
     def compiled(name: str, function: Any) -> Any:
-        """Compile one step the way a trainer does: the gate static, the three state arguments donated."""
+        """Compile one step the way a trainer does: the two state arguments donated."""
         if name == "_inference_step":
             return nnx.jit(function)
-        return nnx.jit(function, static_argnames="need_update", donate_argnames=("models", "optimizers", "acc_grads"))
+        return nnx.jit(function, donate_argnames=("models", "optimizers"))
 
     learner._training_step = counted
     for name, function in learner.flow_functions.items():
@@ -301,7 +300,7 @@ def test_compiled_training_step_settles_at_one_variant_per_gate(
             learner.training_step(x=X, y=Y)
 
     assert [str(w.message) for w in caught if "donated" in str(w.message)] == []
-    assert traces == [False, True]
+    assert traces == [True]
     assert learner.learning_rates == rates
 
 
@@ -378,9 +377,9 @@ def test_a_generated_accumulating_learner_updates_twice_over_six_trainer_steps(t
     """The accumulation window is the learner's, and the trainer must see exactly its updates.
 
     `BaseTrainer` asks the learner whether this step updates and counts the answer, so a window the
-    generated `update` got wrong -- one update too many, or a buffer reset per epoch -- shows up here
-    as an update count that no longer matches the configured `ACCUMULATE_GRADIENTS`. Six steps at
-    three is the smallest run that closes two windows.
+    generated `update` got wrong -- one update too many, or a gate out of phase with the on-device
+    `MultiSteps` counter -- shows up here as an update count that no longer matches the configured
+    window. Six steps at three is the smallest run that closes two windows.
 
     The events land on steps 2 and 5, not 3 and 6: the emitted gate is `(step + 1) % 3 == 0`, which
     counts from zero, while the trainer's own step counter starts at one. The first window is
@@ -420,7 +419,7 @@ LOUD_Y = 100.0 * Y
 def _tx_learner(tmp_path: Path, name: str, tx: list[Any]) -> Any:
     """Generate a learner from the linear fixture with *tx* as its optimizer's transformation."""
     raw = load_any(LEARNER_YAML)
-    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = tx
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": tx}}
     FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()(tmp_path / f"{name}.py")
     return _load(tmp_path / f"{name}.py", f"{name}_learner").Learner
 

@@ -351,11 +351,11 @@ def test_flax_learner_emits_the_steps_as_module_level_functions() -> None:
     """
     script = _learner_script(LEARNER_YAML)
 
-    assert "def _training_step(models, optimizers, acc_grads, need_update, *, x, y, **kwargs):" in script
+    assert "def _training_step(models, optimizers, *, x, y, **kwargs):" in script
     assert "def _inference_step(models, *, x, y, **kwargs):" in script
     assert "(_, (loss,)), _grads = flax.nnx.value_and_grad(_flow_optimizer, has_aux=True)(model)" in script
     assert "lrs = {'optimizer': get_learning_rate(optimizers['optimizer'])}" in script
-    assert "return {'loss': loss}, lrs, acc_grads" in script
+    assert "return {'loss': loss}, lrs\n" in script
     # The keys are attribute names: a trainer compiles a step by rebinding the attribute it names.
     assert 'return {"_training_step": self._training_step, "_inference_step": self._inference_step}' in script
     assert "self._training_step = _training_step" in script
@@ -393,36 +393,100 @@ def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
     assert imports["jax.numpy"] == {None}
 
 
-def test_flax_learner_gates_accumulated_gradients_on_a_static_flag() -> None:
-    """Accumulation is manual: add every micro-step, apply and zero under the host-computed flag.
+def test_flax_learner_bakes_the_multi_steps_window_into_the_update_gate() -> None:
+    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and `update` predicts it.
 
-    `need_update` stays a Python bool so it compiles to two variants instead of a traced branch, and
-    the loss is divided only inside the differentiated closure, so the reported loss is unscaled.
+    The builder statically parses the wrapper's int-literal window and bakes `(step + 1) % k == 0`
+    as a pure host formula, so the generated step carries no accumulator buffer and no static flag
+    (`docs/adr/0017`).
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
-    assert "return (loss / 3), (loss,)" in script
-    assert "acc_grads['optimizer'] = jax.tree.map(jax.numpy.add, acc_grads['optimizer'], _grads)" in script
-    assert "if need_update:\n        optimizers['optimizer'].update(model, acc_grads['optimizer'])" in script
-    assert "acc_grads['optimizer'] = jax.tree.map(jax.numpy.zeros_like, acc_grads['optimizer'])" in script
-    assert "self._acc_grads = {'optimizer': jax.tree.map(jax.numpy.zeros_like, flax.nnx.state(model, Param))}" in script
-    assert "self.need_update = (step + 1) % 3 == 0" in script
+    assert "MultiSteps(" in script
+    assert "def update(self, step: int) -> bool:\n        return (step + 1) % 3 == 0" in script
+    assert "acc_grads" not in script
+    assert "need_update" not in script
 
 
-def test_flax_learner_without_accumulation_keeps_no_buffer() -> None:
-    """A learner that updates every step must not pay for a parameter-shaped buffer it never reads."""
+def test_flax_learner_without_multi_steps_updates_every_step() -> None:
+    """A learner without the wrapper updates every step and pays for no buffer or gate arithmetic."""
     script = _learner_script(LEARNER_YAML)
 
-    assert "self._acc_grads = {}" in script
-    assert "if need_update:" not in script
-    assert "acc_grads['optimizer']" not in script
+    assert "MultiSteps(" not in script
+    assert "def update(self, step: int) -> bool:\n        return True" in script
+    assert "acc_grads" not in script
+    assert "need_update" not in script
+
+
+def _multi_steps_tx(**arguments: Any) -> list[Any]:
+    """Build a `MultiSteps` tx pattern over the fixture's sgd, with *arguments* as extra keywords."""
+    inner = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]
+    return ["_obj_", {"_addr_": "optax.MultiSteps"}, {"_call_": {"opt": inner, **arguments}}]
+
+
+def test_flax_learner_rejects_a_multi_steps_window_that_is_not_a_literal() -> None:
+    """Only an int literal window can be baked into the generated `update` at build time.
+
+    A schedule (or any pattern) computes the window on the device, where the host formula cannot
+    follow it, so the mismatch is refused while the script is still being generated.
+    """
+    raw = load_any(LEARNER_YAML)
+    schedule = [
+        "_obj_",
+        {"_addr_": "optax.linear_schedule"},
+        {"_call_": {"init_value": 2, "end_value": 4, "transition_steps": 10}},
+    ]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=schedule)}}
+
+    with pytest.raises(SpecError, match="int literal"):
+        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_flax_learner_rejects_a_multi_steps_skip_predicate() -> None:
+    """`should_skip_update_fn` breaks the call-count identity the baked `update` gate relies on."""
+    raw = load_any(LEARNER_YAML)
+    predicate = ["_obj_", {"_addr_": "optax.skip_not_finite"}]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {
+        "_bind_": {"tx": _multi_steps_tx(every_k_schedule=2, should_skip_update_fn=predicate)}
+    }
+
+    with pytest.raises(SpecError, match="should_skip_update_fn"):
+        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_flax_learner_rejects_nested_multi_steps_wrappers() -> None:
+    """Two wrappers declare two windows, so the one the gate should bake is ambiguous."""
+    raw = load_any(LEARNER_YAML)
+    doubled = [
+        "_obj_",
+        {"_addr_": "optax.MultiSteps"},
+        {"_call_": {"opt": _multi_steps_tx(every_k_schedule=2), "every_k_schedule": 2}},
+    ]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": doubled}}
+
+    with pytest.raises(SpecError, match="ambiguous"):
+        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+
+def test_flax_learner_rejects_windows_that_disagree_across_segments() -> None:
+    """One learner, one window: the trainer's update counter answers for the whole learner.
+
+    A segment without `MultiSteps` counts as a window of one, so wrapping only the first optimizer
+    has to be refused with the two values named.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=2)}}
+
+    with pytest.raises(SpecError, match=r"disagree.*\[1, 2\]"):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
 def test_flax_learner_wraps_several_owned_models_in_one_persistent_list() -> None:
     """One optimizer over several models needs a single container built once.
 
-    The same `flax.nnx.List` instance has to be the optimizer's module, the differentiated argument
-    and the key of the accumulated gradients; a fresh list per step would be a fresh graph node.
+    The same `flax.nnx.List` instance has to be the optimizer's module and the differentiated
+    argument; a fresh list per step would be a fresh graph node.
     """
     script = _learner_script(SEGMENTS_YAML)
 
@@ -457,13 +521,16 @@ def test_flax_learner_keeps_a_hand_bound_wrt() -> None:
 
     script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
 
-    assert "wrt=flax.nnx.Param, **_kw0))(model)" in script
+    # The hand-bound `wrt` survives inside the pattern, and none is appended to the applied call.
+    assert "wrt=flax.nnx.Param" in script
+    assert "(model, wrt=Param)" not in script
+    assert "))(model)" in script
 
 
 def test_flax_learner_warns_when_the_learning_rate_cannot_be_reported(caplog: pytest.LogCaptureFixture) -> None:
     """A rate the rewrite cannot find is reported as NaN for the whole run, which has to be said out loud."""
     raw = load_any(LEARNER_YAML)
-    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"] = ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]}}
 
     with caplog.at_level(logging.WARNING):
         script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
@@ -613,9 +680,16 @@ def test_flax_learner_emits_the_digest_of_the_optimizer_pattern_as_written() -> 
 
     It is taken before `inject_learning_rate` rewrites the pattern, so the digest a run records is
     the one the configuration itself hashes to -- turning the injection on or off must not read as a
-    changed optimizer.
+    changed optimizer. "As written" is after the jinja accumulation switch resolves: under the
+    default parameters the fixture renders the plain sgd tx spelled out here.
     """
-    pattern = ObjectPattern.model_validate(load_any(LEARNER_YAML)["LEARNERS"][0]["OPTIMIZER"])
+    pattern = ObjectPattern.model_validate(
+        [
+            "_obj_",
+            {"_addr_": "flax.nnx.Optimizer"},
+            {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]}},
+        ]
+    )
 
     assert _emitted_hashes(_learner_script(LEARNER_YAML)) == {"optimizer": optimizer_hash(pattern)}
 
@@ -627,7 +701,9 @@ def test_flax_learner_optimizer_hashes_are_stable_but_move_with_the_schedule() -
     never warn, and optax rebuilds `tx` from configuration without the restored state noticing.
     """
     raw = load_any(LEARNER_YAML)
-    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"] = 0.2
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {
+        "_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.2}}]}
+    }
     rebuilt = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
 
     assert _emitted_hashes(_learner_script(LEARNER_YAML)) == _emitted_hashes(_learner_script(LEARNER_YAML))
