@@ -10,48 +10,11 @@ from typing import TYPE_CHECKING, Any, Literal
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# Both are package shims routing to lazy submodules, so importing them pulls in no framework.
-# Wrapping them in `LazyModuleImporter` would not work: it copies the shim's still unresolved
-# submodule slots, so every access after the first would hand back `None`.
-from structcast_model import loggers as scm_loggers, torch as scm_torch
-from structcast_model.base_trainer import (
-    Printer,
-    ProgressBar,
-    SimpleDataProvider,
-)
-from structcast_model.commands.shared_args import (
-    PATH_FORM_HELP,
-    batch_size,
-    ci,
-    compile_option,
-    epochs,
-    experiment,
-    higher_criteria,
-    learner_outputs,
-    learner_pattern,
-    log_arguments,
-    log_artifacts,
-    logger_name,
-    lower_criteria,
-    matmul_precision_option,
-    model_pattern,
-    object_pattern_help,
-    output_script_path,
-    resume_option,
-    save_criteria,
-    seed_option,
-    shapes_help,
-    shapes_option,
-    start_epoch,
-    template_param_option,
-    times,
-    trainer_option,
-    training_dataset_option,
-    training_mode,
-    validation_dataset_pattern,
-    validation_frequency,
-    warmup_runs,
-)
+# `scm`, `scm_loggers` and `scm_torch` are package shims routing to lazy submodules, so importing
+# them pulls in no framework. Wrapping them in `LazyModuleImporter` would not work: it copies the
+# shim's still unresolved submodule slots, so every access after the first would hand back `None`.
+import structcast_model as scm
+import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
     dict_parser,
     get_module_outputs,
@@ -59,6 +22,8 @@ from structcast_model.commands.utils import (
     path_or_any_parser,
     reduce_dict,
 )
+import structcast_model.loggers as scm_loggers
+import structcast_model.torch as scm_torch
 
 if TYPE_CHECKING:
     import calflops
@@ -89,24 +54,24 @@ DEVICE_HELP = (
     "falls back to CPU with a warning when CUDA is unavailable."
 )
 
-SHAPES_HELP = shapes_help('"image: [3, 224, 224]"', "torch.zeros")
-template_param = template_param_option(
+SHAPES_HELP = scm_args.shapes_help('"image: [3, 224, 224]"', "torch.zeros")
+template_param = scm_args.template_param_option(
     'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"'
 )
 # --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
-shapes = shapes_option(
+shapes = scm_args.shapes_option(
     SHAPES_HELP + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
     "neither exists."
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
-compile_pattern: dict[str, Any] | None = compile_option("torch.compile")
-matmul_precision: Literal["highest", "high", "medium"] = matmul_precision_option()
+compile_pattern: dict[str, Any] | None = scm_args.compile_option("torch.compile")
+matmul_precision: Literal["highest", "high", "medium"] = scm_args.matmul_precision_option()
 
 
 @creator.command(name="model")
 def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Model", "--classname", "-n", help="Name of the generated model class."),
     structured_output: bool | None = Option(
@@ -132,7 +97,7 @@ def create_model(
 @creator.command(name="learner")
 def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
 ) -> None:
@@ -154,14 +119,14 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
 
 @app.command(name="time")
 def measure_inference_time(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = training_mode,
-    warmup_runs: int = warmup_runs,
-    times: int = times,
-    batch_size: int = batch_size,
+    training_mode: bool = scm_args.training_mode,
+    warmup_runs: int = scm_args.warmup_runs,
+    times: int = scm_args.times,
+    batch_size: int = scm_args.batch_size,
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
@@ -204,7 +169,7 @@ def measure_inference_time(
 
 @app.command(name="ptflops")
 def call_ptflops(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
     flops_units: Literal["GMac", "MMac", "KMac"] = Option(
@@ -246,7 +211,7 @@ def call_ptflops(
 
 @app.command(name="calflops")
 def call_calflops(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     include_bp: bool = Option(False, help="Whether to include backpropagation in FLOPs computation."),
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
@@ -367,7 +332,7 @@ def _restore_training_state(
 def _build_callbacks(
     *,
     trainer: Any,
-    provider: SimpleDataProvider,
+    provider: "scm.SimpleDataProvider",
     strategy: "scm_torch.DistributedStrategy",
     learner_outputs: list[str],
     higher_criteria: list[str],
@@ -387,9 +352,9 @@ def _build_callbacks(
     display: list[Any] = []
     if is_main:
         display.append(
-            Printer()
+            scm.Printer()
             if ci
-            else ProgressBar(
+            else scm.ProgressBar(
                 steps_per_epoch=provider.steps_per_epoch,
                 validation_steps=provider.validation_steps,
                 training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
@@ -403,7 +368,7 @@ def _build_callbacks(
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
-        help=object_pattern_help("the model", "MyModel", keyed=True)
+        help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
         + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
         "inline; a file path is not accepted here. The names are passed to the --learner factory as keyword "
         "arguments and are the keys used by --initializer.",
@@ -413,12 +378,12 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "--initializer",
         "-I",
         parser=dict_parser,
-        help=object_pattern_help("the initializer", "initialize_fn", keyed=True, call=False)
+        help=scm_args.object_pattern_help("the initializer", "initialize_fn", keyed=True, call=False)
         + " Key each pattern by one of the model names given as positional arguments; a key matching no model is "
         "ignored. Each initializer is applied to every submodule of its model on rank 0 and broadcast to the other "
         "ranks, and the whole option is skipped when --resume is given, because the loaded state would overwrite it.",
     ),
-    shapes: list[dict] | None = shapes_option(
+    shapes: list[dict] | None = scm_args.shapes_option(
         SHAPES_HELP
         + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
         "twice keeps only the last occurrence. When omitted, the INPUT_SHAPES declared by the built models are "
@@ -430,30 +395,30 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "-d",
         help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
     ),
-    learner_pattern: Any = learner_pattern,
-    learner_outputs: list[str] | None = learner_outputs,
+    learner_pattern: Any = scm_args.learner_pattern,
+    learner_outputs: list[str] | None = scm_args.learner_outputs,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    trainer_pattern: Any | None = trainer_option(
+    trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(device=..., learner=..., tracker=..., data=..., callbacks=[])", "TorchTrainer"
     ),
-    epochs: int = epochs,
-    start_epoch: int = start_epoch,
-    resume: str | None = resume_option(
+    epochs: int = scm_args.epochs,
+    start_epoch: int = scm_args.start_epoch,
+    resume: str | None = scm_args.resume_option(
         "Restores models, optimizers, grad scalers, and continues from the saved epoch.", "data-order, sampler or RNG"
     ),
-    training_dataset_pattern: Any = training_dataset_option(),
-    validation_dataset_pattern: Any | None = validation_dataset_pattern,
-    validation_frequency: int = validation_frequency,
-    lower_criteria: list[str] = lower_criteria,
-    higher_criteria: list[str] = higher_criteria,
-    save_criteria: list[str] = save_criteria,
-    seed: int = seed_option(),
+    training_dataset_pattern: Any = scm_args.training_dataset_option(),
+    validation_dataset_pattern: Any | None = scm_args.validation_dataset_pattern,
+    validation_frequency: int = scm_args.validation_frequency,
+    lower_criteria: list[str] = scm_args.lower_criteria,
+    higher_criteria: list[str] = scm_args.higher_criteria,
+    save_criteria: list[str] = scm_args.save_criteria,
+    seed: int = scm_args.seed_option(),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
-    experiment: str = experiment,
-    logger_name: Literal["mlflow", "wandb"] = logger_name,
-    log_arguments: list[dict] | None = log_arguments,
-    log_artifacts: list[Path] | None = log_artifacts,
-    ci: bool = ci,
+    experiment: str = scm_args.experiment,
+    logger_name: Literal["mlflow", "wandb"] = scm_args.logger_name,
+    log_arguments: list[dict] | None = scm_args.log_arguments,
+    log_artifacts: list[Path] | None = scm_args.log_artifacts,
+    ci: bool = scm_args.ci,
     dist_backend: str | None = Option(
         None,
         envvar="DIST_BACKEND",
@@ -469,8 +434,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         None,
         "--strategy",
         parser=path_or_any_parser,
-        help=object_pattern_help("the distributed strategy factory", "MyStrategy", call=False)
-        + PATH_FORM_HELP
+        help=scm_args.object_pattern_help("the distributed strategy factory", "MyStrategy", call=False)
+        + scm_args.PATH_FORM_HELP
         + " The factory is called with the resolved device and local rank. Defaults to "
         "DistributedDataParallelStrategy when a distributed environment is detected, otherwise SingleDeviceStrategy.",
     ),
@@ -491,7 +456,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     input_shapes = reduce_dict(shapes)
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
-    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
+    provider = scm.SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     if is_main:
         print("Count the dataset sizes...")
         print(f"Training dataset size: {provider.steps_per_epoch} steps.")

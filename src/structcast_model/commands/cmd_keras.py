@@ -12,40 +12,10 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# A package shim routing to lazy submodules, so importing it pulls in no framework, as in cmd_flax.
-from structcast_model import loggers as scm_loggers
-from structcast_model.base_trainer import Printer, ProgressBar, SimpleDataProvider
-from structcast_model.commands.shared_args import (
-    PATH_FORM_HELP,
-    batch_size,
-    ci,
-    epochs,
-    experiment,
-    higher_criteria,
-    learner_outputs,
-    learner_pattern,
-    log_arguments,
-    log_artifacts,
-    logger_name,
-    lower_criteria,
-    model_pattern,
-    object_pattern_help,
-    output_script_path,
-    resume_option,
-    save_criteria,
-    seed_option,
-    shapes_help,
-    shapes_option,
-    start_epoch,
-    template_param_option,
-    times,
-    trainer_option,
-    training_dataset_option,
-    training_mode,
-    validation_dataset_pattern,
-    validation_frequency,
-    warmup_runs,
-)
+# `scm` and `scm_loggers` are package shims routing to lazy submodules, so importing them pulls in
+# no framework, as in cmd_flax.
+import structcast_model as scm
+import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
     config_hash,
@@ -55,6 +25,7 @@ from structcast_model.commands.utils import (
     reduce_dict,
     strategy_parser,
 )
+import structcast_model.loggers as scm_loggers
 
 if TYPE_CHECKING:
     import jax
@@ -85,9 +56,10 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating Keras layer classes.")
 
-template_param = template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
-shapes = shapes_option(
-    shapes_help('"image: [224, 224, 3]"', "numpy.zeros") + " Omit it only when the model declares INPUT_SHAPES itself."
+template_param = scm_args.template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
+shapes = scm_args.shapes_option(
+    scm_args.shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+    + " Omit it only when the model declares INPUT_SHAPES itself."
 )
 device = Option(
     None,
@@ -130,7 +102,7 @@ compile_pattern: dict[str, Any] | None = Option(
 @creator.command(name="model")
 def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Model", "--classname", "-n", help="Name of the generated layer class."),
     structured_output: bool = Option(
@@ -155,7 +127,7 @@ def create_model(
 @creator.command(name="learner")
 def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
 ) -> None:
@@ -180,14 +152,14 @@ def _get_sync_fn(device: str) -> Any:
 
 @app.command(name="time")
 def measure_inference_time(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = training_mode,
-    warmup_runs: int = warmup_runs,
-    times: int = times,
-    batch_size: int = batch_size,
+    training_mode: bool = scm_args.training_mode,
+    warmup_runs: int = scm_args.warmup_runs,
+    times: int = scm_args.times,
+    batch_size: int = scm_args.batch_size,
 ) -> None:
     """Measure the average inference time of a Keras model."""
     device = keras_utils.get_keras_device(device)
@@ -334,7 +306,7 @@ def _build_logger(logger_name: str, experiment: str, is_main: bool) -> "scm_logg
 def _build_callbacks(
     *,
     trainer: Any,
-    provider: SimpleDataProvider,
+    provider: "scm.SimpleDataProvider",
     strategy: "keras_distributed.KerasDistributedStrategy",
     outputs: list[str],
     higher_criteria: list[str],
@@ -358,9 +330,9 @@ def _build_callbacks(
     display: list[Any] = []
     if strategy.is_main:
         display.append(
-            Printer()
+            scm.Printer()
             if ci
-            else ProgressBar(
+            else scm.ProgressBar(
                 steps_per_epoch=provider.steps_per_epoch,
                 validation_steps=provider.validation_steps,
                 training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
@@ -374,15 +346,15 @@ def _build_callbacks(
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
-        help=object_pattern_help("the model", "MyModel", keyed=True)
+        help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
         + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
         "inline; a file path is not accepted here. A pattern building a layer is traced into a model with the "
         "run's shapes before the Learner is built, because a Keras layer owns no variables until it is. The names "
         "are passed to the --learner factory as keyword arguments.",
     ),
     backend: Literal["tensorflow", "jax", "torch"] = backend_option,
-    shapes: list[dict] | None = shapes_option(
-        shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+    shapes: list[dict] | None = scm_args.shapes_option(
+        scm_args.shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
         + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
         "twice keeps only the last occurrence. When omitted, each model is traced with the INPUT_SHAPES it "
         "declares itself; given, the same shapes are used for every model."
@@ -398,38 +370,38 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "fraction knob at all -- it is only switched to growth on demand (TF_FORCE_GPU_ALLOW_GROWTH), which caps "
         "nothing but stops the run from taking the whole device up front. Uncapped when omitted.",
     ),
-    learner_pattern: Any = learner_pattern,
-    learner_outputs: list[str] | None = learner_outputs,
-    trainer_pattern: Any | None = trainer_option(
+    learner_pattern: Any = scm_args.learner_pattern,
+    learner_outputs: list[str] | None = scm_args.learner_outputs,
+    trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "KerasTrainer"
     ),
-    epochs: int = epochs,
-    start_epoch: int = start_epoch,
-    resume: str | None = resume_option(
+    epochs: int = scm_args.epochs,
+    start_epoch: int = scm_args.start_epoch,
+    resume: str | None = scm_args.resume_option(
         "Restores models and optimizers, and continues from the saved epoch. The state carries the Keras backend "
         "it was written on and a resume onto another one is refused: normalization statistics and RNG "
         "trajectories are not verified equivalent across backends.",
         "data-order or RNG",
     ),
-    training_dataset_pattern: Any = training_dataset_option(
+    training_dataset_pattern: Any = scm_args.training_dataset_option(
         " Every batch it yields is passed to the Learner as it is; a multi-device strategy places it across the "
         "replicas first, so each entry needs a leading dimension the replica count divides -- except on the "
         "torch backend, where the loader hands each rank its own slice."
     ),
-    validation_dataset_pattern: Any | None = validation_dataset_pattern,
-    validation_frequency: int = validation_frequency,
-    lower_criteria: list[str] = lower_criteria,
-    higher_criteria: list[str] = higher_criteria,
-    save_criteria: list[str] = save_criteria,
-    seed: int = seed_option(
+    validation_dataset_pattern: Any | None = scm_args.validation_dataset_pattern,
+    validation_frequency: int = scm_args.validation_frequency,
+    lower_criteria: list[str] = scm_args.lower_criteria,
+    higher_criteria: list[str] = scm_args.higher_criteria,
+    save_criteria: list[str] = scm_args.save_criteria,
+    seed: int = scm_args.seed_option(
         ' It is applied with "keras.utils.set_random_seed" before the models are built, which seeds Python, NumPy '
         "and the active backend, so it decides both the model initialization and every random draw a step makes."
     ),
-    experiment: str = experiment,
-    logger_name: Literal["mlflow", "wandb"] = logger_name,
-    log_arguments: list[dict] | None = log_arguments,
-    log_artifacts: list[Path] | None = log_artifacts,
-    ci: bool = ci,
+    experiment: str = scm_args.experiment,
+    logger_name: Literal["mlflow", "wandb"] = scm_args.logger_name,
+    log_arguments: list[dict] | None = scm_args.log_arguments,
+    log_artifacts: list[Path] | None = scm_args.log_artifacts,
+    ci: bool = scm_args.ci,
     strategy_pattern: Any = Option(
         "single",
         "--strategy",
@@ -439,8 +411,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "preset runs on the mechanism its Keras backend actually has -- keras.distribution on jax, "
         "tf.distribute.MirroredStrategy on tensorflow, DistributedDataParallel on torch -- and fsdp is available "
         "on jax alone; the other two cells are refused with the reason. "
-        + object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
-        + PATH_FORM_HELP
+        + scm_args.object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
+        + scm_args.PATH_FORM_HELP
         + " The factory is called with the resolved device; the templates under cfg/keras/strategies bind the "
         "remaining knobs.",
     ),
@@ -493,7 +465,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     # constructor, and each one runs the replicas itself rather than being traced into a scope.
     strategy.wrap_steps(learner)
     outputs = get_module_outputs(learner, learner_outputs, "learner")
-    provider = SimpleDataProvider(
+    provider = scm.SimpleDataProvider(
         training_dataset=instantiate_object(training_dataset_pattern),
         validation_dataset=(
             None if validation_dataset_pattern is None else instantiate_object(validation_dataset_pattern)

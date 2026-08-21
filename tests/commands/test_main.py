@@ -2,8 +2,11 @@
 
 from collections.abc import Callable, Iterator
 import inspect
+import subprocess
+import sys
 from typing import Any
 
+import pytest
 from structcast.utils.base import register_dir, unregister_dir
 from typer import Typer
 from typer.models import ArgumentInfo, OptionInfo
@@ -50,6 +53,33 @@ def test_short_flags_are_globally_unique() -> None:
                 if meanings.setdefault(short, long) != long:
                     collisions.append(f"{short}: {meanings[short]} vs {long} (at {command_path} / {param_name})")
     assert not collisions, f"Short flags meaning more than one long option: {collisions}"
+
+
+@pytest.mark.parametrize("module", ["cmd_flax", "cmd_keras", "cmd_torch"])
+def test_importing_a_command_module_imports_no_framework(module: str) -> None:
+    """Building the CLI must cost no framework: `main` imports all three command modules at once.
+
+    Every framework a command drives is reached through a lazy router or a `LazyModuleImporter`, so
+    that `--help` and the framework-free commands stay fast and a run pays only for the framework it
+    asked for. A single eager import -- a plain `from structcast_model.torch import ...` here, or one
+    added to a shim on the way -- would silently make every invocation import torch, JAX and Keras.
+    A subprocess is the only honest check: the test session has all three imported long before this
+    runs.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import structcast_model.commands.{module}; import sys; "
+            "leaked = [name for name in ('torch', 'tensorflow', 'jax', 'keras', 'flax') if name in sys.modules]; "
+            "raise SystemExit(f'imported: {leaked}' if leaked else 0)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_app_no_args_is_help(cli_runner: CliRunner) -> None:
