@@ -45,6 +45,9 @@ stashed arrays lazily so the host sync lands on the epoch-end read, not on the s
 
 ## Gradient accumulation stays manual, not `optax.MultiSteps`
 
+> **Superseded by ADR-0017.** Accumulation now goes through `optax.MultiSteps` in the user's chain,
+> under the static-parse constraints recorded there; the rest of this ADR stands.
+
 `Learner.update(step)` is the host-side single source of truth for "does this step apply" — the trainer counts
 updates and dispatches the Update event from it. `MultiSteps` duplicates that counter in device state
 (`mini_step`/`gradient_step`), returns all-zero update trees on non-apply steps, defaults to `use_grad_mean`

@@ -1,5 +1,9 @@
 # Keras training drives Keras-native APIs behind per-backend adapters
 
+> **Superseded in part by ADR-0017.** The gradient-accumulation consequence below — `update()`
+> returning true every step and the accepted update-counter divergence — is replaced by the
+> private-counter gate of ADR-0017. The rest stands.
+
 Keras 3 runs on three backends whose training mechanics disagree: TensorFlow allows only stateful
 `optimizer.apply` under a `GradientTape`, JAX requires the stateless `stateless_call` /
 `stateless_apply` path under `jax.jit`, and torch uses autograd with path-keyed parameters. We

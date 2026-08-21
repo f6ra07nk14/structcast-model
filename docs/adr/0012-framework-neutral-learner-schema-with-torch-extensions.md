@@ -1,5 +1,8 @@
 # The learner schema splits into a framework-neutral base and torch extensions
 
+> **Amended by ADR-0017.** `ACCUMULATE_GRADIENTS` is now torch-only, on `TorchUserDefinedLearner`;
+> the "stays in the base: portable" rationale below no longer holds.
+
 `LearnerBehavior.CLIP`, `UserDefinedLearner.MIXED_PRECISION`, and `MIXED_PRECISION_TYPE` encode torch-only
 machinery: `CLIP` resolves to a callable applied to `.grad` buffers between backward and step, and the mixed
 precision pair configures `torch.amp` autocast plus a `GradScaler`. Neither concept exists in Flax/optax —
