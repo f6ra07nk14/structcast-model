@@ -156,12 +156,14 @@ def test_each_optimizer_moves_only_the_models_it_owns(tmp_path: Path) -> None:
         assert np.allclose(actual_bias, bias, atol=1e-6)
 
 
-def test_accumulated_gradients_reach_the_optimizer_and_delay_the_update(tmp_path: Path) -> None:
-    """`ACCUMULATE_GRADIENTS: 3` is the Keras optimizer's own window, and it has to be its own.
+def test_accumulated_gradients_reach_the_optimizer_and_update_predicts_the_apply(tmp_path: Path) -> None:
+    """`gradient_accumulation_steps: 3` in the OPTIMIZER pattern is the window, and `update` foresees it.
 
-    Keras accumulates the gradients and gates the update inside `optimizer.apply`, so the variables
-    may only move on every third step; a learner that dropped the setting would move them on every
-    one, and `update` stays true throughout because the gate is no longer the learner's.
+    Keras accumulates the gradients and gates the apply inside `optimizer.apply`, so the variables
+    may only move on every third step; `update` reads the optimizer's own private step counter
+    pre-step -- pinned here so a Keras upgrade that renames `_iterations` fails loudly -- and must
+    answer False on the two buffering steps and True exactly when the step about to run lands the
+    apply (`docs/adr/0017`).
     """
     model = _models(tmp_path)[0]
     learner = _learner_type(tmp_path, name="accumulated", parameters={"DEFAULT": {"accumulate_gradients": 3}})(model)
@@ -169,7 +171,7 @@ def test_accumulated_gradients_reach_the_optimizer_and_delay_the_update(tmp_path
 
     assert learner.optimizers["optimizer"].gradient_accumulation_steps == 3
     for step in range(2):
-        assert learner.update(step) is True
+        assert learner.update(step) is False
         learner.training_step(**BATCH)
         assert _moved(before, _values(model.trainable_variables)) == 0.0
 
@@ -179,14 +181,12 @@ def test_accumulated_gradients_reach_the_optimizer_and_delay_the_update(tmp_path
     assert _moved(before, _values(model.trainable_variables)) > 0.0
 
 
-def test_accumulated_gradients_gate_the_variables_but_not_the_update_counter(tmp_path: Path) -> None:
-    """Driven by the trainer, `ACCUMULATE_GRADIENTS: 2` moves the variables on every second step only.
+def test_the_trainer_update_counter_counts_real_optimizer_applies(tmp_path: Path) -> None:
+    """Driven by the trainer, a window of two moves the variables -- and the counter -- every second step.
 
-    The counter is the documented divergence (`docs/adr/0016`): the gate belongs to the Keras
-    optimizer, so `update()` stays true and `BaseInfo.update` counts steps rather than optimizer
-    applications -- 4 over an epoch of 4 steps, where the torch and flax learners would report 2.
-    Re-deriving the gate in the learner to make the counters agree is exactly what the ADR refuses,
-    so this pins both halves at once: the real gate is the optimizer's, the counter is not it.
+    `BaseInfo.update` feeds every `on_update` consumer, so it has to count optimizer applies, not
+    steps: 2 over an epoch of 4 steps, as the torch and flax learners report. ADR-0016 accepted the
+    divergence (4 there); `docs/adr/0017` removes it by gating `update` on the optimizer's counter.
     """
     model = _models(tmp_path)[0]
     learner = _learner_type(tmp_path, name="gated", parameters={"DEFAULT": {"accumulate_gradients": 2}})(model)
@@ -201,7 +201,24 @@ def test_accumulated_gradients_gate_the_variables_but_not_the_update_counter(tmp
     trainer.fit(epochs=1)
 
     assert recorder.moved == [False, True, False, True]
-    assert trainer.update == 4
+    assert trainer.update == 2
+
+
+def test_two_accumulation_windows_in_one_learner_are_rejected_at_construction(tmp_path: Path) -> None:
+    """`update` answers for the whole learner, so its optimizers must agree on one window.
+
+    The first optimizer's counter is the learner's clock; a second segment on another window would
+    be mis-gated silently, so the generated `__init__` refuses instead, naming both values
+    (`docs/adr/0017` -- a ValueError, since generated scripts import no builder errors).
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2]["_call_"]["gradient_accumulation_steps"] = 2
+    raw["LEARNERS"][1]["OPTIMIZER"][2]["_call_"]["gradient_accumulation_steps"] = 3
+    KerasLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()(tmp_path / "windows.py")
+    models = _models(tmp_path, 3)
+
+    with pytest.raises(ValueError, match=r"\[2, 3\]"):
+        _load(tmp_path / "windows.py", "windows_learner").Learner(*models)
 
 
 def test_the_optimizer_pattern_carries_the_clipping_that_replaces_clip(tmp_path: Path) -> None:

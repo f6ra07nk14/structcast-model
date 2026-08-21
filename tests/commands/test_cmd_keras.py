@@ -183,8 +183,11 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     assert hasattr(module, "MyLearner")
     assert module.MIXED_PRECISION is False
     assert module.MIXED_PRECISION_TYPE is None
-    # The parameter reached the template: Keras accumulates inside the optimizer.
-    assert "optimizer.gradient_accumulation_steps = 3" in out.read_text()
+    # The parameter reached the template: the window is the OPTIMIZER pattern's keyword, and the
+    # written learner gates `update` on the optimizer's own counter (`docs/adr/0017`).
+    text = out.read_text()
+    assert "gradient_accumulation_steps=3" in text
+    assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in text
 
 
 def test_create_learner_takes_no_backend_because_it_imports_no_keras(tmp_path: Path) -> None:

@@ -345,9 +345,6 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         body = [f"self.{name} = {name}" for name in self.models]
         body += [f"self.{k} = {v}" for k, v in initialized_layers.items()]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
-        # Keras accumulates and gates the update inside the optimizer, and refuses a window of one.
-        if (steps := self.accumulate_gradients or 1) > 1:
-            body += [f"{name}.gradient_accumulation_steps = {steps}" for name in self.optimizers]
         body.append(f"self._models = {{{', '.join(f'{n!r}: self.{n}' for n in self.models)}}}")
         body.append(f"self._segments = [{sep3}{sep3.join(segments)}{sep2}]")
         body.append("adapter = select_backend_adapter()")
@@ -357,6 +354,24 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         )
         # After `prepare`: it replaces the optimizer of a segment it wrapped for loss scaling.
         body.append("self._optimizers = {segment.name: segment.optimizer for segment in self._segments}")
+        # After `prepare` for the same reason: under a float16 policy the accumulation window and
+        # the step counter are the wrapped inner optimizer's, and the wrapping is final by now.
+        body.append(
+            'inners = [getattr(segment.optimizer, "inner_optimizer", segment.optimizer) for segment in self._segments]'
+        )
+        # `update` answers for the whole learner, so the optimizers must agree on one window
+        # (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
+        body.append("windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})")
+        body.append(
+            f'if len(windows) > 1:{sep3}raise ValueError(f"One learner, one update window: the optimizers '
+            'disagree on gradient_accumulation_steps {windows}.")'
+        )
+        # The first inner optimizer's private `_iterations` is the learner's clock: the raw call
+        # count `update` needs, where the public `iterations` floor-divides the window away
+        # (`docs/adr/0017`). The captured variable stays live on every backend -- the jax adapter
+        # assigns the optimizer state back onto these same variables each step.
+        body.append("self._accumulate = windows[0]")
+        body.append("self._counter = inners[0]._iterations")
         body.append("self._training_step = adapter.build_train_step(self._segments)")
         body.append(
             f"self._inference_step = adapter.build_inference_step(self._flow_inference, models=[{every_model}])"
@@ -395,8 +410,11 @@ class {self.classname}:
     models' variables are threaded through a compiled step, so a variable held by such a layer would
     freeze at its first value on the JAX backend.
 
-    Gradient accumulation is the optimizer's (`gradient_accumulation_steps`), so `update` is
-    trivially true: every step feeds the optimizer, which decides when the update lands.
+    Gradient accumulation is the optimizer's (`gradient_accumulation_steps` in the OPTIMIZER
+    pattern), and `update` is a pre-step read of the optimizer's own counter: the trainer asks
+    before `training_step` runs, so the `+ 1` predicts whether the step about to run lands the
+    apply. The optimizer's counter, not the trainer step, is the clock, which is why a float16
+    loss-scale skip -- it freezes the counter -- cannot de-phase the prediction (`docs/adr/0017`).
     \"\"\"
 
     def __init__(self, {self._learner_models}, **kwargs):
@@ -413,7 +431,7 @@ class {self.classname}:
         return self._inference_step({batch})
 
     def update(self, step: int) -> bool:
-        return True
+        return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0
 
     @property
     def models(self):
