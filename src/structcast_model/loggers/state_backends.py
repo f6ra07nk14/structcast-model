@@ -15,16 +15,22 @@ from typing import TYPE_CHECKING, Any
 from typing_extensions import Protocol
 
 if TYPE_CHECKING:
+    import numpy as np
     import orbax.checkpoint as ocp
 
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
-    # Both frameworks are bound lazily, as in `loggers.base`: importing this module must not drag
-    # torch into a Flax run nor jax into a torch one. They are touched inside `save` and `load` only.
+    # Every third-party module is bound lazily, as in `loggers.base`: importing this module must not
+    # drag torch into a Flax run nor jax into a torch one. They are touched inside `save` and `load`
+    # only. The Keras backend needs no keras at all -- a Keras state is numpy on the way out.
+    np = LazyModuleImporter("numpy")
     ocp = LazyModuleImporter("orbax.checkpoint")
     torch = LazyModuleImporter("torch")
+
+_JSON_ITEM = "__json__"
+"""Archive member the Keras backend stores its non-array items in; `numpy` archives hold arrays only."""
 
 
 class StateBackend(Protocol):
@@ -124,6 +130,75 @@ class FlaxStateBackend:
         return {item: _sequence_keys(value) for item, value in restored.items()}
 
 
+class KerasStateBackend:
+    """Training states as one compressed numpy archive.
+
+    A Keras state is path-keyed arrays on every backend -- the tree
+    `keras.Model.get_state_tree(value_format="numpy_array")` describes -- so the whole payload is a
+    tree of numpy arrays and needs no keras to read or write. The archive members are the paths
+    joined by "/", which is the separator Keras already uses inside a variable path, so nesting the
+    keys back on load reproduces the tree whichever depth it was flattened from. The items holding
+    no arrays -- `meta`, and the always-empty `grad_scalers` -- travel as one JSON member.
+
+    The state is backend-portable but a resume is not: `meta` carries the Keras backend that wrote
+    it, and P5's resume refuses a mismatch (`docs/adr/0016`).
+    """
+
+    suffix = ".npz"
+    """A numpy archive is one file."""
+
+    def save(self, states: Mapping[str, Any], directory: Path, name: str) -> Path:
+        """Write *states* into `directory/name.npz` and return that path."""
+        path = directory / f"{name}{self.suffix}"
+        arrays: dict[str, Any] = {}
+        plain: dict[str, Any] = {}
+        for item, value in states.items():
+            try:
+                json.dumps(value)
+            except TypeError:
+                arrays.update(_flatten_arrays(value, item))
+            else:
+                plain[item] = value
+        arrays[_JSON_ITEM] = np.array(json.dumps(plain))
+        np.savez_compressed(path, **arrays)
+        return path
+
+    def load(self, path: Path) -> dict[str, Any]:
+        """Read back an archive this backend wrote, as host numpy arrays nested under their paths."""
+        restored: dict[str, Any] = {}
+        # `np.load` does not unpickle unless asked to, and it is not asked to: the reference this
+        # path is reached with is user input, as in the torch backend's `weights_only`.
+        with np.load(path) as archive:
+            for key in archive.files:
+                if key == _JSON_ITEM:
+                    restored.update(json.loads(str(archive[key])))
+                    continue
+                *parents, leaf = key.split("/")
+                branch = restored
+                for part in parents:
+                    branch = branch.setdefault(part, {})
+                branch[leaf] = archive[key]
+        return restored
+
+
+def _flatten_arrays(value: Any, prefix: str) -> dict[str, Any]:
+    """Flatten one array item into `numpy` archive members, keyed by their "/"-joined path."""
+    if isinstance(value, Mapping):
+        return {
+            key: item for name, sub in value.items() for key, item in _flatten_arrays(sub, f"{prefix}/{name}").items()
+        }
+    array = np.asarray(value)
+    if array.dtype.isbuiltin == 2:
+        # `ml_dtypes` registers bfloat16 as a user dtype, which `numpy.save` stores as an opaque
+        # 2-byte void and reads back as one: the values would survive and the type would not.
+        raise TypeError(
+            f"training-state entry {prefix!r} holds {array.dtype.name} arrays, which a numpy archive cannot "
+            "store without losing the element type. Keep the saved variables in a native numpy type "
+            "(a keras mixed-precision policy keeps them float32)."
+        )
+    return {prefix: array}
+
+
 def _save_item(item: str, value: Any) -> Any:
     """Return the orbax argument saving one top-level entry: JSON for plain data, arrays otherwise.
 
@@ -175,7 +250,7 @@ def _sequence_keys(value: Any) -> Any:
     return {int(key) if key.isascii() and key.isdecimal() else key: _sequence_keys(item) for key, item in value.items()}
 
 
-__all__ = ["FlaxStateBackend", "StateBackend", "TorchStateBackend"]
+__all__ = ["FlaxStateBackend", "KerasStateBackend", "StateBackend", "TorchStateBackend"]
 
 
 if not TYPE_CHECKING:

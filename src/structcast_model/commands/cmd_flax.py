@@ -2,8 +2,6 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
-from hashlib import sha256
-from json import dumps
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -11,51 +9,22 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# Both are package shims routing to lazy submodules, so importing them pulls in no framework.
-# Wrapping them in `LazyModuleImporter` would not work: it copies the shim's still unresolved
-# submodule slots, so every access after the first would hand back `None`.
-from structcast_model import flax as scm_flax, loggers as scm_loggers
-from structcast_model.base_trainer import Printer, ProgressBar, SimpleDataProvider
-from structcast_model.commands.shared_args import (
-    PATH_FORM_HELP,
-    batch_size,
-    ci,
-    compile_option,
-    epochs,
-    experiment,
-    higher_criteria,
-    learner_outputs,
-    learner_pattern,
-    log_arguments,
-    log_artifacts,
-    logger_name,
-    lower_criteria,
-    matmul_precision_option,
-    model_pattern,
-    object_pattern_help,
-    output_script_path,
-    resume_option,
-    save_criteria,
-    seed_option,
-    shapes_help,
-    shapes_option,
-    start_epoch,
-    template_param_option,
-    times,
-    trainer_option,
-    training_dataset_option,
-    validation_dataset_pattern,
-    validation_frequency,
-    warmup_runs,
-)
+# `scm`, `scm_flax` and `scm_loggers` are package shims routing to lazy submodules, so importing
+# them pulls in no framework. Wrapping them in `LazyModuleImporter` would not work: it copies the
+# shim's still unresolved submodule slots, so every access after the first would hand back `None`.
+import structcast_model as scm
+import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    config_hash,
     dict_parser,
     get_module_outputs,
     instantiate_object,
-    path_or_any_parser,
     reduce_dict,
+    strategy_parser,
 )
+import structcast_model.flax as scm_flax
+import structcast_model.loggers as scm_loggers
 
 if TYPE_CHECKING:
     import jax
@@ -76,9 +45,9 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating Flax nnx modules.")
 
-template_param = template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
-shapes = shapes_option(
-    shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
+template_param = scm_args.template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
+shapes = scm_args.shapes_option(
+    scm_args.shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
     + " Omit it only when the model declares INPUT_SHAPES itself."
 )
 device = Option(
@@ -88,13 +57,13 @@ device = Option(
     help='Device the dummy inputs are placed on, named "<platform>:<index>" as listed by JAX (e.g. "cpu:0", '
     '"gpu:0"). If not specified, the first available JAX device is used.',
 )
-compile_pattern: dict[str, Any] | None = compile_option("nnx.jit")
+compile_pattern: dict[str, Any] | None = scm_args.compile_option("nnx.jit")
 
 
 @creator.command(name="model")
 def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Model", "--classname", "-n", help="Name of the generated model class."),
     structured_output: bool = Option(
@@ -119,7 +88,7 @@ def create_model(
 @creator.command(name="learner")
 def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
     classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
 ) -> None:
@@ -130,7 +99,7 @@ def create_learner(
 
 @app.command(name="time")
 def measure_inference_time(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
@@ -151,9 +120,9 @@ def measure_inference_time(
         "derived from --training-mode as {training: <flag>, deterministic: <not flag>, "
         "use_running_average: <not flag>}.",
     ),
-    warmup_runs: int = warmup_runs,
-    times: int = times,
-    batch_size: int = batch_size,
+    warmup_runs: int = scm_args.warmup_runs,
+    times: int = scm_args.times,
+    batch_size: int = scm_args.batch_size,
 ) -> None:
     """Measure the average inference time of a Flax model."""
     jax_device = scm_flax.get_jax_device(device)
@@ -220,17 +189,6 @@ def _compile_parser(value: str) -> dict[str, Any] | None:
     return bool_or_path_or_dict_parser(value) or {}
 
 
-def _config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
-    """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
-
-    Recorded in the saved training state so a resumed run can be told apart from the configuration it
-    was saved from. The optimizers are not part of it: they are hashed separately, by the builder
-    that emits them, and reported per segment as `optimizer_hashes`.
-    """
-    payload = {"models": model_patterns, "learner": learner_pattern, "shapes": shapes}
-    return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
 
@@ -253,23 +211,18 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "scm_flax.FlaxDistri
     return instantiate_object(strategy)(device=device)
 
 
-def _strategy_parser(value: str) -> Any:
-    """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one."""
-    return value if value.isidentifier() else path_or_any_parser(value)
-
-
 @app.command()
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
-        help=object_pattern_help("the model factory", "MyModel", keyed=True, call=False)
+        help=scm_args.object_pattern_help("the model factory", "MyModel", keyed=True, call=False)
         + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
         "inline; a file path is not accepted here. Each pattern resolves to a factory, not to a model: the command "
         'calls it with the run\'s "flax.nnx.Rngs" as rngs=..., built from --seed, which is how a generated model '
         "class is initialized. The names are passed to the --learner factory as keyword arguments.",
     ),
-    shapes: list[dict] | None = shapes_option(
-        shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
+    shapes: list[dict] | None = scm_args.shapes_option(
+        scm_args.shapes_help('"image: [224, 224, 3]"', "jax.numpy.zeros")
         + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
         "twice keeps only the last occurrence. When omitted, the INPUT_SHAPES declared by the built models are "
         "used, merged across them. Nothing is allocated from them here -- Flax modules build their parameters in "
@@ -283,8 +236,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         '"gpu:0"). If not specified, the first available JAX device is used. The multi-device strategies span the '
         "devices themselves and ignore it.",
     ),
-    learner_pattern: Any = learner_pattern,
-    learner_outputs: list[str] | None = learner_outputs,
+    learner_pattern: Any = scm_args.learner_pattern,
+    learner_outputs: list[str] | None = scm_args.learner_outputs,
     compile_pattern: dict[str, Any] | None = Option(
         "",
         "--compile",
@@ -297,45 +250,45 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "arguments deciding what is static and what is donated are the generated step's contract and cannot be "
         "overridden.",
     ),
-    trainer_pattern: Any | None = trainer_option(
+    trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "FlaxTrainer"
     ),
-    epochs: int = epochs,
-    start_epoch: int = start_epoch,
-    resume: str | None = resume_option(
+    epochs: int = scm_args.epochs,
+    start_epoch: int = scm_args.start_epoch,
+    resume: str | None = scm_args.resume_option(
         "Restores models and optimizers, and continues from the saved epoch. The models are built exactly as they "
         "are without it -- the restore overwrites the initialization rather than replacing it.",
         "data-order or RNG",
     ),
-    training_dataset_pattern: Any = training_dataset_option(
+    training_dataset_pattern: Any = scm_args.training_dataset_option(
         " Every batch it yields is placed across the strategy's mesh before it reaches the Learner, so each "
         "entry needs a leading dimension the mesh size divides."
     ),
-    validation_dataset_pattern: Any | None = validation_dataset_pattern,
-    validation_frequency: int = validation_frequency,
-    lower_criteria: list[str] = lower_criteria,
-    higher_criteria: list[str] = higher_criteria,
-    save_criteria: list[str] = save_criteria,
-    seed: int = seed_option(
+    validation_dataset_pattern: Any | None = scm_args.validation_dataset_pattern,
+    validation_frequency: int = scm_args.validation_frequency,
+    lower_criteria: list[str] = scm_args.lower_criteria,
+    higher_criteria: list[str] = scm_args.higher_criteria,
+    save_criteria: list[str] = scm_args.save_criteria,
+    seed: int = scm_args.seed_option(
         " It keys the run's RNG streams, so it decides both the model initialization and every random draw a "
         "step makes."
     ),
-    matmul_precision: Literal["highest", "high", "medium"] = matmul_precision_option(
+    matmul_precision: Literal["highest", "high", "medium"] = scm_args.matmul_precision_option(
         ", the latter by computing in bfloat16"
     ),
-    experiment: str = experiment,
-    logger_name: Literal["mlflow", "wandb"] = logger_name,
-    log_arguments: list[dict] | None = log_arguments,
-    log_artifacts: list[Path] | None = log_artifacts,
-    ci: bool = ci,
+    experiment: str = scm_args.experiment,
+    logger_name: Literal["mlflow", "wandb"] = scm_args.logger_name,
+    log_arguments: list[dict] | None = scm_args.log_arguments,
+    log_artifacts: list[Path] | None = scm_args.log_artifacts,
+    ci: bool = scm_args.ci,
     strategy_pattern: Any = Option(
         "single",
         "--strategy",
-        parser=_strategy_parser,
+        parser=strategy_parser,
         help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
         'every device, parameters replicated) or "fsdp" (the batch split and the parameters sharded too). '
-        + object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
-        + PATH_FORM_HELP
+        + scm_args.object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
+        + scm_args.PATH_FORM_HELP
         + " The factory is called with the resolved device; the templates under cfg/flax/strategies bind the "
         "remaining knobs.",
     ),
@@ -364,7 +317,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             )
         models[model_name] = factory(rngs=rngs)
     input_shapes = scm_flax.resolve_input_shapes(models, reduce_dict(shapes)) or {}
-    config_hash = _config_hash(model_patterns, learner_pattern, input_shapes)
+    config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
     # Before the learner: an optimizer inherits the sharding of the parameters it is built over, and
     # the learner's inference views are taken from the models as they are when it is constructed.
     models = strategy.wrap(models)
@@ -383,7 +336,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             # one takes the static flag and the donated state (`docs/adr/0015`).
             arguments = {**TRAINING_COMPILE_KW, **extra} if flow_name == "_training_step" else extra
             setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), arguments))
-    provider = SimpleDataProvider(
+    provider = scm.SimpleDataProvider(
         training_dataset=scm_flax.ShardedDataset(instantiate_object(training_dataset_pattern), strategy),
         validation_dataset=(
             None
@@ -408,16 +361,16 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
             start_epoch=start_epoch,
             logger=logger,
             optimizer_hashes=optimizer_hashes,
-            config_hash=config_hash,
+            config_hash=config_digest,
         )
     trainer_type = scm_flax.FlaxTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(
         learner=learner, tracker=scm_flax.FlaxTracker.from_criteria(outputs), data=provider, callbacks=[]
     )
     display = (
-        Printer()
+        scm.Printer()
         if ci
-        else ProgressBar(
+        else scm.ProgressBar(
             steps_per_epoch=provider.steps_per_epoch,
             validation_steps=provider.validation_steps,
             training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
@@ -427,7 +380,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     saver = scm_flax.FlaxTrainingStateSaver(
         logger=logger,
         strategy=strategy,
-        extra_meta={"seed": seed, "config_hash": config_hash, "optimizer_hashes": dict(optimizer_hashes)},
+        extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
     )
     bests = scm_flax.FlaxBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy

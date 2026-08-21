@@ -9,13 +9,14 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import optax
 import pytest
 
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
-from structcast_model.loggers.state_backends import FlaxStateBackend, TorchStateBackend
+from structcast_model.loggers.state_backends import FlaxStateBackend, KerasStateBackend, TorchStateBackend
 import torch
 
 
@@ -150,3 +151,45 @@ def test_flax_backend_refuses_to_extract_on_an_interpreter_without_the_filters(
 
     with pytest.raises(RuntimeError, match="Python 3.11.4"):
         FlaxStateBackend().load(archive_path)
+
+
+def test_keras_backend_round_trips_a_path_keyed_state(tmp_path: Path) -> None:
+    """What comes out of the archive must be exactly what the saver put in, `meta` included.
+
+    The Keras payload is plain numpy -- no keras is imported here, and none is needed -- but the
+    backend it was produced on is: a resume compares that field and refuses a mismatch, because
+    normalization statistics and RNG trajectories are not verified equivalent across the backends.
+    """
+    states: dict[str, Any] = {
+        "models": {"model": {"model": {"fc": {"kernel": np.ones((4, 2), "float32"), "bias": np.zeros(2, "float16")}}}},
+        "optimizers": {"optimizer": {"optimizer": {"iteration": np.asarray(3, "int64")}}},
+        "grad_scalers": {},
+        "meta": {"epoch": 2, "step": 7, "update": 3, "backend": "jax", "seed": 42},
+    }
+
+    path = KerasStateBackend().save(states, tmp_path, "training_state")
+    restored = KerasStateBackend().load(path)
+
+    assert path == tmp_path / "training_state.npz"
+    assert restored["meta"] == states["meta"]
+    assert restored["meta"]["backend"] == "jax"
+    assert restored["grad_scalers"] == {}
+    assert restored["models"]["model"]["model"]["fc"].keys() == {"kernel", "bias"}
+    for name, saved in (("kernel", np.ones((4, 2), "float32")), ("bias", np.zeros(2, "float16"))):
+        loaded = restored["models"]["model"]["model"]["fc"][name]
+        assert loaded.dtype == saved.dtype
+        assert np.array_equal(loaded, saved)
+    assert restored["optimizers"]["optimizer"]["optimizer"]["iteration"] == 3
+
+
+def test_keras_backend_refuses_a_dtype_a_numpy_archive_cannot_store(tmp_path: Path) -> None:
+    """`numpy` stores an ml_dtypes bfloat16 array as an opaque void and reads it back as one.
+
+    The values would survive and the element type would not, so a state saved from bfloat16
+    variables has to fail here rather than resume into arrays whose type no longer says what they
+    are.
+    """
+    states = {"models": {"model": {"kernel": np.ones(2, dtype=ml_dtypes.bfloat16)}}}
+
+    with pytest.raises(TypeError, match="bfloat16"):
+        KerasStateBackend().save(states, tmp_path, "training_state")

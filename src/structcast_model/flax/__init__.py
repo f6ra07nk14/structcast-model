@@ -36,11 +36,10 @@ if TYPE_CHECKING:
         ShardedDataset,
         TensorInitializer,
         create_jax_inputs,
-        get_jax_device,
-        get_jax_devices,
         resolve_input_shapes,
         restore_training_state,
     )
+    from structcast_model.flax.utils import get_jax_device, get_jax_devices
 else:
     import sys
 
@@ -48,7 +47,7 @@ else:
 
     # Each symbol is listed exactly once: _class_to_module is a dict comprehension, so a name listed
     # twice silently keeps the last writer. A re-exported name goes under its defining module when
-    # that module has an entry of its own -- distributed re-exports get_jax_device, routed to trainer
+    # that module has an entry of its own -- distributed re-exports get_jax_device, routed to utils
     # instead. The layers subpackage stays submodule-only, as its torch twin does.
     import_structure = {
         "distributed": ["AXIS", "PRESET_RULES", "TACTICS", "FlaxDistributedStrategy"],
@@ -62,10 +61,9 @@ else:
             "ShardedDataset",
             "TensorInitializer",
             "create_jax_inputs",
-            "get_jax_device",
-            "get_jax_devices",
             "resolve_input_shapes",
             "restore_training_state",
         ],
+        "utils": ["get_jax_device", "get_jax_devices"],
     }
     sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

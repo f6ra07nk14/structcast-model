@@ -4,8 +4,6 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
-from hashlib import sha256
-from json import dumps
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -22,7 +20,14 @@ from structcast_model.builders.base import (
     OptimizerSegment,
 )
 from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
-from structcast_model.builders.utils import resolve_object, statement_names
+from structcast_model.builders.utils import (
+    # Framework-neutral and shared with the Keras builder, re-exported here because a caller reading
+    # a learner's `OPTIMIZER_HASHES` reaches for it next to the builder that emitted them.
+    optimizer_hash,
+    resolve_object,
+    statement_names,
+    stored_names,
+)
 from structcast_model.utils.base import unique
 
 logger = getLogger(__name__)
@@ -215,25 +220,6 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     return ObjectPattern.model_validate(rewritten), True
 
 
-def optimizer_hash(optimizer: ObjectPattern) -> str:
-    """Return the digest identifying one `OPTIMIZER` pattern, as it was written.
-
-    Recorded in the generated learner and in the training state so a resume can report an optimizer
-    that was rebuilt from a different configuration (`docs/adr/0015`): optax builds `tx` from the
-    pattern and the restored state cannot see it, so a swapped schedule would otherwise continue
-    silently from the old step count. The pattern is hashed before `inject_learning_rate` rewrites
-    it, so turning the injection on or off never moves the digest.
-
-    Args:
-        optimizer (ObjectPattern): The validated `OPTIMIZER` pattern of one learner behavior.
-
-    Returns:
-        str: The hex SHA-256 of the pattern's canonical JSON dump.
-    """
-    dumped = optimizer.model_dump(by_alias=True)
-    return sha256(dumps(dumped, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
-
-
 def _container(trainable_layers: list[str]) -> str:
     """Return the name of the variable holding the modules one optimizer owns.
 
@@ -244,11 +230,6 @@ def _container(trainable_layers: list[str]) -> str:
     if len(trainable_layers) == 1:
         return trainable_layers[0]
     return f"_seg_{'_'.join(trainable_layers)}"
-
-
-def _stored(output: str) -> list[str]:
-    """Return the variable names one flow step assigns, unpacking the `(a, b)` form of a multi-output step."""
-    return [name.strip() for name in output.strip("()").split(",") if name.strip()]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -324,7 +305,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             parameters = [container, *unique([L for _, _, L in units if L in self.models and L not in owned])]
             body = [f"{', '.join(owned)} = {container}"] if len(owned) > 1 else []
             body += [self._get_regular_step(i, o, L) for i, o, L in units]
-            stores = unique([name for _, output, _ in units for name in _stored(output)])
+            stores = unique([name for _, output, _ in units for name in stored_names(output)])
             bound, external = set(parameters), set[str]()
             deferred = set(stores) - bound
             for line in body:

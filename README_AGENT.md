@@ -377,7 +377,7 @@ timm data integrations — example code in `examples/torch/data.py`, not package
 Utility functions:
 
 - `create_jax_inputs(shape)` — creates JAX arrays from shape specs
-- `get_jax_device(device=None)` — resolves JAX device (cpu, gpu:N)
+- `get_jax_device(device=None)` (in `flax/utils.py`) — resolves JAX device (cpu, gpu:N)
 - `measure_inference_time(...)` — benchmarks Flax model inference with optional `nnx.jit` compilation
 
 ### Keras runtime layer
@@ -387,7 +387,7 @@ Utility functions:
 Utility functions:
 
 - `create_numpy_inputs(shape)` — creates NumPy arrays from shape specs
-- `get_keras_device(device=None)` — resolves Keras/JAX device
+- `get_keras_device(device=None)` (in `keras/utils.py`) — resolves Keras/JAX device
 - `measure_inference_time(...)` — benchmarks Keras model inference with optional compilation
 
 ### Training flow in practice

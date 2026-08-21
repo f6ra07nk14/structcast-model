@@ -68,6 +68,17 @@ A named sharding-rule table (`single`, `dp`, `fsdp`) selecting how a distributed
 parameters, optimizer state, and batches across the devices of one host.
 _Avoid_: ZeRO stage, parallelism mode, sharding config
 
+**Keras backend**:
+The engine — TensorFlow, JAX, or PyTorch — that Keras executes on, fixed for the whole process
+before Keras first imports. Each training run names exactly one; it is not a Distributed strategy.
+_Avoid_: backend (unqualified), framework (for the engine under Keras)
+
+**Backend adapter**:
+The single component owning everything Keras-backend-specific in a training run — gradient
+computation, optimizer application, variable state handling, and step compilation — selected once
+from the active Keras backend.
+_Avoid_: backend branch, per-backend conditional
+
 **State backend**:
 The serialization component behind a Logger's training-state methods: it turns a training state into one
 artifact file and back into host-memory state. Each framework supplies one; loggers default to the torch

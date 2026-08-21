@@ -39,8 +39,10 @@ Issues = "https://github.com/f6ra07nk14/structcast-model/issues"
 scm = "structcast_model.commands.main:app"
 
 [project.optional-dependencies]
-# NOTE: TensorFlow and Keras extras install dependencies only.
-# No builder or trainer implementations exist for those frameworks yet.
+# NOTE: The Keras extras carry the builders and the training workflow; each one pairs keras with the
+# backend it runs on, and `tox -e keras-tf,keras-jax,keras-torch` proves the three of them.
+# The TensorFlow extras install dependencies only: TensorFlow is reachable as a Keras backend, and no
+# builder or trainer targets it directly.
 # The JAX extras carry the flax/optax/orbax stack the flax builders and training workflow generate code against.
 jax-cpu = ["flax>=0.12.6", "jax[cpu]>=0.9.0.1", "optax>=0.2.6", "orbax-checkpoint>=0.11.20"]
 jax-cu12 = ["flax>=0.12.6", "jax[cuda12]>=0.9.0.1", "optax>=0.2.6", "orbax-checkpoint>=0.11.20"]

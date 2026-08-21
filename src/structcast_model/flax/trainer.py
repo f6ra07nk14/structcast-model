@@ -1,9 +1,7 @@
 """Trainer helpers for Flax models."""
 
-from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self, cast
 
@@ -27,13 +25,9 @@ from structcast_model.base_trainer import (
     get_dataset_size,
 )
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
-
-if TYPE_CHECKING:
-    # Only for the annotations: `flax.distributed` imports this module, so importing it back here
-    # at runtime would close the cycle.
-    from structcast_model.flax.distributed import FlaxDistributedStrategy
 
 # `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named `logger`.
 _logger = getLogger(__name__)
@@ -107,40 +101,6 @@ def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     if isinstance(node, Mapping):
         return {key: create_jax_inputs(value, batch_size=batch_size) for key, value in node.items()}
     return [create_jax_inputs(value, batch_size=batch_size) for value in node]
-
-
-# `jax.Device` is Any to mypy: jaxlib re-exports it from its `_jax` C extension, which ships no stubs.
-@lru_cache(maxsize=1)
-def get_jax_devices() -> OrderedDict[str, jax.Device]:  # type: ignore[no-any-unimported]
-    """Get a mapping of available JAX devices.
-
-    Returns:
-        OrderedDict[str, jax.Device]: An ordered dictionary mapping device strings (e.g., "cpu:0", "gpu:0") to
-            JAX Device objects.
-    """
-    return OrderedDict((f"{d.platform}:{d.id}", d) for d in jax.devices())
-
-
-# `jax.Device` is Any to mypy, as above.
-def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-any-unimported]
-    """Get a JAX device based on the provided device string.
-
-    Args:
-        device (str | None): The device string to look for (e.g., "cpu:0", "gpu:0").
-            If None, the first available device will be returned.
-
-    Returns:
-        jax.Device: The JAX device corresponding to the provided device string.
-    """
-    devices = get_jax_devices()
-    if not devices:
-        raise ValueError("No JAX devices are available.")
-    if device is None:
-        device = next(iter(devices))
-    if device in devices:
-        return devices[device]
-    devices_str = ", ".join(f"{d!r}" for d in devices)
-    raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
 @dataclass(frozen=True)
@@ -276,7 +236,7 @@ class FlaxBestCriterion(BestCriterion[nnx.Module]):
         lower_criteria: Sequence[str],
         save_criteria: Collection[str],
         logger: Logger,
-        strategy: "FlaxDistributedStrategy",
+        strategy: FlaxDistributedStrategy,
     ) -> list[Self]:
         """Build one monitor per criterion, each logging its best value through *logger*.
 
@@ -305,7 +265,7 @@ class _BestLogger:
     save: bool
     """Whether to also save the model states that reached the best value."""
 
-    strategy: "FlaxDistributedStrategy"
+    strategy: FlaxDistributedStrategy
     """The strategy producing the model states to save."""
 
     def on_best(self, info: BaseInfo[nnx.Module], best: BestCriterion[nnx.Module]) -> None:
@@ -328,7 +288,7 @@ class FlaxTrainingStateSaver:
     logger: Logger
     """The logger the training-state artifacts are written through."""
 
-    strategy: "FlaxDistributedStrategy"
+    strategy: FlaxDistributedStrategy
     """The strategy producing the model and optimizer states to save."""
 
     extra_meta: Mapping[str, Any] = field(default_factory=dict)
@@ -348,7 +308,7 @@ class FlaxTrainingStateSaver:
 def restore_training_state(
     *,
     resume: str,
-    strategy: "FlaxDistributedStrategy",
+    strategy: FlaxDistributedStrategy,
     models: Mapping[str, nnx.Module],
     learner: Any,
     start_epoch: int,
@@ -410,8 +370,6 @@ __all__ = [
     "ShardedDataset",
     "TensorInitializer",
     "create_jax_inputs",
-    "get_jax_device",
-    "get_jax_devices",
     "resolve_input_shapes",
     "restore_training_state",
 ]

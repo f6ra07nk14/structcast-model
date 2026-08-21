@@ -13,14 +13,8 @@ import jax.numpy as jnp
 import pytest
 
 from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider
-from structcast_model.flax.trainer import (
-    FlaxTracker,
-    FlaxTrainer,
-    ShardedDataset,
-    create_jax_inputs,
-    get_jax_device,
-    get_jax_devices,
-)
+from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer, ShardedDataset, create_jax_inputs
+from structcast_model.flax.utils import get_jax_device, get_jax_devices
 
 
 class _StubLearner:
