@@ -1,5 +1,9 @@
 # Accumulation gating follows each backend's native mechanism
 
+> **Superseded in part by ADR-0018.** The "`update()` keeps its pre-step position" clause below and
+> the rejection of the post-hoc read-back considered option are replaced by the learner-owned
+> retrospective counters of ADR-0018. The per-backend window mechanisms stand.
+
 `ACCUMULATE_GRADIENTS` was a shared schema field on `UserDefinedLearner`, on the theory that gradient
 accumulation is portable (ADR-0012). Practice disagreed per backend: torch derives a host-side
 `(step + 1) % k` gate; keras mapped the field onto the optimizer's own `gradient_accumulation_steps`
