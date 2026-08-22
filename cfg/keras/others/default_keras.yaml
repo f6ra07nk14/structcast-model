@@ -1,20 +1,18 @@
 # The Keras counterpart of "cfg/torch/others/default_timm.yaml": one rendered dataset pattern for
 # "scm keras train --training-dataset" / "--validation-dataset".
-# "training" selects the split and everything that follows from it -- the training split is shuffled
-# and augmented (a horizontal flip and a pad-then-crop, as core Keras preprocessing layers inside the
-# tf.data pipeline), the validation split is neither.
+# "dataset" has no default and must be given: it names the "keras.datasets" set to download, and a
+# default here would fetch one nobody asked for. "training" selects the split and everything that
+# follows from it -- the training split is shuffled and augmented (a horizontal flip and a
+# pad-then-crop, as core Keras preprocessing layers inside the tf.data pipeline), the validation
+# split is neither.
 # Render it twice, once per split, e.g.
 #   scm format cfg/keras/others/default_keras.yaml -o dataset_train.yaml \
-#       -p 'DEFAULT: {training: true, dataset: cifar100, num_classes: 100}'
+#       -p 'DEFAULT: {dataset: cifar100, training: true}'
 PARAMETERS:
   DEFAULT:
     training: false
-    dataset: synthetic # "synthetic", "mnist", "cifar10" or "cifar100"; only "synthetic" downloads nothing
     batch_size: 32
     image_size: [32, 32]
-    image_channels: 3
-    num_classes: 10
-    samples: 1024 # number of synthetic items; ignored for a keras.datasets set
     crop_padding: 4 # pixels padded on each side before the random crop; 0 disables the crop
     seed: 42
 _obj_:
@@ -29,12 +27,12 @@ _obj_:
     - image_key: image
       label_key: label
       _jinja_yaml_: |-
-        training: {{training}}
+        {% if dataset is not defined %}
+        {{ 'dataset is required and has no default: pass -p "DEFAULT: {dataset: cifar10}" (or mnist, cifar100).' | raise_error }}
+        {% endif %}
         dataset: {{dataset}}
+        training: {{training}}
         batch_size: {{batch_size}}
         image_size: {{image_size}}
-        image_channels: {{image_channels}}
-        num_classes: {{num_classes}}
-        samples: {{samples}}
         crop_padding: {{crop_padding}}
         seed: {{seed}}

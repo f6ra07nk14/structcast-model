@@ -17,27 +17,32 @@ _obj_:
       is_training: true
 ```
 
+The dataset is loaded through `tensorflow_datasets`, which is not a dependency of this package:
+install it with `uv pip install tensorflow-datasets`, or point `--training-dataset` at a dataset
+object of your own, since the training loop takes any iterable of dictionaries.
+
 The pipeline is big_vision-shaped and host-side: resize, then a random crop and a horizontal flip
 while training or a central crop while evaluating, then the channel-wise normalization. `tf.data`
 runs all of it on CPU threads while the device is busy with the previous step, which is what keeps
 a JAX run fed. Building a loader takes every GPU out of TensorFlow's sight, so the two frameworks
 never fight over device memory.
 
-With `name` left empty the loader serves a deterministic synthetic split instead, so an example, a
-smoke test or a CI run needs no download at all; a non-empty `name` is loaded through
-`tensorflow_datasets`, which is not a dependency of this package and must be installed separately.
-
 Unlike `examples/torch/data.py` there is no epoch hook and no rank sharding here: `tf.data`
 reshuffles on every iteration by itself, and JAX is single-controller, so the strategy splits each
-batch across the devices rather than the loader feeding each rank its own slice.
+batch across the devices rather than the loader feeding each rank its own slice -- a loader that
+also sharded per rank would double-shard (see `examples/flax/corpus.py` for the long version).
 """
 
 from collections.abc import Iterator
 from functools import cached_property
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from structcast.utils.lazy_import import try_import
 import tensorflow as tf
+
+with try_import() as _tfds_imports:  # not a dependency of structcast-model; the use site says so.
+    import tensorflow_datasets as tfds
 
 DTYPES = {"float32": tf.float32, "float16": tf.float16, "bfloat16": tf.bfloat16}
 """TensorFlow element types of the supported image element types."""
@@ -61,9 +66,9 @@ def hide_gpus_from_tensorflow() -> None:
 class TFDataLoader(BaseModel):
     """A `tf.data` pipeline yielding batches of NumPy arrays keyed by the learner's input names.
 
-    Every field has a default that works without any data on disk: the loader then serves
-    `synthetic_samples` deterministic random images, which is what makes this file runnable in a
-    test. Set `name` to load a real dataset through `tensorflow_datasets` instead.
+    `source` is the only place a dataset comes from: it is a `cached_property`, so a caller with a
+    `tf.data.Dataset` already in hand -- a test, or a pipeline of its own -- replaces it by writing
+    the instance dictionary, and nothing here downloads anything.
     """
 
     spec: dict[str, int] = Field(default_factory=lambda: {"image": 0, "label": 1})
@@ -75,11 +80,11 @@ class TFDataLoader(BaseModel):
     elementwise comparison rather than a truth value.
     """
 
-    name: str = ""
-    """The `tensorflow_datasets` name to load, e.g. "cifar10". Empty serves the synthetic split."""
+    name: str
+    """The `tensorflow_datasets` name to load, e.g. "cifar10"; required, and it may not be empty."""
 
     split: str = "train"
-    """The split to read, in `tensorflow_datasets` split syntax. Ignored by the synthetic split."""
+    """The split to read, in `tensorflow_datasets` split syntax."""
 
     data_dir: str | None = None
     """Directory the dataset is read from and downloaded into; the tfds default when None."""
@@ -117,15 +122,20 @@ class TFDataLoader(BaseModel):
     seed: int = 42
     """Seed of the shuffle and of the per-item augmentation draws, so a run is reproducible."""
 
-    num_classes: int = 10
-    """Number of classes the synthetic split labels cycle through."""
-
-    synthetic_samples: int = 256
-    """Number of items the synthetic split holds."""
-
     drop_remainder: bool = True
     """Whether the final short batch is dropped. A Flax run wants this: the strategy splits a batch
     across its mesh, so a short one would not divide."""
+
+    @field_validator("name")
+    @classmethod
+    def _reject_an_unnamed_dataset(cls, name: str) -> str:
+        """Refuse an empty name here rather than let tfds fail on it much later."""
+        if not name.strip():
+            raise ValueError(
+                'A dataset name is required, e.g. name="cifar10": it is looked up with '
+                "tensorflow_datasets, whose catalogue is at https://www.tensorflow.org/datasets/catalog."
+            )
+        return name
 
     def model_post_init(self, context: Any, /) -> None:
         """Hide the GPUs from TensorFlow, now that something in the run is about to read data."""
@@ -138,24 +148,18 @@ class TFDataLoader(BaseModel):
 
     @cached_property
     def source(self) -> tf.data.Dataset:
-        """The undecoded `(uint8 image, int32 label)` pairs of this split.
+        """The undecoded `(uint8 image, int32 label)` pairs of this split, loaded through tfds.
 
-        The synthetic branch builds them from a fixed seed, so the same items come back on every
-        run and nothing is downloaded.
+        Raises:
+            ImportError: If `tensorflow_datasets` is not installed.
         """
-        if not self.name:
-            images = tf.random.stateless_uniform(
-                (self.synthetic_samples, self.resize_size, self.resize_size, 3),
-                seed=(self.seed, self.seed),
-                maxval=256,
-                dtype=tf.int32,
+        if not _tfds_imports.is_successful:
+            raise ImportError(
+                f'Loading the dataset "{self.name}" needs the tensorflow_datasets package, which is not '
+                "installed and is not a dependency of structcast-model. Install it with "
+                '"uv pip install tensorflow-datasets", or point --training-dataset at a dataset object '
+                "of your own -- the training loop takes any iterable of dictionaries."
             )
-            labels = tf.range(self.synthetic_samples, dtype=tf.int32) % self.num_classes
-            return tf.data.Dataset.from_tensor_slices((tf.cast(images, tf.uint8), labels))
-        # Imported here, not at module scope: `tensorflow_datasets` is not a dependency of this
-        # package, and the synthetic split above must stay usable without it.
-        import tensorflow_datasets as tfds  # noqa: PLC0415  # optional, only the named-dataset path needs it
-
         return tfds.load(
             self.name,
             split=self.split,
@@ -167,10 +171,18 @@ class TFDataLoader(BaseModel):
 
     @cached_property
     def num_examples(self) -> int:
-        """Number of items in the split, which is what `__len__` divides into batches."""
-        if not self.name:
-            return self.synthetic_samples
-        return int(self.source.cardinality())
+        """Number of items in the split, which is what `__len__` divides into batches.
+
+        Raises:
+            ValueError: If the split reports no size, which would make `__len__` meaningless.
+        """
+        count = int(self.source.cardinality())
+        if count < 0:
+            raise ValueError(
+                f'The split "{self.split}" of "{self.name}" reports no size, so an epoch cannot be counted. '
+                'A split written as a slice, e.g. "train[:5%]", reports one.'
+            )
+        return count
 
     # AutoGraph has nothing to rewrite here -- every branch below is decided while the graph is
     # traced, and the rest is tf ops -- and it fails to introspect a method of a pydantic model.

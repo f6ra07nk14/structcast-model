@@ -2,8 +2,12 @@
 
 Everything here is loaded by file path, the way a configuration reaches it with `_addr_` plus
 `_file_`: an example that only works when it is imported as a module is an example the configuration
-form cannot use. Nothing downloads anything -- the image pipeline runs on its synthetic split and the
-corpus reads a local file through `data_path`.
+form cannot use.
+
+Nothing downloads anything. The corpus reads a local file through `data_path`, and the image
+pipeline gets its arrays through the `arrays` fixture below, which replaces the module-level
+`load_arrays` -- the one place the pipeline reaches for data, so everything under test between that
+call and the batch is the real code.
 """
 
 from importlib.util import module_from_spec, spec_from_file_location
@@ -16,6 +20,11 @@ import pytest
 
 import keras
 from structcast_model.base_trainer import Learner
+from structcast_model.builders.schema import Template
+from tests import CFG_DIR
+
+BACKEND = keras.backend.backend()
+"""The active Keras backend, as in `tests/keras/test_distributed.py`."""
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "keras"
 
@@ -36,13 +45,32 @@ OPTIMIZERS = _example("optimizers")
 SIMPLE_TRAINING = _example("simple_training")
 
 
+IMAGES = np.arange(16 * 12 * 12 * 3, dtype="uint8").reshape(16, 12, 12, 3)
+"""Sixteen 12x12 images, larger than the pipeline's crop so the random crop has room to move."""
+
+LABELS = np.arange(16, dtype="int64")
+"""One distinct label per image, so a batch's labels say exactly which items produced it."""
+
+
+@pytest.fixture
+def arrays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feed the pipeline the arrays above instead of a `keras.datasets` download.
+
+    `load_arrays` is the single seam between the pipeline and where its data comes from, which is
+    what makes it the right thing to replace: the sharding, the shuffle, the augmentation, the
+    batching and the keys under test are all the real code. Downloading a set would put the network
+    and a hundred megabytes of cache into every run of this file.
+    """
+    monkeypatch.setattr(DATA, "load_arrays", lambda dataset, training: (IMAGES, LABELS))
+
+
 def _pipeline(**kwargs: Any) -> Any:
-    """Build a tiny synthetic image pipeline, small enough to iterate twice per test."""
-    defaults = {"batch_size": 4, "samples": 16, "image_size": (8, 8), "num_classes": 3}
+    """Build a tiny image pipeline; `dataset` names the set the patched `load_arrays` ignores."""
+    defaults = {"dataset": "cifar10", "batch_size": 4, "image_size": (8, 8)}
     return DATA.KerasImageData(**{**defaults, **kwargs})
 
 
-def test_the_image_pipeline_yields_batches_keyed_by_the_model_input_names() -> None:
+def test_the_image_pipeline_yields_batches_keyed_by_the_model_input_names(arrays: None) -> None:
     """The keys are the learner's keyword arguments, so they are the whole interface of a dataset.
 
     The trainer calls `training_step(**batch)`, which makes a renamed key a `TypeError` on the first
@@ -59,7 +87,7 @@ def test_the_image_pipeline_yields_batches_keyed_by_the_model_input_names() -> N
     assert len(data) == 4
 
 
-def test_the_image_pipeline_normalizes_and_stays_numpy() -> None:
+def test_the_image_pipeline_normalizes_and_stays_numpy(arrays: None) -> None:
     """Batches leave the pipeline as NumPy in [0, 1], which is what every Keras backend accepts.
 
     TensorFlow tensors would work on the tensorflow backend and nowhere else, and unscaled uint8
@@ -108,12 +136,87 @@ def test_only_the_training_split_augments_its_images() -> None:
     assert np.array_equal(first, second)
 
 
-def test_the_validation_split_yields_the_same_epoch_every_time() -> None:
+def test_the_validation_split_yields_the_same_epoch_every_time(arrays: None) -> None:
     """Evaluation is a measurement, so it has to be the same one: no shuffle and no augmentation."""
     validation = _pipeline(training=False)
 
     assert np.array_equal(next(iter(validation))["image"], next(iter(validation))["image"])
     assert np.array_equal(next(iter(validation))["label"], next(iter(validation))["label"])
+
+
+def _labels_of_rank(rank: int, monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
+    """Every label one rank of a two-process launch sees in an epoch, in order."""
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    data = _pipeline(training=False)
+    assert len(data) == 2, "eight items per rank, four to a batch"
+    return np.concatenate([batch["label"] for batch in data])
+
+
+def test_the_image_pipeline_shards_its_items_across_the_launcher_ranks(
+    arrays: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a torchrun launch every rank is its own process, so an unsharded loader trains on copies.
+
+    That failure is silent -- the run completes, the loss falls, and every rank has just replayed the
+    same epoch -- so the shards are pinned here: disjoint, covering the split between them, the same
+    length, and the same on a second construction of the same rank.
+    """
+    first = _labels_of_rank(0, monkeypatch)
+    second = _labels_of_rank(1, monkeypatch)
+
+    assert not set(first) & set(second)
+    assert sorted([*first, *second]) == LABELS.tolist()
+    assert len(first) == len(second)
+    assert np.array_equal(first, _labels_of_rank(0, monkeypatch))
+
+
+def test_the_image_pipeline_serves_the_whole_split_outside_a_multi_process_launch(arrays: None) -> None:
+    """Without RANK and WORLD_SIZE the loader must not shard, which is the tensorflow and jax case.
+
+    Those backends run one process and the distributed strategy splits each batch across the
+    replicas itself, so a loader sharding here as well would hand each replica a shard of a shard --
+    the same silent correctness bug as not sharding under torchrun, in the other direction.
+    """
+    data = _pipeline(training=False)
+
+    assert len(data) == 4
+    assert sorted(np.concatenate([batch["label"] for batch in data])) == LABELS.tolist()
+
+
+def test_the_image_pipeline_requires_a_dataset_and_names_the_ones_it_knows() -> None:
+    """`dataset` has no default, because any default downloads a set nobody asked for.
+
+    A typo has to be refused where it is written, not at the first batch after a download of the
+    wrong thing, and the message has to say what the alternatives are.
+    """
+    with pytest.raises(ValueError, match="Field required"):
+        DATA.KerasImageData()
+
+    with pytest.raises(ValueError, match="'mnist', 'cifar10' or 'cifar100'"):
+        DATA.KerasImageData(dataset="synthetic")
+
+
+def test_the_shipped_dataset_template_refuses_to_render_without_a_dataset() -> None:
+    """`scm format` must fail on the missing parameter, not render `{{dataset}}` into the pattern.
+
+    An undefined parameter renders as its own literal here, so without the guard the template would
+    produce a file that looks complete and fails one command later; the message has to name the
+    parameter and the sets. The rendered pattern is only inspected, never instantiated: `_file_`
+    loads a fresh copy of the example module, which the `arrays` fixture cannot reach, so building
+    it would download a real set.
+    """
+    template: Template[Any] = Template.from_path(CFG_DIR / "keras" / "others" / "default_keras.yaml")
+
+    with pytest.raises(ValueError, match="dataset is required and has no default"):
+        template({})
+
+    pattern = template({"DEFAULT": {"dataset": "cifar100", "batch_size": 8}}).model_dump(mode="json")
+
+    arguments = pattern["_obj_"][-1][-1]
+    assert arguments["dataset"] == "cifar100"
+    assert arguments["batch_size"] == 8
+    assert (arguments["image_key"], arguments["label_key"]) == ("image", "label")
 
 
 def test_the_corpus_yields_the_shifted_pair_the_language_learner_reads(tmp_path: Path) -> None:
@@ -154,6 +257,59 @@ def test_the_corpus_reads_a_local_file_without_downloading(tmp_path: Path, monke
     assert not (tmp_path / CORPUS.CORPUS_PATH).exists()
 
 
+def _corpus_loader(path: Path) -> Any:
+    """A loader over 23 blocks of four identical characters each, so every block is recognizable."""
+    path.write_text("".join(chr(ord("a") + index) * 4 for index in range(23)), encoding="utf-8")
+    return CORPUS.TinyShakespeareLoader(block_size=4, batch_size=2, split="train", data_path=path)
+
+
+def _blocks_of_rank(rank: int, path: Path, monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
+    """Every block one rank of a two-process launch sees in an epoch, named by its first token."""
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    loader = _corpus_loader(path)
+    return np.concatenate([batch["tokens"][:, 0] for batch in loader])
+
+
+def test_the_corpus_loader_shards_its_blocks_across_the_launcher_ranks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same defect as in the image pipeline, and the same silence: every rank replays one epoch.
+
+    The blocks are pinned the same way -- disjoint, covering the split between them, the same
+    length, and stable for a rank -- with `shuffle` off, so what the shards contain is the sharding
+    alone and not a draw.
+    """
+    corpus = tmp_path / "corpus.txt"
+    blocks = len(_corpus_loader(corpus).dataset)
+
+    first = _blocks_of_rank(0, corpus, monkeypatch)
+    second = _blocks_of_rank(1, corpus, monkeypatch)
+
+    assert not set(first) & set(second)
+    assert sorted([*first, *second]) == list(range(blocks))
+    assert len(first) == len(second)
+    assert np.array_equal(first, _blocks_of_rank(0, corpus, monkeypatch))
+
+
+def test_the_corpus_loader_serves_the_whole_split_outside_a_multi_process_launch(tmp_path: Path) -> None:
+    """Without RANK and WORLD_SIZE the loader must not shard: the strategy splits the batch instead.
+
+    On the tensorflow and jax backends the run is one process feeding a strategy that spreads each
+    batch over the replicas, so sharding here too would give every replica a shard of a shard.
+    """
+    loader = _corpus_loader(tmp_path / "corpus.txt")
+
+    seen = np.concatenate([batch["tokens"][:, 0] for batch in loader])
+
+    assert sorted(seen) == list(range(len(loader.dataset)))
+
+
+@pytest.mark.skipif(
+    BACKEND == "jax",
+    reason="The stateful optimizer.apply this asserts through is a tensorflow and torch path; on jax "
+    "the backend adapter applies statelessly inside the jitted step, which no eager call can stand in for.",
+)
 def test_the_optimizer_factory_exempts_the_named_variables_from_weight_decay() -> None:
     """This is the one thing the factory exists for, so it is the one thing worth testing.
 

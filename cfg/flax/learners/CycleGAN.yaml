@@ -12,13 +12,17 @@
 #   * the generated images are not criteria. The trainer's tracker sums every output into a scalar
 #     mean, so "fake_A" and "fake_B" -- which the torch template lists in "OUTPUTS" -- would break
 #     it; log them from a callback instead.
-# The learning rate is a schedule from "examples/flax/optimizers.py", the file-addressed counterpart
-# of the "OptimizerWithNativeScheduler" the torch template loads from "examples/torch/optimizers.py":
-# optax schedules count optimizer applies, so the epoch-based recipe needs "steps_per_epoch".
-# Nothing checks that number against the run: it is a plain template parameter, and a wrong one
-# silently stretches or collapses the decay -- a value ten times too large leaves the rate flat for
-# the whole run. Set it to len(training_dataset), which is the "Training dataset size" the command
-# prints before the first epoch, divided by the accumulation window if one is configured.
+# The learning rate needs no counterpart to the "OptimizerWithNativeScheduler" the torch template
+# loads from "examples/torch/optimizers.py": an "optax.linear_schedule" holds "lr" until
+# "transition_begin" and then ramps it to zero, which is exactly the "LambdaLR" of the torch recipe.
+# The two are not the same curve, only the same envelope -- torch steps once per epoch and holds one
+# rate for all of it, an optax schedule is read on every update and falls continuously -- so they
+# agree exactly at epoch boundaries and drift inside an epoch.
+# optax counts optimizer applies where the recipe counts epochs, which is what "steps_per_epoch"
+# converts. Nothing checks that number against the run: it is a plain template parameter, and a
+# wrong one silently stretches or collapses the decay -- a value ten times too large leaves the rate
+# flat for the whole run. Set it to len(training_dataset), which is the "Training dataset size" the
+# command prints before the first epoch, divided by the accumulation window if one is configured.
 PARAMETERS:
   DEFAULT:
     epochs: 200
@@ -48,15 +52,16 @@ LEARNERS:
             - _call_:
                 learning_rate:
                   - _obj_
-                  - _addr_: linear_decay_after
-                    _file_: examples/flax/optimizers.py
+                  - _addr_: optax.linear_schedule
                   - _call_:
+                      end_value: 0.0
                       _jinja_yaml_: |-
+                        {% if epochs <= decay_epoch %}
+                        {{ "epochs ({}) must be greater than decay_epoch ({}), or the rate never decays.".format(epochs, decay_epoch) | raise_error }}
+                        {% endif %}
                         init_value: {{lr}}
-                        epochs: {{epochs}}
-                        decay_epoch: {{decay_epoch}}
-                        steps_per_epoch: {{steps_per_epoch}}
-                        offset: {{offset}}
+                        transition_steps: {{(epochs - decay_epoch) * steps_per_epoch}}
+                        transition_begin: {{(decay_epoch - offset) * steps_per_epoch}}
                 _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
     EXTRA: {}
     FLOW:
@@ -125,15 +130,13 @@ LEARNERS:
             - _call_:
                 learning_rate:
                   - _obj_
-                  - _addr_: linear_decay_after
-                    _file_: examples/flax/optimizers.py
+                  - _addr_: optax.linear_schedule
                   - _call_:
+                      end_value: 0.0
                       _jinja_yaml_: |-
                         init_value: {{lr}}
-                        epochs: {{epochs}}
-                        decay_epoch: {{decay_epoch}}
-                        steps_per_epoch: {{steps_per_epoch}}
-                        offset: {{offset}}
+                        transition_steps: {{(epochs - decay_epoch) * steps_per_epoch}}
+                        transition_begin: {{(decay_epoch - offset) * steps_per_epoch}}
                 _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
     EXTRA: {}
     FLOW:
@@ -158,15 +161,13 @@ LEARNERS:
             - _call_:
                 learning_rate:
                   - _obj_
-                  - _addr_: linear_decay_after
-                    _file_: examples/flax/optimizers.py
+                  - _addr_: optax.linear_schedule
                   - _call_:
+                      end_value: 0.0
                       _jinja_yaml_: |-
                         init_value: {{lr}}
-                        epochs: {{epochs}}
-                        decay_epoch: {{decay_epoch}}
-                        steps_per_epoch: {{steps_per_epoch}}
-                        offset: {{offset}}
+                        transition_steps: {{(epochs - decay_epoch) * steps_per_epoch}}
+                        transition_begin: {{(decay_epoch - offset) * steps_per_epoch}}
                 _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
     EXTRA: {}
     FLOW:

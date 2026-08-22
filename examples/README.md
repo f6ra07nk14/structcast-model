@@ -9,7 +9,6 @@ Two ways to build the same training program, plus the integrations a configurati
 | [`torch/data.py`](torch/data.py)                 | timm dataset and dataloader wrappers, referenced from YAML by file path   |
 | [`torch/corpus.py`](torch/corpus.py)             | A character-level text corpus, referenced from the CLI by file path       |
 | [`flax/simple_training.py`](flax/simple_training.py) | The same tutorial against the Flax trainer, run standalone or by `scm flax train` |
-| [`flax/optimizers.py`](flax/optimizers.py)       | optax schedules written in epochs, referenced from YAML by file path      |
 | [`flax/data.py`](flax/data.py)                   | A `tf.data` input pipeline, referenced from YAML by file path             |
 | [`flax/corpus.py`](flax/corpus.py)               | The same character-level corpus, as NumPy batches                         |
 | [`keras/simple_training.py`](keras/simple_training.py) | A complete Keras training program written by hand, run standalone or by `scm keras train` |
@@ -351,29 +350,52 @@ transformation — the generated step reads its applied count off the outermost 
 window buried inside `optax.chain` would accumulate identically and still report an update every
 step. `CLIP` is torch-only too: clipping is an `optax.clip_by_global_norm` at the head of the chain.
 
-[`flax/optimizers.py`](flax/optimizers.py) is much shorter than its torch twin, and deliberately:
-optax already ships `chain`, `adamw`, `clip_by_global_norm` and `MultiSteps`, and `nnx.Optimizer`
-only binds the result to a module, so no wrapper class is needed. What optax does not do is count
-epochs, so the two helpers there convert a recipe written in epochs into a schedule over optimizer
-applies. They are not the same curve as their torch counterparts, only the same envelope: a torch
-scheduler holds one rate for a whole epoch, an optax schedule is read on every update, so the two
-agree exactly at epoch boundaries and drift inside an epoch. It is also why the CycleGAN learner
-takes a `steps_per_epoch` parameter the torch one does not — an unguarded number; set it to the
-"Training dataset size" the command prints before the first epoch.
+There is no `examples/flax/optimizers.py`, and that absence is the point. optax already ships
+`chain`, `adamw`, `clip_by_global_norm`, `MultiSteps` and every schedule a recipe needs, and
+`flax.nnx.Optimizer` only binds the result to a module — so where the torch side needs a wrapper
+class to marry an optimizer to a scheduler, the Flax side writes the whole thing in the template:
+
+```yaml
+learning_rate:
+  - _obj_
+  - _addr_: optax.linear_schedule
+  - _call_:
+      end_value: 0.0
+      _jinja_yaml_: |-
+        init_value: {{lr}}
+        transition_steps: {{(epochs - decay_epoch) * steps_per_epoch}}
+        transition_begin: {{(decay_epoch - offset) * steps_per_epoch}}
+```
+
+The one thing optax does not do is count epochs: its schedules are functions of the update count,
+so `cfg/flax/learners/CycleGAN.yaml` takes a `steps_per_epoch` parameter and does the conversion in
+jinja. Nothing checks that number against the run — set it to the "Training dataset size" the
+command prints before the first epoch, divided by the accumulation window if one is configured. The
+result is not the same curve as the torch `LambdaLR`, only the same envelope: torch steps once per
+epoch and holds one rate for all of it, an optax schedule is read on every update and falls
+continuously, so the two agree exactly at epoch boundaries and drift inside an epoch.
 
 [`flax/data.py`](flax/data.py) is a `tf.data` pipeline: resize, then a random crop and flip while
 training or a central crop while evaluating, then normalization — all on CPU threads. Constructing
-a loader takes every GPU out of TensorFlow's sight, so it never reserves the memory JAX needs;
+a loader takes every GPU out of TensorFlow's sight so it never reserves the memory JAX needs;
 importing the module does not, because importing is something a test collector may do incidentally.
 The draws are stateless and keyed by each item's position in the shuffled stream, so epochs differ
 while a seed still replays a whole run. There is no epoch hook and no rank sharding: `tf.data`
-reshuffles by itself, and JAX is single-controller, so the strategy splits each batch across the
-mesh. Leaving `name` empty serves a deterministic synthetic split, which makes the file runnable
-with no download and no `tensorflow_datasets` installed.
+reshuffles by itself, and the strategy is the only thing that splits a batch.
 
-[`flax/corpus.py`](flax/corpus.py) is the same Tiny Shakespeare corpus as NumPy: no device
-placement and no `DistributedSampler`, since the trainer places batches itself and one process
-reads the whole batch.
+A dataset `name` is required — there is no synthetic fallback and no placeholder to train on by
+accident — and it is loaded through `tensorflow_datasets`, which is not a dependency of this
+package: `uv pip install tensorflow-datasets`, or point `--training-dataset` at a dataset object of
+your own, since the training loop takes any iterable of dictionaries. The loader's items come from
+one `cached_property`, `source`, so a caller that already has a `tf.data.Dataset` replaces it and
+nothing downloads anything.
+
+[`flax/corpus.py`](flax/corpus.py) is the same Tiny Shakespeare corpus as NumPy batches, with no
+device placement and — deliberately — no `DistributedSampler`. The torch twin shards per rank
+because `torchrun` starts one process per rank and each must be handed a different slice of the
+epoch. JAX is single-controller: one process reads the whole batch and the strategy splits it
+across the mesh. A loader that also sharded per rank would double-shard, and most of the epoch
+would never be trained on.
 
 ## The Keras side
 
@@ -424,7 +446,9 @@ back to TensorFlow operations when a `tf.data` pipeline traces them, so one pipe
 any backend, while a layer built into the model would augment whatever loads that model afterwards.
 Building the pipeline therefore needs `tensorflow` installed even for a `jax` or `torch` run. The
 batches leave as NumPy, keyed by `image_key` and `label_key` — which is where a learner whose inputs
-are named differently is served. `dataset: synthetic` downloads nothing.
+are named differently is served. `dataset` is required and names a `keras.datasets` set — there is no synthetic fallback and no
+placeholder to train on by accident. The arrays arrive through one module-level `load_arrays`, so a
+caller who already has their own images replaces that function and nothing downloads anything.
 
 [`keras/optimizers.py`](keras/optimizers.py) exists for one knob: weight-decay exemptions are
 configured by `optimizer.exclude_from_weight_decay(...)` after construction and before the optimizer
@@ -437,3 +461,14 @@ scales and lookup tables" rule.
 `keras.layers.MultiHeadAttention(use_causal_mask=true)` owns its projections — so unlike the torch
 twin there is no attention section, and positions come from a learned table whose `max_seq_len`
 rows bound the longest sequence the model runs.
+
+Both Keras loaders shard per rank when `RANK` and `WORLD_SIZE` are set, and serve the whole stream
+when they are not — read from the environment rather than from a framework, because the file must
+not import one. Only the torch Keras backend is multi-process, and there `torchrun` starts one
+process per rank: an unsharded loader would hand every rank the same epoch, which completes, lowers
+the loss, and is wrong. On tensorflow and jax the run is a single process whose strategy splits
+each batch across the replicas itself, so sharding in the loader as well would give each replica a
+shard of a shard. The tail the world size does not divide is dropped, so every rank sees the same
+number of batches. `keras/data.py` shards before its shuffle, so a rank's items are fixed for the
+run and only their order changes — `DistributedSampler` without `set_epoch`, as in the torch twin;
+`keras/corpus.py` shards after, so a rank's items change each epoch.

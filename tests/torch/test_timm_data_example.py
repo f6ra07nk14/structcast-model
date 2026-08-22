@@ -322,6 +322,42 @@ def test_timm_dataloader_wrapper_dataloader_with_aug_splits(image_folder: Path) 
     assert isinstance(wrapper.dataset_wrapper, AugMixDataset)
 
 
+def _distributed_wrapper(image_folder: Path) -> Any:
+    """A wrapper that believes it is running distributed, so timm builds a sharding sampler."""
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        **_LOADER_BASE_KWARGS,
+    )
+    wrapper.__dict__["distributed"] = True
+    return wrapper
+
+
+def test_timm_dataloader_shards_on_the_data_coordinates_rather_than_the_global_rank(
+    image_folder: Path, single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`create_loader` shards on the global rank, which `scm torch train`'s coordinates override.
+
+    Under a tensor-parallel strategy the ranks of one group split a single model and must be fed
+    the identical batch: the sampler timm builds hands each of them a different slice instead,
+    which trains a mismatched model rather than failing. Without the variables -- a standalone run,
+    or a plain `torchrun` -- timm's own sampler is left alone, which is what DDP needs.
+    """
+    monkeypatch.setenv("DATA_RANK", "1")
+    monkeypatch.setenv("DATA_WORLD_SIZE", "2")
+    published = _distributed_wrapper(image_folder).dataloader.sampler
+
+    # The process group is rank 0 of 1; the published coordinates are what the sampler must use.
+    assert (published.rank, published.num_replicas) == (1, 2)
+    assert len(published) == 4  # half of the 8 images
+
+    monkeypatch.delenv("DATA_RANK")
+    monkeypatch.delenv("DATA_WORLD_SIZE")
+    fallback = _distributed_wrapper(image_folder).dataloader.sampler
+
+    assert (fallback.rank, fallback.num_replicas) == (0, 1)
+    assert len(fallback) == 8
+
+
 def test_timm_dataloader_wrapper_len(image_folder: Path) -> None:
     """__len__ delegates to the underlying dataloader."""
     wrapper = TimmDataLoaderWrapper(

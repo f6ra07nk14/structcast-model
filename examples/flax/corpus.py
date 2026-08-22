@@ -16,10 +16,20 @@ Every batch is `{"tokens": ..., "targets": ...}` of shape `[batch, block_size]`,
 passes those to the learner as keyword arguments -- which is why the keys match the inputs of
 `cfg/flax/learners/SmallLanguageModel.yaml`.
 
-This is the twin of `examples/torch/corpus.py`, minus two things the Flax side does not need: the
-batches are NumPy arrays and stay on the host, because `scm flax train` places every batch on the
-strategy's mesh itself, and there is no distributed sampler, because JAX is single-controller --
-one process reads the whole batch and the strategy splits it across the devices.
+This is the twin of `examples/torch/corpus.py`, minus two things the Flax side must not do.
+
+The batches are NumPy arrays and stay on the host: `scm flax train` places every batch on the
+strategy's mesh itself, so a loader that moved them onto a device first would only add a transfer
+the placement then undoes.
+
+And there is no rank sharding, by design. The torch twin wraps its dataset in a
+`DistributedSampler` because `torchrun` starts one process per rank and each of them must be handed
+a different slice of the epoch. JAX is single-controller: one process reads the whole batch and
+`FlaxDistributedStrategy.shard_batch` splits it across the mesh along its leading dimension. A
+loader that also sharded per rank would double-shard -- each device would see a slice of a slice,
+the effective batch would be the configured one divided by the device count squared, and most of
+the epoch would never be trained on. So the loader hands over whole batches and lets the strategy
+be the only thing that splits them.
 """
 
 from collections.abc import Iterator
@@ -106,9 +116,10 @@ class TinyShakespeare(BaseModel):
 class TinyShakespeareLoader(BaseModel):
     """Batches `TinyShakespeare` into NumPy arrays the trainer hands straight to the learner.
 
-    Deliberately not a `torch.utils.data.DataLoader` equivalent: there are no workers and no
-    sampler, because the whole epoch is one contiguous int32 array already in memory and slicing it
-    costs less than handing slices to a worker would. The shuffle order is drawn from one generator
+    Deliberately not a `torch.utils.data.DataLoader` equivalent: there are no workers, because the
+    whole epoch is one contiguous int32 array already in memory and slicing it costs less than
+    handing slices to a worker would, and no sampler, because the strategy is what splits a batch
+    across the devices (see the module docstring). The shuffle order is drawn from one generator
     seeded with `seed`, so a whole run is reproducible while every epoch sees a different order.
     """
 

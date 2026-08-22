@@ -20,6 +20,7 @@ which is why the keys match the inputs of `cfg/torch/learners/SmallLanguageModel
 
 from collections.abc import Iterator
 from functools import cached_property
+import os
 from pathlib import Path
 from typing import Any, Literal
 from urllib.request import urlretrieve
@@ -38,6 +39,23 @@ CORPUS_PATH = Path("data/tinyshakespeare.txt")
 
 TRAIN_FRACTION = 0.9
 """Fraction of the corpus used for training, the remainder being the validation split."""
+
+
+def data_shard() -> tuple[int | None, int | None]:
+    """The `rank` and `num_replicas` a sampler must shard on, both None when nothing published them.
+
+    `scm torch train` puts the run's coordinates on the *data* axis of the device mesh into
+    `DATA_RANK` and `DATA_WORLD_SIZE`, because a dataset is instantiated from its own pattern and
+    the CLI hands it nothing. They are the global rank and world size under DDP and FSDP2, but not
+    under a tensor-parallel strategy: the ranks of one tensor-parallel group split a single model
+    and must therefore read the identical slice of the dataset. Nothing publishes them in a
+    standalone run or under a plain `torchrun`, and None is what a sampler already reads as "take
+    the process group's rank and size".
+    """
+    rank, world_size = os.environ.get("DATA_RANK"), os.environ.get("DATA_WORLD_SIZE")
+    if rank is None or world_size is None:
+        return None, None
+    return int(rank), int(world_size)
 
 
 class TinyShakespeare(BaseModel):
@@ -106,6 +124,9 @@ class TinyShakespeareLoader(BaseModel):
     `DataLoader` would leave batches on the CPU and feed every rank the same items. Under
     distributed execution the shuffle order repeats every epoch (nothing calls
     `DistributedSampler.set_epoch`), which this example accepts.
+
+    The two coordinates are not the same one: batches land on the *local* rank's device, while the
+    shard comes from `data_shard`, which under a tensor-parallel strategy is not the global rank.
     """
 
     block_size: int = 256
@@ -138,9 +159,12 @@ class TinyShakespeareLoader(BaseModel):
 
     @cached_property
     def dataloader(self) -> "torch.utils.data.DataLoader[dict[str, Tensor]]":
-        """The underlying loader, sharded with a `DistributedSampler` when ranks exist."""
+        """The underlying loader, sharded with a `DistributedSampler` on the run's data coordinates."""
+        rank, num_replicas = data_shard()
         sampler = (
-            torch.utils.data.distributed.DistributedSampler(self.dataset, shuffle=self.shuffle)
+            torch.utils.data.distributed.DistributedSampler(
+                self.dataset, shuffle=self.shuffle, rank=rank, num_replicas=num_replicas
+            )
             if self.distributed_results["distributed"]
             else None
         )

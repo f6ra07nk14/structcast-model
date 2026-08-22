@@ -6,18 +6,16 @@ PARAMETERS:
     # name, e.g. -p "DEFAULT: {split: test}" for a dataset whose evaluation split is called that.
     split: null
     batch_size: 128
-    # A "tensorflow_datasets" name, e.g. "cifar10". Empty serves the deterministic synthetic split
-    # of "examples/flax/data.py", which needs neither a download nor the tensorflow_datasets package.
-    dataset: ""
+    # Required: the "tensorflow_datasets" name to load, e.g. -p "DEFAULT: {dataset: cifar10}".
+    # The catalogue is at https://www.tensorflow.org/datasets/catalog.
+    dataset: null
     dataset_dir: data
     download: false
-    num_classes: 1000
     image_size: 224
     image_dtype: float32 # "float32", "float16", or "bfloat16"
     crop_pct: 0.875 # images are resized to image_size / crop_pct before being cropped
     hflip: true # random horizontal flip, training split only
     seed: 42
-    synthetic_samples: 256 # size of the synthetic split, ignored once "dataset" names a real one
 _obj_:
   - _addr_: TFDataLoader
     _file_: examples/flax/data.py
@@ -32,6 +30,9 @@ _obj_:
       # A batch is split across the strategy's mesh, so a short final batch would not divide.
       drop_remainder: true
       _jinja_yaml_: |-
+        {% if dataset is none %}
+        {{ 'A dataset is required, e.g. -p "DEFAULT: {dataset: cifar10}".' | raise_error }}
+        {% endif %}
         name: "{{dataset}}"
         split: {{split if split is not none else ("train" if training else "validation")}}
         data_dir: {{dataset_dir}}
@@ -43,5 +44,3 @@ _obj_:
         crop_pct: {{crop_pct}}
         hflip: {{hflip}}
         seed: {{seed}}
-        num_classes: {{num_classes}}
-        synthetic_samples: {{synthetic_samples}}

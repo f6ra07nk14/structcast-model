@@ -15,6 +15,10 @@ _obj_:
     - {dataset: cifar10, training: true, batch_size: 32, image_size: [32, 32]}
 ```
 
+The arrays come from `keras.datasets`, downloaded once into the Keras cache directory, through the
+module-level `load_arrays` below -- which is also where a corpus of your own is plugged in, without
+touching the pipeline.
+
 Augmentation happens here, in the `tf.data` pipeline, and never inside the model: Keras' image
 preprocessing layers fall back to TensorFlow operations when a `tf.data` pipeline traces them, so
 one pipeline feeds a run on any Keras backend, while a layer built into the model would augment
@@ -25,14 +29,11 @@ The batch keys are `image_key` and `label_key`, which is where a learner whose i
 differently is served. A `structcast` `FlexSpec` would be the other way to remap them, and it is
 deliberately not offered here: it compares each constructed value against a sentinel, which raises
 on a NumPy array.
-
-`dataset: synthetic` builds a deterministic, learnable set of arrays from `seed` and downloads
-nothing, which is what the tests use; the other names are `keras.datasets` sets, downloaded once
-into the Keras cache directory.
 """
 
 from collections.abc import Iterator
 from functools import cached_property
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -42,6 +43,39 @@ import tensorflow as tf
 import keras
 
 
+def load_arrays(dataset: str, training: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Load one split of a `keras.datasets` set as (uint8 images, int64 labels).
+
+    The single seam between the pipeline below and where its arrays come from: point it at your own
+    corpus and everything downstream -- the sharding, the augmentation, the batching -- is unchanged.
+
+    Args:
+        dataset (str): Name of a set in `keras.datasets`, e.g. `cifar10`.
+        training (bool): Whether to return the training split rather than the test split.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: The images as `(n, height, width, channels)` and the labels
+            as `(n,)`.
+    """
+    train, validation = getattr(keras.datasets, dataset).load_data()
+    images, labels = train if training else validation
+    # MNIST arrives as (n, 28, 28) and the others as (n, 32, 32, 3); this gives both a channel axis.
+    return images.reshape(*images.shape[:3], -1).astype("uint8"), labels.reshape(-1).astype("int64")
+
+
+def rank_and_world() -> tuple[int, int]:
+    """Return this process's rank and the number of processes in the launch, or `(0, 1)`.
+
+    Read from `RANK` and `WORLD_SIZE` rather than from a framework, because those are what a
+    launcher sets and this file must not import one: only the torch Keras backend runs multi-process
+    at all, and the pipeline has to keep working on the other two.
+
+    Returns:
+        tuple[int, int]: The rank and the world size.
+    """
+    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+
+
 class KerasImageData(BaseModel):
     """A `tf.data` pipeline yielding dictionary batches keyed by the model's input names.
 
@@ -49,8 +83,8 @@ class KerasImageData(BaseModel):
     usable on the `jax` and `torch` backends.
     """
 
-    dataset: Literal["synthetic", "mnist", "cifar10", "cifar100"] = "synthetic"
-    """The source of the arrays: a deterministic synthetic set, or a `keras.datasets` set."""
+    dataset: Literal["mnist", "cifar10", "cifar100"]
+    """The `keras.datasets` set to read. Required: a default would download something unasked."""
 
     training: bool = False
     """Whether this is the training split: it is shuffled and augmented, the other one is not."""
@@ -62,23 +96,14 @@ class KerasImageData(BaseModel):
     """The (height, width) the model sees.
 
     A training image larger than this is randomly cropped to it and a validation image is resized to
-    it, the usual pair; the synthetic set is generated at exactly this size.
+    it, the usual pair.
     """
-
-    image_channels: int = 3
-    """Channels of the synthetic images; a `keras.datasets` set brings its own."""
-
-    num_classes: int = 10
-    """Number of classes of the synthetic set; a `keras.datasets` set brings its own."""
-
-    samples: int = 1024
-    """Number of synthetic items to build, ignored for a `keras.datasets` set."""
 
     crop_padding: int = 4
     """Pixels of zero padding added on each side before the random crop; 0 disables the crop."""
 
     seed: int = 42
-    """Seed of the synthetic arrays, of the shuffle and of the augmentation draws."""
+    """Seed of the shuffle and of the augmentation draws."""
 
     image_key: str = "image"
     """The batch key the images are stored under, i.e. the model input they feed."""
@@ -88,21 +113,27 @@ class KerasImageData(BaseModel):
 
     @cached_property
     def arrays(self) -> tuple[np.ndarray, np.ndarray]:
-        """The whole split as (uint8 images, int64 labels), built or loaded once."""
-        if self.dataset == "synthetic":
-            return self._synthetic()
-        train, validation = getattr(keras.datasets, self.dataset).load_data()
-        images, labels = train if self.training else validation
-        # MNIST arrives as (n, 28, 28) and the others as (n, 32, 32, 3); this gives both a channel axis.
-        return images.reshape(*images.shape[:3], -1).astype("uint8"), labels.reshape(-1).astype("int64")
+        """This process's share of the split, as (uint8 images, int64 labels), loaded once.
 
-    def _synthetic(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build a learnable classification set: one random image per class, plus per-item noise."""
-        rng = np.random.default_rng(self.seed)
-        patterns = rng.random((self.num_classes, *self.image_size, self.image_channels))
-        labels = rng.integers(0, self.num_classes, self.samples)
-        noise = rng.normal(scale=0.1, size=(self.samples, *self.image_size, self.image_channels))
-        return (np.clip(patterns[labels] + noise, 0.0, 1.0) * 255.0).astype("uint8"), labels.astype("int64")
+        Under a multi-process launch each rank takes every `WORLD_SIZE`-th item starting at its own
+        rank, so the shards are disjoint and every rank sees the same number of batches; the tail
+        the world size does not divide is dropped, as `DistributedSampler` plus `drop_last` does on
+        the torch side. Which items a rank owns is fixed for the whole run and only their order is
+        reshuffled each epoch -- the same thing `DistributedSampler` does when nobody calls
+        `set_epoch`, and what the torch example accepts too. `examples/keras/corpus.py` shards after
+        its shuffle instead, so there a rank's items do change between epochs.
+
+        Outside such a launch -- the tensorflow and jax backends, and any single-process run --
+        every rank is rank 0 and the whole split is served. That is not an oversight: those backends
+        run one process and the distributed strategy splits each batch across the replicas itself,
+        so a loader that sharded here as well would hand each replica a shard of a shard.
+        """
+        images, labels = load_arrays(self.dataset, self.training)
+        rank, world = rank_and_world()
+        if world > 1:
+            usable = len(labels) - len(labels) % world
+            images, labels = images[rank:usable:world], labels[rank:usable:world]
+        return images, labels
 
     @cached_property
     def augmentation(self) -> list[keras.layers.Layer]:
@@ -135,7 +166,7 @@ class KerasImageData(BaseModel):
 
     @cached_property
     def pipeline(self) -> tf.data.Dataset:
-        """The batched, augmented and prefetched pipeline over this split."""
+        """The batched, augmented and prefetched pipeline over this process's share of the split."""
         images, labels = self.arrays
         data = tf.data.Dataset.from_tensor_slices((images, labels))
         if self.training:
@@ -144,7 +175,7 @@ class KerasImageData(BaseModel):
         return data.map(self._prepare, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
 
     def __len__(self) -> int:
-        """Number of batches in one epoch, the short final batch being dropped."""
+        """Number of batches one rank sees per epoch, the short final batch being dropped."""
         return len(self.arrays[1]) // self.batch_size
 
     def __iter__(self) -> Iterator[dict[str, Any]]:

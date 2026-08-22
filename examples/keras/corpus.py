@@ -17,14 +17,13 @@ Every batch is `{"tokens": ..., "targets": ...}` of `[batch, block_size]` NumPy 
 trainer passes them to the learner as keyword arguments -- which is why the keys match the inputs of
 `cfg/keras/learners/SmallLanguageModel.yaml`.
 
-The loader is single-stream: it hands the whole batch to the trainer and the distributed strategy
-splits it across the replicas, which is what `keras.distribution` on jax and
-`tf.distribute.MirroredStrategy` on tensorflow do. Under a torchrun launch on the torch backend the
-loader owns each rank's slice instead, so that case needs a rank-aware loader of its own.
+Under a multi-process launch the loader hands each rank its own shard; in a single process it hands
+over the whole stream. See `TinyShakespeareLoader.__iter__` for why both are right.
 """
 
 from collections.abc import Iterator
 from functools import cached_property
+import os
 from pathlib import Path
 from typing import Any, Literal
 from urllib.request import urlretrieve
@@ -40,6 +39,19 @@ CORPUS_PATH = Path("data/tinyshakespeare.txt")
 
 TRAIN_FRACTION = 0.9
 """Fraction of the corpus used for training, the remainder being the validation split."""
+
+
+def rank_and_world() -> tuple[int, int]:
+    """Return this process's rank and the number of processes in the launch, or `(0, 1)`.
+
+    Read from `RANK` and `WORLD_SIZE` rather than from a framework, because those are what a
+    launcher sets and this file must not import one: only the torch Keras backend runs multi-process
+    at all, and the loader has to keep working on the other two.
+
+    Returns:
+        tuple[int, int]: The rank and the world size.
+    """
+    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
 
 class TinyShakespeare(BaseModel):
@@ -133,15 +145,33 @@ class TinyShakespeareLoader(BaseModel):
         return np.random.default_rng(self.seed)
 
     def __len__(self) -> int:
-        """Number of batches per epoch."""
-        items = len(self.dataset)
+        """Number of batches one rank sees per epoch."""
+        _, world = rank_and_world()
+        items = len(self.dataset) // world
         return items // self.batch_size if self.drop_last else -(-items // self.batch_size)
 
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
-        """The batches of one epoch, as `{"tokens": ..., "targets": ...}` NumPy arrays."""
+        """The batches of one epoch, as `{"tokens": ..., "targets": ...}` NumPy arrays.
+
+        Under a multi-process launch each rank takes every `WORLD_SIZE`-th item of the shuffled
+        order starting at its own rank, so the shards are disjoint, cover the split between them and
+        are the same length; the tail the world size does not divide is dropped, as
+        `DistributedSampler` plus `drop_last` does on the torch side. The order itself is drawn from
+        a generator every rank seeds and advances identically, which is what keeps the shards from
+        overlapping -- and it is redrawn each epoch, so a rank does not see the same items every
+        time (the torch twin, which never calls `DistributedSampler.set_epoch`, does).
+
+        Outside such a launch -- the tensorflow and jax backends, and any single-process run --
+        every rank is rank 0 and the whole split is served. That is not an oversight: those backends
+        run one process and the distributed strategy splits each batch across the replicas itself,
+        so a loader that sharded here as well would hand each replica a shard of a shard.
+        """
         order = np.arange(len(self.dataset))
         if self.shuffle:
             self._generator.shuffle(order)
+        rank, world = rank_and_world()
+        if world > 1:
+            order = order[rank : len(order) - len(order) % world : world]
         tokens = self.dataset.tokens
         for start in range(0, len(self) * self.batch_size, self.batch_size):
             offsets = order[start : start + self.batch_size] * self.block_size
