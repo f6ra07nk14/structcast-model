@@ -297,7 +297,7 @@ def _assemble_learner(
     # Flow functions compile only on a single device: distributed wrappers graph-break inside the
     # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
     # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
-    if hasattr(learner, "flow_functions") and not distributed:
+    if not distributed:
         for flow_name in list(learner.flow_functions):
             setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), compile_kw))
     return models, learner, learner_outputs, tracker

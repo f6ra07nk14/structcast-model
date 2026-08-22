@@ -318,7 +318,7 @@ class KerasDistributedStrategy:
             # re-traced below inside the one graph that wraps the replicated call. `flow_functions`
             # is what a learner exposes for exactly this rebinding (as in `cmd_flax`), and what the
             # check below requires here.
-            for name in getattr(learner, "flow_functions", ()):
+            for name in learner.flow_functions:
                 traced = getattr(learner, name)
                 if hasattr(traced, "python_function"):
                     setattr(learner, name, traced.python_function)
@@ -330,7 +330,7 @@ class KerasDistributedStrategy:
             # already treats it: a hand-written learner has none and scales its own loss.
             for segment in getattr(learner, "_segments", ()):
                 segment.flow = _mean_flow(segment.flow, self.replicas)
-            flows = list(getattr(learner, "flow_functions", ()))
+            flows = list(learner.flow_functions)
             if flows:
                 # The generated learner's public steps stay eager: `training_step` owns the host
                 # counters and reads the optimizer counter back after the step (`docs/adr/0018`),

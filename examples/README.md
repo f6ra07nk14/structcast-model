@@ -198,7 +198,7 @@ How the CLI maps onto the objects of the tutorial:
 | Tutorial                       | CLI                                                                       |
 | ------------------------------ | ------------------------------------------------------------------------- |
 | `SimpleLearner(model)`         | `--learner/-L` pattern, called with the models the command instantiated    |
-| `SimpleLearner.flow_functions` | `--compile/-c`, rebinding every listed flow with its compiled wrapper      |
+| `SimpleLearner.flow_functions` | `--compile/-c` (single-device), rebinding flows with compiled wrappers     |
 | `track`                        | `TorchTracker`, built from the learner's `outputs` or `--learner-outputs`  |
 | `SimpleDataProvider(...)`      | `--training-dataset` and `--validation-dataset/-V`, composed into one      |
 | `Printer()`                    | `ProgressBar`, or `Printer` when `--ci` is given                           |
