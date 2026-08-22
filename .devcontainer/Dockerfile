@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     pkg-config \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     ripgrep \
