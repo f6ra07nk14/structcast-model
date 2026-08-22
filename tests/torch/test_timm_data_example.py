@@ -14,6 +14,7 @@ from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 
 from structcast_model.base_trainer import BaseInfo, DataProvider, SimpleDataProvider
 from structcast_model.torch.trainer import TorchTracker, TorchTrainer
+from tests.fakes import CountingLearner
 import torch
 
 
@@ -32,30 +33,6 @@ _EXAMPLE = _load_example_module()
 TimmDatasetWrapper = _EXAMPLE.TimmDatasetWrapper
 TimmDataLoaderWrapper = _EXAMPLE.TimmDataLoaderWrapper
 TimmDataProvider = _EXAMPLE.TimmDataProvider
-
-
-class _StubLearner:
-    """A minimal stub implementing the Learner protocol, for the trainer routing test."""
-
-    models: dict[str, Any] = {}
-    optimizers: dict[str, Any] = {}
-    optimizer_models: dict[str, list[str]] = {}
-    flow_functions: dict[str, Any] = {}
-    learning_rates: dict[str, float] = {}
-    steps: int = 0
-    updates: int = 0
-    has_updated: bool = True
-
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Nothing to seed: the routing test never resumes."""
-
-    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op training step."""
-        return {}
-
-    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op inference step."""
-        return {}
 
 
 def _populate_image_folder(root: Path, *, num_classes: int = 2, images_per_class: int = 4) -> Path:
@@ -276,7 +253,7 @@ def test_timm_dataloader_is_routed_into_the_epoch_events_by_the_trainer() -> Non
     """The renamed hooks are what let the trainer pick the dataset up from the provider scan."""
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(),
+        learner=CountingLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=SimpleDataProvider(training_dataset=_training_wrapper()),
     )
@@ -494,7 +471,7 @@ def test_timm_data_provider_wrappers_are_routed_into_the_epoch_events_by_the_tra
     """
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(),
+        learner=CountingLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=TimmDataProvider(training=_training_wrapper(), validation=TimmDataLoaderWrapper()),
     )

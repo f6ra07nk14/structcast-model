@@ -21,6 +21,7 @@ from structcast_model.keras.trainer import (
     initial_model,
 )
 from structcast_model.keras.utils import get_keras_device
+from tests.fakes import CountingLearner
 
 
 def test_create_numpy_inputs_from_int_tuple_returns_array() -> None:
@@ -223,47 +224,17 @@ def test_get_keras_device_invalid_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _StubLearner:
+class _StubLearner(CountingLearner):
     """A minimal Learner reporting one criterion, so the loop can run without a generated learner."""
 
     def __init__(self, loss: float = 1.0) -> None:
         """Report *loss* from every step."""
+        super().__init__()
         self.loss = loss
-        self.learning_rates: dict[str, float] = {}
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
-
-    @property
-    def models(self) -> dict[str, Any]:
-        """No models: the tracker and the event routing are what these tests drive."""
-        return {}
-
-    @property
-    def optimizers(self) -> dict[str, Any]:
-        """No optimizers."""
-        return {}
-
-    @property
-    def optimizer_models(self) -> dict[str, list[str]]:
-        """No pairing."""
-        return {}
-
-    @property
-    def flow_functions(self) -> dict[str, Any]:
-        """No separable flows: these tests drive the loop, never a strategy."""
-        return {}
-
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Count the Step as one Update and report the current loss as a backend tensor."""
-        self.steps += 1
-        self.updates += 1
-        self.has_updated = True
+        self.count_step()
         return {"loss": keras.ops.convert_to_tensor(self.loss)}
 
     def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:

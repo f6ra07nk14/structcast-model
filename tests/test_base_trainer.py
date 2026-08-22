@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
 from functools import partial
 from math import inf
 from typing import Any, Literal
@@ -23,6 +22,7 @@ from structcast_model.base_trainer import (
     get_dataset,
     get_dataset_size,
 )
+from tests.fakes import CountingLearner, SteppedInfo
 
 # ---------------------------------------------------------------------------
 # get_dataset
@@ -187,7 +187,7 @@ def test_trainer_models_read_the_learner_live() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeLearner:
+class _FakeLearner(CountingLearner):
     """Minimal Learner implementation producing deterministic criteria."""
 
     def __init__(
@@ -197,33 +197,30 @@ class _FakeLearner:
         inference_loss: float = 0.3,
         optimizers: Mapping[str, Any] | None = None,
     ) -> None:
-        self._should_update = should_update
+        super().__init__()
+        self.should_update = should_update
         self._inference_loss = inference_loss
-        self.optimizers = dict(optimizers) if optimizers is not None else {}
-        self.optimizer_models: dict[str, list[str]] = {}
-        self.flow_functions: dict[str, Any] = {}
-        self.learning_rates = {"lr": 0.1}
+        self._optimizers = dict(optimizers) if optimizers is not None else {}
         self.named_models: dict[str, Any] = {"model": "the-model"}
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
         """Return the named models every callback reads off the info."""
         return self.named_models
 
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
+    @property
+    def optimizers(self) -> dict[str, Any]:
+        """Return the optimizers the trainer scans for event protocols."""
+        return self._optimizers
+
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        """Return the rate a finished epoch is logged with."""
+        return {"lr": 0.1}
 
     def training_step(self, **inputs: Any) -> dict[str, Any]:
         """Count the Step, report whether it landed an Update, and return fixed training criteria."""
-        self.steps += 1
-        self.has_updated = self._should_update
-        if self.has_updated:
-            self.updates += 1
+        self.count_step()
         return {"loss": 0.5}
 
     def inference_step(self, **inputs: Any) -> dict[str, Any]:
@@ -313,36 +310,6 @@ def _make_trainer(
         training_prefix=training_prefix,
         validation_prefix=validation_prefix,
     )
-
-
-@dataclass(kw_only=True)
-class _InfoWithModels(BaseInfo[Any]):
-    """Info carrying models without a trainer, for callbacks tested outside a training loop."""
-
-    named_models: dict[str, Any] = field(default_factory=dict)
-    """The models the property hands out."""
-
-    @property
-    def models(self) -> dict[str, Any]:
-        """Return the models this info was built with."""
-        return self.named_models
-
-
-@dataclass(kw_only=True)
-class _SteppedInfo(BaseInfo[Any]):
-    """Info with a directly drivable step count, for criterion tests run outside a trainer.
-
-    ``BaseInfo.step`` is a read-only view of the learner's counter, so a test without a learner
-    overrides it with a settable source.
-    """
-
-    current_step: int = 0
-    """The step count the ``step`` property reports."""
-
-    @property
-    def step(self) -> int:
-        """Report the driven step, standing in for a trainer's learner-backed count."""
-        return self.current_step
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +666,7 @@ def test_best_criterion_tracks_the_best_value(
 ) -> None:
     """The best value survives regressions: that is what makes 'best' meaningful."""
     criterion: BestCriterion[Any] = BestCriterion(target="loss", mode=mode)
-    info = _SteppedInfo()
+    info = SteppedInfo()
     for epoch, value in enumerate(values, start=1):
         info.epoch = epoch
         info.current_step = epoch
@@ -724,7 +691,7 @@ def test_best_criterion_on_best_receives_info_best_and_models() -> None:
     """on_best participants get the criterion itself, so they can log or save by its value/step."""
     recorder = _BestRecorder()
     criterion = BestCriterion(target="loss", callbacks=[recorder])
-    info = _InfoWithModels(named_models={"model": "the-model"})
+    info = SteppedInfo(named_models={"model": "the-model"})
     info.epoch = 1
     info.history[1] = {"loss": 0.5}
     criterion.on_epoch_end(info)

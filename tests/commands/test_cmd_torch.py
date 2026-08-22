@@ -31,6 +31,7 @@ from structcast_model.loggers.base import NullLogger
 from structcast_model.torch.distributed import SingleDeviceStrategy
 from structcast_model.torch.trainer import TorchTrainer, initial_model, restore_training_state
 from tests import CFG_DIR, FIXTURES_DIR
+from tests.fakes import CountingLearner
 import torch
 import torch.distributed as dist
 
@@ -131,35 +132,26 @@ class _SimpleLoss(torch.nn.Module):
         return {"loss": torch.nn.functional.cross_entropy(logits, target)}
 
 
-class SimpleLearner:
+class SimpleLearner(CountingLearner):
     """Minimal learner implementing the Learner protocol with a real optimizer."""
 
     outputs: list[str] = ["loss", "acc"]
 
     def __init__(self, **models: torch.nn.Module) -> None:
         """Keep the models and build one optimizer over the first of them."""
+        super().__init__()
         self._models = models
         model = next(iter(models.values()))
         self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
         """Return models."""
         return self._models
 
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
-
     def training_step(self, **kwargs: Any) -> dict[str, Any]:
         """Count one step that always lands an update, returning fixed training criteria."""
-        self.steps += 1
-        self.updates += 1
-        self.has_updated = True
+        self.count_step()
         return {"loss": torch.tensor(0.5), "acc": torch.tensor(0.9)}
 
     def inference_step(self, **kwargs: Any) -> dict[str, Any]:
@@ -174,11 +166,6 @@ class SimpleLearner:
     @property
     def optimizer_models(self) -> dict[str, list[str]]:
         """Declare no pairing; these runs do not exercise sharded optimizer state."""
-        return {}
-
-    @property
-    def flow_functions(self) -> dict[str, Any]:
-        """Declare no separable flows: the whole step is written out by hand here."""
         return {}
 
     @property
@@ -204,7 +191,7 @@ class LearnerWithoutOutputs(SimpleLearner):
     outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
 
 
-class GradientLearner:
+class GradientLearner(CountingLearner):
     """Learner running one squared-error step and dumping the gradient it produced to disk.
 
     The command builds the learner with the models the strategy wrapped, so the gradient read here
@@ -216,46 +203,17 @@ class GradientLearner:
 
     def __init__(self, **models: torch.nn.Module) -> None:
         """Keep the models the command built."""
+        super().__init__()
         self._models = models
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
         """Return models."""
         return self._models
 
-    @property
-    def optimizers(self) -> dict[str, Any]:
-        """Return no optimizers: the run reads gradients, it never applies them."""
-        return {}
-
-    @property
-    def optimizer_models(self) -> dict[str, list[str]]:
-        """Return no pairing, there being no optimizer."""
-        return {}
-
-    @property
-    def flow_functions(self) -> dict[str, Any]:
-        """Return no separable flows: the whole step is written out by hand here."""
-        return {}
-
-    @property
-    def learning_rates(self) -> dict[str, float]:
-        """Return no learning rates, there being no optimizer."""
-        return {}
-
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
-
     def training_step(self, x: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         """Run one step and write the model's gradient, right after the backward, to `GRADIENT_DIR`."""
-        self.steps += 1
-        self.updates += 1
-        self.has_updated = True
+        self.count_step()
         model = self._models["model"]
         loss = ((model(x) - target) ** 2).sum()
         loss.backward()

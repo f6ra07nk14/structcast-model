@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 from typing import Any
 
@@ -23,6 +22,7 @@ from structcast_model.torch.trainer import (
     initial_distributed_env,
     initial_model,
 )
+from tests.fakes import CountingLearner, SteppedInfo
 import torch
 
 # ---------------------------------------------------------------------------
@@ -44,32 +44,7 @@ class _LossModule(Module):
         return {"loss": torch.tensor(0.5)}
 
 
-@dataclass(kw_only=True)
-class _InfoWithModels(BaseInfo[torch.nn.Module]):
-    """Info carrying models without a trainer, for callbacks tested outside a training loop.
-
-    ``BaseInfo.step`` is a read-only view of the learner's counter, so this learner-less info
-    overrides it with the settable ``current_step``.
-    """
-
-    named_models: dict[str, torch.nn.Module] = field(default_factory=dict)
-    """The models the property hands out."""
-
-    current_step: int = 0
-    """The step count the ``step`` property reports."""
-
-    @property
-    def models(self) -> dict[str, torch.nn.Module]:
-        """Return the models this info was built with."""
-        return self.named_models
-
-    @property
-    def step(self) -> int:
-        """Report the driven step, standing in for a trainer's learner-backed count."""
-        return self.current_step
-
-
-class _StubLearner:
+class _StubLearner(CountingLearner):
     """A minimal stub implementing the Learner protocol for tests that don't exercise a real step."""
 
     def __init__(
@@ -79,12 +54,10 @@ class _StubLearner:
         optimizers: dict[str, Any] | None = None,
     ) -> None:
         """Initialize with optional models, optimizers, and the learning rates a real learner would report."""
+        super().__init__()
         self._models = models or {}
         self._optimizers = optimizers or {}
-        self.learning_rates = learning_rates or {}
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
+        self._learning_rates = learning_rates or {}
 
     @property
     def models(self) -> dict[str, Any]:
@@ -102,25 +75,9 @@ class _StubLearner:
         return {name: list(self._models) for name in self._optimizers}
 
     @property
-    def flow_functions(self) -> dict[str, Any]:
-        """No separable flows: these tests never compile or replicate a step."""
-        return {}
-
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
-
-    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Count one step that always lands an update, returning no criteria."""
-        self.steps += 1
-        self.updates += 1
-        self.has_updated = True
-        return {}
-
-    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op inference step."""
-        return {}
+    def learning_rates(self) -> dict[str, float]:
+        """Return the learning rates a real learner would report."""
+        return self._learning_rates
 
 
 class _MetricModule(Module):
@@ -674,7 +631,7 @@ def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
     """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
     logger = _BestRecordingLogger()
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger, SingleDeviceStrategy(device="cpu"))
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
@@ -689,7 +646,7 @@ def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: lis
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], save_criteria, logger, SingleDeviceStrategy(device="cpu")
     )
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
@@ -702,7 +659,7 @@ def test_from_criteria_does_not_save_a_stale_best() -> None:
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], ["val_loss"], logger, SingleDeviceStrategy(device="cpu")
     )
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
     info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
@@ -722,7 +679,7 @@ def test_from_criteria_saves_the_states_the_strategy_produced() -> None:
     strategy = _RecordingStrategy()
     model = torch.nn.Linear(4, 2)
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger, strategy)
-    info = _InfoWithModels(named_models={"model": model})
+    info = SteppedInfo(named_models={"model": model})
     info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)

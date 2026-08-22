@@ -31,6 +31,7 @@ from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.flax.trainer import FlaxTrainer
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR, FIXTURES_DIR
+from tests.fakes import CountingLearner
 
 LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
 LEARNER_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "LinearLearner.yaml")
@@ -242,17 +243,14 @@ class PrebuiltModel(nnx.Module):
         return x
 
 
-class NamelessLearner:
+class NamelessLearner(CountingLearner):
     """A hand-written learner that trains but declares no criterion names, as the protocol allows."""
 
     def __init__(self, model: nnx.Module) -> None:
         """Keep *model* and the optimizer over it."""
+        super().__init__()
         self._models = {"model": model}
         self._optimizers = {"optimizer": nnx.Optimizer(model, tx=optax.sgd(0.1), wrt=nnx.Param)}
-        self.learning_rates = {"optimizer": 0.1}
-        self.steps = 0
-        self.updates = 0
-        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
@@ -270,23 +268,16 @@ class NamelessLearner:
         return {"optimizer": ["model"]}
 
     @property
-    def flow_functions(self) -> dict[str, Any]:
-        """No separable flows: the whole step is written out by hand here, so nothing is compiled."""
-        return {}
-
-    def restore_counters(self, steps: int, updates: int) -> None:
-        """Seed the counters, the way a resume path would."""
-        self.steps = steps
-        self.updates = updates
+    def learning_rates(self) -> dict[str, float]:
+        """The rate the optimizer was built with."""
+        return {"optimizer": 0.1}
 
     def training_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:
         """Take one plain gradient step, count it as one Update, and report the squared error."""
         model, optimizer = self._models["model"], self._optimizers["optimizer"]
         loss, grads = nnx.value_and_grad(lambda m: jnp.mean((m(x) - y) ** 2))(model)
         optimizer.update(model, grads)
-        self.steps += 1
-        self.updates += 1
-        self.has_updated = True
+        self.count_step()
         return {"loss": loss}
 
     def inference_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:
