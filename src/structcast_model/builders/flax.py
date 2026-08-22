@@ -479,7 +479,10 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         models_repr = ", ".join(f"{m!r}: self._models[{m!r}]" for m in self.models)
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
         # A pure host formula: `MultiSteps` gates the apply on the device, and this predicts it.
-        gate = f"return (step + 1) % {self._window} == 0" if self._window > 1 else "return True"
+        # The trainer increments its step before asking, so the 1-based step is the number of
+        # `optimizer.update` calls made once this one runs -- exactly the count `MultiSteps` gates
+        # on. `(step + 1)` here would fire one step before the on-device apply (`docs/adr/0017`).
+        gate = f"return step % {self._window} == 0" if self._window > 1 else "return True"
         body = [f"{name} = flax.nnx.List([{', '.join(owned)}])" for name, owned in self._module_lists.items()]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
         layers = [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]

@@ -113,6 +113,7 @@ def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> N
 
     The accumulation now lives inside the optimizer state on the device; the generated `update`
     bakes the same window as a host formula, so the two must agree on which step the apply lands.
+    Steps are fed 1-based, mirroring the trainer, which increments its counter before asking.
     """
     learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
         _model_type(tmp_path)(rngs=nnx.Rngs(0))
@@ -120,13 +121,13 @@ def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> N
     before = _parameters(learner.models["model"])
 
     gates = []
-    for step in range(3):
+    for step in range(1, 4):
         gates.append(learner.update(step))
         learner.training_step(x=X, y=Y)
         moved = not all(
             jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True)
         )
-        assert moved == (step == 2)
+        assert moved == (step == 3)
 
     assert gates == [False, False, True]
     assert not any(jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True))
@@ -373,33 +374,49 @@ class _UpdateRecorder:
         self.steps.append(info.step)
 
 
+class _MovementRecorder:
+    """A callback recording, per trainer step, whether the model's parameters moved."""
+
+    def __init__(self, model: nnx.Module) -> None:
+        """Snapshot the parameters the trainer is about to move."""
+        self.model = model
+        self.previous = jax.tree.leaves(jax.tree.map(jnp.copy, nnx.state(model, nnx.Param)))
+        self.moved_steps: list[int] = []
+
+    def on_training_step_end(self, info: Any) -> None:
+        """Record the step when any parameter changed since the previous step."""
+        current = jax.tree.leaves(jax.tree.map(jnp.copy, nnx.state(self.model, nnx.Param)))
+        if any(not jnp.array_equal(a, b) for a, b in zip(self.previous, current, strict=True)):
+            self.moved_steps.append(info.step)
+        self.previous = current
+
+
 def test_a_generated_accumulating_learner_updates_twice_over_six_trainer_steps(tmp_path: Path) -> None:
-    """The accumulation window is the learner's, and the trainer must see exactly its updates.
+    """The update event must land on the step the parameters actually move.
 
-    `BaseTrainer` asks the learner whether this step updates and counts the answer, so a window the
-    generated `update` got wrong -- one update too many, or a gate out of phase with the on-device
-    `MultiSteps` counter -- shows up here as an update count that no longer matches the configured
-    window. Six steps at three is the smallest run that closes two windows.
-
-    The events land on steps 2 and 5, not 3 and 6: the emitted gate is `(step + 1) % 3 == 0`, which
-    counts from zero, while the trainer's own step counter starts at one. The first window is
-    therefore one step short and every later one is exactly three. This is what the PyTorch learners
-    emit too (`builders/torch.py`), so it is asserted as parity rather than fixed here.
+    `on_update` consumers (a per-update LR scheduler, the update counter) act on the step the
+    optimizer applies, and with `MultiSteps` the apply happens on the device, on the k-th
+    `optimizer.update` call. The trainer's step counter is 1-based and increments before it asks,
+    so the k-th call is exactly `step % k == 0` -- an emitted `(step + 1)` gate would fire one step
+    before the weights move, which this test pins by asserting events and movement on the same
+    steps. Six steps at three is the smallest run that closes two windows. The cadence follows the
+    native mechanism, not the torch learners' historically short first window (`docs/adr/0017`).
     """
-    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
-        _model_type(tmp_path)(rngs=nnx.Rngs(0))
-    )
+    model = _model_type(tmp_path)(rngs=nnx.Rngs(0))
+    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(model)
     recorder = _UpdateRecorder()
+    movement = _MovementRecorder(model)
     trainer = FlaxTrainer(
         learner=learner,
         tracker=FlaxTracker.from_criteria(learner.outputs),
         data=SimpleDataProvider(training_dataset=[{"x": X, "y": Y}] * 6),
-        callbacks=[recorder],
+        callbacks=[recorder, movement],
     )
 
     trainer.fit(epochs=1)
 
-    assert recorder.steps == [2, 5]
+    assert recorder.steps == [3, 6]
+    assert movement.moved_steps == [3, 6]
     assert trainer.update == 2
 
 

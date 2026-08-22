@@ -50,7 +50,11 @@ reconciled.
 The builder parses the `OPTIMIZER` pattern for a `MultiSteps` wrapper: `every_k_schedule` must be an
 int literal (a callable is a `SpecError`) and `should_skip_update_fn` is rejected (`SpecError`) —
 either would break the identity that `mini_step` is a pure function of the update-call count, which
-is what lets `update()` bake `(step + 1) % k == 0` as a compile-time constant with no device read.
+is what lets `update()` bake `step % k == 0` as a compile-time constant with no device read — the
+trainer's step counter is 1-based and increments before it asks, so the step *is* the call count,
+and the apply lands on the k-th call. The cadence therefore follows the native mechanism (windows
+of exactly `k`), not the torch learners' historically short first window, whose `(step + 1)` gate
+is self-consistent only because it also drives the apply.
 No `MultiSteps` in the pattern means `update()` returns true. This reverses ADR-0013 because the
 constraints dissolve its objections: with no skip predicate the device counter can never disagree
 with the host constant, the `use_grad_mean` default replaces the previously emitted `loss / k`

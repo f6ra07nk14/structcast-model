@@ -190,7 +190,7 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     # and the baked host gate agrees with it.
     text = out.read_text()
     assert "MultiSteps" in text
-    assert "(step + 1) % 2 == 0" in text
+    assert "return step % 2 == 0" in text
 
 
 # ---------------------------------------------------------------------------

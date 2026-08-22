@@ -396,14 +396,14 @@ def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
 def test_flax_learner_bakes_the_multi_steps_window_into_the_update_gate() -> None:
     """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and `update` predicts it.
 
-    The builder statically parses the wrapper's int-literal window and bakes `(step + 1) % k == 0`
+    The builder statically parses the wrapper's int-literal window and bakes `step % k == 0`
     as a pure host formula, so the generated step carries no accumulator buffer and no static flag
     (`docs/adr/0017`).
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "MultiSteps(" in script
-    assert "def update(self, step: int) -> bool:\n        return (step + 1) % 3 == 0" in script
+    assert "def update(self, step: int) -> bool:\n        return step % 3 == 0" in script
     assert "acc_grads" not in script
     assert "need_update" not in script
 
