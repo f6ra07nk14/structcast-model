@@ -307,6 +307,8 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
             else "__need_update__ = True",
         ] + [f"{n} = self.{n}" for n in used]
         return defs, binds + step + [
+            "# Intent, not detection: under float16 the gradient scaler may skip the apply this flag reports,",
+            "# and a torch optimizer exposes no counter to check it against (docs/adr/0018).",
             "if __need_update__:",
             f"{' ' * 4}self._updates += 1",
             "self._has_updated = __need_update__",

@@ -187,6 +187,8 @@ def test_learner_accumulate_gradients_script_patterns() -> None:
     assert script.index("self._steps += 1") < script.index("__need_update__ = (self._steps + 1) % 4 == 0")
     assert "self._updates += 1" in script
     assert "self._has_updated = __need_update__" in script
+    # The intent-vs-detection note belongs where a reader of the generated learner meets the flag.
+    assert script.index("# Intent, not detection") < script.index("self._has_updated = __need_update__")
 
 
 def test_learner_accumulate_gradients_reports_unscaled_loss() -> None:

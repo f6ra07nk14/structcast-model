@@ -290,7 +290,7 @@ def restore_training_state(
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
         config_hash (str | None): Digest of what this run trains, compared with the saved one.
-        is_main (bool): Whether this process prints the override message.
+        is_main (bool): Whether this process logs the override message.
 
     Returns:
         int: The epoch to continue at: the saved one plus one.
