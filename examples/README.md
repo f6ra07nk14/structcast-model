@@ -4,7 +4,7 @@ Two ways to build the same training program, plus the integrations a configurati
 
 | File                                             | What it shows                                                             |
 | ------------------------------------------------ | ------------------------------------------------------------------------- |
-| [`torch/simple_training.py`](torch/simple_training.py) | A complete training program written by hand against the trainer API   |
+| [`torch/simple_training.py`](torch/simple_training.py) | A complete training program written by hand, run standalone or by `scm torch train` |
 | [`torch/optimizers.py`](torch/optimizers.py)     | Optimizer + scheduler compositions referenced from YAML by file path      |
 | [`torch/data.py`](torch/data.py)                 | timm dataset and dataloader wrappers, referenced from YAML by file path   |
 | [`torch/corpus.py`](torch/corpus.py)             | A character-level text corpus, referenced from the CLI by file path       |
@@ -18,19 +18,38 @@ uv run python examples/torch/simple_training.py
 It trains a two-layer MLP on a synthetic dataset for three epochs and finishes in a few seconds on
 the CPU.
 
+Or run the very same objects under the CLI, which adds the stages the tutorial leaves out —
+`torch.compile` over the learner's flow function, an experiment logger, and the checkpoint savers:
+
+```bash
+FILE=examples/torch/simple_training.py
+
+uv run scm torch train "model: [_obj_, {_addr_: build_model, _file_: $FILE}, _call_]" \
+    --learner "[_obj_, {_addr_: SimpleLearner, _file_: $FILE}]" \
+    --training-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 20, seed: 0}}]" \
+    --validation-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 5, seed: 1}}]" \
+    --device cpu --epochs 3 --compile true --ci -LC val_loss -HC val_accuracy -E simple-training
+```
+
+Nothing is generated for that: `_addr_` names a symbol of the file and `_file_` the path to load it
+from, resolved from the working directory. The learner is hand-written, and the command drives it
+exactly as it drives a generated one — which is why the members below are worth writing in full.
+
 ## Walkthrough: `torch/simple_training.py`
 
 ### The dataset
 
 A dataset is any iterable of dictionaries. `make_dataset` builds a list of pre-made batches from a
-seeded `torch.Generator`, so no download and no `DataLoader` are involved:
+`torch.Generator` seeded by its `seed` argument, so no download and no `DataLoader` are involved:
 
 ```python
 dataset.append({"x": x, "y": y})
 ```
 
 The keys of each dictionary become the keyword arguments of the learner's steps: the trainer calls
-`training_step(**inputs)` for every item it pulls from the dataset.
+`training_step(**inputs)` for every item it pulls from the dataset. Taking a seed rather than a
+generator is what lets `--training-dataset` and `--validation-dataset` build the two splits from
+plain YAML values.
 
 ### The learner
 
@@ -44,8 +63,25 @@ protocol — nothing is subclassed, nothing is registered:
   accumulating gradients over N batches reports `has_updated` only after every N-th step, and the
   trainer fires `on_update` that often. `restore_counters(steps, updates)` seeds them when a run
   resumes from a checkpoint.
-- **`training_step(**inputs)`** — forward, backward, optimizer step. Returns the criteria of the step.
-- **`inference_step(**inputs)`** — the validation counterpart, returning the same criteria.
+- **`flow_functions`** — the compile units, by attribute name: `{"_flow_optimizer": self._flow_optimizer}`.
+  `torch.compile` is applied to the flows, never to the step (`docs/adr/0004`), so `scm torch train
+  --compile` rebinds every name listed here with the compiled wrapper —
+  `setattr(learner, name, torch.compile(...))`. That is why `_flow_optimizer` is a closure bound as
+  an attribute in `__init__` and why both steps call it back through `self`: a step calling the
+  closure directly would look compiled and train uncompiled, and returning `{}` skips the stage
+  altogether, leaving only the models compiled.
+- **`training_step(**inputs)`** — the flow function, then backward and the optimizer step. Returns the
+  criteria of the step. It stays eager on purpose: it owns the host-side counters and the optimizer
+  calls, which inside a compiled region would only become graph breaks and guards.
+- **`inference_step(**inputs)`** — the validation counterpart, running the same flow under
+  `torch.no_grad()` and returning the same criteria.
+- **`outputs`** — the criterion names the steps return. The CLI reads them off the learner to build
+  the tracker and the progress-bar rows, unless `--learner-outputs` overrides them.
+
+The flow function takes `__need_update__` first, as every generated one does: it arms the gradient
+synchronization of a DDP- or FSDP2-wrapped model on the last backward of an update, and does nothing
+on a plain module. A generated learner emits one `_flow_<optimizer>` per optimizer segment plus a
+`_flow_inference`; one flow covers both steps here because they compute the same thing.
 
 The optimizer lives on the learner, together with its schedule. `SimpleLearner` also defines
 `on_epoch_end`, which advances the schedule after each epoch. The trainer finds that method by
@@ -128,8 +164,8 @@ scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs
 ```
 
 `learner.py` holds a `Learner` class with exactly the members the tutorial writes by hand — `models`,
-`update`, `training_step`, `inference_step`, plus `optimizers`, `optimizer_models`, `grad_scalers`,
-`learning_rates`, `weight_decays`, and `param_group_names`.
+`update`, `training_step`, `inference_step`, plus `flow_functions`, `optimizers`, `optimizer_models`,
+`grad_scalers`, `learning_rates`, `weight_decays`, and `param_group_names`.
 
 Then render the dataset configurations and train:
 
@@ -162,6 +198,7 @@ How the CLI maps onto the objects of the tutorial:
 | Tutorial                       | CLI                                                                       |
 | ------------------------------ | ------------------------------------------------------------------------- |
 | `SimpleLearner(model)`         | `--learner/-L` pattern, called with the models the command instantiated    |
+| `SimpleLearner.flow_functions` | `--compile/-c`, rebinding every listed flow with its compiled wrapper      |
 | `track`                        | `TorchTracker`, built from the learner's `outputs` or `--learner-outputs`  |
 | `SimpleDataProvider(...)`      | `--training-dataset` and `--validation-dataset/-V`, composed into one      |
 | `Printer()`                    | `ProgressBar`, or `Printer` when `--ci` is given                           |
