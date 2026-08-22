@@ -56,9 +56,10 @@ class SimpleLearner:
     """A hand-written learner: it owns the model and the optimizer and defines both steps.
 
     This is the object the redesign asks you to customize per model. It implements the `Learner`
-    protocol -- the `models`, `optimizers`, `optimizer_models`, and `learning_rates` properties
-    plus `update`, `training_step`, and `inference_step`. Extra methods named after a lifecycle
-    event, such as `on_epoch_end` below, are picked up by the trainer automatically.
+    protocol -- the `models`, `optimizers`, `optimizer_models`, `learning_rates`, `steps`,
+    `updates`, and `has_updated` properties plus `restore_counters`, `training_step`, and
+    `inference_step`. Extra methods named after a lifecycle event, such as `on_epoch_end` below,
+    are picked up by the trainer automatically.
     """
 
     def __init__(self, model: torch.nn.Module, learning_rate: float = 0.1) -> None:
@@ -76,6 +77,10 @@ class SimpleLearner:
         # optimizer wrapper that implements the event protocols itself -- see
         # `examples/torch/optimizers.py` for that variant.
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=0.5)
+        # The learner owns the training counters: the trainer only reads them (docs/adr/0018).
+        self._steps = 0
+        self._updates = 0
+        self._has_updated = False
 
     @property
     def models(self) -> dict[str, torch.nn.Module]:
@@ -97,23 +102,38 @@ class SimpleLearner:
         """The current learning rate per optimizer, shown by `Printer` next to the criteria."""
         return {name: opt.param_groups[0]["lr"] for name, opt in self.optimizers.items()}
 
-    def update(self, step: int) -> bool:
-        """Report whether *step* applied the optimizer.
+    @property
+    def steps(self) -> int:
+        """The number of training steps completed so far, counted by this learner."""
+        return self._steps
 
-        Returning True on every step means "no gradient accumulation": one step, one update. A
-        learner accumulating over N batches would return True only every N-th step, and the trainer
-        would fire `on_update` that often.
+    @property
+    def updates(self) -> int:
+        """The number of optimizer applies completed so far -- one per step here."""
+        return self._updates
+
+    @property
+    def has_updated(self) -> bool:
+        """Report whether the step that just finished applied the optimizer.
+
+        True after every step here means "no gradient accumulation": one step, one update. A
+        learner accumulating over N batches would report True only after every N-th step, and the
+        trainer would fire `on_update` that often.
+        """
+        return self._has_updated
+
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters after a checkpoint restore; a fresh run never calls this.
 
         Args:
-            step: The training step that just ran, counted from 1 across the whole run.
-
-        Returns:
-            True, because this learner updates on every step.
+            steps: The number of completed training steps read back from the checkpoint.
+            updates: The number of completed optimizer applies read back from the checkpoint.
         """
-        return True
+        self._steps = steps
+        self._updates = updates
 
     def training_step(self, x: torch.Tensor, y: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
-        """Run one training batch: forward, backward, and optimizer step.
+        """Run one training batch: forward, backward, and optimizer step, counting as it goes.
 
         Args:
             x: The input features of the batch.
@@ -123,11 +143,14 @@ class SimpleLearner:
         Returns:
             The criteria of this step, which the tracker turns into logged values.
         """
+        self._steps += 1
         self.model.train()
         loss = self.criterion(self.model(x), y)
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
+        self._updates += 1
+        self._has_updated = True
         return {"loss": loss.detach(), "accuracy": self._accuracy(x, y)}
 
     @torch.no_grad()

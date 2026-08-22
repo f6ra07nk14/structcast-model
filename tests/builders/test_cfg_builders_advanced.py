@@ -71,14 +71,14 @@ def test_learner_class_documents_the_compile_seam_and_update_gating() -> None:
     """The generated class carries the docstring; nothing else in the emitted file explains it.
 
     Whoever opens `learner.py` has to learn from the file itself that `flow_functions` is the seam a
-    trainer rebinds compiled, and that `update(step)` decides when the optimizers actually step.
+    trainer rebinds compiled, and that the learner's own counters decide when the optimizers step.
     """
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     docstring = script.split("class Learner:\n", 1)[1].split('"""')[1]
 
     assert docstring.startswith("Learner generated from a PyTorch learner template.")
     assert "`flow_functions`" in docstring
-    assert "`update(step)`" in docstring
+    assert "`has_updated`" in docstring
 
 
 def test_learner_script_contains_autocast() -> None:
@@ -125,12 +125,13 @@ def test_learner_script_defines_steps_as_methods() -> None:
     """The steps are class-level methods, not closures bound onto the instance in `__init__`.
 
     The bodies rebind the models and optimizers off `self`, so a compiled `_flow_*` function can be
-    swapped on the instance and still be picked up; the training method reads `need_update` off
-    `self` too, so no wrapper has to thread it through.
+    swapped on the instance and still be picked up; the training method counts `self._steps` and
+    computes the gate itself, so no wrapper has to thread it through.
     """
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
     assert "    def training_step(self, image, label, **kwargs):" in script
-    assert "__need_update__ = self.need_update" in script
+    assert "self._steps += 1" in script
+    assert "__need_update__ = True" in script
     assert "    @torch.no_grad()\n    def inference_step(self, image, label, **kwargs):" in script
     assert "self.training_step = training_step" not in script
     assert "self.inference_step = inference_step" not in script
@@ -173,13 +174,19 @@ def test_learner_accumulate_gradients_stored() -> None:
 
 
 def test_learner_accumulate_gradients_script_patterns() -> None:
-    """Script scales only the backward pass, keeps the need_update guard and modular update."""
+    """Script scales only the backward pass, keeps the need_update guard, and counts on the learner.
+
+    Incrementing `_steps` before the `(self._steps + 1) % 4` gate keeps the historical 1-based
+    cadence: the first window is one step short, so the applies land at steps 3, 7, 11.
+    """
     params = {"DEFAULT": {"accumulate_gradients": 4}}
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "(ce_loss / 4).backward()" in script
     assert "if __need_update__:" in script
-    assert "self.need_update = (step + 1) % 4 == 0" in script
-    assert "return self.need_update" in script
+    assert "__need_update__ = (self._steps + 1) % 4 == 0" in script
+    assert script.index("self._steps += 1") < script.index("__need_update__ = (self._steps + 1) % 4 == 0")
+    assert "self._updates += 1" in script
+    assert "self._has_updated = __need_update__" in script
 
 
 def test_learner_accumulate_gradients_reports_unscaled_loss() -> None:
@@ -334,4 +341,4 @@ def test_learner_full_combo_accumulate_clip_mp() -> None:
     assert "optimizer_grad_scaler.unscale_(optimizer)" in script
     assert "dispatch_clip_grad" in script
     assert "if __need_update__:" in script
-    assert "self.need_update = (step + 1) % 4 == 0" in script
+    assert "__need_update__ = (self._steps + 1) % 4 == 0" in script

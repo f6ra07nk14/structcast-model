@@ -234,13 +234,14 @@ def test_keras_learner_runs_a_model_another_segment_owns_in_inference_mode() -> 
     assert "        out_c = self.c(x, training=True)" in script
 
 
-def test_keras_learner_gates_update_on_the_optimizers_own_counter() -> None:
-    """The window is the OPTIMIZER pattern's `gradient_accumulation_steps`, and `update` predicts it.
+def test_keras_learner_counts_updates_from_the_optimizers_own_counter() -> None:
+    """The window is the OPTIMIZER pattern's `gradient_accumulation_steps`, and the learner reads it back.
 
     The generated `__init__` unwraps a possible `LossScaleOptimizer`, refuses optimizers that
-    disagree on the window, and captures the first inner optimizer's private step counter; `update`
-    reads that counter, not the trainer step, so a float16 loss-scale skip -- which freezes the
-    counter -- cannot de-phase the prediction (`docs/adr/0017`).
+    disagree on the window, and captures the first inner optimizer's private step counter;
+    `training_step` counts itself on the host and reads that counter back after the step, so
+    `has_updated` is detection, not prediction -- under a float16 loss-scale skip the frozen
+    counter truthfully reports no update (`docs/adr/0018`).
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
@@ -252,26 +253,31 @@ def test_keras_learner_gates_update_on_the_optimizers_own_counter() -> None:
     assert "windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})" in script
     assert "if len(windows) > 1:" in script
     assert "raise ValueError" in script
+    assert "self._window = windows[0]" in script
     assert "self._counter = inners[0]._iterations" in script
-    assert "def update(self, step: int) -> bool:" in script
+    assert "self._steps += 1" in script
     # `convert_to_numpy`, not a bare `int()`: under `tf.distribute` the counter's value is a
     # `MirroredVariable`, which `int()` refuses to read.
-    assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in script
+    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in script
+    assert "self._has_updated = current > self._last_updates" in script
+    assert "def restore_counters(self, steps: int, updates: int) -> None:" in script
+    assert "def update(" not in script
 
 
 def test_keras_learner_leaves_a_window_of_one_to_the_plain_optimizer() -> None:
-    """An unset window emits no optimizer keyword and short-circuits the gate.
+    """An unset window emits no optimizer keyword, and the counter read stays the truth source.
 
     Keras refuses `gradient_accumulation_steps=1` outright, so nothing may be added to the pattern;
-    the window read falls back to one, and the gate must answer without touching the device
-    counter -- a per-step host sync the unaccumulated learner would otherwise pay for nothing.
+    the window read falls back to one, and there is deliberately no short-circuit around the
+    post-step counter read: under a float16 loss-scale skip the counter freezes, and only the read
+    reports the skipped step truthfully (`docs/adr/0018`).
     """
     script = _learner_script(LEARNER_YAML)
 
     assert "optimizer = SGD(learning_rate=0.1)" in script
     assert ".gradient_accumulation_steps = " not in script
-    assert "if self._accumulate == 1:\n            return True" in script
-    assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in script
+    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in script
+    assert "if self._window == 1" not in script
 
 
 @pytest.mark.parametrize(

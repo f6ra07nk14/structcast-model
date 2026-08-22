@@ -396,16 +396,18 @@ class {self.classname}:
     attributes `flow_functions` names. A trainer that compiles them wraps those functions -- the
     models and optimizers donated -- and rebinds each attribute to its wrapper; the learner itself
     is never traced. Gradient accumulation, when configured, is the optimizer's own
-    `optax.MultiSteps`, gating on the device; `update` predicts its window as a pure host formula.
-    `outputs` names the criteria the steps return, and `inference_step` runs against inference
-    views of the models.
+    `optax.MultiSteps`, gating on the device; the learner owns the training counters
+    (`docs/adr/0018`): `steps` counts every `training_step` call on the host, and with a window
+    `updates` and `has_updated` come from a post-step read of the `MultiStepsState.gradient_step`
+    the device actually advanced. `outputs` names the criteria the steps return, and
+    `inference_step` runs against inference views of the models.
     \"\"\"
 
     def __init__(self, {self._learner_models}, **kwargs):
         {sep2.join(body)}
         self._models = {{{", ".join(f"{n!r}: {n}" for n in [*self.models, *self._module_lists])}}}
         self._optimizers = {{{", ".join(f"{n!r}: {n}" for n in self.optimizers)}}}
-        # `update` answers for the whole learner, so the optimizers just built must agree on one
+        # The counters answer for the whole learner, so the optimizers just built must agree on one
         # window (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
         windows = sorted({{accumulation_window(optimizer) for optimizer in self._optimizers.values()}})
         if len(windows) > 1:
@@ -413,7 +415,10 @@ class {self.classname}:
                 "One learner, one update window: "
                 f"the optimizers disagree on their MultiSteps windows {{windows}}."
             )
-        self._accumulate = windows[0]
+        self._window = windows[0]
+        self._steps = 0
+        self._last_updates = 0
+        self._has_updated = False
         self._learning_rates = {{{", ".join(f"{n!r}: float('nan')" for n in self.optimizers)}}}
         self._views = {views}
         self._training_step = _training_step
@@ -422,19 +427,45 @@ class {self.classname}:
         self.outputs = {self.outputs}
 
     def training_step(self, {inputs}**kwargs):
+        self._steps += 1
         criteria, learning_rates = self._training_step(self._models, self._optimizers, {passed}**kwargs)
         self._learning_rates = learning_rates
+        if self._window > 1:
+            # A genuine post-step read of the count `MultiSteps` advanced on the device; the
+            # tracker syncs the host every step anyway, so this costs nothing (`docs/adr/0018`).
+            applied = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])
+            self._has_updated = applied > self._last_updates
+            self._last_updates = applied
+        else:
+            # Without a window every step applies, and no device read is paid for the count.
+            self._has_updated = True
+            self._last_updates = self._steps
         return criteria
 
     def inference_step(self, {inputs}**kwargs):
         return self._inference_step(self._views, {passed}**kwargs)
 
-    def update(self, step: int) -> bool:
-        # A pure host formula: `MultiSteps` gates the apply on the device, and this predicts it.
-        # The trainer increments its step before asking, so the 1-based step is the number of
-        # `optimizer.update` calls made once this one runs -- exactly the count `MultiSteps` gates
-        # on. `(step + 1)` here would fire one step before the on-device apply (`docs/adr/0017`).
-        return step % self._accumulate == 0
+    def restore_counters(self, steps: int, updates: int) -> None:
+        # `updates` is ignored on purpose: with a window the restored optimizer state already
+        # carries the count, and re-reading it here keeps the two sources from ever disagreeing;
+        # without one every step applies, so the count is the step count.
+        self._steps = steps
+        if self._window > 1:
+            self._last_updates = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])
+        else:
+            self._last_updates = steps
+
+    @property
+    def steps(self):
+        return self._steps
+
+    @property
+    def updates(self):
+        return self._last_updates
+
+    @property
+    def has_updated(self):
+        return self._has_updated
 
     @property
     def models(self):

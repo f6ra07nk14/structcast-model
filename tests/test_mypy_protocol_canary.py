@@ -52,8 +52,20 @@ class Conforming:
     def learning_rates(self) -> dict[str, float]:
         return {{}}
 
-    def update(self, step: int) -> bool:
+    @property
+    def steps(self) -> int:
+        return 0
+
+    @property
+    def updates(self) -> int:
+        return 0
+
+    @property
+    def has_updated(self) -> bool:
         return True
+
+    def restore_counters(self, steps: int, updates: int) -> None:
+        return None
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return {{}}

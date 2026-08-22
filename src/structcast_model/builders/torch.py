@@ -298,8 +298,19 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 step.append(f"{indent}{mixed_precision_name}.update()")
             step.append(f"{indent}{optimizer_name}.zero_grad()")
             available |= set(info["stores"])
-        binds = ["__need_update__ = self.need_update"] + [f"{n} = self.{n}" for n in used]
-        return defs, binds + step
+        # Incrementing `_steps` first keeps `_steps` on the trainer's old 1-based clock, so the
+        # `(+ 1) % k` gate preserves the historically short first accumulation window.
+        binds = [
+            "self._steps += 1",
+            f"__need_update__ = (self._steps + 1) % {self.accumulate_gradients} == 0"
+            if self.accumulate_gradients
+            else "__need_update__ = True",
+        ] + [f"{n} = self.{n}" for n in used]
+        return defs, binds + step + [
+            "if __need_update__:",
+            f"{' ' * 4}self._updates += 1",
+            "self._has_updated = __need_update__",
+        ]
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner."""
@@ -313,9 +324,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         )
         flow_names = [f"_flow_{n}" for n in self.optimizers] + ["_flow_inference"]
         flow_functions_repr = ", ".join(f'"{n}": self.{n}' for n in flow_names)
-        need_update = ["return self.need_update"]
-        if self.accumulate_gradients:
-            need_update = [f"self.need_update = (step + 1) % {self.accumulate_gradients} == 0"] + need_update
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
@@ -328,10 +336,13 @@ class {self.classname}:
     rebinds each attribute to its compiled wrapper, so backward, clipping and stepping stay eager here.
     `training_step` runs backward every call -- dividing the loss by the accumulation divisor inside the
     backward expression -- and gates clipping, the optimizer step, `zero_grad()` and, under mixed precision,
-    the gradient scaler's unscale and update behind the `need_update` flag `update(step)` sets on the host,
-    while `inference_step` runs under `torch.no_grad()`. `outputs` names the criteria the steps return, and
-    `models`, `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`, `weight_decays` and
-    `param_group_names` expose what a trainer reads off the learner.
+    the gradient scaler's unscale and update behind the accumulation gate it computes from its own `_steps`
+    counter, while `inference_step` runs under `torch.no_grad()`. The learner owns the training counters
+    (docs/adr/0018): `steps`, `updates` and `has_updated` report completed counts after each step, and
+    `restore_counters` seeds them after a checkpoint restore. Under float16 the gate keeps intent semantics:
+    `has_updated` reports that an apply was attempted, not that the gradient scaler let it land. `outputs`
+    names the criteria the steps return, and `models`, `optimizers`, `optimizer_models`, `grad_scalers`,
+    `learning_rates`, `weight_decays` and `param_group_names` expose what a trainer reads off the learner.
     \"\"\"
 
     def __init__(self, {self._learner_models}, **kwargs):
@@ -344,7 +355,9 @@ class {self.classname}:
         {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
         self._requires_grad_defaults = {{{defaults}}}
-        self.need_update = True
+        self._steps = 0
+        self._updates = 0
+        self._has_updated = False
         self.inputs = {self.inputs}
         self.outputs = {self.outputs}
 
@@ -357,8 +370,21 @@ class {self.classname}:
         {sep.join(self._inference_flow_parts[1])}
         return {self._forward_outputs}
 
-    def update(self, step: int) -> bool:
-        {sep.join(need_update)}
+    def restore_counters(self, steps: int, updates: int) -> None:
+        self._steps = steps
+        self._updates = updates
+
+    @property
+    def steps(self):
+        return self._steps
+
+    @property
+    def updates(self):
+        return self._updates
+
+    @property
+    def has_updated(self):
+        return self._has_updated
 
     @property
     def models(self):

@@ -359,7 +359,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         body.append(
             'inners = [getattr(segment.optimizer, "inner_optimizer", segment.optimizer) for segment in self._segments]'
         )
-        # `update` answers for the whole learner, so the optimizers must agree on one window
+        # The counters answer for the whole learner, so the optimizers must agree on one window
         # (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
         body.append("windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})")
         body.append(
@@ -367,11 +367,14 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             'disagree on gradient_accumulation_steps {windows}.")'
         )
         # The first inner optimizer's private `_iterations` is the learner's clock: the raw call
-        # count `update` needs, where the public `iterations` floor-divides the window away
-        # (`docs/adr/0017`). The captured variable stays live on every backend -- the jax adapter
-        # assigns the optimizer state back onto these same variables each step.
-        body.append("self._accumulate = windows[0]")
+        # count the post-step read needs, where the public `iterations` floor-divides the window
+        # away (`docs/adr/0017`). The captured variable stays live on every backend -- the jax
+        # adapter assigns the optimizer state back onto these same variables each step.
+        body.append("self._window = windows[0]")
         body.append("self._counter = inners[0]._iterations")
+        body.append("self._steps = 0")
+        body.append("self._last_updates = 0")
+        body.append("self._has_updated = False")
         body.append("self._training_step = adapter.build_train_step(self._segments)")
         body.append(
             f"self._inference_step = adapter.build_inference_step(self._flow_inference, models=[{every_model}])"
@@ -411,10 +414,11 @@ class {self.classname}:
     freeze at its first value on the JAX backend.
 
     Gradient accumulation is the optimizer's (`gradient_accumulation_steps` in the OPTIMIZER
-    pattern), and `update` is a pre-step read of the optimizer's own counter: the trainer asks
-    before `training_step` runs, so the `+ 1` predicts whether the step about to run lands the
-    apply. The optimizer's counter, not the trainer step, is the clock, which is why a float16
-    loss-scale skip -- it freezes the counter -- cannot de-phase the prediction (`docs/adr/0017`).
+    pattern). The learner owns the training counters (`docs/adr/0018`): `steps` counts every
+    `training_step` call on the host, while `updates` and `has_updated` come from a post-step read
+    of the inner optimizer's own counter -- detection, not prediction, so a float16 loss-scale
+    skip, which freezes the counter, truthfully reports no update. `restore_counters` re-seeds
+    `steps` after a checkpoint restore and re-baselines the counter read.
     \"\"\"
 
     def __init__(self, {self._learner_models}, **kwargs):
@@ -425,17 +429,36 @@ class {self.classname}:
         {sep2.join(self._forward_inference_flow)}
 
     def training_step(self, {inputs}**kwargs):
-        return self._training_step({batch})
+        self._steps += 1
+        res = self._training_step({batch})
+        # A genuine post-step read: the adapter has assigned the optimizer variables back by now,
+        # so under a float16 loss-scale skip the frozen counter truthfully reports no update
+        # (`docs/adr/0018`). The tracker syncs the host every step anyway, so this costs nothing.
+        current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window
+        self._has_updated = current > self._last_updates
+        self._last_updates = current
+        return res
 
     def inference_step(self, {inputs}**kwargs):
         return self._inference_step({batch})
 
-    def update(self, step: int) -> bool:
-        # A window of one short-circuits: every step applies, and no host read of the device
-        # counter is paid for it.
-        if self._accumulate == 1:
-            return True
-        return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0
+    def restore_counters(self, steps: int, updates: int) -> None:
+        # `updates` is ignored on purpose: the restored optimizer variables already carry the
+        # count, and re-reading it here keeps the two sources from ever disagreeing.
+        self._steps = steps
+        self._last_updates = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window
+
+    @property
+    def steps(self):
+        return self._steps
+
+    @property
+    def updates(self):
+        return self._last_updates
+
+    @property
+    def has_updated(self):
+        return self._has_updated
 
     @property
     def models(self):

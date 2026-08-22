@@ -187,10 +187,11 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     module = _load(out, "generated_learner")
     assert hasattr(module, "MyLearner")
     # The parameter reached the template: the MultiSteps wrapper carries the window on the device,
-    # and the generated __init__ reads it back for the host gate.
+    # and the generated __init__ reads it back for the post-step counter read (`docs/adr/0018`).
     text = out.read_text()
     assert "MultiSteps" in text
-    assert "return step % self._accumulate == 0" in text
+    assert "self._window = windows[0]" in text
+    assert "applied = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])" in text
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,9 @@ class NamelessLearner:
         self._models = {"model": model}
         self._optimizers = {"optimizer": nnx.Optimizer(model, tx=optax.sgd(0.1), wrt=nnx.Param)}
         self.learning_rates = {"optimizer": 0.1}
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
@@ -265,15 +269,19 @@ class NamelessLearner:
         """The optimizer owns the only model."""
         return {"optimizer": ["model"]}
 
-    def update(self, step: int) -> bool:
-        """Every step applies the optimizer."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:
-        """Take one plain gradient step and report the squared error."""
+        """Take one plain gradient step, count it as one Update, and report the squared error."""
         model, optimizer = self._models["model"], self._optimizers["optimizer"]
         loss, grads = nnx.value_and_grad(lambda m: jnp.mean((m(x) - y) ** 2))(model)
         optimizer.update(model, grads)
+        self.steps += 1
+        self.updates += 1
+        self.has_updated = True
         return {"loss": loss}
 
     def inference_step(self, x: jax.Array, y: jax.Array) -> dict[str, Any]:

@@ -24,6 +24,9 @@ class _StubLearner:
         """Report *loss* from every step."""
         self.loss = loss
         self.learning_rates: dict[str, float] = {}
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
@@ -40,12 +43,16 @@ class _StubLearner:
         """No pairing."""
         return {}
 
-    def update(self, step: int) -> bool:
-        """Always signal an update."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Report the fixed loss as a device array, the way a jitted step does."""
+        """Count the Step as one Update and report the fixed loss as a device array."""
+        self.steps += 1
+        self.updates += 1
+        self.has_updated = True
         return {"loss": jnp.asarray(self.loss)}
 
     def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:

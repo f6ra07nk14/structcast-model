@@ -394,21 +394,24 @@ def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
 
 
 def test_flax_learner_reads_the_window_back_from_the_built_optimizers() -> None:
-    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and `update` predicts it.
+    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and the learner reads it back.
 
     The pattern is never parsed for the window: the generated `__init__` reads it back from every
-    optimizer it just built with `accumulation_window`, refuses optimizers that disagree, and
-    `update` gates on the stored attribute -- a pure host formula, no accumulator buffer and no
-    static flag (`docs/adr/0017`).
+    optimizer it just built with `accumulation_window` and refuses optimizers that disagree.
+    `training_step` counts itself on the host and, with a window, reads the applied count back from
+    `MultiStepsState.gradient_step` after the step -- detection, not prediction (`docs/adr/0018`).
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "MultiSteps(" in script
     assert "windows = sorted({accumulation_window(optimizer) for optimizer in self._optimizers.values()})" in script
     assert "One learner, one update window" in script
-    assert "self._accumulate = windows[0]" in script
-    assert "def update(self, step: int) -> bool:" in script
-    assert "return step % self._accumulate == 0" in script
+    assert "self._window = windows[0]" in script
+    assert "self._steps += 1" in script
+    assert "applied = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])" in script
+    assert "self._has_updated = applied > self._last_updates" in script
+    assert "def restore_counters(self, steps: int, updates: int) -> None:" in script
+    assert "def update(" not in script
     assert "acc_grads" not in script
     assert "need_update" not in script
 

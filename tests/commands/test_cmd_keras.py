@@ -184,10 +184,10 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     assert module.MIXED_PRECISION is False
     assert module.MIXED_PRECISION_TYPE is None
     # The parameter reached the template: the window is the OPTIMIZER pattern's keyword, and the
-    # written learner gates `update` on the optimizer's own counter (`docs/adr/0017`).
+    # written learner reads the optimizer's own counter back after each step (`docs/adr/0018`).
     text = out.read_text()
     assert "gradient_accumulation_steps=3" in text
-    assert "return (int(keras.ops.convert_to_numpy(self._counter.value)) + 1) % self._accumulate == 0" in text
+    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in text
 
 
 def test_create_learner_takes_no_backend_because_it_imports_no_keras(tmp_path: Path) -> None:

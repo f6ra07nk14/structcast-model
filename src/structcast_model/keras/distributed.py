@@ -327,6 +327,15 @@ class KerasDistributedStrategy:
             # already treats it: a hand-written learner has none and scales its own loss.
             for segment in getattr(learner, "_segments", ()):
                 segment.flow = _mean_flow(segment.flow, self.replicas)
+            flows = list(getattr(learner, "flow_functions", ()))
+            if flows:
+                # The generated learner's public steps stay eager: `training_step` owns the host
+                # counters and reads the optimizer counter back after the step (`docs/adr/0018`),
+                # neither of which can run inside the replicated graph, so the strategy wraps the
+                # inner flow steps it just unwrapped instead.
+                for name in flows:
+                    setattr(learner, name, self._replicated_flow(getattr(learner, name)))
+                return
         for name in ("training_step", "inference_step"):
             setattr(learner, name, self._replicated(getattr(learner, name)))
 
@@ -421,6 +430,27 @@ class KerasDistributedStrategy:
             raise ValueError("A training state is required to resume from.")
         apply_state_dict(models, optimizers, state)
         return state
+
+    def _replicated_flow(self, flow: Any) -> Any:
+        """Wrap one inner flow step -- taking the batch mapping -- across the TensorFlow replicas.
+
+        The counterpart of :meth:`_replicated` for a generated learner under `MirroredStrategy`:
+        the learner's public steps keep their host-side counter bookkeeping outside the graph, and
+        the replication wraps the flow attribute the public step calls through.
+        """
+
+        @tf.function
+        def replicated(batch: Mapping[str, Any]) -> dict[str, Any]:
+            criteria = self._mirrored.run(flow, args=(batch,))
+            return {
+                name: self._mirrored.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
+                for name, value in criteria.items()
+            }
+
+        def flow_step(batch: Mapping[str, Any]) -> dict[str, Any]:
+            return dict(replicated(self.shard_batch(batch)))
+
+        return flow_step
 
     def _replicated(self, step: Any) -> Any:
         """Wrap one learner step so it runs across the replicas and reports reduced criteria."""

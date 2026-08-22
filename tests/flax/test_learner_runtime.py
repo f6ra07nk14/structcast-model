@@ -101,9 +101,9 @@ def test_training_step_lowers_the_loss_it_reports(tmp_path: Path) -> None:
     learner = _learner_type(tmp_path)(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
 
     losses = []
-    for step in range(3):
-        learner.update(step)
+    for _ in range(3):
         losses.append(float(learner.training_step(x=X, y=Y)["loss"]))
+        assert learner.has_updated is True
 
     assert losses == sorted(losses, reverse=True)
     assert losses[-1] < losses[0]
@@ -112,9 +112,9 @@ def test_training_step_lowers_the_loss_it_reports(tmp_path: Path) -> None:
 def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> None:
     """With a `MultiSteps` window of 3 the parameters may move on every third step and no other.
 
-    The accumulation now lives inside the optimizer state on the device; the generated `update`
-    bakes the same window as a host formula, so the two must agree on which step the apply lands.
-    Steps are fed 1-based, mirroring the trainer, which increments its counter before asking.
+    The accumulation lives inside the optimizer state on the device; the learner reads the applied
+    count back from `MultiStepsState.gradient_step` after each step (`docs/adr/0018`), so
+    `has_updated` must agree, step by step, with which step the parameters actually moved on.
     """
     learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
         _model_type(tmp_path)(rngs=nnx.Rngs(0))
@@ -123,14 +123,15 @@ def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> N
 
     gates = []
     for step in range(1, 4):
-        gates.append(learner.update(step))
         learner.training_step(x=X, y=Y)
+        gates.append(learner.has_updated)
         moved = not all(
             jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True)
         )
         assert moved == (step == 3)
 
     assert gates == [False, False, True]
+    assert (learner.steps, learner.updates) == (3, 1)
     assert not any(jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True))
 
 
@@ -145,7 +146,6 @@ def test_each_optimizer_moves_only_the_models_it_owns(tmp_path: Path) -> None:
     expected = [_sgd_step(models[0], 0.1), _sgd_step(models[1], 0.1), _sgd_step(models[2], 0.01)]
     learner = _learner_type(tmp_path, SEGMENTS_YAML)(*models)
 
-    learner.update(0)
     learner.training_step(x=X, y=Y)
 
     for model, (kernel, bias) in zip(models, expected, strict=True):
@@ -194,7 +194,6 @@ def test_inference_step_runs_deterministically_and_leaves_the_parameters_untouch
 def test_inference_views_see_the_trained_parameters(tmp_path: Path) -> None:
     """The views share arrays with the models, so validation reads what the last update wrote."""
     learner = _learner_type(tmp_path)(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
-    learner.update(0)
     learner.training_step(x=X, y=Y)
 
     trained = _parameters(learner.models["model"])
@@ -209,7 +208,6 @@ def test_learning_rate_is_nan_until_a_step_reports_it(tmp_path: Path) -> None:
 
     assert jnp.isnan(jnp.asarray(learner.learning_rates["optimizer"]))
 
-    learner.update(0)
     learner.training_step(x=X, y=Y)
 
     assert learner.learning_rates == {"optimizer": pytest.approx(0.1)}
@@ -225,7 +223,6 @@ def test_learning_rate_stays_nan_when_the_pattern_hides_it(tmp_path: Path, caplo
     built(tmp_path / "hidden.py")
     learner = _load(tmp_path / "hidden.py", "hidden_learner").Learner(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
 
-    learner.update(0)
     losses = [float(learner.training_step(x=X, y=Y)["loss"]) for _ in range(2)]
 
     assert jnp.isnan(jnp.asarray(learner.learning_rates["optimizer"]))
@@ -247,7 +244,6 @@ def test_a_value_no_later_code_reads_never_leaves_the_differentiated_closure(tmp
     assert "tag = 'tag'" in (tmp_path / "tagged.py").read_text()
     assert "return loss, (loss,)" in (tmp_path / "tagged.py").read_text()
 
-    learner.update(0)
     losses = [float(learner.training_step(x=X, y=Y)["loss"]) for _ in range(2)]
 
     assert losses[1] < losses[0]
@@ -297,12 +293,12 @@ def test_compiled_training_step_never_retraces_across_the_window(
         setattr(learner, name, compiled(name, function))
     with catch_warnings(record=True) as caught:
         simplefilter("always")
-        for index in range(6):
-            learner.update(index)
+        for _ in range(6):
             learner.training_step(x=X, y=Y)
 
     assert [str(w.message) for w in caught if "donated" in str(w.message)] == []
     assert traces == [True]
+    assert learner.updates == 6 // accumulate
     assert learner.learning_rates == rates
 
 
@@ -318,8 +314,7 @@ def test_a_training_forward_draws_exactly_one_dropout_key(tmp_path: Path) -> Non
     learner = _learner_type(tmp_path)(model)
     counts = []
 
-    for step in range(2):
-        learner.update(step)
+    for _ in range(2):
         learner.training_step(x=X, y=Y)
         counts.append(int(model.dropout.rngs.count[...]))
     before_inference = counts[-1]
@@ -353,7 +348,6 @@ def test_running_statistics_move_while_training_and_hold_while_evaluating(tmp_pa
     learner = _learner_type(tmp_path)(model)
     initial = jax.tree.leaves(nnx.state(model, nnx.BatchStat))
 
-    learner.update(0)
     learner.training_step(x=X, y=Y)
     trained = jax.tree.leaves(nnx.state(model, nnx.BatchStat))
     learner.inference_step(x=X, y=Y)
@@ -397,11 +391,11 @@ def test_a_generated_accumulating_learner_updates_twice_over_six_trainer_steps(t
 
     `on_update` consumers (a per-update LR scheduler, the update counter) act on the step the
     optimizer applies, and with `MultiSteps` the apply happens on the device, on the k-th
-    `optimizer.update` call. The trainer's step counter is 1-based and increments before it asks,
-    so the k-th call is exactly `step % k == 0` -- an emitted `(step + 1)` gate would fire one step
-    before the weights move, which this test pins by asserting events and movement on the same
-    steps. Six steps at three is the smallest run that closes two windows. The cadence follows the
-    native mechanism, not the torch learners' historically short first window (`docs/adr/0017`).
+    `optimizer.update` call. The learner reads the applied count back from the optimizer state
+    after each step (`docs/adr/0018`), so the event may only fire on the step the weights actually
+    move -- which this test pins by asserting events and movement on the same steps. Six steps at
+    three is the smallest run that closes two windows. The cadence follows the native mechanism,
+    not the torch learners' historically short first window (`docs/adr/0017`).
     """
     model = _model_type(tmp_path)(rngs=nnx.Rngs(0))
     learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(model)
@@ -445,7 +439,6 @@ def _tx_learner(tmp_path: Path, name: str, tx: list[Any]) -> Any:
 def _step_distance(learner: Any) -> float:
     """Run one training step on the loud batch and return how far the parameters moved."""
     before = _parameters(learner.models["model"])
-    learner.update(0)
     learner.training_step(x=X, y=LOUD_Y)
     after = _parameters(learner.models["model"])
     return float(jnp.sqrt(sum(jnp.sum((a - b) ** 2) for a, b in zip(before, after, strict=True))))

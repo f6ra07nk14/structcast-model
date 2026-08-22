@@ -469,7 +469,7 @@ def test_torch_learner_builder_with_accumulate_gradients() -> None:
     intermediate = TorchLearnerBuilder(raw=raw)()
     scripts = intermediate._get_scripts()
     combined = "\n".join(scripts)
-    assert "need_update" in combined.lower() or "__need_update__" in combined
+    assert "__need_update__ = (self._steps + 1) % 4 == 0" in combined
 
 
 def test_torch_learner_builder_with_extra_kwargs() -> None:

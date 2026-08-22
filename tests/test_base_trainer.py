@@ -203,18 +203,26 @@ class _FakeLearner:
         self.optimizer_models: dict[str, list[str]] = {}
         self.learning_rates = {"lr": 0.1}
         self.named_models: dict[str, Any] = {"model": "the-model"}
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
         """Return the named models every callback reads off the info."""
         return self.named_models
 
-    def update(self, step: int) -> bool:
-        """Report whether this step ends an update."""
-        return self._should_update
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, **inputs: Any) -> dict[str, Any]:
-        """Return fixed training criteria."""
+        """Count the Step, report whether it landed an Update, and return fixed training criteria."""
+        self.steps += 1
+        self.has_updated = self._should_update
+        if self.has_updated:
+            self.updates += 1
         return {"loss": 0.5}
 
     def inference_step(self, **inputs: Any) -> dict[str, Any]:
@@ -317,6 +325,23 @@ class _InfoWithModels(BaseInfo[Any]):
     def models(self) -> dict[str, Any]:
         """Return the models this info was built with."""
         return self.named_models
+
+
+@dataclass(kw_only=True)
+class _SteppedInfo(BaseInfo[Any]):
+    """Info with a directly drivable step count, for criterion tests run outside a trainer.
+
+    ``BaseInfo.step`` is a read-only view of the learner's counter, so a test without a learner
+    overrides it with a settable source.
+    """
+
+    current_step: int = 0
+    """The step count the ``step`` property reports."""
+
+    @property
+    def step(self) -> int:
+        """Report the driven step, standing in for a trainer's learner-backed count."""
+        return self.current_step
 
 
 # ---------------------------------------------------------------------------
@@ -673,10 +698,10 @@ def test_best_criterion_tracks_the_best_value(
 ) -> None:
     """The best value survives regressions: that is what makes 'best' meaningful."""
     criterion: BestCriterion[Any] = BestCriterion(target="loss", mode=mode)
-    info: BaseInfo[Any] = BaseInfo()
+    info = _SteppedInfo()
     for epoch, value in enumerate(values, start=1):
         info.epoch = epoch
-        info.step = epoch
+        info.current_step = epoch
         info.history[epoch] = {"loss": value}
         criterion.on_epoch_end(info)
     assert criterion.value == pytest.approx(expected)

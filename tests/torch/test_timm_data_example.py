@@ -41,10 +41,12 @@ class _StubLearner:
     optimizers: dict[str, Any] = {}
     optimizer_models: dict[str, list[str]] = {}
     learning_rates: dict[str, float] = {}
+    steps: int = 0
+    updates: int = 0
+    has_updated: bool = True
 
-    def update(self, step: int) -> bool:
-        """Always signal that an update should occur."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Nothing to seed: the routing test never resumes."""
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """No-op training step."""

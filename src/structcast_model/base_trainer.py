@@ -52,8 +52,8 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
 class Learner(Protocol, Generic[ModelT]):
     """Protocol for the object that owns the models and defines how they learn.
 
-    A learner decides when an update should happen, how a training step runs, and how an
-    inference step runs.
+    A learner owns the training counters (docs/adr/0018), defines how a training step runs and
+    how an inference step runs, and reports after each step whether an Update landed.
     """
 
     @property
@@ -76,8 +76,20 @@ class Learner(Protocol, Generic[ModelT]):
     def learning_rates(self) -> dict[str, float]:
         """The current learning rate of each optimizer, for display and logging."""
 
-    def update(self, step: int) -> bool:
-        """Determine whether to update the model based on the current step and any internal state."""
+    @property
+    def steps(self) -> int:
+        """The number of completed training Steps (batch iterations)."""
+
+    @property
+    def updates(self) -> int:
+        """The number of completed Updates (optimizer applies)."""
+
+    @property
+    def has_updated(self) -> bool:
+        """Whether the just-finished Step landed an Update."""
+
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the host-owned counters after a checkpoint restore."""
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Perform the training step for the given criteria."""
@@ -159,17 +171,31 @@ class SimpleDataProvider:
 class BaseInfo(Generic[ModelT]):
     """Base information for building a model."""
 
-    step: int = 0
-    """The current training step."""
-
-    update: int = 0
-    """The number of times the model has been updated."""
-
     epoch: int = 0
     """The current epoch."""
 
     history: dict[int, dict[str, Any]] = field(default_factory=dict)
     """History of training and validation logs."""
+
+    @property
+    def step(self) -> int:
+        """The number of completed training Steps, read from the learner (docs/adr/0018).
+
+        Read-only: the learner owns the counters. An info without a ``learner`` attribute (a bare
+        ``BaseInfo`` outside a trainer) reads 0.
+        """
+        learner: Learner[ModelT] | None = getattr(self, "learner", None)
+        return 0 if learner is None else learner.steps
+
+    @property
+    def update(self) -> int:
+        """The number of completed Updates, read from the learner (docs/adr/0018).
+
+        Read-only: the learner owns the counters. An info without a ``learner`` attribute (a bare
+        ``BaseInfo`` outside a trainer) reads 0.
+        """
+        learner: Learner[ModelT] | None = getattr(self, "learner", None)
+        return 0 if learner is None else learner.updates
 
     @property
     def models(self) -> dict[str, ModelT]:
@@ -412,6 +438,9 @@ class BaseTrainer(BaseInfo[ModelT]):
     def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
         """Perform a training step and update the models.
 
+        The update flag is a post-step read of the learner's ``has_updated``: the learner owns the
+        training counters (docs/adr/0018).
+
         Args:
             __inputs__ (Any): The inputs for the training step.
 
@@ -419,7 +448,8 @@ class BaseTrainer(BaseInfo[ModelT]):
             tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
                 a dictionary of criteria for tracking.
         """
-        return self.learner.update(self.step), self.learner.training_step(**__inputs__)
+        res = self.learner.training_step(**__inputs__)
+        return self.learner.has_updated, res
 
     def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
         """Train the model on the given dataset.
@@ -434,7 +464,6 @@ class BaseTrainer(BaseInfo[ModelT]):
         self._dispatch("on_training_begin")
         elapsed_time = 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
-            self.step += 1
             self._dispatch("on_training_step_begin")
             elapsed_time -= time()
             updated, criteria = self.update_models(inputs)
@@ -446,7 +475,6 @@ class BaseTrainer(BaseInfo[ModelT]):
                 logs = {f"{self.training_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
             if updated:
-                self.update += 1
                 self._dispatch("on_update")
             self._dispatch("on_training_step_end")
         self._dispatch("on_training_end")

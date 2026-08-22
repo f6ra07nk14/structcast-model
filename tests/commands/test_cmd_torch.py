@@ -137,18 +137,25 @@ class SimpleLearner:
         self._models = models
         model = next(iter(models.values()))
         self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
         """Return models."""
         return self._models
 
-    def update(self, step: int) -> bool:
-        """Always signal update."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, **kwargs: Any) -> dict[str, Any]:
-        """Return fixed training criteria."""
+        """Count one step that always lands an update, returning fixed training criteria."""
+        self.steps += 1
+        self.updates += 1
+        self.has_updated = True
         return {"loss": torch.tensor(0.5), "acc": torch.tensor(0.9)}
 
     def inference_step(self, **kwargs: Any) -> dict[str, Any]:
@@ -201,6 +208,9 @@ class GradientLearner:
     def __init__(self, **models: torch.nn.Module) -> None:
         """Keep the models the command built."""
         self._models = models
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
@@ -222,12 +232,16 @@ class GradientLearner:
         """Return no learning rates, there being no optimizer."""
         return {}
 
-    def update(self, step: int) -> bool:
-        """Always signal update."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, x: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         """Run one step and write the model's gradient, right after the backward, to `GRADIENT_DIR`."""
+        self.steps += 1
+        self.updates += 1
+        self.has_updated = True
         model = self._models["model"]
         loss = ((model(x) - target) ** 2).sum()
         loss.backward()
@@ -447,7 +461,14 @@ def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: C
     script = (tmp_path / "learner.py").read_text()
     assert "class Learner" in script
     # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
-    for member in ("def update(self", "def training_step(self", "def inference_step(self"):
+    for member in (
+        "def training_step(self",
+        "def inference_step(self",
+        "def steps(self",
+        "def updates(self",
+        "def has_updated(self",
+        "def restore_counters(self",
+    ):
         assert member in script
     assert "def models(self" in script
 

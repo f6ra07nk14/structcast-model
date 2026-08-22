@@ -46,15 +46,27 @@ class _LossModule(Module):
 
 @dataclass(kw_only=True)
 class _InfoWithModels(BaseInfo[torch.nn.Module]):
-    """Info carrying models without a trainer, for callbacks tested outside a training loop."""
+    """Info carrying models without a trainer, for callbacks tested outside a training loop.
+
+    ``BaseInfo.step`` is a read-only view of the learner's counter, so this learner-less info
+    overrides it with the settable ``current_step``.
+    """
 
     named_models: dict[str, torch.nn.Module] = field(default_factory=dict)
     """The models the property hands out."""
+
+    current_step: int = 0
+    """The step count the ``step`` property reports."""
 
     @property
     def models(self) -> dict[str, torch.nn.Module]:
         """Return the models this info was built with."""
         return self.named_models
+
+    @property
+    def step(self) -> int:
+        """Report the driven step, standing in for a trainer's learner-backed count."""
+        return self.current_step
 
 
 class _StubLearner:
@@ -70,6 +82,9 @@ class _StubLearner:
         self._models = models or {}
         self._optimizers = optimizers or {}
         self.learning_rates = learning_rates or {}
+        self.steps = 0
+        self.updates = 0
+        self.has_updated = False
 
     @property
     def models(self) -> dict[str, Any]:
@@ -86,12 +101,16 @@ class _StubLearner:
         """Pair every optimizer with every model, which is the pairing a single-model learner reports."""
         return {name: list(self._models) for name in self._optimizers}
 
-    def update(self, step: int) -> bool:
-        """Always signal that an update should occur."""
-        return True
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the counters, the way a resume path would."""
+        self.steps = steps
+        self.updates = updates
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op training step."""
+        """Count one step that always lands an update, returning no criteria."""
+        self.steps += 1
+        self.updates += 1
+        self.has_updated = True
         return {}
 
     def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -557,13 +576,15 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     """A run is resumed from the weights, the optimizer state, and the loop counters together."""
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    learner = _StubLearner(models={"model": model}, optimizers={"opt": optimizer})
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(models={"model": model}, optimizers={"opt": optimizer}),
+        learner=learner,
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=SimpleDataProvider(training_dataset=[]),
     )
-    trainer.epoch, trainer.step, trainer.update = 3, 7, 2
+    trainer.epoch = 3
+    learner.restore_counters(steps=7, updates=2)
     recorder = _RecordingLogger()
     TrainingStateSaver(logger=recorder, strategy=SingleDeviceStrategy(device="cpu")).on_epoch_end(trainer)
     states, name = recorder.states[0]
@@ -649,7 +670,7 @@ def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
     logger = _BestRecordingLogger()
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger, SingleDeviceStrategy(device="cpu"))
     info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert logger.metrics == [("best_val_loss", 0.3, 1)]
@@ -664,7 +685,7 @@ def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: lis
         [], ["val_loss"], save_criteria, logger, SingleDeviceStrategy(device="cpu")
     )
     info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert logger.states == expected
@@ -677,10 +698,10 @@ def test_from_criteria_does_not_save_a_stale_best() -> None:
         [], ["val_loss"], ["val_loss"], logger, SingleDeviceStrategy(device="cpu")
     )
     info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
-    info.epoch, info.step = 2, 9
+    info.epoch, info.current_step = 2, 9
     info.history[2] = {"val_loss": 0.9}
     monitor.on_epoch_end(info)
     assert logger.states == ["best_val_loss"]
@@ -697,7 +718,7 @@ def test_from_criteria_saves_the_states_the_strategy_produced() -> None:
     model = torch.nn.Linear(4, 2)
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger, strategy)
     info = _InfoWithModels(named_models={"model": model})
-    info.epoch, info.step = 1, 5
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert strategy.calls == [{"model": model}]

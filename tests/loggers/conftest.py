@@ -36,9 +36,23 @@ class _LearningRateLearner:
         """The optional decay metrics the finished epoch is logged with."""
         return {"opt_group0_weight_decay": 0.05}
 
-    def update(self, step: int) -> bool:
-        """Always signal that an update should occur."""
-        return True
+    @property
+    def steps(self) -> int:
+        """No steps taken: the loggers under test never run the loop."""
+        return 0
+
+    @property
+    def updates(self) -> int:
+        """No updates applied: the loggers under test never run the loop."""
+        return 0
+
+    @property
+    def has_updated(self) -> bool:
+        """No step just finished, so nothing was applied."""
+        return False
+
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Nothing to seed: the loggers under test never resume."""
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """No-op training step."""
