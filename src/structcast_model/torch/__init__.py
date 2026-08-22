@@ -3,15 +3,18 @@
 from typing import TYPE_CHECKING
 
 __all__ = [
+    "PARALLEL_STYLES",
     "CriteriaTracker",
     "DType",
     "DeviceLike",
     "DistributedDataParallelStrategy",
     "DistributedStrategy",
     "FullyShardedDataParallelStrategy",
+    "FullyShardedTensorParallelStrategy",
     "SingleDeviceStrategy",
     "Tensor",
     "TensorInitializer",
+    "TensorParallelStrategy",
     "TorchBestCriterion",
     "TorchTracker",
     "TorchTrainer",
@@ -39,10 +42,13 @@ __all__ = [
 if TYPE_CHECKING:
     from structcast_model.torch import layers
     from structcast_model.torch.distributed import (
+        PARALLEL_STYLES,
         DistributedDataParallelStrategy,
         DistributedStrategy,
         FullyShardedDataParallelStrategy,
+        FullyShardedTensorParallelStrategy,
         SingleDeviceStrategy,
+        TensorParallelStrategy,
         initial_distributed_env,
         matched_shard_modules,
         sync_gate,
@@ -82,10 +88,13 @@ else:
     # is defined in the layers subpackage, whose entry stays submodule-only, so trainer routes it.
     import_structure = {
         "distributed": [
+            "PARALLEL_STYLES",
             "DistributedDataParallelStrategy",
             "DistributedStrategy",
             "FullyShardedDataParallelStrategy",
+            "FullyShardedTensorParallelStrategy",
             "SingleDeviceStrategy",
+            "TensorParallelStrategy",
             "initial_distributed_env",
             "matched_shard_modules",
             "sync_gate",

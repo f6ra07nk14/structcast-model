@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from functools import partial
+import os
 from pathlib import Path
 import random
 from time import time
@@ -422,10 +423,17 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     )
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    torch.manual_seed(seed + global_rank)
-    np.random.seed(seed + global_rank)
-    random.seed(seed + global_rank)
+    # Before the seeding, which is derived from the strategy's data coordinates rather than the
+    # global rank: the ranks of one tensor-parallel group split a model, so they must draw the same
+    # dropout masks as each other and read the same slice of the dataset (ADR-0022). The coordinates
+    # go into the environment too, because a dataset is an independently instantiated object pattern
+    # the CLI hands nothing to, and a rank-aware loader has no other way to reach them.
     strategy = _resolve_strategy(strategy_pattern, device, local_rank, distributed)
+    os.environ["DATA_RANK"] = str(strategy.data_rank)
+    os.environ["DATA_WORLD_SIZE"] = str(strategy.data_world_size)
+    torch.manual_seed(seed + strategy.data_rank)
+    np.random.seed(seed + strategy.data_rank)
+    random.seed(seed + strategy.data_rank)
     is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
     training_dataset = instantiate_object(training_dataset_pattern)
@@ -459,7 +467,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         start_epoch = scm_torch.restore_training_state(
             resume=resume,
             strategy=strategy,
-            models=models,
+            # The learner's mapping, not the command's: the saver writes `learner.models`, which
+            # also carries the `ema_<model>` shadows the command never built (`docs/adr/0021`).
+            models=dict(learner.models),
             learner=learner,
             start_epoch=start_epoch,
             is_main=is_main,

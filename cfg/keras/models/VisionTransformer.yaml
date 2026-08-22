@@ -30,6 +30,14 @@ PARAMETERS:
     # depths, so the ramp is just "drop_path_rate * i / (depth - 1)".
     drop_path_rate: 0.1
     norm_eps: 1.0e-6
+    # Activation checkpointing on every transformer block, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on with -p "SHARED: {gradient_checkpointing: true}",
+    # which buys the block's activation memory with a second forward pass over it (REFERENCE.md,
+    # "GRADIENT_CHECKPOINTING"). Pair it with "drop_path_rate: 0.0", or the build is refused:
+    # "keras.remat" re-draws "SeedGenerator" state on the recomputation, and the "DropPath" sublayer
+    # of a block is a "keras.layers.Dropout". At rate 0 that Dropout returns its input untouched and
+    # draws nothing, so the second pass matches and the build goes through.
+    gradient_checkpointing: false
   # model size parameters
   base:
     dim: 768
@@ -114,6 +122,7 @@ Block:
   # "vit_base_patch16_224" sets "init_values=None", which makes it an identity.
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    GRADIENT_CHECKPOINTING: {{gradient_checkpointing}}
     FLOW:
       - [inp, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
       # Bidirectional self-attention: every patch may read every patch, so no causal mask.

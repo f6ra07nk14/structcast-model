@@ -334,6 +334,14 @@ class UserDefinedLayer(Serializable):
     STRUCTURED_OUTPUT: bool = False
     """Whether the output is structured."""
 
+    GRADIENT_CHECKPOINTING: bool | dict[str, Any] = False
+    """Whether the layer recomputes its own forward pass during the backward pass.
+
+    `true` enables the framework's own mechanism with its defaults; a mapping enables it too and carries the
+    keyword arguments of that mechanism, each value resolved like any other DSL value, so patterns and
+    callables work. Which keywords are legal is checked by the framework builder (`docs/adr/0020`).
+    """
+
     @field_validator("IMPORTS", mode="before")
     @classmethod
     def _validate_imports(cls, data: Any) -> Any:

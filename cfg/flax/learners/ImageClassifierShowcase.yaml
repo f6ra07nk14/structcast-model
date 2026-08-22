@@ -1,0 +1,108 @@
+# "cfg/flax/learners/ImageClassifier.yaml" with the memory-and-stability features of the Flax
+# backend turned on at once. The chain, the flow and the criteria are the base learner's, unchanged,
+# so a diff against it shows the knobs and nothing else.
+#
+#   scm flax train \
+#     --model cfg/flax/models/VisionTransformer.yaml \
+#     --learner cfg/flax/learners/ImageClassifierShowcase.yaml \
+#     -p "SHARED: {gradient_checkpointing: true}"
+#
+# 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
+#    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section, which then
+#    inherits "structcast_model.flax.layers.GradientCheckpointingModule" and emits its body as
+#    "_forward" (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020").
+# 2. Accumulation is the "optax.MultiSteps" below.
+# 3. Mixed precision has no learner field on this backend, and no "-p" reaches it either.
+#    Flax carries precision on the model, as the "dtype" (compute) and "param_dtype" (storage)
+#    keywords of each "flax.nnx" layer, and "cfg/flax/models/VisionTransformer.yaml" does not
+#    parameterize them: bf16 there is an edit to that template's layer patterns, e.g.
+#      [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {..., dtype: "eval: jax.numpy.bfloat16"}}]
+#    which leaves "param_dtype" at float32 -- fp32 weights, bf16 matmuls. What "-p" does reach is
+#    the dtype of the batch, on the dataset template:
+#      --training-dataset cfg/flax/others/default_tfdata.yaml -p "DEFAULT: {image_dtype: bfloat16}"
+#    and that alone is not mixed precision: "flax.nnx" promotes a bf16 input against fp32 parameters
+#    back up to fp32. The one precision knob that does belong here is "accumulator_dtype" below.
+# 4. EMA is the "EMA" field below.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+IMPORTS: {}
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+# 4. EMA: an exponential moving average of "model" as "flax.nnx.EMA", emitted as the learner
+#    attribute "ema_model" -- the "apply_to" view, so the averaged weights are directly callable.
+#    "true" takes the filled-in defaults, "decay: 0.999" over "flax.nnx.Param" alone (an RNG key
+#    cannot be blended). It is blended once per Update, never on an accumulation micro-step, by an
+#    eager call at the end of the host "training_step" (REFERENCE.md, "EMA"; "docs/adr/0021").
+EMA: {model: true}
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # 2. Accumulation: "optax.MultiSteps" must be the outermost transformation -- one nested inside
+    #    the chain would buffer the gradients just the same but count every micro-step as an update,
+    #    so a per-update schedule or callback would fire "every_k_schedule" times too often. The
+    #    generated "__init__" reads the window back to validate it, and the step reads
+    #    "MultiStepsState.gradient_step" for "updates" and "has_updated" (REFERENCE.md,
+    #    "ACCUMULATE_GRADIENTS"; "docs/adr/0017", "docs/adr/0018"). Clipping stays inside the chain,
+    #    so it applies once per update to the accumulated gradients. "accumulator_dtype" is where
+    #    precision would enter this template -- the buffer defaults to float32, which doubles its
+    #    memory against bf16 parameters -- and is left at that default, the shipped model being
+    #    float32 throughout.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _jinja_yaml_: |-
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.MultiSteps
+                - _call_:
+                    opt:
+                      - _obj_
+                      - _addr_: optax.chain
+                      - _call_:
+                          {% if clip_grad_norm is not none %}
+                          - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                          {% endif %}
+                          - - _obj_
+                            - _addr_: optax.adamw
+                            - _call_:
+                                learning_rate: {{lr}}
+                                weight_decay: {{weight_decay}}
+                                b1: 0.9
+                                b2: 0.999
+                                mask:
+                                  - _obj_
+                                  - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                                  - _call_:
+                                      - ^(?:\w+\.)*bias$
+                                      - ^(?:\w+\.)*scale$
+                                      - ^(?:\w+\.)*embedding$
+                    every_k_schedule: {{accumulate_gradients}}
+    EXTRA: {}
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - INPUTS: {logits: cls, labels: label}
+        OUTPUTS: sample_losses
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: optax.softmax_cross_entropy_with_integer_labels}]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+    # Validation runs the average, which is the point of keeping one.
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: ema_model
+      - [{logits: cls, labels: label}, sample_losses, cross_entropy_loss]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+LOSSES: []
+MODELS: []

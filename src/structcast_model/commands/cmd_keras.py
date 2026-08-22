@@ -275,7 +275,7 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "scm_keras.KerasDist
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
         # active backend supports, and rejects the rest with the reason -- which is the error to read.
-        preset = cast('Literal["single", "dp", "fsdp"]', strategy)
+        preset = cast('Literal["single", "dp", "fsdp", "tp"]', strategy)
         return scm_keras.KerasDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
 
@@ -400,7 +400,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         'the replicas, variables replicated) or "fsdp" (the batch split and the variables sharded too). Each '
         "preset runs on the mechanism its Keras backend actually has -- keras.distribution on jax, "
         "tf.distribute.MirroredStrategy on tensorflow, DistributedDataParallel on torch -- and fsdp is available "
-        "on jax alone; the other two cells are refused with the reason. "
+        'on jax alone; the other two cells are refused with the reason. The tensor-parallel preset "tp" splits '
+        "layers across a second mesh axis and needs a rule table naming which ones, so it is selected through its "
+        "cfg/keras/strategies template, not by name. "
         + scm_args.object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
         + scm_args.PATH_FORM_HELP
         + " The factory is called with the resolved device; the templates under cfg/keras/strategies bind the "

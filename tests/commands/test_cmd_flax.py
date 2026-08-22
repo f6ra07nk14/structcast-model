@@ -29,6 +29,7 @@ from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
 from structcast_model.commands.cmd_flax import app
 from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.flax.trainer import FlaxTrainer
+from structcast_model.loggers.state_backends import FlaxStateBackend
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR, FIXTURES_DIR
 from tests.fakes import CountingLearner
@@ -515,6 +516,43 @@ def test_train_resumes_from_a_saved_training_state(
     assert [metric.step for metric in history] == [3]
     # Training continued from the restored weights rather than from a fresh initialization.
     assert history[0].value < first.data.metrics["loss"]
+
+
+def test_train_resumes_the_averaged_shadow_models_the_learner_declares(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """A resume restores everything the learner calls a model, which is more than the command built.
+
+    The command builds the models named on its command line; the average is the learner's own, and
+    the saver writes it because it writes `learner.models`. Restoring the command's mapping instead
+    would leave the average at its construction value -- a checkpoint that saves what it cannot
+    resume. One batch per epoch makes the blend exact: the resumed run's average has to be the saved
+    one blended once with the parameters that epoch left behind.
+    """
+    raw = {**load_any(LEARNER_CFG), "EMA": {"model": {"decay": 0.5}}}
+    FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "averaging.py")
+    model_pattern, _ = patterns
+    averaging = (model_pattern, f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'averaging.py'}}}]")
+    one_batch = ["--training-dataset", f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: {{count: 1}}}}]"]
+    _train(cli_runner, averaging, tmp_path, experiment="flax-ema-resume", epochs=1, extra=one_batch)
+    (first,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
+    saved = FlaxStateBackend().load(first)["models"]
+
+    _train(
+        cli_runner,
+        averaging,
+        tmp_path,
+        experiment="flax-ema-resume",
+        epochs=2,
+        extra=[*one_batch, "--resume", str(first)],
+    )
+
+    path = next(p for p in (tmp_path / "mlruns").rglob("training_state.tar.gz") if p != first)
+    resumed = FlaxStateBackend().load(path)["models"]
+    expected = 0.5 * jnp.asarray(saved["ema_model"]["fc"]["kernel"]) + 0.5 * jnp.asarray(
+        resumed["model"]["fc"]["kernel"]
+    )
+    assert jnp.allclose(jnp.asarray(resumed["ema_model"]["fc"]["kernel"]), expected, rtol=1e-6)
 
 
 def test_train_warns_when_the_optimizer_pattern_changed_between_save_and_resume(

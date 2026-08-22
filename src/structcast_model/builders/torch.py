@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
-from pydantic import PositiveInt, model_validator
+from pydantic import Field, PositiveInt, model_validator
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 
@@ -20,6 +20,27 @@ from structcast_model.builders.base import (
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import resolve_getter, resolve_object, statement_names
 from structcast_model.utils.base import to_snake, unique
+
+_CHECKPOINT_OPTIONS = frozenset(
+    {"context_fn", "debug", "determinism_check", "early_stop", "preserve_rng_state", "use_reentrant"}
+)
+"""The keyword arguments `torch.utils.checkpoint.checkpoint` accepts, which `GRADIENT_CHECKPOINTING` carries."""
+
+
+def _unwrapped(model: str) -> str:
+    """The emitted expression naming the module a DDP wrapper holds, or the model when it holds none.
+
+    By type, never by attribute name: a model owning a submodule of its own called `module` would
+    otherwise be averaged in fragments, silently.
+    """
+    return f"({model}.module if isinstance({model}, torch.nn.parallel.DistributedDataParallel) else {model})"
+
+
+_EMA_DEFAULTS = {"multi_avg_fn": "eval: torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)"}
+"""What makes an `AveragedModel` an exponential moving average: without it torch averages equally (SWA).
+
+Filled in under a mapping too, the way `use_reentrant` is, so a mapping that only sets `device` still
+declares what its `EMA` key says it declares. Pass `multi_avg_fn: null` for torch's own SWA."""
 
 
 class TorchLayerIntermediate(LayerIntermediate):
@@ -36,6 +57,14 @@ class TorchLayerIntermediate(LayerIntermediate):
         """Implement the method to get the script for the layer."""
         indent = " " * 4
         sep = "\n" + indent * 2
+        base, attributes = "torch.nn.Module", ""
+        if self.gradient_checkpointing is not None:
+            base = "GradientCheckpointingLayer"
+            lines = ["gradient_checkpointing = True"]
+            if self.gradient_checkpointing:
+                keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
+                lines.append(f"_checkpoint_kwargs = {{{keywords}}}")
+            attributes = "".join(f"{indent}{line}\n" for line in lines) + "\n"
         if self._forward_inference_flow:
             codes = [
                 "if self.training:",
@@ -48,9 +77,9 @@ class TorchLayerIntermediate(LayerIntermediate):
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
         return f"""\
-class {class_name}(torch.nn.Module):
+class {class_name}({base}):
 
-    def __init__(self):
+{attributes}    def __init__(self):
         super().__init__()
         self.inputs = {self.inputs}
         self.input_shapes = {self.input_shapes}
@@ -68,6 +97,29 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
     """Builder for PyTorch models."""
 
     user_defined_layer_type: ClassVar[type[TorchLayerIntermediate]] = TorchLayerIntermediate
+
+    def _resolve_gradient_checkpointing(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        config: bool | dict[str, Any],
+    ) -> dict[str, str] | None:
+        """Validate the mapping against the keywords of `torch.utils.checkpoint.checkpoint`.
+
+        `use_reentrant` is filled in as `False` when the mapping leaves it out: torch has no usable
+        default for it -- it warns on every call and announces an exception in a later release -- and
+        the reentrant variant differentiates nothing it was not handed positionally, which a
+        generated layer called with its batch by name would be.
+        """
+        if config is False:
+            return None
+        options = {} if isinstance(config, bool) else config
+        if unknown := sorted(options.keys() - _CHECKPOINT_OPTIONS):
+            raise SpecError(
+                f'GRADIENT_CHECKPOINTING option "{unknown[0]}" is not a keyword argument of '
+                f"torch.utils.checkpoint.checkpoint, which accepts {sorted(_CHECKPOINT_OPTIONS)}."
+            )
+        imports["structcast_model.torch.layers"].add("GradientCheckpointingLayer")
+        return {key: resolve_getter(imports, value) for key, value in {"use_reentrant": False, **options}.items()}
 
 
 class TorchLearnerBehavior(LearnerBehavior):
@@ -98,6 +150,15 @@ class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
 
     MIXED_PRECISION_TYPE: Literal["bfloat16", "float16"] | None = None
     """The mixed precision type to use during backward pass when mixed precision is enabled."""
+
+    EMA: dict[str, bool | dict[str, Any]] = Field(default_factory=dict)
+    """The models an exponential moving average shadows, keyed by the model name.
+
+    `true` takes the defaults; a mapping carries the keyword arguments of
+    `torch.optim.swa_utils.AveragedModel`, each value resolved like any other DSL value. The average
+    is emitted as the learner attribute `ema_<model>`, updated once per Update and runnable from
+    `INFERENCE_FLOW` under that name (`docs/adr/0021`).
+    """
 
     @model_validator(mode="after")
     def _validate_mixed_precision(self) -> Self:
@@ -137,6 +198,12 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
 
     mixed_precision_type: str | None
     """The mixed precision type for the learner, or `None` if mixed precision is not used."""
+
+    ema: tuple[str, ...] = ()
+    """The models carrying an exponential moving average, in `EMA` declaration order.
+
+    Each one is emitted as the attribute `ema_<model>`, built from the expression the builder
+    registered under that name in `others` (`docs/adr/0021`)."""
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
@@ -306,19 +373,67 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
             if self.accumulate_gradients
             else "__need_update__ = True",
         ] + [f"{n} = self.{n}" for n in used]
-        return defs, binds + step + [
+        return defs, binds + step + self._step_tail
+
+    @cached_property
+    def _step_tail(self) -> list[str]:
+        """The lines closing the training step: the counters, and the averages that follow them."""
+        tail = [
             "# Intent, not detection: under float16 the gradient scaler may skip the apply this flag reports,",
             "# and a torch optimizer exposes no counter to check it against.",
             "if __need_update__:",
             f"{' ' * 4}self._updates += 1",
             "self._has_updated = __need_update__",
         ]
+        if self.ema:
+            # One blend per Update, never per accumulation micro-step, and after every segment of the
+            # step has applied: what an average follows is the weights a whole step produced.
+            tail.append("if self._has_updated:")
+            tail += [f"{' ' * 4}self.ema_{m}.update_parameters({_unwrapped(m)})" for m in self.ema]
+        return tail
+
+    @cached_property
+    def _ema_lines(self) -> list[str]:
+        """Emit the `__init__` lines building each averaged model, refusing an already sharded one."""
+        lines: list[str] = []
+        for model in self.ema:
+            message = (
+                f'The exponential moving average of "{model}" cannot be built: an AveragedModel copies the '
+                "module it averages, and a module whose parameters are sharded (DTensor) has no copy to take. "
+                "EMA works with neither FSDP2 nor tensor parallel; drop the EMA entry, or train this model "
+                "under a strategy that keeps whole parameters."
+            )
+            lines += [
+                f'if any(type(p).__name__ == "DTensor" for p in {model}.parameters()):',
+                f"{' ' * 4}raise ValueError({message!r})",
+                "# Averaged over the module a DDP wrapper holds: the wrapper is not copyable, and the",
+                "# weights are the ones inside it. The average is only ever evaluated, never trained,",
+                "# so it stays in eval mode for the whole run.",
+                f"ema_{model} = {self.others[f'ema_{model}']}",
+                f"ema_{model}.eval()",
+            ]
+        return lines
+
+    def _reject_ema_in_training_flow(self) -> None:
+        """Reject a training FLOW reading an EMA shadow: an average follows training, it is not trained."""
+        shadows = {f"ema_{name}" for name in self.ema}
+        for unit in self.flow:
+            if isinstance(unit, OptimizerSegment):
+                continue
+            if shared := sorted(statement_names(self._get_regular_step(*unit))[0] & shadows):
+                raise SpecError(
+                    f'The training FLOW reads "{shared[0]}", the exponential moving average of a model: the '
+                    "average is a copy the optimizers never touch, and differentiating it trains nothing. "
+                    "Read it from INFERENCE_FLOW instead."
+                )
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner."""
+        self._reject_ema_in_training_flow()
         indent = " " * 4
         sep = "\n" + indent * 2
-        models_repr = ", ".join([f'"{m}": self.{m}' for m in self.models])
+        shadows = [f"ema_{m}" for m in self.ema]
+        models_repr = ", ".join([f'"{m}": self.{m}' for m in self.models] + [f'"{n}": self.{n}' for n in shadows])
         opts_repr = ", ".join([f'"{n}": self.{n}' for n in self.optimizers])
         grad_scalers_repr = ", ".join([f'"{n}": self.{n}' for n in self.mixed_precision_scales])
         optimizer_models_repr = ", ".join(
@@ -329,6 +444,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
         defaults = ", ".join(f'"{m}": [p.requires_grad for p in {m}.parameters()]' for m in self.models)
+        instances = [f"{k} = {v}" for k, v in self.others.items() if k != v and k not in shadows] + self._ema_lines
         return f"""\
 class {self.classname}:
     \"\"\"Learner generated from a PyTorch learner template.
@@ -351,7 +467,7 @@ class {self.classname}:
         device_type = next({self.models[0]}.parameters()).device.type
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
         {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
-        {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
+        {sep.join(instances)}
         {sep.join(self._forward_training_flow)}
         {sep.join(self._forward_inference_flow)}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
@@ -464,11 +580,38 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
             scaler=amp_name,
         )
 
+    def _register_shadow_models(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        module: TorchUserDefinedLearner,
+        naming: AutoName,
+        others: dict[str, str],
+    ) -> None:
+        """Register one `torch.optim.swa_utils.AveragedModel` per `EMA` entry, named `ema_<model>`."""
+        for model, config in module.EMA.items():
+            if model not in module.TRAINABLE_LAYERS:
+                raise SpecError(
+                    f'EMA names "{model}", which is not a model of the learner: an EMA key names a model the '
+                    f"learner trains, which are {module.TRAINABLE_LAYERS}."
+                )
+            if (name := f"ema_{model}") in others or name in module.INPUTS or name in module.OUTPUTS:
+                raise SpecError(
+                    f'The EMA of "{model}" is emitted as "{name}", which the learner already uses for a model, '
+                    "an input or an output of its own. Rename that one."
+                )
+            # Reserved with the rest, so an auto-named flow layer cannot claim the name afterwards.
+            naming(name)
+            imports["torch.optim.swa_utils"].add(None)
+            options = {} if isinstance(config, bool) else config
+            keywords = "".join(f", {k}={resolve_getter(imports, v)}" for k, v in {**_EMA_DEFAULTS, **options}.items())
+            others[name] = f"torch.optim.swa_utils.AveragedModel({_unwrapped(model)}{keywords})"
+
     def _intermediate_fields(self, module: TorchUserDefinedLearner) -> dict[str, Any]:
         """Get the framework-specific fields of the built learner intermediate."""
         return {
             "accumulate_gradients": module.ACCUMULATE_GRADIENTS,
             "mixed_precision_type": module.MIXED_PRECISION_TYPE,
+            "ema": list(module.EMA),
         }
 
     def _get_mixed_precision(

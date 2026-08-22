@@ -911,3 +911,84 @@ def test_flax_learner_emits_one_optimizer_hash_per_segment() -> None:
 
     assert sorted(hashes) == ["optimizer_ab", "optimizer_c"]
     assert len(set(hashes.values())) == 2
+
+
+AVERAGED_INFERENCE = [
+    ["x", "prediction", "ema_model"],
+    [{"predictions": "prediction", "targets": "y"}, "errors", "mse"],
+    ["eval: errors.mean()", "loss", None],
+]
+"""An inference flow validating over the average instead of over the trained parameters."""
+
+
+def _ema_script(inference: list[Any] | None = None, **ema: Any) -> str:
+    """Build the linear learner with an `EMA` over its model and return the script holding the class."""
+    raw = {**load_any(LEARNER_YAML), "EMA": {"model": ema or True}}
+    if inference is not None:
+        raw["LEARNERS"][0]["INFERENCE_FLOW"] = inference
+    return FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+
+def test_flax_learner_emits_the_average_as_a_state_and_the_view_applied_from_it() -> None:
+    """`flax.nnx.EMA` holds the averaged variables; only the view it applies to a model is callable.
+
+    Both are kept: the state is what an Update blends, the view is what a flow runs and what the
+    `models` property carries to a checkpoint -- they share their variables, so saving the view saves
+    the average. The default filters to the parameters, which is the only thing that can be blended:
+    an RNG key cannot be multiplied by a float at all (`docs/adr/0021`).
+    """
+    script = _ema_script()
+
+    assert "self._ema_state_model = flax.nnx.EMA(model, decay=0.999, only=Param)" in script
+    assert "self.ema_model = self._ema_state_model.apply_to(model)" in script
+    assert "'model': self.model, 'ema_model': self.ema_model" in script
+
+
+def test_flax_learner_blends_the_average_on_the_host_after_the_step_returns() -> None:
+    """The blend is deliberately outside the traced step, and gated on the Update the step reported.
+
+    An `nnx.EMA` a compiled step closed over would be mutated from another trace level, which flax
+    rejects; threading it through the signature instead would change the donation contract for a host
+    call that costs nothing where it is. It may not reach the step's parameters either way.
+    """
+    script = _ema_script()
+    step = script.index("def _training_step(")
+    update = script.index("self._ema_state_model.update(self.model)")
+
+    assert "def _training_step(model, optimizer, *, x, y, **kwargs):" in script
+    assert script.index("self._has_updated = bool(has_updated)") < script.index("if self._has_updated:") < update
+    assert script.index("def training_step(self, x, y, **kwargs):") < update
+    assert step < script.index("def training_step(self, x, y, **kwargs):")
+
+
+def test_flax_learner_passes_the_average_to_the_inference_step_the_flow_runs_it_in() -> None:
+    """An average a flow runs is state the step takes, not a value it closes over.
+
+    Read from `__init__` it would be a constant to the tracer, so a compiled evaluation would keep
+    reporting the average as it stood when the learner was built. It gets an inference view of its
+    own for the same reason the models do: dropout off, running statistics frozen.
+    """
+    script = _ema_script(AVERAGED_INFERENCE)
+
+    assert "def _inference_step(model, ema_model, *, x, y, **kwargs):" in script
+    assert (
+        "self._view_ema_model = flax.nnx.view(self.ema_model, raise_if_not_found=False, training=False, "
+        "deterministic=True, use_running_average=True)"
+    ) in script
+    assert "return self._inference_step(self._view_model, self._view_ema_model, x=x, y=y, **kwargs)" in script
+
+
+def test_flax_learner_builds_no_inference_view_of_an_average_no_flow_runs() -> None:
+    """A view nothing runs is one more argument for a trainer to compile around, so it is not built."""
+    script = _ema_script()
+
+    assert "_view_ema_model" not in script
+    assert "def _inference_step(model, *, x, y, **kwargs):" in script
+
+
+def test_flax_learner_without_ema_is_emitted_as_it_was_before_the_field_existed() -> None:
+    """The field is opt-in: a learner that declares none may gain no line from it."""
+    built = FlaxLearnerBuilder.from_path(LEARNER_YAML)()
+
+    assert built.ema == ()
+    assert "ema_" not in built.scripts[-1]

@@ -153,6 +153,60 @@ OUTPUTS: [feat1, feat2, feat3, feat4]
 STRUCTURED_OUTPUT: true
 ```
 
+**`GRADIENT_CHECKPOINTING`** — Recomputes this layer's forward pass during the backward pass instead of keeping its activations alive, trading compute for memory. Available on all three frameworks (see [`docs/adr/0020`](docs/adr/0020-one-gradient-checkpointing-field-three-runtime-bases.md)); the key is valid on the root model and on any named sublayer, and applies to the layer it is written on, not to its sublayers.
+
+| Value             | Behavior                                                                                                       |
+| ----------------- | -------------------------------------------------------------------------------------------------------------- |
+| `false` (default) | No checkpointing. The generated class is byte-for-byte what it was before this key existed.                     |
+| `true`            | Checkpointing with the framework's defaults.                                                                    |
+| `dict`            | Checkpointing; the dict carries the keyword arguments of the framework's mechanism, each value resolved like any other DSL value (so `eval:`, object patterns and callables work). Unknown keys are rejected at build time, by name. |
+
+```yaml
+# On the root model, or on any named sublayer:
+GRADIENT_CHECKPOINTING: true
+
+Block:
+  GRADIENT_CHECKPOINTING: {use_reentrant: false}
+  INPUTS: [x]
+  OUTPUTS: [y]
+  FLOW: [[x, y, [_obj_, {_addr_: torch.nn.LazyLinear}, {_call_: {out_features: 64}}]]]
+```
+
+**The recomputation is not free.** Every checkpointed layer runs its forward pass twice per training step, so the memory it saves is bought with roughly one extra forward pass over that layer. Apply it to the blocks that dominate activation memory — a transformer block, a backbone stage — not to a whole model whose activations already fit.
+
+**Checkpointing follows training mode.** On torch it runs when the layer is in training mode and gradients are being recorded; on flax and keras when the call is a training call. A model a learner freezes runs in `eval()` (or `training=False`) while gradients still flow through it, and it is deliberately *not* checkpointed there: recomputing a forward pass that is defined to behave differently in the two modes is the anomaly, so the memory saving is declined rather than bought under other semantics. The torch `torch.is_grad_enabled()` half decides nothing beyond keeping a `torch.no_grad()` forward — an inference step — from paying for a checkpoint no backward pass will use. Two otherwise identical sublayers with different values stay two generated classes.
+
+**The layer must hold no state the second pass would advance.** Recomputation runs the body twice, so anything inside a checkpointed layer that draws from a random seed or writes its own variables happens twice per training step:
+
+- *torch* — a buffer-mutating sub-layer (`BatchNorm*`, and anything else updating running statistics in `forward`) updates those buffers **twice per step**; this is torch's own documented caveat, not something the builder detects. Dropout and other RNG layers are safe by default: `preserve_rng_state` is `true`, so the recomputation replays the same draw.
+- *keras* — the builder **refuses at build time** when a checkpointed layer builds a Keras layer known to carry that state, anywhere in its subtree — its own `FLOW` or any `TYPE`/`CFG` sublayer below it, since recomputation reaches exactly as far as the forward pass does. The list is the `Dropout` family (`Dropout`, `SpatialDropout1D/2D/3D`, `GaussianDropout`, `GaussianNoise`, `AlphaDropout`), `BatchNormalization` / `SyncBatchNormalization`, and every `Random*` preprocessing layer; the message names the sub-layer. A `Dropout`-family layer written with a literal `rate: 0` is allowed: `Dropout.call` is guarded by `rate > 0`, so it returns its input and draws nothing, which is how a template with parametrized stochastic depth (`cfg/keras/models/VisionTransformer.yaml`) turns checkpointing on — `drop_path_rate: 0.0` is required there, not decorative. The check matches on the name a layer is constructed under, so the general constraint remains yours to keep: a **user-defined** class that consumes a seed or updates a variable — including one reached through `_file_` — is invisible to it and will silently give different gradients on TensorFlow and PyTorch, or a tracer error on JAX.
+- *flax* — `nnx` state is threaded explicitly, so an `nnx.Rngs` draw or a variable update inside a rematerialized body is the same hazard; nothing detects it.
+
+*torch* — the keywords of [`torch.utils.checkpoint.checkpoint`](https://docs.pytorch.org/docs/stable/checkpoint.html). The generated class inherits `structcast_model.torch.layers.GradientCheckpointingLayer`, which intercepts `__call__`: no wrapper module is introduced, so `named_modules()` paths, parameter names and state-dict keys — which `shard_modules` globs and in-place compilation depend on — are unchanged.
+
+| Keyword              | Since torch | Notes                                                                                     |
+| -------------------- | ----------- | ----------------------------------------------------------------------------------------- |
+| `use_reentrant`      | 1.11        | Defaulted to `false` when the mapping leaves it out: torch itself has no usable default (it warns on every call and announces an exception in a later release). `true` selects the legacy variant, which computes no gradient unless one of the layer's **positional** arguments requires grad — a model whose batch enters as keyword arguments, or a first layer fed by plain data, silently gets no gradients from it. |
+| `preserve_rng_state` | 1.0         | `true` by default; set `false` when the layer has no randomness to reproduce.               |
+| `context_fn`         | 2.1         | Torch's selective-checkpointing knob, the counterpart of the flax `policy`: a callable returning the two context managers, typically `torch.utils.checkpoint.create_selective_checkpoint_contexts(...)`. Only with `use_reentrant: false`. |
+| `determinism_check`  | 2.1         | `"default"` or `"none"`; only meaningful with `use_reentrant: false`.                       |
+| `debug`              | 2.1         | Records the two traces and reports where they diverged; only with `use_reentrant: false`.   |
+| `early_stop`         | 2.9         | `false` recomputes the whole layer instead of stopping at the last needed activation.        |
+
+The floors above are the versions each keyword appeared in, not a supported-version floor (the project keeps [`docs/adr/0003`](docs/adr/0003-distributed-strategy-owns-the-distributed-lifecycle.md)'s guard-not-floor stance): an option unknown to the installed torch surfaces as a `TypeError` from `checkpoint` on the first training step.
+
+*flax* — the keywords of [`flax.nnx.remat`](https://flax.readthedocs.io/en/latest/api_reference/flax.nnx/transforms.html): `policy`, `prevent_cse`, `static_argnums`, `graph` and `graph_updates`. A `policy` written as a plain name resolves to `jax.checkpoint_policies.<name>` (e.g. `dots_saveable`, `nothing_saveable`); anything else — an object pattern building a parameterized policy, say — resolves like any other DSL value. The generated module inherits `structcast_model.flax.layers.GradientCheckpointingModule` and emits its body as `_forward`.
+
+`static_argnums` indexes the rematerialized callable, whose **argument 0 is the module itself**: the layer's first declared input is argument 1, the second is argument 2, and so on. `graph` and `graph_updates` are passed through as written.
+
+```yaml
+GRADIENT_CHECKPOINTING: {policy: dots_saveable, prevent_cse: false}
+```
+
+*keras* — [`keras.remat`](https://keras.io/api/utils/rematerialization/) (Keras 3.9+) takes the function alone, so a non-empty mapping is rejected at build time: use `GRADIENT_CHECKPOINTING: true`. The generated layer stays a plain `keras.layers.Layer` — which keeps the `call` signature Keras reads to route a batch passed by name — and emits its body as `_call_body`, wrapped by `call` on the training path alone.
+
+That wrapping is a Python `if training:`, so `training` has to be a Python value, not a traced tensor. Every generated learner passes a literal, and Keras itself passes a Python bool; a hand-written caller that threads a *traced* flag into a checkpointed layer gets `OperatorNotAllowedInGraphError` from TensorFlow instead of a silent wrong branch. Pass the flag as a Python value, or checkpoint a layer whose mode does not come from the graph.
+
 #### `FLOW` and `INFERENCE_FLOW`
 
 `FLOW` is the training-time execution graph: an ordered list of `LayerBehavior` entries (see [`FLOW` Entry Format](#flow-entry-format) below) that describes how tensors are routed through the model's submodules.
@@ -254,7 +308,7 @@ present:
 
 The following keys appear in learner configuration files such as [`cfg/torch/learners/ConvNeXtV2.yaml`](cfg/torch/learners/ConvNeXtV2.yaml) and [`cfg/torch/learners/CycleGAN.yaml`](cfg/torch/learners/CycleGAN.yaml). `scm torch create learner` turns them into a class implementing the `Learner` protocol.
 
-The schema splits in two (see [`docs/adr/0012`](docs/adr/0012-framework-neutral-learner-schema-with-torch-extensions.md)): [`builders/schema.py`](src/structcast_model/builders/schema.py) owns the framework-neutral `UserDefinedLearner` and `LearnerBehavior`, and [`builders/torch.py`](src/structcast_model/builders/torch.py) adds the torch-only keys as `TorchUserDefinedLearner` and `TorchLearnerBehavior`, reached through the `TorchTemplateLearner` the torch builder validates against. `scm flax create learner` validates the same file against the neutral classes, which forbid unknown fields, so the keys marked *(torch only)* below are rejected there.
+The schema splits in two (see [`docs/adr/0012`](docs/adr/0012-framework-neutral-learner-schema-with-torch-extensions.md)): [`builders/schema.py`](src/structcast_model/builders/schema.py) owns the framework-neutral `UserDefinedLearner` and `LearnerBehavior`, and [`builders/torch.py`](src/structcast_model/builders/torch.py) adds the torch-only keys as `TorchUserDefinedLearner` and `TorchLearnerBehavior`, reached through the `TorchTemplateLearner` the torch builder validates against. `scm flax create learner` validates against `FlaxUserDefinedLearner` in [`builders/flax.py`](src/structcast_model/builders/flax.py), which extends the neutral learner with `EMA` alone. A key a framework's learner schema does not declare is **not** rejected: the template class accepts extra keys and routes them to the layer builder as user-defined layer declarations, so a top-level key nothing references is silently ignored. `ACCUMULATE_GRADIENTS` or `EMA` written in a Keras learner therefore builds and does nothing — check the generated learner when a key seems to have no effect.
 
 **`IMPORTS`** — Same format as in the model schema. Injects additional Python imports into the generated learner file.
 
@@ -326,6 +380,50 @@ OPTIMIZER:
             opt: [_obj_, {_addr_: optax.sgd}, {_call_: {learning_rate: 0.1}}]
             every_k_schedule: 4
 ```
+
+**`EMA`** *(torch and flax, not keras)* — The models an exponential moving average shadows, keyed by model name. Each key must name a model the learner trains; anything else is a `SpecError` naming it. `true` takes the defaults, and a mapping carries the keyword arguments of the framework's EMA class, each value resolved like any other DSL value (patterns and callables work). See [`docs/adr/0021`](docs/adr/0021-ema-as-learner-declared-shadow-models.md).
+
+The average is emitted as the learner attribute `ema_<model>` and is a first-class flow name: `INFERENCE_FLOW` may run it, to validate over the averaged weights, while the training `FLOW` may not — an average is a copy no optimizer owns, so reading it there is a `SpecError`. It rides the generated `models` property, which is the persistence path: the existing `state_dict`/`load_state_dict` and best-checkpoint callbacks carry it with no change to the training-state payload. Blending happens once per Update, never on an accumulation micro-step, after every optimizer segment of the step has applied.
+
+```yaml
+EMA: {} # no averages (default)
+EMA: {model: true} # one average over "model", with the framework defaults
+EMA: {model: {decay: 0.99}} # the keywords of the framework's EMA class (flax here)
+```
+
+*torch* — [`torch.optim.swa_utils.AveragedModel`](https://docs.pytorch.org/docs/stable/optim.html#stochastic-weight-averaging) over the model, built from `getattr(model, "module", model)` because the models reach the learner already wrapped: a `DistributedDataParallel` wrapper cannot be copied, and the weights are the ones inside it. `multi_avg_fn: torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)` is filled in when the mapping leaves it out — without it `AveragedModel` averages every Update equally, which is SWA rather than EMA — so a mapping declares keywords, not a different mechanism (pass `multi_avg_fn: null` for torch's own SWA). The first Update seeds the average from the current weights, and every Update after it is `decay * average + (1 - decay) * weights`. The averaged weights and `n_averaged` restore through the module's state dict like any model's state. FSDP2 is refused rather than silently degraded: the generated `__init__` raises a `ValueError` when the model's parameters are `DTensor` shards, which an `AveragedModel` has no copy to take.
+
+```yaml
+EMA:
+  model:
+    multi_avg_fn: [_obj_, {_addr_: torch.optim.swa_utils.get_ema_multi_avg_fn}, {_call_: {decay: 0.99}}]
+    use_buffers: true # average the buffers too; by default they are copied from the model each Update
+```
+
+Buffers — batch-normalization running statistics above all — travel either way: `use_buffers: false` (torch's default) copies them from the source model on every Update, `use_buffers: true` folds them into the same average as the weights.
+
+*flax* — `flax.nnx.EMA` as `_ema_state_<model>`, with its `apply_to(<model>)` view bound to `ema_<model>` so the averaged weights are directly callable; the two share their variables, so saving the view saves the average. `decay: 0.999` and `only: flax.nnx.Param` are filled in when the mapping leaves them out: `nnx.EMA` tracks every Variable by default, and an RNG key cannot be blended at all (a `TypeError` on the first Update of any model with dropout), so the average is taken over the parameters, exactly as the optimizers are built `wrt=Param`. The update is a deliberate eager call at the end of the host `training_step`, not part of the traced step: an `nnx.EMA` a compiled step closes over is mutated at another trace level, which flax rejects, and threading it through the donated signature would change the step contract for a host call that costs nothing where it is. An average an `INFERENCE_FLOW` runs is passed to `_inference_step` as its own parameter, through an inference view of its own.
+
+*keras* — nothing is declared: the Keras optimizer already owns EMA through its `use_ema`, `ema_momentum`, `ema_overwrite_frequency` keywords in the `OPTIMIZER` pattern. Three limitations come with that and are not worked around: it updates on every `apply` call, including the accumulation no-ops of a `gradient_accumulation_steps` window; it must be configured on the inner optimizer when a `LossScaleOptimizer` wraps it; and it keeps no separate averaged copy, so there is nothing to validate against until `finalize_variable_values` overwrites the weights themselves.
+
+```yaml
+OPTIMIZER:
+  - _obj_
+  - _addr_: keras.optimizers.AdamW
+  - _call_: {learning_rate: 0.001, use_ema: true, ema_momentum: 0.99}
+```
+
+#### Putting it together
+
+One learner per framework turns every field above on at once over the shipped Vision Transformer, so the combination can be read in one file instead of assembled from four sections. `GRADIENT_CHECKPOINTING` is not among them — it belongs to the model — so each is paired with `cfg/<framework>/models/VisionTransformer.yaml` and a `-p` that sets the template's `gradient_checkpointing` parameter, which is `false` by default.
+
+| Learner | Turns on | Command |
+| ------- | -------- | ------- |
+| [`cfg/torch/learners/ImageClassifierShowcase.yaml`](cfg/torch/learners/ImageClassifierShowcase.yaml) | `ACCUMULATE_GRADIENTS`, `MIXED_PRECISION_TYPE` (and `MIXED_PRECISION` when that type is `float16`), `EMA` | `-p "SHARED: {gradient_checkpointing: true}"` |
+| [`cfg/flax/learners/ImageClassifierShowcase.yaml`](cfg/flax/learners/ImageClassifierShowcase.yaml) | `optax.MultiSteps`, `EMA` | `-p "SHARED: {gradient_checkpointing: true}"` |
+| [`cfg/keras/learners/ImageClassifierShowcase.yaml`](cfg/keras/learners/ImageClassifierShowcase.yaml) | `gradient_accumulation_steps`, `MIXED_PRECISION`/`MIXED_PRECISION_TYPE`, `use_ema` | `-p "SHARED: {gradient_checkpointing: true, drop_path_rate: 0.0}"` |
+
+Two of those cells are shorter than the others, and the files say why rather than papering over it. Flax has no mixed-precision field at all: precision is `dtype`/`param_dtype` on the model's layers there, which the shipped template does not parameterize, so no `-p` reaches it. Keras needs `drop_path_rate: 0.0`: a block's `DropPath` is a `keras.layers.Dropout` reached through a `TYPE` sublayer, which the build-time refusal above cannot see, and `keras.remat` re-draws its seed on the recomputation — at rate 0 it draws nothing. The Keras showcase also casts the logits to float32 before the loss and the metrics, because `keras.metrics.sparse_top_k_categorical_accuracy` raises a `TypeError` on a bfloat16 prediction.
 
 #### `LEARNERS`
 
@@ -539,7 +637,11 @@ Fields: `target` (str), `mode` (`"min"` or `"max"`, default `"min"`), `callbacks
 
 ## API Reference: `trainer.py`
 
-[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer. The `DistributedStrategy` implementations it saves states through live in [`src/structcast_model/torch/distributed.py`](src/structcast_model/torch/distributed.py) — `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, and `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) — together with `sync_gate(model, armed)`, the per-call gradient-synchronization gate the generated learners use.
+[`src/structcast_model/torch/trainer.py`](src/structcast_model/torch/trainer.py) contains the PyTorch-specific runtime layer. The `DistributedStrategy` implementations it saves states through live in [`src/structcast_model/torch/distributed.py`](src/structcast_model/torch/distributed.py) — `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`), `TensorParallelStrategy` (`torch>=2.4`), and `FullyShardedTensorParallelStrategy`, which combines the last two — together with `sync_gate(model, armed)`, the per-call gradient-synchronization gate the generated learners use.
+
+The two tensor-parallel strategies take a `parallel_modules` plan: ordered `(glob over named_modules() paths, style)` pairs, the globs being `shard_modules`' (`*` and `?` never cross a `.`), the first pair matching a path winning. A style is one of `PARALLEL_STYLES` — `"column"` (`ColwiseParallel`), `"row"` (`RowwiseParallel`), `"sequence"` (`SequenceParallel`), `"column_heads"` (`ColwiseParallel(use_local_output=False)`, whose output stays a `DTensor` for an attention head reshape to see the sharded head count) — or any `ParallelStyle` instance, written as an object pattern inside the strategy pattern. A pattern matching no module in any model is refused as a typo, and a tied parameter landing in two matched modules is refused before anything is parallelized, exactly as `shard_modules` does. `TensorParallelStrategy` builds a one-dimensional mesh over every rank; `FullyShardedTensorParallelStrategy` builds a two-dimensional `(dp, tp)` one, applies the plan on the `tp` submesh first and `fully_shard` on the `dp` submesh after — torchtitan's order — and is what `tensor_parallel_size` sizes. `loss_parallel` is out of scope ([`docs/adr/0022`](docs/adr/0022-tensor-parallel-strategies-on-a-second-mesh-axis.md)).
+
+Every strategy also reports `data_rank` and `data_world_size`, the run's coordinates on the *data* axis: the global rank and world size under DDP and FSDP2, `0` and `1` under `TensorParallelStrategy` (whose ranks split one model and must therefore consume the identical batch), and the `dp` coordinate and size under the combination. `scm torch train` derives its per-rank seed from `data_rank` rather than the global rank (the process group's rank, which under a SLURM launch is the `SLURM_PROCID` the group was initialized with), and publishes both values as the `DATA_RANK` and `DATA_WORLD_SIZE` environment variables — a dataset is an independently instantiated object pattern the CLI hands nothing to, so a rank-aware loader reads them there. **A loader that shards on the global rank (a bare `torch.utils.data.distributed.DistributedSampler`, whose defaults are the process group's rank and size) is wrong under tensor parallelism**: pass `num_replicas=int(os.environ["DATA_WORLD_SIZE"])` and `rank=int(os.environ["DATA_RANK"])` instead. `sync_gate` needs nothing added for either strategy: a parallelized module is a plain `nn.Module` and DTensor emits each layer's collective inside the operation itself, so there is no deferred bucket to arm, while the combination still ends up with `fully_shard` on the model root, whose reduce-scatter — over the data axis alone — the gate arms as before.
 
 Both multi-rank strategies convert every `BatchNorm` layer to `SyncBatchNorm` inside `wrap()`, before DDP construction or FSDP2 sharding; `SingleDeviceStrategy` never converts, and the conversion is skipped on CPU devices, where `SyncBatchNorm`'s training forward rejects the input. It runs through timm's `convert_sync_batchnorm`, so a fused `BatchNormAct2d` becomes a `SyncBatchNormAct` — a `torch.nn.SyncBatchNorm` subclass — keeping the activation that a plain replacement would drop. The conversion is idempotent — a layer that already is a `torch.nn.SyncBatchNorm` is left untouched, `process_group` included — so pre-converted models keep working; calling `torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)` in the model definition is no longer needed. Bind `sync_batchnorm: false` on the strategy pattern to opt out — there is no CLI flag. Limitations: a non-timm third-party `_BatchNorm` subclass is flattened to a plain `SyncBatchNorm` (opt out and convert it yourself), `torch.compile` graph-breaks on `SyncBatchNorm`, and every replaced layer is a new object, so hooks registered on it are dropped — as is an in-place `--compile` of a model root or `shard_modules` match that is itself a `BatchNorm` layer.
 
@@ -717,7 +819,7 @@ trainer = FlaxTrainer(learner=learner, tracker=tracker, data=data, callbacks=[lo
 
 **`FlaxDistributedStrategy`** — Satisfies the torch `DistributedStrategy` protocol structurally, so the trainer and the checkpointing callbacks treat both backends alike. Constructing it activates its mesh process-wide (`jax.set_mesh` takes effect at `__init__`), which is what makes models built afterwards land on it — so `scm flax train` builds it before anything else.
 
-Fields: `preset` (`"single"`, `"dp"`, or `"fsdp"`, default `"single"`), `device` (the device the `single` preset runs on, e.g. `"cpu:0"`; the first available one by default), `devices` (how many devices `dp` and `fsdp` span; every available one by default), `rules` (ordered `(parameter-path regex, tactic)` pairs replacing the preset's table), and `min_size` (parameters smaller than this many bytes stay replicated, default 1 MiB).
+Fields: `preset` (`"single"`, `"dp"`, `"fsdp"`, `"tp"`, or `"fsdp_tp"`, default `"single"`), `device` (the device the `single` preset runs on, e.g. `"cpu:0"`; the first available one by default), `devices` (how many devices the multi-device presets span; every available one by default), `model_devices` (how many of them the model axis spans under the `tp` presets; every device under `tp`, required under `fsdp_tp`), `model_axis_mode` (`"auto"` or `"explicit"`, see below), `rules` (ordered `(parameter-path regex, tactic)` pairs replacing the preset's table), and `min_size` (parameters smaller than this many bytes stay replicated, default 1 MiB — the `fsdp` tactic's cutoff alone, since a `column`/`row` rule names one half of a plan whose other half is named too).
 
 Members:
 
@@ -728,4 +830,8 @@ Members:
 - `shard_batch(batch)` — splits a batch across the mesh along its leading dimension and commits it to the devices, raising when an entry has no leading dimension or one the mesh size does not divide
 - `state_dict(models, optimizers=None, optimizer_models=None)` and `load_state_dict(models, optimizers, optimizer_models, state)` — the full state (parameters, batch statistics, and RNG state) to and from host memory, keyed by model and by optimizer name. A typed RNG key travels as its raw key data and is rewrapped on the way back, and a restored leaf takes the dtype and the sharding of the live array it replaces — which is what makes a state saved on four devices load onto one. *optimizer_models* is accepted for protocol compatibility and unused: nnx optimizer state is already keyed by parameter path
 
-Module constants: `AXIS` (`"data"`, the single mesh axis every preset builds), `TACTICS` (`"replicate"` and `"fsdp"`, the tactics a rule may name), and `PRESET_RULES` (each preset's ordered rule table). The `fsdp` tactic only ever splits a parameter's leading dimension — sharding any other one puts the parameter's own axis on the axis the batch is already split along — and falls back to replication for a parameter with fewer than two dimensions, one below `min_size`, or one whose leading dimension the mesh size does not divide.
+Module constants: `AXIS` (`"data"`, the mesh axis every preset builds), `MODEL_AXIS` (`"model"`, the second one the `tp` presets add), `TP_PRESETS` (the presets that build it), `TACTICS` (`"replicate"`, `"fsdp"`, `"column"`, and `"row"`), and `PRESET_RULES` (each preset's ordered rule table). The `fsdp` tactic only ever splits a parameter's leading dimension — sharding any other one puts the parameter's own axis on the axis the batch is already split along — and falls back to replication for a parameter with fewer than two dimensions, one below `min_size`, or one whose leading dimension the **data axis** size does not divide — the data axis and not the mesh, since on the two-dimensional `fsdp_tp` mesh the mesh is wider and dividing by it would leave replicated exactly the parameters the data axis alone would have sharded.
+
+Tensor parallelism ([`docs/adr/0022`](docs/adr/0022-tensor-parallel-strategies-on-a-second-mesh-axis.md)) is the `tp` and `fsdp_tp` presets, whose mesh is `(data, model)`. `column` splits a parameter by its last dimension — a one-dimensional bias with it, since a column-parallel bias belongs to the output dimension — while `row` splits by the first one **and pins a one-dimensional bias to `P()`**: a bias split along the model axis, or added once per shard, is counted as many times as that axis is wide by the reduction a row-parallel layer ends in, which is the one tensor-parallel mistake that reports a plausible loss instead of an error, so it lives in the tactic where a rule table cannot reach it. Both fall back to replication for a dimension the model axis does not divide. Precedence is the table's own order, first match wins, as everywhere: under `fsdp_tp` the tensor-parallel rules come before the catch-all `fsdp` one, and each parameter is sharded on one axis or the other. Under these two presets alone, a parameter **no** rule matched keeps the sharding it was constructed with, so a model template's own `nnx.with_partitioning` or `dot_general` annotations survive a strategy that says nothing about them; `dp` and `fsdp` are unchanged and replicate whatever no rule shards. `shard_batch` divides by the data axis only and places `P("data")` on the two-dimensional mesh, because every device of one model-axis group runs the same items.
+
+The data axis is always Explicit. The model axis follows `model_axis_mode`: `"auto"` (the default) makes it `AxisType.Auto`, so the compiler inserts a row-parallel layer's reduction itself and a plain layer parallelizes with no model-template change; `"explicit"` types it like the data axis, and `wrap()` then verifies that every layer a `row` rule matched carries a `dot_general` hook of its own, raising with the layer path and the template line that fixes it. A template annotating its own parameters with `nnx.with_partitioning` needs `"explicit"` too: Flax refuses a mesh whose axes do not all have the same type (`Mesh must have all axes as Explicit or all axes as Auto`), so those initializers raise while the model axis is Auto. That hook is **`dot_general_out(*spec)`** (in [`flax/utils.py`](src/structcast_model/flax/utils.py), re-exported from `structcast_model.flax`) — a `jax.lax.dot_general` placing its result on `PartitionSpec(*spec)`, reached from a model template as `dot_general: "eval: dot_general_out('data', None)"`. It is a closure rather than a `functools.partial` because Flax passes `out_sharding=` explicitly on every call to the hook, silently overriding a keyword a partial bound.

@@ -28,6 +28,10 @@ import pytest
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.keras.distributed import REJECTED, KerasDistributedStrategy
+
+# The protocol the trainer and the checkpoint callbacks are written against lives on the torch side;
+# importing it here is what the Flax twin does, and pulls in no Keras backend.
+from structcast_model.torch.distributed import DistributedStrategy
 from tests import FIXTURES_DIR
 
 CFG_DIR = FIXTURES_DIR / "cfg" / "keras"
@@ -70,6 +74,16 @@ def _run(source: str, tmp_path: Path, *args: str, backend: str, **environment: s
 # ---------------------------------------------------------------------------
 
 
+def test_the_strategy_satisfies_the_distributed_strategy_protocol() -> None:
+    """The trainer and the checkpoint callbacks accept any strategy structurally, so this is the contract.
+
+    The torch protocol is the one they are written against, and this backend's strategy has to
+    satisfy it member for member -- `data_rank` and `data_world_size` included, which is what a
+    Keras run's loader and seeding would read if it ever grew ranks of its own.
+    """
+    assert isinstance(KerasDistributedStrategy(), DistributedStrategy)
+
+
 def test_an_unknown_preset_is_refused() -> None:
     """A typo'd preset must fail at configuration time, not silently train on one device."""
     with pytest.raises(ValueError, match="Unknown preset"):
@@ -83,9 +97,26 @@ def test_an_unknown_tactic_is_refused() -> None:
 
 
 def test_rules_given_to_a_preset_that_replicates_are_refused() -> None:
-    """Only fsdp shards anything, so rules handed to another preset would be silently ignored."""
+    """Only fsdp and tp split anything, so rules handed to another preset would be silently ignored."""
     with pytest.raises(ValueError, match="Sharding rules only decide"):
         KerasDistributedStrategy(preset="dp", rules=[(".*", "fsdp")])
+
+
+def test_the_tp_preset_without_rules_is_refused() -> None:
+    """It has no table of its own, so an accepted run would replicate everything and report success.
+
+    Which layers pair up into a column/row split is the model's own shape, and unlike the Flax twin a
+    Keras variable carries no annotation of its own to fall back on. Refused on every backend, before
+    the (preset, backend) matrix speaks, because a missing plan is a mistake everywhere.
+    """
+    with pytest.raises(ValueError, match="has no table of its own"):
+        KerasDistributedStrategy(preset="tp")
+
+
+def test_a_model_axis_tactic_is_refused_on_a_preset_without_one() -> None:
+    """`column` and `row` name a mesh axis only the tp preset builds, on every backend."""
+    with pytest.raises(ValueError, match='splits a variable along the "model" axis'):
+        KerasDistributedStrategy(preset="fsdp", rules=[(".*", "row")])
 
 
 @pytest.mark.skipif(BACKEND == "jax", reason="fsdp is supported on the jax backend, and asserted below.")
@@ -115,6 +146,28 @@ def test_fsdp_is_refused_on_a_backend_that_cannot_shard() -> None:
 def test_fsdp_is_accepted_on_the_jax_backend() -> None:
     """The one supported cell of the sharding column must construct, or the matrix says nothing."""
     assert KerasDistributedStrategy(preset="fsdp").preset == "fsdp"
+
+
+@pytest.mark.skipif(BACKEND == "jax", reason="tp is supported on the jax backend, and asserted below.")
+def test_tp_is_refused_on_a_backend_that_cannot_split_a_layer() -> None:
+    """Both rejected cells train replicated variables and report success, so each is refused by name.
+
+    TensorFlow would route the split through a `keras.distribution` prototype that does nothing, and
+    torch has no `keras.distribution` implementation at all -- neither raises on its own, which is
+    what makes a refusal at construction the only place the run can still be stopped.
+    """
+    with pytest.raises(ValueError, match="is not available") as error:
+        KerasDistributedStrategy(preset="tp", rules=[(".*", "column")])
+
+    message = str(error.value)
+    assert message == REJECTED[("tp", BACKEND)]
+    assert 'Use the "dp" preset' in message
+
+
+@pytest.mark.skipif(BACKEND != "jax", reason="tp is only available on the jax backend.")
+def test_tp_is_accepted_with_rules_on_the_jax_backend() -> None:
+    """The guard that keeps rules out of the replicating presets must let the tp ones through."""
+    assert KerasDistributedStrategy(preset="tp", rules=[(".*kernel", "column")]).preset == "tp"
 
 
 @pytest.mark.skipif(BACKEND != "torch", reason="Only the torch backend takes its ranks from the launcher.")
@@ -194,7 +247,8 @@ def load(path, name):
     return module
 
 directory, preset, devices = sys.argv[1], sys.argv[2], int(sys.argv[3]) or None
-strategy = KerasDistributedStrategy(preset=preset, devices=devices)
+rules = json.loads(sys.argv[4]) if len(sys.argv) > 4 else None
+strategy = KerasDistributedStrategy(preset=preset, devices=devices, rules=rules)
 # Before the model: a JAX variable reads the active distribution while it is created.
 with strategy.activate():
     keras.utils.set_random_seed(0)
@@ -265,6 +319,72 @@ def test_the_jax_fsdp_preset_shards_the_leading_dimension_of_what_it_can_divide(
 
     assert result["replicas"] == 2
     assert sorted(result["variables"].values()) == ["P('batch', None)", "P(None,)"]
+
+
+def test_the_jax_tp_preset_splits_a_column_parallel_layer_and_its_bias(
+    tmp_path: Path, generated: Path, jax_reference: dict[str, Any]
+) -> None:
+    """A column-parallel split takes the bias with it: it belongs to the output dimension.
+
+    The batch axis of the `tp` mesh is one device wide, so every device runs the whole batch through
+    its own slice of the layer -- `replicas` is 1 and the batch is placed whole. The losses are the
+    yardstick: a split that changed them would be a wrong answer, not a faster one.
+    """
+    rules = json.dumps([["kernel", "column"], ["bias", "column"]])
+
+    result = _run(JAX_SCRIPT, tmp_path, str(generated), "tp", "2", rules, **JAX_DEVICES)
+
+    assert result["replicas"] == 1
+    assert sorted(result["variables"].values()) == ["P('model',)", "P(None, 'model')"]
+    assert result["losses"] == pytest.approx(jax_reference["losses"], rel=1e-6)
+    assert np.allclose(result["kernel"], jax_reference["kernel"], rtol=1e-6)
+
+
+def test_the_jax_tp_preset_leaves_a_row_parallel_bias_whole(
+    tmp_path: Path, generated: Path, jax_reference: dict[str, Any]
+) -> None:
+    """The one tensor-parallel mistake that reports a plausible loss instead of an error.
+
+    A row-parallel layer reduces partial products across the model axis, so a bias split along it --
+    or added once per shard -- is counted as many times as the axis is wide. The rule table asks for
+    `row` on both variables here and the tactic must still leave the bias replicated.
+    """
+    rules = json.dumps([["kernel", "row"], ["bias", "row"]])
+
+    result = _run(JAX_SCRIPT, tmp_path, str(generated), "tp", "2", rules, **JAX_DEVICES)
+
+    assert sorted(result["variables"].values()) == ["P('model', None)", "P(None,)"]
+    assert result["losses"] == pytest.approx(jax_reference["losses"], rel=1e-6)
+
+
+UNMATCHED_RULES_SCRIPT = """
+import json
+import keras
+from structcast_model.keras.distributed import KerasDistributedStrategy
+
+strategy = KerasDistributedStrategy(preset="tp", devices=2,
+                                    rules=[["kernel", "column"], ["kernle", "row"]])
+with strategy.activate():
+    model = keras.Sequential([keras.Input(shape=(4,)), keras.layers.Dense(4)])
+try:
+    strategy.wrap({"model": model})
+    print(json.dumps({"error": ""}))
+except ValueError as error:
+    print(json.dumps({"error": str(error)}))
+"""
+
+
+def test_a_rule_matching_no_variable_is_refused(tmp_path: Path) -> None:
+    """A typo'd rule leaves its variables replicated and says nothing, so wrap refuses the table.
+
+    Wrap is the first moment the table can be checked at all -- the variables only exist once the
+    models are built -- and it is still before the first step. The message has to name the pattern:
+    a table of a dozen rules gives no other way to find the one that never fired.
+    """
+    result = _run(UNMATCHED_RULES_SCRIPT, tmp_path, **JAX_DEVICES)
+
+    assert "matched no variable" in result["error"]
+    assert "kernle" in result["error"]
 
 
 def test_the_jax_fsdp_preset_replicates_what_the_devices_do_not_divide(tmp_path: Path, generated: Path) -> None:

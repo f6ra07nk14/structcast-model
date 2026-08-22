@@ -38,9 +38,19 @@ with try_import() as _dcp_imports:  # torch >= 2.2; older builds admitted by the
     from torch.distributed.checkpoint import state_dict as _dcp_state_dict
     from torch.distributed.device_mesh import init_device_mesh
 
+with try_import() as _tp_imports:  # torch >= 2.4 ships the DTensor tensor-parallel styles at this path.
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        RowwiseParallel,
+        SequenceParallel,
+        parallelize_module,
+    )
+
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
-_WRAPPER_PREFIXES = ("module.", "_orig_mod.")
+PARALLEL_STYLES = ("column", "row", "sequence", "column_heads")
+"""The tensor-parallel styles a ``parallel_modules`` entry may name; any other value is used as the
+``ParallelStyle`` instance itself, which is the escape hatch for the styles this vocabulary lacks."""
 
 
 def _state_dict_api() -> Any:
@@ -116,22 +126,6 @@ def initial_distributed_env(
     return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
 
 
-def _strip_wrapper_prefixes(state: dict[str, Any]) -> dict[str, Any]:
-    """Strip ``module.`` / ``_orig_mod.`` wrapper prefixes from state-dict keys (old-torch fallback)."""
-
-    def _clean(key: str) -> str:
-        changed = True
-        while changed:
-            changed = False
-            for prefix in _WRAPPER_PREFIXES:
-                if key.startswith(prefix):
-                    key = key[len(prefix) :]
-                    changed = True
-        return key
-
-    return {_clean(k): v for k, v in state.items()}
-
-
 def sync_gate(module: Any, armed: bool) -> None:
     """Arm or disarm *module*'s next gradient synchronization; a no-op for plain modules.
 
@@ -161,7 +155,26 @@ class DistributedStrategy(Protocol):
     constructed, because generated learner step closures and optimizers capture the exact module
     objects handed to ``__init__``. ``sync_initial_weights`` must run before ``wrap`` so all
     implementations broadcast plain tensors.
+
+    Checkable with ``isinstance`` only: ``data_rank`` and ``data_world_size`` are non-method members,
+    and ``issubclass`` against a protocol that has any of those raises ``TypeError`` by design --
+    attribute-style annotations are counted the same way, so there is no spelling that keeps it.
     """
+
+    @property
+    def data_rank(self) -> int:
+        """Which slice of the dataset this rank must consume, and what its seed is derived from.
+
+        The global rank wherever every rank holds its own replica (DDP, FSDP2), but 0 on every rank
+        of a tensor-parallel group: those ranks split one model and must run the identical batch
+        through it under the identical dropout mask (``docs/adr/0022``). A run reading the global
+        rank instead would feed a tensor-parallel group as many different batches as it has ranks,
+        and every shard would draw its own mask -- both silently wrong rather than failing.
+        """
+
+    @property
+    def data_world_size(self) -> int:
+        """How many distinct dataset slices the run is split into: the data axis of the mesh."""
 
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap the models for this strategy and return the wrapped mapping."""
@@ -212,8 +225,21 @@ def _optimizer_container(
     return torch.nn.ModuleDict({n: models[n] for n in names})
 
 
+def _missing_model_state(name: str) -> ValueError:
+    """The error a resume raises when the saved state holds nothing for one of the live models."""
+    return ValueError(
+        f'The saved training state carries no state for model "{name}": it was written before that model '
+        "was declared -- an EMA shadow added to the learner since, most likely. Resume with the learner "
+        "the checkpoint was saved from, or start a fresh run."
+    )
+
+
 def _innermost_module(module: torch.nn.Module) -> torch.nn.Module:
-    """Peel DDP and torch.compile wrappers off *module*, in whatever order they were applied."""
+    """Peel DDP and torch.compile wrappers off *module*, in whatever order they were applied.
+
+    By type, never by attribute name: an `AveragedModel` keeps the module it averages under `.module`
+    too, and peeling that one would save a fragment of the average and load it back into nothing.
+    """
     while True:
         if isinstance(module, torch.nn.parallel.DistributedDataParallel):
             module = module.module
@@ -250,7 +276,10 @@ class _StateDictMixin:
         """Produce wrapper-free model (and optimizer) state dicts. See :class:`DistributedStrategy`."""
         api = _state_dict_api()
         if api is None:
-            states: dict[str, Any] = {"models": {n: _strip_wrapper_prefixes(m.state_dict()) for n, m in models.items()}}
+            # Saved from the module the wrappers hold, which is exactly what the fallback load path
+            # writes back into: stripping the prefixes off the wrapper's own keys instead would also
+            # strip a `module.` a model owns itself.
+            states: dict[str, Any] = {"models": {n: _innermost_module(m).state_dict() for n, m in models.items()}}
             if optimizers is not None:
                 states["optimizers"] = {n: o.state_dict() for n, o in optimizers.items()}
             return states
@@ -278,10 +307,20 @@ class _StateDictMixin:
         state: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Load a saved training state. See :class:`DistributedStrategy`."""
+        # Whether this rank was handed the state: the model tensors stay rank-0-only and reach the
+        # others through `broadcast_from_rank0`, so only the rank holding them can say what is missing.
+        holds_state = state is not None
         state = self._share_state(state)
         api = _state_dict_api()
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
+        # Checked before anything is written: torch reports a model it was handed an empty state for
+        # as a process-group failure, and a wrapped one accepts it silently and keeps its
+        # construction weights. A state holding models the learner no longer has is simply ignored.
+        if holds_state:
+            for name in models:
+                if name not in model_states:
+                    raise _missing_model_state(name)
         if api is None:
             # The old-torch fallback saved wrapper-free keys, so it must load into the innermost
             # module of whatever wrappers the CLI applied.
@@ -291,6 +330,8 @@ class _StateDictMixin:
                 optimizer.load_state_dict(optimizer_states[name])
             return state
         for name, module in models.items():
+            # `.get`, because the ranks the tensors are broadcast to hold none of them: what the
+            # state must carry was checked above, on the rank that was handed it.
             api.set_model_state_dict(module, model_states.get(name, {}), options=self._load_options(api))
         if not optimizer_models and optimizers:
             self._require_pairing_or_warn("loading")
@@ -404,6 +445,16 @@ class SingleDeviceStrategy(_CompileMixin, _StateDictMixin):
     local_rank: int = 0
     """Local rank; unused on a single device, accepted for a uniform constructor."""
 
+    @property
+    def data_rank(self) -> int:
+        """The only slice there is."""
+        return 0
+
+    @property
+    def data_world_size(self) -> int:
+        """One device consumes the whole dataset."""
+        return 1
+
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Return the models unchanged."""
         return models
@@ -423,6 +474,16 @@ class _MultiRankMixin:
     initial_distributed_env = staticmethod(initial_distributed_env)
 
     _broadcast_on_load = True
+
+    @property
+    def data_rank(self) -> int:
+        """The global rank: every rank holds a full replica and consumes its own slice."""
+        return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    @property
+    def data_world_size(self) -> int:
+        """The world size: one replica per rank. Outside a process group there is one of everything."""
+        return torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
         """Broadcast rank 0's parameters and buffers, making rank-0-only initializers authoritative.
@@ -554,6 +615,8 @@ def _matched_in_model(
 def matched_shard_modules(
     models: Mapping[str, torch.nn.Module],
     patterns: Sequence[str],
+    *,
+    option: str = "shard_modules",
 ) -> "OrderedDict[str, list[tuple[str, torch.nn.Module]]]":
     """Return, per model, the ``named_modules()`` entries whose path matches one of *patterns*.
 
@@ -564,7 +627,9 @@ def matched_shard_modules(
 
     Entries keep ``named_modules()`` (pre-order DFS) order, which the per-block wrap reverses to
     shard descendants before ancestors. A leading ``_orig_mod.`` is stripped before matching so the
-    same patterns keep working on a root already wrapped by ``torch.compile``.
+    same patterns keep working on a root already wrapped by ``torch.compile``. *option* is the name
+    of the strategy field the patterns came from, so the rejection below names the one to fix --
+    ``parallel_modules`` compiles its globs through here too.
 
     Raises:
         ValueError: if a pattern matches no module in any of the models. A pattern matching nothing
@@ -579,19 +644,19 @@ def matched_shard_modules(
     if unmatched:
         available = [p for m in models.values() for p, _ in m.named_modules() if p][:10]
         raise ValueError(
-            f"shard_modules pattern(s) {sorted(unmatched)} matched no module; "
-            f"available module paths include {available}."
+            f"{option} pattern(s) {sorted(unmatched)} matched no module; available module paths include {available}."
         )
     return matched
 
 
-def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str]) -> None:
-    """Refuse to shard *model* when a tied parameter would land in two ``fully_shard`` groups.
+def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str], option: str = "shard_modules") -> None:
+    """Refuse to shard *model* when a tied parameter would land in two sharding groups.
 
     Each parameter belongs to the innermost matched module containing it, or to the root group when
     no matched path contains it. ``fully_shard`` replaces a group's parameters with its own sharded
     copies and checks nothing, so a tie split across two groups silently becomes two parameters that
-    drift apart. A tie staying inside one group is untouched and fine.
+    drift apart; ``parallelize_module`` does the same with the styles' own DTensors, and can even
+    give the two ends different placements. A tie staying inside one group is untouched and fine.
     """
     groups: dict[int, tuple[str, str]] = {}
     for occurrence, parameter in model.named_parameters(remove_duplicate=False):
@@ -600,9 +665,139 @@ def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str]) -> None
         if owner != group:
             raise RuntimeError(
                 f"Tied parameter {first!r} and {occurrence!r} would be sharded into different "
-                f"fully_shard groups ({owner or '<root>'} and {group or '<root>'}); "
-                "shard_modules must keep tied parameters inside one group."
+                f"groups ({owner or '<root>'} and {group or '<root>'}); "
+                f"{option} must keep tied parameters inside one group."
             )
+
+
+def _device_mesh(device: str, **dims: int) -> Any:
+    """Build a named device mesh over the process group's ranks, on *device*'s own device type.
+
+    Without an explicit mesh, ``fully_shard`` follows the accelerator, which reports CUDA on
+    CUDA-enabled builds even when the strategy trains on CPU -- the mesh must follow the strategy's
+    device instead. Every dimension is named, so a two-dimensional mesh hands out its submeshes by
+    axis (``mesh["dp"]``, ``mesh["tp"]``) and the keyword order is the mesh order.
+    """
+    device_type = "cpu" if "cpu" in device else device.split(":", maxsplit=1)[0]
+    return init_device_mesh(device_type, tuple(dims.values()), mesh_dim_names=tuple(dims))
+
+
+def _parallel_style(style: Any) -> Any:
+    """Return the ``ParallelStyle`` a plan entry names, or *style* itself when it is not a name.
+
+    The vocabulary covers the four shapes a transformer needs; anything else -- ``PrepareModuleInput``,
+    a custom style, a ``ColwiseParallel`` with hand-picked layouts -- is written as an object pattern
+    in the strategy pattern, which the CLI instantiates before the strategy sees it.
+
+    Raises:
+        ValueError: if *style* is a string the vocabulary does not have.
+    """
+    if not isinstance(style, str):
+        return style
+    if style == "column":
+        return ColwiseParallel()
+    if style == "row":
+        return RowwiseParallel()
+    if style == "sequence":
+        return SequenceParallel()
+    if style == "column_heads":
+        # The attention shape: the projection's output stays a DTensor, so the head reshape that
+        # consumes it sees the sharded head count instead of the full one.
+        return ColwiseParallel(use_local_output=False)
+    raise ValueError(f"Unknown parallel style {style!r}. Available styles: {', '.join(PARALLEL_STYLES)}.")
+
+
+def _parallelize_models(
+    models: Mapping[str, torch.nn.Module],
+    mesh: Any,
+    parallel_modules: Sequence[tuple[str, Any]],
+) -> None:
+    """Apply *parallel_modules* to every model in place, over the one-dimensional *mesh*.
+
+    The globs are the ``shard_modules`` ones -- ``*`` and ``?`` never cross a ``.`` -- and go through
+    the same machinery: a pattern matching nothing anywhere is a typo and is refused, and every model
+    is checked for a tie split across two matched modules before any of them is parallelized. The
+    first entry matching a path decides its style, as the Flax and Keras rule tables do.
+    """
+    matched = matched_shard_modules(models, [pattern for pattern, _ in parallel_modules], option="parallel_modules")
+    for name, model in models.items():
+        _check_tied_parameters(model, [path for path, _ in matched[name]], "parallel_modules")
+    for model in models.values():
+        plan: dict[str, Any] = {}
+        for pattern, style in parallel_modules:
+            instance = _parallel_style(style)
+            for path, _ in _matched_in_model(model, [pattern])[0]:
+                plan.setdefault(path, instance)
+        if plan:
+            parallelize_module(model, mesh, plan)
+
+
+@dataclass(kw_only=True)
+class TensorParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
+    """Strategy splitting the matched layers of every model across all ranks (tensor parallelism).
+
+    One tensor-parallel group spans the whole world: each rank holds a shard of every matched layer
+    and runs the *same* batch through it, so the run has a single data slice
+    (:attr:`data_rank` 0 of :attr:`data_world_size` 1) and its loader must hand every rank identical
+    items -- a ``DistributedSampler`` keyed on the global rank would give each shard a different
+    batch and quietly train nonsense.
+
+    Nothing is gated: DTensor inserts each layer's collective inside the operation that needs it, so
+    there is no deferred bucket for :func:`sync_gate` to arm, and a parallelized module is a plain
+    ``nn.Module`` neither of its branches fires on. ``BatchNorm`` is likewise left alone -- every rank
+    already computes the statistics of the same batch, so there is nothing to synchronize.
+
+    Requires torch >= 2.4. ``loss_parallel`` is out of scope (``docs/adr/0022``): it constrains the
+    loss to cross-entropy with a mean reduction, which the generated learners do not promise.
+    """
+
+    device: str
+    """Device this rank trains on."""
+
+    local_rank: int = 0
+    """Local rank; the mesh is derived from the default process group."""
+
+    parallel_modules: Sequence[tuple[str, Any]] = ()
+    """Ordered (glob over ``named_modules()`` paths, style) pairs, e.g. ``[("*.wq", "column_heads")]``.
+    A style is one of :data:`PARALLEL_STYLES` or a ``ParallelStyle`` instance written as an object
+    pattern; the first entry matching a path wins."""
+
+    _mesh: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Fail loud when the installed torch has no tensor-parallel API, or the plan is empty.
+
+        Raises:
+            ImportError: if ``torch.distributed.tensor.parallel`` is missing.
+            ValueError: if no ``parallel_modules`` entry was given, which would parallelize nothing.
+        """
+        if not _tp_imports.is_successful:
+            raise ImportError(
+                "TensorParallelStrategy requires torch>=2.4 for the DTensor tensor-parallel API; the "
+                "installed torch does not provide torch.distributed.tensor.parallel.parallelize_module."
+            )
+        if not self.parallel_modules:
+            raise ValueError(
+                "TensorParallelStrategy needs a parallel_modules plan naming which submodules to split "
+                "and how; without one it would run every rank on the whole model and the whole batch."
+            )
+
+    @property
+    def data_rank(self) -> int:
+        """0 on every rank: the ranks of a tensor-parallel group consume one and the same slice."""
+        return 0
+
+    @property
+    def data_world_size(self) -> int:
+        """One slice: the whole world is a single tensor-parallel group."""
+        return 1
+
+    def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
+        """Parallelize every model's matched submodules in place and return the same modules."""
+        if self._mesh is None:
+            self._mesh = _device_mesh(self.device, tp=torch.distributed.get_world_size())
+        _parallelize_models(models, self._mesh, self.parallel_modules)
+        return models
 
 
 @dataclass(kw_only=True)
@@ -665,11 +860,15 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         if self.sync_batchnorm:
             models = _convert_sync_batchnorm(models, self.device)
         if self._mesh is None:
-            # Without an explicit mesh, fully_shard follows the accelerator, which reports CUDA on
-            # CUDA-enabled builds even when this strategy trains on CPU — the mesh must follow the
-            # strategy's device instead.
-            device_type = "cpu" if "cpu" in self.device else self.device.split(":")[0]
-            self._mesh = init_device_mesh(device_type, (torch.distributed.get_world_size(),))
+            self._mesh = _device_mesh(self.device, dp=torch.distributed.get_world_size())
+        return self._shard(models)
+
+    def _shard(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
+        """Shard *models* over ``self._mesh``: the matched submodules first, then every root.
+
+        Split out of :meth:`wrap` so the combination with tensor parallelism can put its own two
+        steps -- a two-dimensional mesh and ``parallelize_module`` -- in front of exactly this.
+        """
         kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
             # Any-valued because a dict[str, dtype] unpacked as **kwargs is checked against every
@@ -736,11 +935,113 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         return True
 
 
+@dataclass(kw_only=True)
+class FullyShardedTensorParallelStrategy(FullyShardedDataParallelStrategy):
+    """Strategy combining FSDP2 and tensor parallelism on a two-dimensional ``(dp, tp)`` mesh.
+
+    The ranks are laid out row-major, so rank ``r`` is tensor-parallel shard
+    ``r % tensor_parallel_size`` of data replica ``r // tensor_parallel_size``: the ranks of one
+    tensor-parallel group are adjacent and share :attr:`data_rank`, which is what the loader and the
+    seed derivation must follow.
+
+    ``parallelize_module`` runs first and ``fully_shard`` wraps its result on the data submesh --
+    torchtitan's order. Reversing it hands the tensor-parallel styles the ``fully_shard`` parameters
+    instead of the module's own, and the sharded model is then not the one the plan describes.
+    :func:`sync_gate` keeps working unchanged: ``fully_shard`` still runs on the model root, so the
+    root is an ``FSDPModule`` whose reduce-scatter -- over the data axis alone -- the gate arms.
+    """
+
+    tensor_parallel_size: int = 1
+    """How many ranks one tensor-parallel group spans; the world size divided by it is the data axis."""
+
+    parallel_modules: Sequence[tuple[str, Any]] = ()
+    """The tensor-parallel plan, in :class:`TensorParallelStrategy`'s form."""
+
+    _tp_mesh: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Fail loud when FSDP2 or the tensor-parallel API is missing, or the plan or degree is unusable.
+
+        Raises:
+            ImportError: if either API is unavailable in the installed torch.
+            ValueError: if no ``parallel_modules`` entry was given, or the degree is not a usable one.
+        """
+        super().__post_init__()
+        if not _tp_imports.is_successful:
+            raise ImportError(
+                "FullyShardedTensorParallelStrategy requires torch>=2.4 for the DTensor tensor-parallel "
+                "API; the installed torch does not provide "
+                "torch.distributed.tensor.parallel.parallelize_module."
+            )
+        if not self.parallel_modules:
+            raise ValueError(
+                "FullyShardedTensorParallelStrategy needs a parallel_modules plan naming which submodules "
+                "to split and how; without one, select FullyShardedDataParallelStrategy instead."
+            )
+        self._check_degree()
+
+    def _check_degree(self) -> None:
+        """Refuse a tensor-parallel degree no ``(dp, tp)`` mesh can express.
+
+        Runs at construction and again at wrap. Construction is where it matters: the CLI builds the
+        strategy inside an already-initialized process group and reads :attr:`data_rank` immediately
+        after, which divides by the degree -- a zero would surface as a bare ``ZeroDivisionError``
+        from the seeding line and a negative one would publish a negative world size. A strategy
+        built before the group can only be checked against a world size at wrap.
+
+        Raises:
+            ValueError: if the degree is below 1, or does not divide the world size.
+        """
+        if self.tensor_parallel_size < 1:
+            raise ValueError(
+                f"tensor_parallel_size must be at least 1, got {self.tensor_parallel_size}: it is how many "
+                "ranks one tensor-parallel group spans, and the world size divided by it is the data axis."
+            )
+        if not torch.distributed.is_initialized():
+            return
+        world_size = torch.distributed.get_world_size()
+        if world_size % self.tensor_parallel_size:
+            raise ValueError(
+                f"A tensor_parallel_size of {self.tensor_parallel_size} does not divide the world size "
+                f"{world_size}: the (dp, tp) mesh needs every rank in exactly one group of each axis."
+            )
+
+    @property
+    def data_rank(self) -> int:
+        """The data-axis coordinate: every rank of one tensor-parallel group reports the same one."""
+        return super().data_rank // self.tensor_parallel_size
+
+    @property
+    def data_world_size(self) -> int:
+        """The size of the data axis: the world size divided by the tensor-parallel degree."""
+        return super().data_world_size // self.tensor_parallel_size
+
+    def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
+        """Parallelize the matched submodules on the model axis, then shard on the data axis.
+
+        Raises:
+            ValueError: if the tensor-parallel degree does not divide the world size, which no mesh
+                can express and which would otherwise leave ranks out of the run.
+        """
+        if self.sync_batchnorm:
+            models = _convert_sync_batchnorm(models, self.device)
+        if self._mesh is None:
+            self._check_degree()
+            world_size = torch.distributed.get_world_size()
+            mesh = _device_mesh(self.device, dp=world_size // self.tensor_parallel_size, tp=self.tensor_parallel_size)
+            self._tp_mesh, self._mesh = mesh["tp"], mesh["dp"]
+        _parallelize_models(models, self._tp_mesh, self.parallel_modules)
+        return self._shard(models)
+
+
 __all__ = [
+    "PARALLEL_STYLES",
     "DistributedDataParallelStrategy",
     "DistributedStrategy",
     "FullyShardedDataParallelStrategy",
+    "FullyShardedTensorParallelStrategy",
     "SingleDeviceStrategy",
+    "TensorParallelStrategy",
     "initial_distributed_env",
     "matched_shard_modules",
     "sync_gate",

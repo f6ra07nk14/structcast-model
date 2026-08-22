@@ -1,0 +1,104 @@
+# "cfg/torch/learners/ImageClassifier.yaml" with the four memory-and-stability features of the torch
+# backend turned on at once. The optimizer, the flow and the criteria are the base learner's,
+# unchanged, so a diff against it shows the four knobs and nothing else.
+#
+#   scm torch train \
+#     --model cfg/torch/models/VisionTransformer.yaml \
+#     --learner cfg/torch/learners/ImageClassifierShowcase.yaml \
+#     -p "SHARED: {gradient_checkpointing: true}"
+#
+# 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
+#    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section
+#    (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020"). "timm.layers.DropPath" inside the
+#    block is safe under it -- torch replays the same random draw when it recomputes.
+# 2..4 are the three fields below.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+    mixed_precision_type: bfloat16 # "bfloat16" (unscaled) or "float16" (adds the GradScaler)
+    ema_decay: 0.999
+IMPORTS: {}
+_jinja_yaml_: |-
+  # 2. Accumulation: each loss is divided by the window, "optimizer.step()" runs once every
+  #    "accumulate_gradients" batches, and "has_updated" reads true only on those steps -- which is
+  #    what makes the trainer fire "on_update" per update instead of per batch (REFERENCE.md,
+  #    "ACCUMULATE_GRADIENTS"; "docs/adr/0017", "docs/adr/0018").
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  # 3. Mixed precision: "MIXED_PRECISION_TYPE" is the dtype the flow runs under "torch.autocast",
+  #    and "MIXED_PRECISION" is the "torch.amp.GradScaler" -- which only float16 needs, so it
+  #    follows the type rather than being set on its own (REFERENCE.md, "MIXED_PRECISION").
+  MIXED_PRECISION_TYPE: {{mixed_precision_type}}
+  MIXED_PRECISION: {{mixed_precision_type == "float16"}}
+  # 4. EMA: an exponential moving average of "model", emitted as the learner attribute "ema_model"
+  #    and blended once per Update -- never on an accumulation micro-step, and, under float16, even
+  #    on an apply the scaler skipped (REFERENCE.md, "EMA"; "docs/adr/0021"). It rides the "models"
+  #    property, so checkpoints and resume carry it. Point an "INFERENCE_FLOW" at "ema_model" to
+  #    validate over the averaged weights; the training "FLOW" may not read it.
+  EMA:
+    model:
+      multi_avg_fn:
+        - _obj_
+        - _addr_: torch.optim.swa_utils.get_ema_multi_avg_fn
+        - _call_: {decay: {{ema_decay}}}
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    NAME: optimizer
+    OPTIMIZER:
+      - _obj_
+      - _addr_: structcast_model.torch.optimizers.create_opt
+      - _bind_:
+          opt: torch.optim.AdamW
+          betas: [0.9, 0.999]
+          weight_decay_regexes: []
+          no_weight_decay_regexes:
+            - ^(?:\w+\.)*bias$
+            - ^(?:\w+\.)*\w*norm\w*(?:\.\w+)*$
+            - ^(?:\w+\.)*\w*embedding\w*(?:\.\w+)*$
+          _jinja_yaml_: |-
+            lr: {{lr}}
+            weight_decay: {{weight_decay}}
+    _jinja_yaml_: |-
+      {% if clip_grad_norm is none %}
+      CLIP: null
+      {% else %}
+      CLIP:
+        - _obj_
+        - _addr_: timm.utils.clip_grad.dispatch_clip_grad
+        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+      {% endif %}
+    EXTRA: {}
+    FLOW:
+      - [image, cls, model]
+      - INPUTS: {input: cls, target: label}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: torch.nn.CrossEntropyLoss}, _call_]
+      - INPUTS: {y_true: label, y_pred: cls}
+        OUTPUTS: acc1
+        NAME: accuracy
+        LAYER:
+          - _obj_
+          - _addr_: torch.no_grad
+          - _call_
+          - _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_categorical_accuracy}]]
+      - INPUTS: {y_true: label, y_pred: cls, k: 5}
+        OUTPUTS: acc5
+        NAME: top_5_accuracy
+        LAYER:
+          - _obj_
+          - _addr_: torch.no_grad
+          - _call_
+          - _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_top_k_categorical_accuracy}]]
+    # Validation runs the average, which is the point of keeping one.
+    INFERENCE_FLOW:
+      - [image, cls, ema_model]
+      - [{input: cls, target: label}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: cls}, acc1, accuracy]
+      - [{y_true: label, y_pred: cls, k: 5}, acc5, top_5_accuracy]
+LOSSES: []
+MODELS: []

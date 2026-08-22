@@ -1,5 +1,6 @@
 """Builder for Keras models."""
 
+import ast
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -20,6 +21,64 @@ from structcast_model.builders.base import (
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import optimizer_hash, statement_names, stored_names
 from structcast_model.utils.base import unique
+
+_STATEFUL_KERAS_LAYERS = frozenset(
+    {
+        "AlphaDropout",
+        "BatchNormalization",
+        "Dropout",
+        "GaussianDropout",
+        "GaussianNoise",
+        "SpatialDropout1D",
+        "SpatialDropout2D",
+        "SpatialDropout3D",
+        "SyncBatchNormalization",
+    }
+)
+"""Keras layers that draw from a seed or update their own variables, plus every `Random*` preprocessing layer.
+
+Matched by the name a layer is constructed under, so a user-defined class doing the same thing --
+including one reached through `_file_` -- is invisible here and documented in `REFERENCE.md` instead.
+"""
+
+
+def _stateful_sublayer(expression: str) -> str | None:
+    """Return the blocklisted Keras layer one emitted constructor expression builds, if it builds one.
+
+    A `rate=0` member of the Dropout family is let through: `Dropout.call` is guarded by `self.rate > 0`,
+    so it returns its input untouched and draws nothing, and the recomputation matches the first pass.
+    That is the shape a stochastic-depth section takes when its rate is parametrized down to zero.
+    """
+    try:
+        node = ast.parse(expression, mode="eval").body
+    except SyntaxError:
+        # A lambda or another expression form: not a constructor call, so not a layer to judge.
+        return None
+    if not isinstance(node, ast.Call):
+        return None
+    called = node.func
+    name = called.attr if isinstance(called, ast.Attribute) else getattr(called, "id", "")
+    if not (name in _STATEFUL_KERAS_LAYERS or name.startswith("Random")):
+        return None
+    rates = [k.value for k in node.keywords if k.arg == "rate"]
+    if rates and all(isinstance(rate, ast.Constant) and rate.value == 0 for rate in rates):
+        return None
+    return name
+
+
+def _stateful_sublayers(layer: LayerIntermediate) -> list[str]:
+    """Collect the blocklisted layers anywhere under one layer, its nested TYPE/CFG sections included.
+
+    Recursion is the point: a stochastic-depth section is a sublayer of the block that gets
+    checkpointed, one level down, and recomputation reaches just as far as the forward pass does.
+    """
+    found: list[str] = []
+    for value in layer.layers.values():
+        if isinstance(value, LayerIntermediate):
+            found += _stateful_sublayers(value)
+        elif name := _stateful_sublayer(value):
+            found.append(name)
+    return found
 
 
 class KerasLayerIntermediate(LayerIntermediate):
@@ -47,6 +106,24 @@ class KerasLayerIntermediate(LayerIntermediate):
     default_imports: ClassVar[dict[str, set[str | None]]] = {"keras": {None}}
     """Default imports for Keras layers."""
 
+    @model_validator(mode="after")
+    def _reject_stateful_sublayers(self) -> Self:
+        """Refuse to checkpoint a layer whose subtree carries state the recomputation would advance.
+
+        Here rather than in the builder hook because the whole subtree is only assembled by the time
+        the intermediate exists: the sublayers of the sublayers are what the earlier import-name scan
+        could not see.
+        """
+        if self.gradient_checkpointing is None or not (stateful := _stateful_sublayers(self)):
+            return self
+        raise SpecError(
+            f'GRADIENT_CHECKPOINTING cannot be applied to a layer whose FLOW builds "{stateful[0]}", here or in '
+            "one of its sublayers: keras.remat runs the wrapped body a second time in the backward pass, and a "
+            "layer that draws from a seed or updates its own variables does it twice -- different gradients on "
+            "the TensorFlow and PyTorch backends, a tracer error on JAX. Checkpoint a layer that holds no such "
+            f"state, or parametrize {stateful[0]} down to a rate of 0, which draws nothing."
+        )
+
     def _get_layer(self, layername: str) -> str:
         """Get the sub-layer with the given name."""
         return f"self.{layername}"
@@ -70,6 +147,24 @@ class KerasLayerIntermediate(LayerIntermediate):
             codes = self._forward_training_flow
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
+        body = "call"
+        wrapper = ""
+        if self.gradient_checkpointing is not None:
+            # No base class: Keras reads the `call` signature to decide whether it forwards
+            # `training` and how it maps a batch passed by name, and a `*args` base would erase both.
+            # Not `_call_impl`: on the torch backend a Keras layer inherits `torch.nn.Module`, which
+            # owns that name for its call dispatcher, so it is not this emission's to take.
+            body = "_call_body"
+            # The rematerialized callable takes the arrays positionally and reads the flags off the
+            # closure: on the TensorFlow backend the custom gradient behind `keras.remat` refuses
+            # keyword arguments outside eager execution, which is every compiled training step.
+            remat = "keras.remat(lambda *arrays: self._call_body(*arrays, training=training, **kwargs))"
+            wrapper = (
+                f"    def call(self, {inputs}*, training = None, **kwargs):\n"
+                f"        if training:\n"
+                f"            return {remat}({self._forward_inputs})\n"
+                f"        return self._call_body({inputs}training=training, **kwargs)\n\n"
+            )
         return f"""\
 class {class_name}(keras.layers.Layer):
 
@@ -80,7 +175,7 @@ class {class_name}(keras.layers.Layer):
         self.output_names = {self.outputs}
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
-    def call(self, {inputs}*, training = None, **kwargs):
+{wrapper}    def {body}(self, {inputs}*, training = None, **kwargs):
         {sep.join(codes)}
         return {self._forward_outputs}
 """
@@ -106,6 +201,25 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
     """
 
     user_defined_layer_type: ClassVar[type[KerasLayerIntermediate]] = KerasLayerIntermediate
+
+    def _resolve_gradient_checkpointing(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        config: bool | dict[str, Any],
+    ) -> dict[str, str] | None:
+        """Reject the mapping form: `keras.remat` takes the function alone.
+
+        The sub-layers recomputation would run twice are rejected by
+        `KerasLayerIntermediate._reject_stateful_sublayers`, which sees the whole subtree.
+        """
+        if config is False:
+            return None
+        if isinstance(config, dict) and config:
+            raise SpecError(
+                f"GRADIENT_CHECKPOINTING keyword arguments {sorted(config)} have no Keras equivalent: "
+                "keras.remat takes the function alone, so set GRADIENT_CHECKPOINTING to true and drop them."
+            )
+        return {}
 
 
 class KerasLearnerBehavior(LearnerBehavior):

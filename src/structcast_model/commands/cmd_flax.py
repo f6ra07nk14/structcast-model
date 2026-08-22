@@ -193,7 +193,7 @@ def _resolve_strategy(strategy: Any, device: str | None) -> "scm_flax.FlaxDistri
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows and rejects the rest
         # with the names it accepts, which is the error a mistyped preset should read.
-        preset = cast('Literal["single", "dp", "fsdp"]', strategy)
+        preset = cast('Literal["single", "dp", "fsdp", "tp", "fsdp_tp"]', strategy)
         return scm_flax.FlaxDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
 
@@ -273,7 +273,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "--strategy",
         parser=strategy_parser,
         help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
-        'every device, parameters replicated) or "fsdp" (the batch split and the parameters sharded too). '
+        'every device, parameters replicated) or "fsdp" (the batch split and the parameters sharded too). The '
+        'tensor-parallel presets "tp" and "fsdp_tp" split layers across a second mesh axis and need a rule table '
+        "naming which ones, so they are selected through their cfg/flax/strategies template, not by name. "
         + scm_args.object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
         + scm_args.PATH_FORM_HELP
         + " The factory is called with the resolved device; the templates under cfg/flax/strategies bind the "
@@ -343,7 +345,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         start_epoch = scm_flax.restore_training_state(
             resume=resume,
             strategy=strategy,
-            models=models,
+            # The learner's mapping, not the command's: the saver writes `learner.models`, which
+            # also carries the `ema_<model>` shadows the command never built (`docs/adr/0021`).
+            models=dict(learner.models),
             learner=learner,
             start_epoch=start_epoch,
             logger=logger,

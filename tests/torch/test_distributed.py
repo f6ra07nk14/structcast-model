@@ -14,7 +14,9 @@ from structcast_model.torch.distributed import (
     DistributedDataParallelStrategy,
     DistributedStrategy,
     FullyShardedDataParallelStrategy,
+    FullyShardedTensorParallelStrategy,
     SingleDeviceStrategy,
+    TensorParallelStrategy,
     matched_shard_modules,
     sync_gate,
 )
@@ -97,6 +99,18 @@ def test_single_device_strategy_satisfies_the_protocol() -> None:
     """All strategies are used through the DistributedStrategy protocol by the CLI."""
     strategy = SingleDeviceStrategy(device="cpu")
     assert isinstance(strategy, DistributedStrategy)
+
+
+def test_the_protocol_is_checkable_by_instance_only() -> None:
+    """`data_rank` and `data_world_size` made it a data protocol, and those refuse `issubclass`.
+
+    Pinned rather than worked around: no spelling of the two members keeps `issubclass` working
+    (attribute annotations are counted the same as properties), so a caller reaching for it has to
+    read this instead of discovering a `TypeError` at runtime.
+    """
+    with pytest.raises(TypeError, match="non-method members"):
+        # mypy rejects the call statically for the same reason the runtime does, which is the point.
+        issubclass(SingleDeviceStrategy, DistributedStrategy)  # type: ignore[misc]
 
 
 def test_single_device_wrap_and_sync_are_no_ops() -> None:
@@ -610,6 +624,213 @@ def test_fsdp2_compile_falls_back_to_the_root_when_the_patterns_match_nothing() 
     model = torch.nn.Linear(4, 2)
     assert strategy.compile(model, {}) is model
     assert _is_compiled(model)
+
+
+# ---------------------------------------------------------------------------
+# Tensor parallelism
+# ---------------------------------------------------------------------------
+
+
+class _MLPModel(torch.nn.Module):
+    """The shape a tensor-parallel plan targets: a column-parallel layer feeding a row-parallel one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = torch.nn.Linear(4, 8)
+        self.down = torch.nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the pair."""
+        return self.down(torch.relu(self.up(x)))
+
+
+_PLAN = [("up", "column"), ("down", "row")]
+
+
+def _mlp_models() -> "OrderedDict[str, torch.nn.Module]":
+    torch.manual_seed(0)
+    return OrderedDict(model=_MLPModel())
+
+
+def _placements(model: torch.nn.Module, name: str) -> Any:
+    """One parameter's DTensor placements; ``parallelize_module`` replaces the parameter with one."""
+    return cast(Any, model.get_parameter(name)).placements
+
+
+def test_tensor_parallel_strategy_satisfies_the_protocol_and_reports_one_data_slice() -> None:
+    """The ranks of a tensor-parallel group split one model, so they consume one and the same batch.
+
+    A strategy reporting the global rank here would have the CLI seed each rank differently and a
+    rank-aware loader hand each of them different items — two silently wrong runs, not two errors.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+
+    assert isinstance(strategy, DistributedStrategy)
+    assert (strategy.data_rank, strategy.data_world_size) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        (SingleDeviceStrategy(device="cpu"), (0, 1)),
+        (DistributedDataParallelStrategy(device="cpu"), (0, 1)),
+    ],
+    ids=["single", "ddp"],
+)
+def test_data_coordinates_of_the_replicating_strategies(
+    strategy: DistributedStrategy, expected: tuple[int, int]
+) -> None:
+    """One replica per rank: outside a process group that is one slice, and the seed is the plain seed."""
+    assert (strategy.data_rank, strategy.data_world_size) == expected
+
+
+def test_tensor_parallel_strategy_requires_the_torch_tensor_parallel_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Selecting it on a torch without parallelize_module must fail with an actionable message."""
+    # The lazy-import shim hides module privates, so patch the globals the class actually reads.
+    monkeypatch.setitem(TensorParallelStrategy.__post_init__.__globals__, "_tp_imports", _FailedImports())
+    with pytest.raises(ImportError, match="torch>=2.4"):
+        TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+
+
+def test_tensor_parallel_strategy_refuses_an_empty_plan() -> None:
+    """Without a plan the strategy would parallelize nothing and run every rank on the whole model."""
+    with pytest.raises(ValueError, match="parallel_modules"):
+        TensorParallelStrategy(device="cpu")
+
+
+def test_a_parallel_modules_pattern_matching_nothing_is_refused(single_process_gloo: None) -> None:
+    """A typo'd path would silently leave the layer unsplit; the message must name the option to fix."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=[("up", "column"), ("dwon", "row")])
+    with pytest.raises(ValueError, match="parallel_modules pattern"):
+        strategy.wrap(_mlp_models())
+
+
+def test_an_unknown_parallel_style_is_refused(single_process_gloo: None) -> None:
+    """A mistyped style is a configuration error, not a reason to leave the layer replicated."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=[("up", "colwise")])
+    with pytest.raises(ValueError, match="Unknown parallel style"):
+        strategy.wrap(_mlp_models())
+
+
+def test_tensor_parallel_refuses_a_tie_across_two_parallelized_modules(single_process_gloo: None) -> None:
+    """The two ends would become separately placed DTensors — the same silent split fully_shard has."""
+    models = _mlp_models()
+    # The shapes do not match, which is irrelevant: the guard runs before anything is placed or run.
+    models["model"].get_submodule("down").weight = models["model"].get_parameter("up.weight")
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    with pytest.raises(RuntimeError, match="Tied parameter"):
+        strategy.wrap(models)
+    assert type(models["model"].get_parameter("up.weight")) is torch.nn.Parameter  # nothing was parallelized
+
+
+def test_tensor_parallel_places_the_styles_the_vocabulary_names(single_process_gloo: None) -> None:
+    """Column splits a weight by its output dimension and row by its input one, bias replicated.
+
+    The bias is what the check is for: a row-parallel layer all-reduces its partial products, so a
+    split bias would be added once per shard and counted as many times as the group is wide.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    placements = {name: _placements(model, name) for name, _ in model.named_parameters()}
+    assert placements["up.weight"] == (torch.distributed.tensor.Shard(0),)
+    assert placements["up.bias"] == (torch.distributed.tensor.Shard(0),)
+    assert placements["down.weight"] == (torch.distributed.tensor.Shard(1),)
+    assert placements["down.bias"] == (torch.distributed.tensor.Replicate(),)
+
+
+def test_the_gate_stays_a_no_op_on_a_tensor_parallel_model(single_process_gloo: None) -> None:
+    """Pure tensor parallelism has no deferred bucket, so the generated steps' gate must find nothing.
+
+    ``parallelize_module`` returns the plain ``nn.Module`` it was given -- neither a DDP wrapper nor
+    an ``FSDPModule`` -- and DTensor emits each layer's collective inside the operation that needs
+    it, so gradients arrive with the gate never having been armed.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    sync_gate(model, armed=False)
+
+    assert not hasattr(model, "require_backward_grad_sync")
+    model(torch.randn(2, 4)).sum().backward()
+    assert model.get_parameter("up.weight").grad is not None
+
+
+def test_tensor_parallel_takes_a_style_instance_from_the_plan(single_process_gloo: None) -> None:
+    """The escape hatch for the styles the vocabulary lacks: an object pattern the CLI instantiated."""
+    parallel = pytest.importorskip("torch.distributed.tensor.parallel")
+    strategy = TensorParallelStrategy(
+        device="cpu",
+        parallel_modules=[("up", parallel.RowwiseParallel(input_layouts=torch.distributed.tensor.Replicate()))],
+    )
+    model = strategy.wrap(_mlp_models())["model"]
+
+    assert _placements(model, "up.weight") == (torch.distributed.tensor.Shard(1),)
+
+
+def test_the_column_heads_style_keeps_its_output_a_dtensor() -> None:
+    """An attention head reshape must see the sharded head count, which a local tensor hides."""
+    parallel = pytest.importorskip("torch.distributed.tensor.parallel")
+    style = distributed._parallel_style("column_heads")
+
+    assert isinstance(style, parallel.ColwiseParallel)
+    assert style.use_local_output is False
+
+
+def test_tensor_parallel_state_dict_gathers_plain_tensors(single_process_gloo: None) -> None:
+    """A checkpoint must not depend on the tensor-parallel degree that wrote it."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    models = _mlp_models()
+    reference = models["model"].get_parameter("up.weight").clone()
+    states = strategy.state_dict(strategy.wrap(models))
+
+    weight = states["models"]["model"]["up.weight"]
+    assert type(weight) is torch.Tensor
+    assert torch.equal(weight, reference)
+
+
+def test_fsdp2_tensor_parallel_shards_the_parallelized_models_and_arms_the_gate(single_process_gloo: None) -> None:
+    """fully_shard must land on the parallelized root, or the gate has nothing to arm.
+
+    Generated steps gate the model root, and only an ``FSDPModule`` reads that flag: if the
+    combination stopped at ``parallelize_module``, gradient synchronization would never be deferred
+    and accumulation would reduce on every micro-step.
+    """
+    fsdp = pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=1, parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    assert isinstance(model, fsdp.FSDPModule)
+    sync_gate(model, armed=False)
+    assert _param_group(model).reduce_grads is False
+    model(torch.randn(2, 4)).sum().backward()  # the two wrappers must still compose into one model
+
+
+def test_fsdp2_tensor_parallel_refuses_a_degree_the_world_does_not_divide(single_process_gloo: None) -> None:
+    """A degree that leaves a partial group cannot be a mesh, and would drop ranks out of the run.
+
+    Refused at construction, where the process group already exists: the CLI reads `data_rank` on
+    the next line, so a degree that only failed at wrap would have gone through the seeding first.
+    """
+    with pytest.raises(ValueError, match="does not divide the world size"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=3, parallel_modules=_PLAN)
+
+
+@pytest.mark.parametrize("degree", [0, -1], ids=["zero", "negative"])
+def test_fsdp2_tensor_parallel_refuses_a_degree_below_one(degree: int) -> None:
+    """The data coordinates divide by the degree, so a degree below 1 is arithmetic, not a strategy.
+
+    Zero reached the CLI's seeding line as a bare ZeroDivisionError and -1 published a negative data
+    world size for the loader to shard on; both are configuration errors that must say so.
+    """
+    with pytest.raises(ValueError, match="at least 1"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=degree, parallel_modules=_PLAN)
+
+
+def test_fsdp2_tensor_parallel_refuses_an_empty_plan() -> None:
+    """Without a plan the combination is plain FSDP2, and saying so beats pretending otherwise."""
+    with pytest.raises(ValueError, match="parallel_modules"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=2)
 
 
 # ---------------------------------------------------------------------------

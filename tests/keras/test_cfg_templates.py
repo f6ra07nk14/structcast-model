@@ -13,6 +13,7 @@ a step that updates nothing still produces a plausible-looking curve.
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from re import search as re_search
 from types import ModuleType
 from typing import Any
 
@@ -22,10 +23,12 @@ import pytest
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.keras.trainer import initial_model
+from structcast_model.utils.base import load_any
 from tests import CFG_DIR
 
 MODELS = CFG_DIR / "keras" / "models"
 LEARNERS = CFG_DIR / "keras" / "learners"
+STRATEGIES = CFG_DIR / "keras" / "strategies"
 
 RNG = np.random.default_rng(0)
 """One generator for every fixed batch below, so the arrays are the same in every process."""
@@ -152,6 +155,33 @@ def test_a_shipped_pair_evaluates_without_training(case: str, tmp_path: Path) ->
     assert _moved(before, _values(model.trainable_variables)) == 0.0
 
 
+@pytest.mark.parametrize("case", ["VisionTransformer", "SmallLanguageModel"], ids=str.lower)
+def test_the_shipped_tensor_parallel_rules_name_this_models_variables(case: str, tmp_path: Path) -> None:
+    """`cfg/keras/strategies/tp.yaml` is written for these templates, so its rules have to match them.
+
+    A rule matching no variable is refused at wrap time -- loud, but only once the run started -- and
+    a table that matched only half of a column/row pair would train a wrong answer, so both halves
+    are pinned against the `MultiHeadAttention` sublayer names Keras builds. The MLP is deliberately
+    outside the plan: Keras numbers its `Dense` layers from a global counter, so no stable regex
+    tells the first of a block from the second.
+    """
+    model_name, model_parameters, shapes, *_ = PAIRS[case]
+    model = _model(tmp_path, model_name, model_parameters, shapes)
+    rules = [(pattern, tactic) for pattern, tactic in load_any(str(STRATEGIES / "tp.yaml"))[2]["_bind_"]["rules"]]
+    paths = [variable.path for variable in model.variables]
+
+    matched = {tactic: [path for path in paths if re_search(pattern, path)] for pattern, tactic in rules}
+
+    depth = next(iter(model_parameters.values()))["depth"]
+    assert [tactic for _, tactic in rules] == ["column", "row"]
+    # A kernel and a bias for each of the three input projections, and for the output one, per block:
+    # the counts are what make this a pinned pair rather than "something matched".
+    assert len(matched["column"]) == 6 * depth
+    assert len(matched["row"]) == 2 * depth
+    assert all(path.rsplit("/", 2)[-2] in ("query", "key", "value") for path in matched["column"])
+    assert all(path.rsplit("/", 2)[-2] == "attention_output" for path in matched["row"])
+
+
 def test_a_shipped_learner_accumulates_over_the_window_its_optimizer_was_given(tmp_path: Path) -> None:
     """`accumulate_gradients` is a template parameter, and it has to reach the run's update cadence.
 
@@ -175,6 +205,79 @@ def test_a_shipped_learner_accumulates_over_the_window_its_optimizer_was_given(t
     assert flags == [False, False, True, False, False, True]
     assert flags == moves
     assert (learner.steps, learner.updates) == (6, 2)
+
+
+SHOWCASE_PARAMETERS: dict[str, dict[str, Any]] = {
+    "base": {"dim": 16, "heads": 2, "depth": 2, "image_size": 16, "patch_size": 8, "num_classes": 10},
+    "SHARED": {"drop_path_rate": 0.0},
+}
+"""The showcase Vision Transformer: two blocks, and the stochastic depth of the recipe switched off.
+
+`drop_path_rate` is not decoration here. A block's `DropPath` is a `keras.layers.Dropout` one TYPE
+sublayer down, and `keras.remat` re-draws seed state on the recomputation, so the checkpointed build
+is refused at any other rate. At rate 0 the layer draws nothing and the build goes through; the
+showcase command sets it for that reason, and `gradient_checkpointing` is left out so the two builds
+below can set it either way.
+"""
+
+
+@pytest.fixture
+def restore_policy() -> Any:
+    """Restore the global mixed precision policy, which is process-wide state."""
+    original = keras.mixed_precision.global_policy()
+    yield
+    keras.mixed_precision.set_global_policy(original)
+
+
+def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
+    tmp_path: Path, restore_policy: None
+) -> None:
+    """Checkpointing, accumulation, the policy and the optimizer's EMA have to hold together.
+
+    Each is pinned on its own elsewhere; what only a combined run can answer is whether they
+    compose, and on this backend three of them meet inside one optimizer. They do interact, not
+    always kindly: the average advances on the accumulation no-ops too (a recorded limitation, and
+    the reason the average is read here rather than its cadence), and under the policy the head
+    emits bfloat16, which `keras.metrics.sparse_top_k_categorical_accuracy` refuses outright -- the
+    float32 cast in the showcase flow is what keeps the two composable.
+    """
+    keras.mixed_precision.set_global_policy("mixed_bfloat16")
+    models = {}
+    for remat in (True, False):
+        name = f"VisionTransformer_{remat}"
+        parameters = {
+            **SHOWCASE_PARAMETERS,
+            "SHARED": {**SHOWCASE_PARAMETERS["SHARED"], "gradient_checkpointing": remat},
+        }
+        KerasBuilder.from_path(MODELS / "VisionTransformer.yaml")(parameters=parameters)(tmp_path / f"{name}.py")
+        keras.utils.set_random_seed(0)
+        models[remat] = initial_model(_load(tmp_path / f"{name}.py", name).Model(), None)
+    learner = _learner(
+        tmp_path, "ImageClassifierShowcase", {"DEFAULT": {"accumulate_gradients": 2}}, model=models[True]
+    )
+    optimizer = learner.optimizers["optimizer"]
+
+    assert "keras.remat(lambda *arrays: self._call_body(" in (tmp_path / "VisionTransformer_True.py").read_text()
+    assert "keras.remat" not in (tmp_path / "VisionTransformer_False.py").read_text()
+    # Keras numbers its layers from a process-global counter, so two builds cannot share a path;
+    # what checkpointing must not do is add a variable or reshape one, which the layout does show.
+    assert [tuple(v.shape) for v in models[True].variables] == [tuple(v.shape) for v in models[False].variables]
+    logits = [keras.ops.cast(m(IMAGE_BATCH["image"], training=True)["cls"], "float32") for m in models.values()]
+    assert np.array_equal(*(keras.ops.convert_to_numpy(value) for value in logits))
+
+    assert (learner.MIXED_PRECISION, learner.MIXED_PRECISION_TYPE) == (True, "bfloat16")
+    assert keras.backend.standardize_dtype(models[True](IMAGE_BATCH["image"])["cls"].dtype) == "bfloat16"
+    assert all(v.dtype == "float32" for v in models[True].trainable_variables)
+    assert (optimizer.gradient_accumulation_steps, optimizer.use_ema, optimizer.ema_momentum) == (2, True, 0.99)
+
+    flags = [(learner.training_step(**IMAGE_BATCH), learner.has_updated)[1] for _ in range(4)]
+
+    assert flags == [False, True, False, True]
+    assert (learner.steps, learner.updates) == (4, 2)
+    # Keras keeps the average in the optimizer and offers no copy to validate against, so what a
+    # combined run can assert is that the averages exist and shadow every trained variable.
+    assert len(optimizer._model_variables_moving_average) == len(models[True].trainable_variables)
+    assert all(np.isfinite(value) for value in _floats(learner.inference_step(**IMAGE_BATCH)).values())
 
 
 CYCLEGAN_BATCH = {

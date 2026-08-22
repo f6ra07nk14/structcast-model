@@ -22,17 +22,29 @@ from flax import nnx
 from structcast_model.flax.utils import get_jax_device
 
 AXIS = "data"
-"""The single mesh axis every preset builds: batches are split along it, FSDP shards along it."""
+"""The mesh axis every preset builds: batches are split along it, FSDP shards along it."""
+
+MODEL_AXIS = "model"
+"""The second mesh axis the `tp` presets add: layers are split along it, batches never are."""
 
 PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
     "single": ((r".*", "replicate"),),
     "dp": ((r".*", "replicate"),),
     "fsdp": ((r".*", "fsdp"),),
+    # No default plan: which layers pair up into a column/row split is the model's own shape, and an
+    # empty table leaves every parameter on the sharding it was constructed with, so a template that
+    # annotates itself needs no rules at all.
+    "tp": (),
+    "fsdp_tp": ((r".*", "fsdp"),),
 }
 """Ordered (parameter-path regex, tactic) rules of each preset; the first matching rule wins."""
 
-TACTICS = ("replicate", "fsdp")
-"""The tactics a rule may name: keep the parameter on every device, or shard it across the mesh."""
+TACTICS = ("replicate", "fsdp", "column", "row")
+"""The tactics a rule may name: keep the parameter on every device, shard it along the data axis, or
+split it along the model axis by its last dimension (`column`) or its first one (`row`)."""
+
+TP_PRESETS = ("tp", "fsdp_tp")
+"""The presets whose mesh has a model axis, and whose unmatched parameters keep their own sharding."""
 
 
 def _to_host(value: Any) -> Any:
@@ -67,6 +79,19 @@ def _host_state(obj: Any) -> dict[str, Any]:
     return jax.tree.map(_to_host, nnx.to_pure_dict(nnx.state(obj)))
 
 
+def _missing_model_state(name: str) -> ValueError:
+    """The error a resume raises when the saved state holds nothing for one of the live models.
+
+    Worded as on the torch side: the two frameworks share the checkpoint contract, so a run that
+    outgrew its checkpoint has to read the same way in both.
+    """
+    return ValueError(
+        f'The saved training state carries no state for model "{name}": it was written before that model '
+        "was declared -- an EMA shadow added to the learner since, most likely. Resume with the learner "
+        "the checkpoint was saved from, or start a fresh run."
+    )
+
+
 def _load_pure_state(obj: Any, saved: Mapping[str, Any]) -> None:
     """Write a saved host state back into an nnx object in place, keeping its identity and metadata.
 
@@ -88,20 +113,35 @@ class FlaxDistributedStrategy:
     which is what makes models built afterwards land on it.
     """
 
-    preset: Literal["single", "dp", "fsdp"] = "single"
-    """Which mesh and rule table to use: one device, replicated parameters, or sharded parameters."""
+    preset: Literal["single", "dp", "fsdp", "tp", "fsdp_tp"] = "single"
+    """Which mesh and rule table to use: one device, replicated parameters, parameters sharded along
+    the data axis, layers split along the model axis, or both at once."""
 
     device: str | None = None
     """Device the `single` preset runs on, e.g. `"cpu:0"`; the first available device by default."""
 
     devices: int | None = None
-    """How many devices the `dp` and `fsdp` presets span; every available device by default."""
+    """How many devices the multi-device presets span; every available device by default."""
+
+    model_devices: int | None = None
+    """How many of them the model axis spans under the `tp` presets; every device under `tp`, and
+    required under `fsdp_tp`, whose data axis is what is left over."""
+
+    model_axis_mode: Literal["auto", "explicit"] = "auto"
+    """Axis type of the model axis. `auto` lets the compiler place what the rules do not, so plain
+    layers row-parallelize with no model-template change; `explicit` types the model axis like the
+    data one, which needs every row-parallel layer to carry its own `dot_general` hook and is
+    verified at :meth:`wrap` time (`docs/adr/0022`). A template whose initializers are
+    `nnx.with_partitioning` needs `explicit` as well: Flax refuses a mesh whose axes do not all have
+    the same type, so those initializers raise while the model axis is Auto."""
 
     rules: Sequence[tuple[str, str]] | None = None
     """Rules replacing the preset's table, as ordered (parameter-path regex, tactic) pairs."""
 
     min_size: int = 2**20
-    """Parameters smaller than this many bytes stay replicated, so biases and norm scales do not shard."""
+    """Parameters smaller than this many bytes stay replicated, so biases and norm scales do not shard.
+    The cutoff is the `fsdp` tactic's alone: a `column`/`row` rule names one layer of a plan whose other
+    half is named too, and silently dropping one of the pair is worse than sharding a small kernel."""
 
     _mesh: Any = field(default=None, init=False, repr=False)
     _rules: tuple[tuple[Pattern[str], str], ...] = field(default=(), init=False, repr=False)
@@ -110,15 +150,28 @@ class FlaxDistributedStrategy:
         """Validate the preset and its rules, then build and activate the mesh.
 
         Raises:
-            ValueError: if the preset is unknown, a rule names an unknown tactic, or the number of
-                devices asked for is not one JAX can give.
+            ValueError: if the preset is unknown, a rule names an unknown tactic or one the preset's
+                mesh has no axis for, or the number of devices asked for is not one JAX can give.
         """
         if self.preset not in PRESET_RULES:
             raise ValueError(f"Unknown preset {self.preset!r}. Available presets: {', '.join(PRESET_RULES)}.")
         rules = PRESET_RULES[self.preset] if self.rules is None else self.rules
+        if self.preset in TP_PRESETS and not rules:
+            raise ValueError(
+                f"The {self.preset!r} preset splits the layers its rules name across the model axis, and the "
+                '"tp" table is empty because which layers pair up into a column/row split is the model\'s own '
+                "shape. Without rules every parameter would keep its construction sharding, so the run would "
+                "replicate the whole model and report success. Bind rules through the strategy pattern "
+                '(cfg/flax/strategies/tp.yaml ships one), or select the "fsdp" preset, which shards by size.'
+            )
         for _, tactic in rules:
             if tactic not in TACTICS:
                 raise ValueError(f"Unknown sharding tactic {tactic!r}. Available tactics: {', '.join(TACTICS)}.")
+            if tactic in ("column", "row") and self.preset not in TP_PRESETS:
+                raise ValueError(
+                    f'The {tactic!r} tactic splits a parameter along the "{MODEL_AXIS}" axis, which the '
+                    f"{self.preset!r} preset's mesh does not have: select one of {', '.join(TP_PRESETS)}."
+                )
         self._rules = tuple((re_compile(pattern), tactic) for pattern, tactic in rules)
         if self.preset == "single":
             devices = [get_jax_device(self.device)]
@@ -130,13 +183,62 @@ class FlaxDistributedStrategy:
                     f"the count must be between 1 and {len(available)}."
                 )
             devices = available[: self.devices]
-        self._mesh = jax.make_mesh((len(devices),), (AXIS,), devices=devices)
+        self._mesh = self._build_mesh(devices)
         jax.set_mesh(self._mesh)
+
+    def _build_mesh(self, devices: Sequence[Any]) -> Any:
+        """Build the mesh of this preset over *devices*: one data axis, plus a model axis for `tp`.
+
+        The data axis is always Explicit, which is what makes a wrong batch or parameter sharding a
+        trace-time error instead of a silent compiler choice (`docs/adr/0014`). The model axis
+        follows :attr:`model_axis_mode`, defaulting to Auto so that a plain layer -- one that names
+        no output sharding of its own -- still row-parallelizes, the compiler inserting the reduction.
+
+        Raises:
+            ValueError: if a preset without a model axis was given one to configure, if `fsdp_tp` was
+                given no model axis size, or if the size does not divide the devices the run spans.
+        """
+        if self.preset not in TP_PRESETS:
+            if self.model_devices is not None or self.model_axis_mode != "auto":
+                raise ValueError(
+                    f"model_devices and model_axis_mode configure the model axis, which the {self.preset!r} "
+                    f"preset's mesh does not have: drop them, or select one of {', '.join(TP_PRESETS)}."
+                )
+            return jax.make_mesh((len(devices),), (AXIS,), devices=devices)
+        if self.preset == "fsdp_tp" and self.model_devices is None:
+            raise ValueError(
+                'The "fsdp_tp" preset splits its devices between the two axes, so model_devices says how '
+                "many of them the model axis spans; without it the data axis would be one device wide and "
+                'nothing would be sharded across it. Bind model_devices, or select the "tp" preset.'
+            )
+        model_devices = self.model_devices or len(devices)
+        if not 1 <= model_devices <= len(devices) or len(devices) % model_devices:
+            raise ValueError(
+                f"Asked for {model_devices} model-axis devices out of {len(devices)}: the count must be "
+                "between 1 and the number of devices the run spans, and must divide it."
+            )
+        explicit = jax.sharding.AxisType.Explicit
+        return jax.make_mesh(
+            (len(devices) // model_devices, model_devices),
+            (AXIS, MODEL_AXIS),
+            devices=devices,
+            axis_types=(explicit, explicit if self.model_axis_mode == "explicit" else jax.sharding.AxisType.Auto),
+        )
 
     @property
     def mesh(self) -> Any:
         """The mesh this strategy activated, e.g. for placing a batch or reading its size."""
         return self._mesh
+
+    @property
+    def data_rank(self) -> int:
+        """0: a JAX run is single-controller, so its one process reads every batch whole."""
+        return 0
+
+    @property
+    def data_world_size(self) -> int:
+        """1: the mesh splits each batch across the devices, not the dataset across processes."""
+        return 1
 
     def wrap(self, models: "OrderedDict[str, nnx.Module]") -> "OrderedDict[str, nnx.Module]":
         """Place every parameter on the sharding its rule asks for, and return the same models.
@@ -145,11 +247,21 @@ class FlaxDistributedStrategy:
         in-place `nnx.update` that leaves every module object -- and the step closures capturing them
         -- untouched. Models built under the activated mesh are already replicated, so `single` and
         `dp` move nothing; an optimizer built after this call inherits the parameters' shardings for
-        its own state.
+        its own state. Under the `tp` presets a parameter no rule matched is left exactly as it was
+        built, so a template's own annotations survive a strategy that says nothing about them.
+
+        Raises:
+            ValueError: if a rule matched no parameter of any model, or -- under
+                `model_axis_mode="explicit"` -- if a row-parallel layer carries no `dot_general` hook
+                to name its output sharding with.
         """
-        for model in models.values():
+        self._check_rules_matched(models)
+        for name, model in models.items():
             state = nnx.state(model, nnx.Param)
-            placed = jax.tree_util.tree_map_with_path(self._place, nnx.to_pure_dict(state))
+            pure = nnx.to_pure_dict(state)
+            if self.model_axis_mode == "explicit":
+                self._check_row_hooks(name, model, pure)
+            placed = jax.tree_util.tree_map_with_path(self._place, pure)
             nnx.replace_by_pure_dict(state, placed)
             nnx.update(model, state)
         return models
@@ -177,16 +289,19 @@ class FlaxDistributedStrategy:
             dict[str, Any]: The same batch, placed.
 
         Raises:
-            ValueError: if an entry has no leading dimension, or one the mesh does not divide.
+            ValueError: if an entry has no leading dimension, or one the data axis does not divide.
         """
-        size = self._mesh.size
+        # The data axis alone: on a two-dimensional mesh every device of one model axis group runs
+        # the same items, so a batch split by the whole mesh would be as many times too small.
+        size = self._mesh.shape[AXIS]
         for key, value in batch.items():
             for leaf in jax.tree.leaves(value):
                 shape = jnp.shape(leaf)
                 if not shape or shape[0] % size:
                     raise ValueError(
-                        f'Batch entry "{key}" of shape {shape} cannot be split across {size} devices: '
-                        "its leading dimension must exist and be divisible by the mesh size."
+                        f'Batch entry "{key}" of shape {shape} cannot be split across the {size} devices of '
+                        f'the "{AXIS}" axis: its leading dimension must exist and be divisible by that '
+                        "axis' size, which is not the mesh's own once a model axis is added."
                     )
         return jax.device_put(dict(batch), NamedSharding(self._mesh, PartitionSpec(AXIS)))
 
@@ -226,20 +341,121 @@ class FlaxDistributedStrategy:
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
         for name, model in models.items():
+            # A state holding models the learner no longer has is ignored; one missing a model the
+            # learner does have is a resume the checkpoint cannot answer, not a `KeyError`.
+            if name not in model_states:
+                raise _missing_model_state(name)
             _load_pure_state(model, model_states[name])
         for name, optimizer in optimizers.items():
             _load_pure_state(optimizer, optimizer_states[name])
         return state
 
-    def _place(self, path: Any, array: Any) -> Any:
-        """Place one parameter on the sharding its first matching rule asks for."""
-        name = jax.tree_util.keystr(path, simple=True, separator=".")
-        spec = PartitionSpec()
+    def _tactic(self, name: str) -> str | None:
+        """The tactic of the first rule matching the parameter path *name*, or None when none does."""
         for pattern, tactic in self._rules:
             if pattern.search(name):
-                spec = self._fsdp_spec(array) if tactic == "fsdp" else PartitionSpec()
-                break
-        return jax.device_put(array, NamedSharding(self._mesh, spec))
+                return tactic
+        return None
+
+    def _check_rules_matched(self, models: Mapping[str, Any]) -> None:
+        """Refuse a rule table holding a pattern no parameter of any model matches.
+
+        A rule that matches nothing is a typo, and its cost is invisible: the parameters it meant to
+        split keep whatever placement the preset gives them and the run trains, slower or larger, with
+        no sign that the plan never applied. Matching nothing *anywhere* is the error; matching
+        nothing in one model of several is normal, as it is for the torch `shard_modules` globs.
+
+        Raises:
+            ValueError: naming the patterns that matched nothing, with real paths to write instead.
+        """
+        names = [
+            jax.tree_util.keystr(path, simple=True, separator=".")
+            for model in models.values()
+            for path, _ in jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(nnx.state(model, nnx.Param)))[0]
+        ]
+        unmatched = [pattern.pattern for pattern, _ in self._rules if not any(pattern.search(n) for n in names)]
+        if unmatched:
+            raise ValueError(
+                f"Sharding rule pattern(s) {unmatched} matched no parameter; available parameter paths "
+                f"include {names[:10]}."
+            )
+
+    def _check_row_hooks(self, name: str, model: Any, pure: Mapping[str, Any]) -> None:
+        """Refuse a row-parallel layer that cannot name the sharding of its own output.
+
+        A row-parallel layer contracts over the axis its kernel is split on, so its result is a
+        partial sum every shard holds a piece of. Under an Auto model axis the compiler inserts the
+        reduction; under an Explicit one it may not choose, and the layer has to say where the result
+        lands -- which is what :func:`structcast_model.flax.utils.dot_general_out` is for. The check
+        runs before anything is placed, so the run stops at configuration rather than deep inside the
+        first traced step. It fails closed: a row-matched parameter whose layer this walk cannot
+        resolve is reported with the rest, because "not found" is not evidence of a hook.
+
+        Raises:
+            ValueError: naming every unverifiable layer and the template line that fixes it.
+        """
+        modules = {
+            ".".join(str(part) for part in path): node
+            for path, node in nnx.iter_graph(model)
+            if isinstance(node, nnx.Module)
+        }
+        unverified = []
+        for path, _ in jax.tree_util.tree_flatten_with_path(pure)[0]:
+            parameter = jax.tree_util.keystr(path, simple=True, separator=".")
+            if self._tactic(parameter) != "row":
+                continue
+            layer = modules.get(parameter.rpartition(".")[0])
+            # `None` and `jax.lax.dot_general` are both "the default": nnx.Linear stores the function
+            # itself, nnx.LinearGeneral stores None and resolves it per call.
+            if layer is not None and getattr(layer, "dot_general", None) not in (None, jax.lax.dot_general):
+                continue
+            unverified.append(parameter)
+        if unverified:
+            raise ValueError(
+                f'Model "{name}" row-parallelizes {unverified}, whose layers compute with the default '
+                f'dot_general (or could not be resolved), and model_axis_mode is "explicit", so the '
+                f'"{MODEL_AXIS}" axis is typed and each of those layers must name the sharding its output '
+                f"lands on. Give the layer the hook in the model template -- "
+                f"dot_general: \"eval: dot_general_out('{AXIS}', None)\" -- or run the strategy with "
+                "model_axis_mode: auto, which lets the compiler place the result itself."
+            )
+
+    def _place(self, path: Any, array: Any) -> Any:
+        """Place one parameter on the sharding its first matching rule asks for.
+
+        Under the `tp` presets an unmatched parameter is returned untouched, keeping whatever
+        sharding it was constructed with; every other preset replicates what no rule shards.
+        """
+        tactic = self._tactic(jax.tree_util.keystr(path, simple=True, separator="."))
+        if tactic is None and self.preset in TP_PRESETS:
+            return array
+        return jax.device_put(array, NamedSharding(self._mesh, self._spec(tactic, array)))
+
+    def _spec(self, tactic: str | None, array: Any) -> PartitionSpec:
+        """Return the spec one tactic asks for on one parameter."""
+        if tactic == "fsdp":
+            return self._fsdp_spec(array)
+        if tactic == "column":
+            # The bias of a column-parallel layer splits with the kernel's output dimension, so a
+            # one-dimensional array is a candidate here where the other tactics leave it whole.
+            return self._model_spec(array, array.ndim - 1)
+        if tactic == "row":
+            # The bias is pinned replicated, and the tactic is where that lives because a rule table
+            # cannot say it: a bias split along the model axis -- or added once per shard -- is
+            # counted as many times as the axis is wide by the reduction that follows, the one
+            # tensor-parallel mistake that reports a plausible loss instead of an error.
+            return PartitionSpec() if array.ndim < 2 else self._model_spec(array, 0)
+        return PartitionSpec()
+
+    def _model_spec(self, array: Any, dim: int) -> PartitionSpec:
+        """Return the spec splitting *dim* of *array* across the model axis, or replicated.
+
+        A dimension the model axis does not divide falls back to replication rather than failing the
+        run, as the `fsdp` tactic does: the result is the same numbers computed without the split.
+        """
+        if array.shape[dim] % self._mesh.shape[MODEL_AXIS]:
+            return PartitionSpec()
+        return PartitionSpec(*(MODEL_AXIS if d == dim else None for d in range(array.ndim)))
 
     def _fsdp_spec(self, array: Any) -> PartitionSpec:
         """Return the FSDP spec of one parameter: its leading dimension split, or replicated.
@@ -248,17 +464,19 @@ class FlaxDistributedStrategy:
         Sharding any other dimension puts the parameter's own axis on the mesh axis the batch is
         already split along, and the elementwise ops that consume it then produce a result sharded
         twice on `data`, which explicit-mode JAX rejects at trace time. A parameter below
-        :attr:`min_size`, or whose leading dimension the mesh does not divide, stays replicated
-        rather than failing the run.
+        :attr:`min_size`, or whose leading dimension the data axis does not divide, stays replicated
+        rather than failing the run. The divisor is the data axis and not the mesh: on the
+        two-dimensional `fsdp_tp` mesh the whole mesh is wider, and dividing by it would leave every
+        parameter the data axis alone would have sharded replicated instead.
         """
-        if array.ndim < 2 or array.nbytes < self.min_size or array.shape[0] % self._mesh.size:
+        if array.ndim < 2 or array.nbytes < self.min_size or array.shape[0] % self._mesh.shape[AXIS]:
             return PartitionSpec()
         return PartitionSpec(AXIS, *([None] * (array.ndim - 1)))
 
 
-# `AXIS`, `PRESET_RULES` and `TACTICS` are listed because the LazySelectedImporter tail below only
-# exposes the names in `__all__`, and a caller naming a preset or writing a rule table reads them.
-__all__ = ["AXIS", "PRESET_RULES", "TACTICS", "FlaxDistributedStrategy"]
+# The module constants are listed because the LazySelectedImporter tail below only exposes the names
+# in `__all__`, and a caller naming a preset or writing a rule table reads them.
+__all__ = ["AXIS", "MODEL_AXIS", "PRESET_RULES", "TACTICS", "TP_PRESETS", "FlaxDistributedStrategy"]
 
 
 if not TYPE_CHECKING:

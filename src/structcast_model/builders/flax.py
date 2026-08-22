@@ -7,7 +7,7 @@ from functools import cached_property
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from structcast.core.exceptions import SpecError
 from structcast.core.instantiator import ObjectPattern
 
@@ -19,11 +19,12 @@ from structcast_model.builders.base import (
     LearnerIntermediate,
     OptimizerSegment,
 )
-from structcast_model.builders.schema import LearnerBehavior, TemplateLearner
+from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import (
     # Framework-neutral and shared with the Keras builder, re-exported here because a caller reading
     # a learner's `OPTIMIZER_HASHES` reaches for it next to the builder that emitted them.
     optimizer_hash,
+    resolve_getter,
     resolve_object,
     statement_names,
     stored_names,
@@ -71,6 +72,15 @@ class FlaxLayerIntermediate(LayerIntermediate):
         """Return the Python class script for a Flax nnx module."""
         indent = " " * 4
         sep = "\n" + indent * 2
+        base, attributes, forward = "flax.nnx.Module", "", "__call__"
+        if self.gradient_checkpointing is not None:
+            # The base owns `__call__` and rematerializes the body it finds under `_forward`.
+            base, forward = "GradientCheckpointingModule", "_forward"
+            lines = ["gradient_checkpointing = True"]
+            if self.gradient_checkpointing:
+                keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
+                lines.append(f"_remat_kwargs = {{{keywords}}}")
+            attributes = "".join(f"{indent}{line}\n" for line in lines) + "\n"
         if self._forward_inference_flow:
             codes = [
                 "if training:",
@@ -83,16 +93,16 @@ class FlaxLayerIntermediate(LayerIntermediate):
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
         return f"""\
-class {class_name}(flax.nnx.Module):
+class {class_name}({base}):
 
-    def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):
+{attributes}    def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):
         self.inputs = {self.inputs}
         self.input_shapes = {self.input_shapes}
         self.outputs = {self.outputs}
         self.training = training
         {sep.join([f"{self._get_layer(v)}" for v in initialized_layers])}
 
-    def __call__(self, {inputs}*, training = None, **kwargs):
+    def {forward}(self, {inputs}*, training = None, **kwargs):
         training = self.training if training is None else training
         {sep.join(codes)}
         return {self._forward_outputs}
@@ -101,6 +111,10 @@ class {class_name}(flax.nnx.Module):
         if training is not None:
             self.training = training
 """
+
+
+_REMAT_OPTIONS = frozenset({"graph", "graph_updates", "policy", "prevent_cse", "static_argnums"})
+"""The keyword arguments `flax.nnx.remat` accepts, which `GRADIENT_CHECKPOINTING` carries."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -123,6 +137,32 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     """
 
     user_defined_layer_type: ClassVar[type[FlaxLayerIntermediate]] = FlaxLayerIntermediate
+
+    def _resolve_gradient_checkpointing(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        config: bool | dict[str, Any],
+    ) -> dict[str, str] | None:
+        """Validate the mapping against the keywords of `flax.nnx.remat`."""
+        if config is False:
+            return None
+        options = {} if isinstance(config, bool) else config
+        if unknown := sorted(options.keys() - _REMAT_OPTIONS):
+            raise SpecError(
+                f'GRADIENT_CHECKPOINTING option "{unknown[0]}" is not a keyword argument of '
+                f"flax.nnx.remat, which accepts {sorted(_REMAT_OPTIONS)}."
+            )
+        imports["structcast_model.flax.layers"].add("GradientCheckpointingModule")
+        resolved: dict[str, str] = {}
+        for key, value in options.items():
+            if key == "policy" and isinstance(value, str):
+                # A bare name is one of the policies JAX ships; anything else -- a pattern building a
+                # parameterized policy, say -- resolves like any other DSL value.
+                imports["jax"].add(None)
+                resolved[key] = f"jax.checkpoint_policies.{value}"
+            else:
+                resolved[key] = resolve_getter(imports, value)
+        return resolved
 
 
 def _keywords(part: Any) -> dict[str, Any] | None:
@@ -237,6 +277,33 @@ def _owned(trainable_layers: list[str]) -> str:
     return f"({', '.join(trainable_layers)})"
 
 
+_EMA_DEFAULTS: dict[str, Any] = {"decay": 0.999, "only": "eval: Param"}
+"""What `flax.nnx.EMA` is given when nothing else is declared.
+
+Its own default tracks every Variable, which blends the RNG counters and the batch statistics along
+with the weights -- a key stream cannot even be multiplied by a float -- so the average is taken over
+the parameters, exactly as the optimizers are built `wrt=Param`."""
+
+
+class FlaxUserDefinedLearner(UserDefinedLearner[LearnerBehavior]):
+    """User defined learner configuration for Flax."""
+
+    EMA: dict[str, bool | dict[str, Any]] = Field(default_factory=dict)
+    """The models an exponential moving average shadows, keyed by the model name.
+
+    `true` takes the defaults; a mapping carries the keyword arguments of `flax.nnx.EMA`, each value
+    resolved like any other DSL value. The average is emitted as the learner attribute `ema_<model>`
+    -- the `apply_to` view, so it is callable -- updated once per Update and runnable from
+    `INFERENCE_FLOW` under that name (`docs/adr/0021`).
+    """
+
+
+class FlaxTemplateLearner(Template[FlaxUserDefinedLearner]):
+    """Template for Flax user-defined learners."""
+
+    target_type: ClassVar[type[FlaxUserDefinedLearner]] = FlaxUserDefinedLearner
+
+
 @dataclass(kw_only=True, slots=True)
 class FlaxOptimizerSegment(OptimizerSegment):
     """One optimizer step of a Flax learner flow, carrying the digest of the pattern that built it."""
@@ -308,6 +375,24 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
 
     _step_locals: ClassVar[frozenset[str]] = frozenset({"_", "_before", "_grads", "_has_updated", "lrs"})
     """The names the generated training step binds for itself, between the flow calls it makes."""
+
+    ema: tuple[str, ...] = ()
+    """The models carrying an exponential moving average, in `EMA` declaration order.
+
+    Each one becomes the `flax.nnx.EMA` state `_ema_state_<model>` and the callable view `ema_<model>`
+    it applies to the model, built from the expression the builder registered under that name in
+    `others` (`docs/adr/0021`)."""
+
+    @cached_property
+    def _inference_shadows(self) -> list[str]:
+        """The models whose average the inference flow runs, in `EMA` declaration order.
+
+        Only those reach `_inference_step`, as one more parameter each: an average the flow never
+        names would be one more donated-looking argument for a trainer to compile around.
+        """
+        lines = [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
+        read = {name for line in lines for name in statement_names(line)[0]}
+        return [name for name in self.ema if f"ema_{name}" in read]
 
     @cached_property
     def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], FlaxOptimizerSegment]]:
@@ -451,8 +536,26 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         itself: an output named like one of them would return the learning rates as a criterion, and
         one named like a model would hand the optimizer something other than the module it owns.
         """
+        shadows = [f"ema_{name}" for name in self.ema]
+        for unit in self.flow:
+            if isinstance(unit, OptimizerSegment):
+                continue
+            if shared := sorted(statement_names(self._get_regular_step(*unit))[0] & set(shadows)):
+                raise SpecError(
+                    f'The training FLOW reads "{shared[0]}", the exponential moving average of a model: the '
+                    "average is a copy the optimizers never touch, and differentiating it trains nothing. "
+                    "Read it from INFERENCE_FLOW instead."
+                )
         state = [*self.models, *self.optimizers]
-        reserved = {"self", "kwargs", *self._learner_members, *[f"_view_{name}" for name in self.models]}
+        reserved = {
+            "self",
+            "kwargs",
+            *self._learner_members,
+            *[f"_view_{name}" for name in self.models],
+            *shadows,
+            *[f"_ema_state_{name}" for name in self.ema],
+            *[f"_view_ema_{name}" for name in self.ema],
+        }
         if shared := sorted(set(state) & set(self.inputs)):
             raise SpecError(
                 f'Name "{shared[0]}" is both an input of the learner and one of its models or optimizers: '
@@ -468,11 +571,11 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                 )
         stored = unique([n for flow in (self.flow, self.inference_flow) for u in flow for n in _stores(u)])
         for name in [*stored, *self.outputs]:
-            if name in {*state, *self._step_locals}:
+            if name in {*state, *shadows, *self._step_locals}:
                 raise SpecError(
                     f'A FLOW of the learner stores "{name}", which the generated training step already binds for '
-                    "a model, an optimizer or a value of its own: the store would overwrite it before the step "
-                    "reads it. Rename the output."
+                    "a model, an average of one, an optimizer or a value of its own: the store would overwrite it "
+                    "before the step reads it. Rename the output."
                 )
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
@@ -487,8 +590,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             "flax.nnx.view({0}, raise_if_not_found=False, training=False, deterministic=True, use_running_average=True)"
         )
         state = ", ".join(f"self.{name}" for name in [*self.models, *self.optimizers])
-        views = ", ".join(f"self._view_{name}" for name in self.models)
-        models_repr = ", ".join(f"{name!r}: self.{name}" for name in self.models)
+        shadows = [f"ema_{name}" for name in self._inference_shadows]
+        views = ", ".join(f"self._view_{name}" for name in [*self.models, *shadows])
+        models_repr = ", ".join(f"{name!r}: self.{name}" for name in [*self.models, *[f"ema_{n}" for n in self.ema]])
         optimizers_repr = ", ".join(f"{name!r}: self.{name}" for name in self.optimizers)
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
         hashes = ", ".join(f"{s.optimizer!r}: {s.optimizer_hash!r}" for _, s in self._segments)
@@ -503,10 +607,15 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             f"self._learning_rates = {{{rates}}}",
         ]
         body += [f"self._view_{name} = {view.format(name)}" for name in self.models]
+        for name in self.ema:
+            # The view shares its variables with the average, so running it is running the average.
+            body.append(f"self._ema_state_{name} = {self.others[f'ema_{name}']}")
+            body.append(f"self.ema_{name} = self._ema_state_{name}.apply_to({name})")
+        body += [f"self._view_{name} = {view.format(f'self.{name}')}" for name in shadows]
         body += self._forward_training_flow
         body.append(f"def _training_step({', '.join([*self.models, *self.optimizers])}, {named}**kwargs):")
         body += [f"{indent}{line}" for line in self._training_flow_parts[1]]
-        body.append(f"def _inference_step({', '.join(self.models)}, {named}**kwargs):")
+        body.append(f"def _inference_step({', '.join([*self.models, *shadows])}, {named}**kwargs):")
         body += [f"{indent}{line}" for line in self._forward_inference_flow]
         body += [
             "self._training_step = _training_step",
@@ -514,6 +623,17 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             f"self.inputs = {self.inputs}",
             f"self.outputs = {self.outputs}",
         ]
+        averages = (
+            [
+                "# One blend per Update, on the host: an EMA the compiled step captured would be",
+                "# mutated from another trace level, which flax rejects.",
+                "if self._has_updated:",
+                *[f"{indent}self._ema_state_{name}.update(self.{name})" for name in self.ema],
+            ]
+            if self.ema
+            else []
+        )
+        updates = "".join(f"\n{indent * 2}{line}" for line in averages)
         return f"""\
 class {self.classname}:
     \"\"\"Learner generated from a Flax (nnx) learner template.
@@ -545,7 +665,7 @@ class {self.classname}:
         criteria, learning_rates, has_updated = self._training_step({state}, {passed}**kwargs)
         self._learning_rates = learning_rates
         self._has_updated = bool(has_updated)
-        self._updates += int(self._has_updated)
+        self._updates += int(self._has_updated){updates}
         return criteria
 
     def inference_step(self, {inputs}**kwargs):
@@ -600,7 +720,7 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
 
     user_defined_learner_layer_type: ClassVar[type[FlaxLearnerIntermediate]] = FlaxLearnerIntermediate
     layer_builder_type: ClassVar[type[FlaxBuilder]] = FlaxBuilder
-    template_type: ClassVar[type[TemplateLearner]] = TemplateLearner
+    template_type: ClassVar[type[FlaxTemplateLearner]] = FlaxTemplateLearner
 
     def _build_segment(
         self,
@@ -627,6 +747,40 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             trainable_layers=base.trainable_layers,
             optimizer_hash=optimizer_hash(learner.OPTIMIZER),
         )
+
+    def _register_shadow_models(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        module: FlaxUserDefinedLearner,
+        naming: AutoName,
+        others: dict[str, str],
+    ) -> None:
+        """Register one `flax.nnx.EMA` per `EMA` entry, under the name of the view it is applied to.
+
+        The registered expression builds the average itself; the learner keeps it as
+        `_ema_state_<model>` and binds `apply_to(<model>)` -- the callable view sharing its variables
+        -- to the registered name, which is what a flow runs (`docs/adr/0021`).
+        """
+        for model, config in module.EMA.items():
+            if model not in module.TRAINABLE_LAYERS:
+                raise SpecError(
+                    f'EMA names "{model}", which is not a model of the learner: an EMA key names a model the '
+                    f"learner trains, which are {module.TRAINABLE_LAYERS}."
+                )
+            if (name := f"ema_{model}") in others or name in module.INPUTS or name in module.OUTPUTS:
+                raise SpecError(
+                    f'The EMA of "{model}" is emitted as "{name}", which the learner already uses for a model, '
+                    "an input or an output of its own. Rename that one."
+                )
+            # Reserved with the rest, so an auto-named flow layer cannot claim the name afterwards.
+            naming(name)
+            options = {} if isinstance(config, bool) else config
+            keywords = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in {**_EMA_DEFAULTS, **options}.items())
+            others[name] = f"flax.nnx.EMA({model}, {keywords})"
+
+    def _intermediate_fields(self, module: FlaxUserDefinedLearner) -> dict[str, Any]:
+        """Get the framework-specific fields of the built learner intermediate."""
+        return {"ema": list(module.EMA)}
 
     def _get_optimizer(
         self,
@@ -657,6 +811,8 @@ __all__ = [
     "FlaxLearnerBuilder",
     "FlaxLearnerIntermediate",
     "FlaxOptimizerSegment",
+    "FlaxTemplateLearner",
+    "FlaxUserDefinedLearner",
     "inject_learning_rate",
     "optimizer_hash",
 ]

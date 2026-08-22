@@ -9,6 +9,7 @@ module-scoped, so the whole file stays a CPU-seconds affair.
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from re import search as re_search
 from types import ModuleType
 from typing import Any
 
@@ -21,6 +22,7 @@ from flax import nnx
 from structcast_model.builders import schema
 from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
 from structcast_model.commands.utils import instantiate_object
+from structcast_model.flax.layers import GradientCheckpointingModule
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR
 
@@ -46,6 +48,11 @@ def _load(path: Path, name: str) -> ModuleType:
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _render(path: Path, parameters: dict[str, Any]) -> Any:
+    """Render a template the way `scm format` does, returning the raw mapping it produces."""
+    return schema.Template.from_path(path)(parameters).model_dump(mode="json")
 
 
 def _model_type(directory: Path, name: str, parameters: dict[str, Any]) -> Any:
@@ -161,8 +168,52 @@ def test_cycle_gan_learner_moves_all_four_models_over_its_three_segments(cycle_g
     assert all(bool(jnp.isfinite(value)) for value in criteria.values())
     assert all(_moved(before[name], model) for name, model in models.items())
     assert (learner.steps, learner.updates, learner.has_updated) == (1, 1, True)
-    # Each rate is the first value of the "linear_decay_after" schedule the example file builds.
+    # Each rate is the first value of the "optax.linear_schedule" the template builds.
     assert all(rate == pytest.approx(2e-4) for rate in learner.learning_rates.values())
+
+
+def _torch_lambda(epoch: int, *, epochs: int, decay_epoch: int, offset: int = 0) -> float:
+    """The `LambdaLR` of `cfg/torch/learners/CycleGAN.yaml`, written out for comparison."""
+    return 1.0 - max(0, epoch + offset - decay_epoch) / (epochs - decay_epoch)
+
+
+def test_cycle_gan_schedule_matches_the_torch_lambda_at_every_epoch_boundary() -> None:
+    """The recipe is the schedule, so the rate has to land where the torch template puts it.
+
+    optax counts optimizer applies where torch counts epochs, and `steps_per_epoch` is the whole
+    conversion -- getting it wrong decays at a different pace than the reference implementation
+    this template mirrors. The two curves are not identical: torch holds one rate for a whole epoch
+    and this one falls continuously, so they are compared where they must agree, at the boundaries.
+    """
+    steps_per_epoch = 5
+    rendered = _render(LEARNERS / "CycleGAN.yaml", {"DEFAULT": {"steps_per_epoch": steps_per_epoch}})
+    # The schedule is a nested pattern under the first segment's optimizer; instantiating it alone
+    # keeps this a schedule test rather than a training one.
+    schedule = instantiate_object(rendered["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"])
+
+    for epoch in (0, 50, 100, 150, 199):
+        expected = 2e-4 * _torch_lambda(epoch, epochs=200, decay_epoch=100)
+        assert float(schedule(epoch * steps_per_epoch)) == pytest.approx(expected, rel=1e-5)
+
+
+def test_cycle_gan_schedule_starts_further_down_the_ramp_for_a_resumed_run() -> None:
+    """`offset` is what makes a resumed run continue the ramp instead of restarting it."""
+    parameters = {"DEFAULT": {"epochs": 4, "decay_epoch": 2, "steps_per_epoch": 1, "offset": 1, "lr": 1.0}}
+    rendered = _render(LEARNERS / "CycleGAN.yaml", parameters)
+    schedule = instantiate_object(rendered["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["tx"][2]["_call_"]["learning_rate"])
+
+    assert [float(schedule(step)) for step in range(4)] == pytest.approx([1.0, 1.0, 0.5, 0.0])
+
+
+def test_cycle_gan_refuses_a_decay_that_starts_at_or_after_the_end_of_the_run() -> None:
+    """A ramp with no length would silently render a constant schedule instead of a decaying one.
+
+    optax answers a non-positive `transition_steps` with a constant schedule and a log line, which
+    is the kind of misconfiguration that only shows up as a run that never converges; the template
+    rejects it while it is still a configuration.
+    """
+    with pytest.raises(ValueError, match="must be greater than decay_epoch"):
+        _render(LEARNERS / "CycleGAN.yaml", {"DEFAULT": {"decay_epoch": 200}})
 
 
 def test_cycle_gan_learner_reports_the_same_criteria_without_training(cycle_gan: tuple[Any, Any, Any]) -> None:
@@ -317,6 +368,47 @@ def test_vision_transformer_drop_path_only_fires_while_training(vision_transform
     assert jnp.array_equal(evaluating(image)["cls"], evaluating(image)["cls"])
 
 
+def _shipped_rules(name: str) -> list[tuple[str, str]]:
+    """The (parameter-path regex, tactic) table one shipped strategy template binds."""
+    bound = load_any(str(CFG_DIR / "flax" / "strategies" / name))[2]["_bind_"]
+    return [(pattern, tactic) for pattern, tactic in bound["rules"]]
+
+
+def test_the_shipped_tensor_parallel_rules_name_this_models_parameters(vision_transformer: Any) -> None:
+    """`cfg/flax/strategies/tp.yaml` is written for this template, so its rules have to match it.
+
+    A rule matching no parameter is refused at wrap time -- loud, but only once the run started --
+    and a table that matched only half of a column/row pair would train a wrong answer, so the four
+    layers and their tactics are pinned here. `fsdp_tp.yaml` carries the same four in front of its
+    catch-all `fsdp` rule; the two drifting apart is the other half of the same defect.
+    """
+    rules = _shipped_rules("tp.yaml")
+    assert _shipped_rules("fsdp_tp.yaml") == [*rules, (".*", "fsdp")]
+
+    model = vision_transformer(rngs=nnx.Rngs(0))
+    names = [
+        jax.tree_util.keystr(path, simple=True, separator=".")
+        for path, _ in jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(nnx.state(model, nnx.Param)))[0]
+    ]
+    matched: dict[str, set[str]] = {"column": set(), "row": set()}
+    for pattern, tactic in rules:
+        matched[tactic] |= {name for name in names if re_search(pattern, name)}
+
+    assert [tactic for _, tactic in rules] == ["column", "row", "column", "row"]
+    assert sorted(matched["column"]) == sorted(
+        f"backbone.block{i}.{layer}.{leaf}"
+        for i in range(2)
+        for layer in ("self_attention.qkv_proj", "linear")
+        for leaf in ("bias", "kernel")
+    )
+    assert sorted(matched["row"]) == sorted(
+        f"backbone.block{i}.{layer}.{leaf}"
+        for i in range(2)
+        for layer in ("self_attention.out_proj", "linear_1")
+        for leaf in ("bias", "kernel")
+    )
+
+
 def test_image_classifier_weight_decay_reaches_the_kernels_and_nothing_else(
     vision_transformer: Any, image_classifier: Any
 ) -> None:
@@ -391,6 +483,70 @@ def test_image_classifier_learner_applies_only_on_the_accumulated_step(
     assert learner.updates == 2
 
 
+SHOWCASE_PARAMETERS: dict[str, dict[str, Any]] = {
+    "base": VIT_PARAMETERS["base"],
+    "SHARED": {"drop_path_rate": 0.0},
+}
+"""The showcase Vision Transformer, with the stochastic depth of the recipe switched off.
+
+`gradient_checkpointing` is the one parameter left out: the two builds below set it either way, and
+the point of the equality assertions is that nothing else differs between them.
+"""
+
+
+def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Checkpointing, accumulation and the EMA have to hold together, not just one by one.
+
+    Each is pinned on its own elsewhere; what only a combined run can answer is whether they
+    compose. They interact: the average follows the `MultiSteps` gate rather than the step count,
+    and the module the average shadows is the rematerialized one. A rematerialized module must also
+    stay the same module -- its variable paths are what a sharding rule and a checkpoint address --
+    so the paths and the forward pass are asserted against the same model built without it.
+
+    Mixed precision has no counterpart here: it is a `dtype`/`param_dtype` on the model's layers on
+    this backend, which the shipped template does not parameterize, and the showcase learner says so
+    rather than pretending otherwise.
+    """
+
+    def _build(remat: bool) -> Any:
+        shared = {**SHOWCASE_PARAMETERS["SHARED"], "gradient_checkpointing": remat}
+        directory = tmp_path_factory.mktemp("remat" if remat else "plain")
+        model_type = _model_type(directory, "VisionTransformer", {**SHOWCASE_PARAMETERS, "SHARED": shared})
+        return model_type(rngs=nnx.Rngs(0))
+
+    checkpointed, plain = _build(True), _build(False)
+    path = tmp_path_factory.mktemp("learner") / "showcase.py"
+    FlaxLearnerBuilder.from_path(LEARNERS / "ImageClassifierShowcase.yaml")(
+        parameters={"DEFAULT": {"accumulate_gradients": 2}}
+    )(path)
+    learner = _load(path, path.stem).Learner(checkpointed)
+    batch = _classification_batch()
+
+    assert isinstance(checkpointed.backbone.block0, GradientCheckpointingModule)
+    assert checkpointed.backbone.block0.gradient_checkpointing is True
+    assert not isinstance(plain.backbone.block0, GradientCheckpointingModule)
+    assert [name for name, _ in _named_parameters(checkpointed)] == [name for name, _ in _named_parameters(plain)]
+    assert jnp.allclose(checkpointed(batch["image"], training=True)["cls"], plain(batch["image"], training=True)["cls"])
+
+    averages, gates = [], []
+    for _ in range(4):
+        learner.training_step(**batch)
+        gates.append(learner.has_updated)
+        averages.append(_parameters(learner.ema_model))
+
+    blended = [
+        any(not jnp.array_equal(a, b) for a, b in zip(x, y, strict=True))
+        for x, y in zip(averages, averages[1:], strict=False)
+    ]
+
+    assert gates == [False, True, False, True]
+    assert blended == [True, False, True]  # one blend per Update, none on the micro-steps between
+    assert sorted(learner.models) == ["ema_model", "model"]
+    assert bool(jnp.isfinite(learner.inference_step(**batch)["ce_loss"]))
+
+
 # ---------------------------------------------------------------------------
 # The "others" templates: what --training-dataset and --compile are pointed at
 # ---------------------------------------------------------------------------
@@ -400,23 +556,27 @@ def test_default_tfdata_template_renders_into_the_example_loader() -> None:
     """`scm format` plus an object pattern is the whole path from that template to a dataset.
 
     The template is the only thing tying `examples/flax/data.py` to a run, by file path and by
-    field name, so a renamed field or a `name:` that renders as YAML null would only fail here --
-    at the start of a training run that already built its models. The split follows `training`, so
-    that no single forgotten parameter can point a validation loader at the training data.
+    field name, so a renamed field would only fail here -- at the start of a training run that
+    already built its models. The split follows `training`, so that no single forgotten parameter
+    can point a validation loader at the training data, and the dataset itself is required, so that
+    nothing silently trains on a placeholder.
     """
     # Instantiating the pattern imports the example, which imports TensorFlow: not installed in the
     # floor environment, where this integration is not what is being pinned.
     pytest.importorskip("tensorflow")
-    parameters = {"DEFAULT": {"training": True, "batch_size": 4, "image_size": 16}}
-    rendered: Any = schema.Template.from_path(OTHERS / "default_tfdata.yaml")(parameters).model_dump(mode="json")
+    parameters = {"DEFAULT": {"dataset": "cifar10", "training": True, "batch_size": 4, "image_size": 16}}
+    rendered: Any = _render(OTHERS / "default_tfdata.yaml", parameters)
 
     loader = instantiate_object(rendered)
 
     assert type(loader).__name__ == "TFDataLoader"
-    assert (loader.name, loader.is_training, loader.split, loader.batch_size) == ("", True, "train", 4)
-    assert next(iter(loader()))["image"].shape == (4, 16, 16, 3)
-    validation: Any = schema.Template.from_path(OTHERS / "default_tfdata.yaml")({}).model_dump(mode="json")
-    assert instantiate_object(validation).split == "validation"
+    assert (loader.name, loader.is_training, loader.split, loader.batch_size) == ("cifar10", True, "train", 4)
+    assert loader.image_size == 16
+    assert instantiate_object(_render(OTHERS / "default_tfdata.yaml", {"DEFAULT": {"dataset": "cifar10"}})).split == (
+        "validation"
+    )
+    with pytest.raises(ValueError, match="A dataset is required"):
+        _render(OTHERS / "default_tfdata.yaml", {})
 
 
 def test_compile_default_template_only_carries_arguments_nnx_jit_accepts() -> None:

@@ -1,0 +1,31 @@
+# Distributed strategy pattern: tensor parallelism. The mesh gains a second axis, "model", and the
+# rules split the layers they name across it: "column" splits a kernel by its last dimension (its
+# bias with it), "row" splits by the first one and pins the bias replicated, which is the mistake a
+# rule table must not be able to make. A parameter no rule matches keeps the sharding it was built
+# with, so a model template's own annotations survive. The batch is never split along the model
+# axis. The pattern is called with device=..., which this preset ignores: it spans the devices
+# itself. Bind model_devices to give the model axis only some of them, leaving the rest as data
+# replicas. model_axis_mode: explicit types the model axis like the data one -- every row-parallel
+# layer must then carry `dot_general: "eval: dot_general_out('data', None)"` in its template, which
+# wrap verifies before the run starts.
+#
+# The rules below are (parameter-path regex, tactic) pairs written for
+# cfg/flax/models/VisionTransformer.yaml and must be adapted to the model they run on: a rule
+# matching no parameter is refused at wrap time. Every generated block exposes the same four layers
+# -- swap self_attention for causal_self_attention under cfg/flax/models/SmallLanguageModel.yaml
+# (commented below).
+- _obj_
+- _addr_: structcast_model.flax.distributed.FlaxDistributedStrategy
+- _bind_:
+    preset: tp
+    # devices: 4
+    # model_devices: 4
+    # model_axis_mode: explicit
+    rules:
+      - ["\\.self_attention\\.qkv_proj\\.", column]
+      - ["\\.self_attention\\.out_proj\\.", row]
+      - ["\\.linear\\.", column]
+      - ["\\.linear_1\\.", row]
+      # SmallLanguageModel.yaml, whose attention is causal:
+      # - ["\\.causal_self_attention\\.qkv_proj\\.", column]
+      # - ["\\.causal_self_attention\\.out_proj\\.", row]

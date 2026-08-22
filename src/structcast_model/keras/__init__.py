@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 __all__ = [
     "AXIS",
+    "MODEL_AXIS",
     "PRESET_RULES",
     "REJECTED",
     "TACTICS",
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     )
     from structcast_model.keras.distributed import (
         AXIS,
+        MODEL_AXIS,
         PRESET_RULES,
         REJECTED,
         TACTICS,
@@ -86,7 +88,15 @@ else:
             "TorchAdapter",
             "select_backend_adapter",
         ],
-        "distributed": ["AXIS", "PRESET_RULES", "REJECTED", "TACTICS", "KerasDistributedStrategy", "RuleModelParallel"],
+        "distributed": [
+            "AXIS",
+            "MODEL_AXIS",
+            "PRESET_RULES",
+            "REJECTED",
+            "TACTICS",
+            "KerasDistributedStrategy",
+            "RuleModelParallel",
+        ],
         "layers": [],
         "trainer": [
             "KerasBestCriterion",

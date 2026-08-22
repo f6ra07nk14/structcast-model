@@ -77,7 +77,41 @@ def donate_argnames(function: Callable[..., Any]) -> tuple[str, ...]:
     return tuple(p.name for p in parameters if p.kind is Parameter.POSITIONAL_OR_KEYWORD)
 
 
-__all__ = ["donate_argnames", "get_jax_device", "get_jax_devices"]
+def dot_general_out(*spec: Any) -> Callable[..., Any]:
+    """Return a `jax.lax.dot_general` that places its result on `PartitionSpec(*spec)`.
+
+    The hook a tensor-parallel layer needs when the model axis is Explicit and the compiler is
+    therefore not allowed to pick the output's sharding itself. A model template reaches it through
+    an `eval:` expression -- `dot_general: "eval: dot_general_out(None, 'model')"` -- so the
+    annotation stays in the template while the strategy decides whether the axis is Explicit at all.
+
+    A closure and not `functools.partial`: Flax passes `out_sharding=` explicitly on every call to
+    the hook (`None` when its own caller gave none), and that pass-through silently overrides a
+    keyword `partial` bound. The keyword is therefore overridden here instead.
+
+    Args:
+        *spec (Any): The `PartitionSpec` entries of the output, e.g. `None, "model"`.
+
+    Returns:
+        Callable[..., Any]: A drop-in `dot_general` naming that sharding on every call.
+
+    Example:
+        >>> import jax, jax.numpy as jnp
+        >>> from structcast_model.flax.utils import dot_general_out
+        >>> with jax.set_mesh(jax.make_mesh((1,), ("model",))):
+        ...     out = dot_general_out(None, "model")(jnp.ones((4, 3)), jnp.ones((3, 2)), (((1,), (0,)), ((), ())))
+        >>> str(out.sharding.spec)
+        "P(None, 'model')"
+    """
+
+    def dot_general(*args: Any, **kwargs: Any) -> Any:
+        """Run `jax.lax.dot_general` with the captured output sharding, whatever the caller asked for."""
+        return jax.lax.dot_general(*args, **{**kwargs, "out_sharding": jax.sharding.PartitionSpec(*spec)})
+
+    return dot_general
+
+
+__all__ = ["donate_argnames", "dot_general_out", "get_jax_device", "get_jax_devices"]
 
 
 if not TYPE_CHECKING:

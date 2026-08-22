@@ -159,6 +159,13 @@ class LayerIntermediate(_Intermediate):
     structured_output: bool
     """Whether the output is structured."""
 
+    gradient_checkpointing: dict[str, str] | None = None
+    """The activation-checkpointing keyword arguments, already resolved to the code emitted for them,
+    or `None` when the layer is not checkpointed; an empty mapping is the framework's own defaults.
+
+    A field of the intermediate, so two otherwise identical layers configured differently hash apart
+    and stay separate generated classes (`docs/adr/0020`)."""
+
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
         """Collect the required imports from the layer and its sub-layers."""
@@ -294,6 +301,29 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             from_references={**self.from_references, self.current_path: current_parts},
         ).get_user_defined_layer(parts, parameters, classname)
 
+    def _resolve_gradient_checkpointing(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        config: bool | dict[str, Any],
+    ) -> dict[str, str] | None:
+        """Validate one layer's `GRADIENT_CHECKPOINTING` and resolve its keywords to emitted code.
+
+        Subclasses check the mapping against the keywords of their own mechanism and add the imports
+        the enabled layer needs -- the runtime base class above all -- to `imports`, which is the
+        per-instance import table of the layer being built rather than the shared `default_imports`,
+        so a module holding no checkpointed layer imports nothing new.
+
+        Returns:
+            dict[str, str] | None: The resolved keyword arguments, empty for the framework's own
+                defaults, or `None` when the layer is not checkpointed.
+        """
+        if config is False:
+            return None
+        raise SpecError(
+            "GRADIENT_CHECKPOINTING names a framework mechanism, and the base builder emits no framework "
+            "module: build the layer with the torch, flax or keras builder."
+        )
+
     def _get_layer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
         if unit.CFG is not None:
             current_path = str(unit.CFG)
@@ -403,6 +433,9 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow=_create_flow(module.FLOW),
             inference_flow=_create_flow(module.INFERENCE_FLOW),
             structured_output=structured_output,
+            # Resolved after the flows: `collected_imports` keeps insertion order, so an earlier
+            # resolution would reorder the emitted import header of every checkpointed layer.
+            gradient_checkpointing=self._resolve_gradient_checkpointing(imports, module.GRADIENT_CHECKPOINTING),
         )
 
 
@@ -601,6 +634,20 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
             trainable_layers=learner.TRAINABLE_LAYERS,
         )
 
+    def _register_shadow_models(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        module: Any,
+        naming: AutoName,
+        others: dict[str, str],
+    ) -> None:
+        """Register the learner-level instances a framework declares beside its trainable models.
+
+        Called before any flow is resolved, so each name it adds to `others` is a name the flows may
+        reference and an instance the generated learner constructs. The torch and flax builders
+        register the `EMA` shadow of each model here (`docs/adr/0021`).
+        """
+
     def _intermediate_fields(self, module: Any) -> dict[str, Any]:
         """Get the framework-specific fields of the built learner intermediate."""
         return {}
@@ -640,6 +687,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
         for layer in module.TRAINABLE_LAYERS:
             layer = naming(layer)
             others[layer] = layer
+        self._register_shadow_models(imports, module, naming, others)
 
         def _inputs(raw: Any) -> str:
             if isinstance(raw, dict):

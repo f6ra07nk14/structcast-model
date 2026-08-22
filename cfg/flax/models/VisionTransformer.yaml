@@ -24,6 +24,13 @@ PARAMETERS:
     # ImageNet recipe.
     drop_path_rate: 0.1
     norm_eps: 1.0e-6
+    # Activation checkpointing on every transformer block, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on with -p "SHARED: {gradient_checkpointing: true}",
+    # which buys the block's activation memory with a second forward pass over it (REFERENCE.md,
+    # "GRADIENT_CHECKPOINTING"). The block's "DropPath" draws from "rngs" inside the rematerialized
+    # body; "nnx.remat" threads that state in as an argument, so the recomputation replays the same
+    # draw. Nothing checks that for a layer that writes its own variables -- keep such state out.
+    gradient_checkpointing: false
   # model size parameters
   base:
     dim: 768
@@ -103,6 +110,7 @@ Block:
   # makes it an identity; it is left out here for the same reason.
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    GRADIENT_CHECKPOINTING: {{gradient_checkpointing}}
     FLOW:
       - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
       - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]

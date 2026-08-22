@@ -191,6 +191,37 @@ class LearnerWithoutOutputs(SimpleLearner):
     outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
 
 
+class AveragingLearner(SimpleLearner):
+    """A learner declaring an averaged shadow of its model, the way a generated one does.
+
+    Public so an object pattern can address it. The weights move by a fixed step per training step,
+    so the average's trajectory is arithmetic: a resume that dropped it is visible in the numbers,
+    not only in the blend counter.
+    """
+
+    def __init__(self, **models: torch.nn.Module) -> None:
+        """Build the average over the model, at a decay far enough from torch's to be unmistakable."""
+        super().__init__(**models)
+        self._model = next(iter(models.values()))
+        self._ema = torch.optim.swa_utils.AveragedModel(
+            self._model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.5)
+        )
+        self._ema.eval()
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return the trained models and the average, which is what a checkpoint carries."""
+        return {**self._models, "ema_model": self._ema}
+
+    def training_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Move the weights by one, then blend the average, as an Update-gated learner does."""
+        criteria = super().training_step(**kwargs)
+        with torch.no_grad():
+            next(self._model.parameters()).add_(1.0)
+        self._ema.update_parameters(self._model)
+        return criteria
+
+
 class GradientLearner(CountingLearner):
     """Learner running one squared-error step and dumping the gradient it produced to disk.
 
@@ -778,6 +809,25 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     assert {"training_state.pt", "best_acc.pt", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
 
 
+def test_train_publishes_the_strategys_data_coordinates_for_the_dataset_patterns(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataset is an object pattern the CLI hands nothing to, so the coordinates travel by environment.
+
+    They are the strategy's, not the process's: the ranks of a tensor-parallel group share one data
+    slice, and a loader keyed on the global rank would hand each of them a different batch
+    (`docs/adr/0022`). The seed derivation reads the same coordinate.
+    """
+    # Set, not deleted, so the teardown restores whatever the session had rather than the value the
+    # run leaves behind.
+    monkeypatch.setenv("DATA_RANK", "unset")
+    monkeypatch.setenv("DATA_WORLD_SIZE", "unset")
+
+    _invoke_train(tmp_path, epochs=1)
+
+    assert (os.environ["DATA_RANK"], os.environ["DATA_WORLD_SIZE"]) == ("0", "1")
+
+
 def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
     """--resume must continue at the epoch after the saved one, with the loop counters seeded.
 
@@ -799,6 +849,29 @@ def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> No
     # 2 epochs of 3 batches ran before the save; the resumed epoch adds 3 more on top of them.
     meta = torch.load(resumed_state, map_location="cpu", weights_only=True)["meta"]
     assert (meta["epoch"], meta["step"], meta["update"]) == (3, 9, 9)
+
+
+def test_train_resumes_the_averaged_shadow_models_the_learner_declares(tmp_path: pathlib.Path) -> None:
+    """A resume restores everything the learner calls a model, which is more than the command built.
+
+    The command builds the models named on its own command line; the average is the learner's, and
+    the saver writes it because it writes `learner.models`. Restoring the command's mapping instead
+    would leave the average at its construction value with nothing blended into it -- a checkpoint
+    that saves what it cannot resume. One batch per epoch makes the blend exact: the resumed run's
+    average must be the saved one blended once with the weights the resumed epoch left.
+    """
+    batches = _make_training_dataset()[:1]
+    _invoke_train(tmp_path, learner_classname="AveragingLearner", epochs=1, training_data=batches)
+    (first,) = (tmp_path / "mlruns").rglob("training_state.pt")
+    saved = torch.load(first, map_location="cpu", weights_only=True)["models"]
+
+    _invoke_train(tmp_path, learner_classname="AveragingLearner", epochs=2, resume=str(first), training_data=batches)
+
+    path = next(p for p in (tmp_path / "mlruns").rglob("training_state.pt") if p != first)
+    resumed = torch.load(path, map_location="cpu", weights_only=True)["models"]
+    assert int(resumed["ema_model"]["n_averaged"]) == 2
+    expected = torch.lerp(saved["ema_model"]["module.fc.weight"], resumed["model"]["fc.weight"], 0.5)
+    assert torch.equal(resumed["ema_model"]["module.fc.weight"], expected)
 
 
 def _load_generated(path: pathlib.Path, name: str) -> Any:

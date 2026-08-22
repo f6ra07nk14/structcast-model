@@ -1,0 +1,114 @@
+# "cfg/keras/learners/ImageClassifier.yaml" with the memory-and-stability features of the Keras
+# backend turned on at once. The optimizer call, the flow and the criteria are the base learner's,
+# unchanged, so a diff against it shows the knobs and nothing else. Three of the four are keyword
+# arguments of the optimizer: Keras owns accumulation and EMA itself, and this backend declares no
+# ACCUMULATE_GRADIENTS and no EMA field of its own (REFERENCE.md, "EMA"; "docs/adr/0017").
+#
+#   scm keras train \
+#     --model cfg/keras/models/VisionTransformer.yaml \
+#     --learner cfg/keras/learners/ImageClassifierShowcase.yaml \
+#     -p "SHARED: {gradient_checkpointing: true, drop_path_rate: 0.0}"
+#
+# 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
+#    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section, whose
+#    generated "call" then wraps "_call_body" in "keras.remat" on the training path. Keras takes the
+#    bare "true" only -- "keras.remat" has no options, and a non-empty mapping is rejected at build
+#    time (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020"). "drop_path_rate: 0.0" travels
+#    with it because the build refuses otherwise: "keras.remat" re-draws seeds on the recomputation,
+#    and a block's "DropPath" is a "keras.layers.Dropout" one TYPE sublayer down. At rate 0 it draws
+#    nothing, so the two passes agree; at any other rate the build stops instead of training on
+#    gradients that silently disagree with the forward pass.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+    ema_momentum: 0.99
+IMPORTS: {}
+# 2. Mixed precision: "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the
+#    training CLI sets before it builds the models, and "MIXED_PRECISION_TYPE" names its element
+#    type. Both are required together on this backend. "bfloat16" shares float32's exponent range and
+#    needs no scaling; "float16" wraps every optimizer in a "keras.optimizers.LossScaleOptimizer",
+#    and a mapping here carries that wrapper's keyword arguments (REFERENCE.md, "MIXED_PRECISION").
+MIXED_PRECISION: true
+MIXED_PRECISION_TYPE: bfloat16
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # 3. Accumulation is "gradient_accumulation_steps": Keras owns both the buffering and the gate,
+    #    and the generated learner reads the optimizer's own counter back after each step, so
+    #    "has_updated" reports a real apply rather than a predicted one -- a step a float16
+    #    "LossScaleOptimizer" skipped truthfully reports no update. Every optimizer of a learner
+    #    must share the window (REFERENCE.md, "ACCUMULATE_GRADIENTS"; "docs/adr/0018").
+    #
+    # 4. EMA is "use_ema"/"ema_momentum" on the optimizer, with three limitations this template does
+    #    not work around and does not hide (REFERENCE.md, "EMA"):
+    #      - the average is updated on every "apply" call, including the accumulation no-ops of the
+    #        window above, so its effective horizon is "accumulate_gradients" times shorter than the
+    #        momentum suggests -- unlike the torch and flax "EMA" fields, which blend once per Update;
+    #      - it belongs on the inner optimizer, which is what this pattern builds: under a float16
+    #        policy the adapter wraps this optimizer in a "LossScaleOptimizer", and "use_ema" set on
+    #        that wrapper instead would do nothing;
+    #      - it keeps no separate averaged copy, so there is nothing to validate against until
+    #        "finalize_variable_values" overwrites the weights themselves. The INFERENCE_FLOW below
+    #        therefore reads "model", not an average -- Keras has no "ema_model" to point it at.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: create_optimizer
+        _file_: examples/keras/optimizers.py
+      - _call_:
+          name: AdamW
+          no_weight_decay_names: [bias, gamma, beta, scale, embeddings]
+          beta_1: 0.9
+          beta_2: 0.999
+          use_ema: true
+          _jinja_yaml_: |-
+            learning_rate: {{lr}}
+            weight_decay: {{weight_decay}}
+            ema_momentum: {{ema_momentum}}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% if clip_grad_norm is not none %}
+            global_clipnorm: {{clip_grad_norm}}
+            {% endif %}
+    EXTRA: {}
+    # The cast is what a mixed policy costs this flow, and it is the difference from the base
+    # learner's: the head emits MIXED_PRECISION_TYPE, and the loss and the accuracies want float32 --
+    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", raises a TypeError
+    # on a bfloat16 prediction outright. This is the "float32 output layer" rule of the Keras mixed
+    # precision guide, written in the flow rather than as a "dtype" on the head, so that the model
+    # template stays the one the base learner trains too.
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - INPUTS: {y_true: label, y_pred: logits}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: keras.losses.SparseCategoricalCrossentropy}, {_call_: {from_logits: true}}]
+      - INPUTS: {y_true: label, y_pred: logits}
+        OUTPUTS: correct1
+        NAME: accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - INPUTS: {y_true: label, y_pred: logits, k: 5}
+        OUTPUTS: correct5
+        NAME: top_5_accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - [{y_true: label, y_pred: logits}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: logits}, correct1, accuracy]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - [{y_true: label, y_pred: logits, k: 5}, correct5, top_5_accuracy]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+LOSSES: []
+MODELS: []

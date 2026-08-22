@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from re import findall
+from typing import Any
 
 import pytest
 
@@ -367,3 +368,75 @@ def test_learner_full_combo_accumulate_clip_mp() -> None:
     assert "dispatch_clip_grad" in script
     assert "if __need_update__:" in script
     assert "__need_update__ = (self._steps + 1) % 4 == 0" in script
+
+
+# ---------------------------------------------------------------------------
+# TorchLearnerBuilder: EMA shadow models
+# ---------------------------------------------------------------------------
+
+
+UNWRAPPED = "(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model)"
+"""What the average is taken over: by wrapper type, so a model owning a `module` keeps its own."""
+
+
+def _ema_script(**ema: Any) -> str:
+    """Build the learner with an `EMA` over its model and return the script holding the class."""
+    raw = {**load_any(LEARNER_YAML), "EMA": {"model": ema or True}}
+    return TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[0]
+
+
+def test_learner_emits_the_average_over_the_module_a_wrapper_holds() -> None:
+    """An `AveragedModel` copies what it is given, and the models reach the learner already wrapped.
+
+    Copying the DDP wrapper is not possible at all, and averaging is meant to happen over the weights
+    either way, so the average is built over what the wrapper holds. `multi_avg_fn` is what makes it
+    exponential: without it torch averages every Update equally, which is a different feature under
+    the same key. The build stays sharding-aware where it cannot work -- a DTensor parameter has no
+    copy -- and the average is never trained, so it is put in eval mode once (`docs/adr/0021`).
+    """
+    script = _ema_script()
+
+    assert 'if any(type(p).__name__ == "DTensor" for p in model.parameters()):' in script
+    assert "EMA works with neither FSDP2 nor tensor parallel" in script
+    assert (
+        f"ema_model = torch.optim.swa_utils.AveragedModel({UNWRAPPED}, "
+        "multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999))"
+    ) in script
+    assert "ema_model.eval()" in script
+    assert script.index("DTensor") < script.index("ema_model = torch.optim.swa_utils.AveragedModel")
+    assert (
+        "torch.optim.swa_utils"
+        in TorchLearnerBuilder(
+            raw={**load_any(LEARNER_YAML), "EMA": {"model": True}}, current_path=str(LEARNER_YAML)
+        )().collected_imports
+    )
+
+
+def test_learner_blends_the_average_once_per_update_and_persists_it_as_a_model() -> None:
+    """The blend rides the Update gate, and the `models` property is what carries it to a checkpoint.
+
+    Blending on every call would advance the average against gradients no optimizer has applied; the
+    average also has to be in `models`, which is the only path a trainer saves and restores through.
+    """
+    script = _ema_script()
+
+    assert "if self._has_updated:" in script
+    assert f"self.ema_model.update_parameters({UNWRAPPED})" in script
+    assert script.index("self._has_updated = __need_update__") < script.index("if self._has_updated:")
+    assert '"model": self.model, "ema_model": self.ema_model' in script
+
+
+def test_learner_ema_mapping_completes_the_defaults_it_leaves_out() -> None:
+    """A mapping declares keywords, not a different mechanism: what it omits stays what `true` means."""
+    script = _ema_script(use_buffers=True)
+
+    assert "multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999), use_buffers=True)" in script
+
+
+def test_learner_without_ema_is_emitted_as_it_was_before_the_field_existed() -> None:
+    """The field is opt-in: a learner that declares none may gain no line and no import from it."""
+    built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
+
+    assert built.ema == ()
+    assert "ema_" not in built.scripts[0]
+    assert "torch.optim.swa_utils" not in built.collected_imports

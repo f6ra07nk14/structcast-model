@@ -20,7 +20,7 @@ import pytest
 
 from flax import nnx
 from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
-from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.distributed import MODEL_AXIS, FlaxDistributedStrategy
 from structcast_model.torch.distributed import DistributedStrategy
 from tests import FIXTURES_DIR
 
@@ -63,6 +63,12 @@ def _build() -> tuple[_Model, nnx.Optimizer]:
 def _step_count(optimizer: Any) -> int:
     """Read an optimizer's update count, which decides the bias correction of its next update."""
     return int(jnp.asarray(nnx.state(optimizer).step[...]))
+
+
+def _spec(parameter: Any) -> str:
+    """One parameter's `PartitionSpec` as a string; `spec` lives on `NamedSharding`, not `Sharding`."""
+    sharding: Any = parameter[...].sharding
+    return str(sharding.spec)
 
 
 def _leaves(obj: Any) -> list[jax.Array]:
@@ -147,6 +153,28 @@ for step in range(6):
 print(json.dumps({"losses": losses, "accumulator": accumulator}))
 """
 
+FSDP_TP_SPEC_SCRIPT = """
+import json
+import jax
+from flax import nnx
+from structcast_model.flax.distributed import FlaxDistributedStrategy
+
+# Leading dimensions of 2 and 6 divide the data axis but not the four devices of the whole mesh; 3
+# divides neither.
+strategy = FlaxDistributedStrategy(preset="fsdp_tp", model_devices=2, min_size=0)
+models = nnx.Dict(
+    two=nnx.Linear(2, 8, rngs=nnx.Rngs(0)),
+    six=nnx.Linear(6, 8, rngs=nnx.Rngs(0)),
+    odd=nnx.Linear(3, 8, rngs=nnx.Rngs(0)),
+)
+strategy.wrap({"model": models})
+print(json.dumps({
+    "mesh": dict(strategy.mesh.shape),
+    "params": {jax.tree_util.keystr(p, simple=True, separator="."): str(v.sharding.spec)
+               for p, v in jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(nnx.state(models, nnx.Param)))[0]},
+}))
+"""
+
 STATE_PRELUDE = """
 import json, pickle, sys
 import jax, jax.numpy as jnp, optax
@@ -213,6 +241,70 @@ print(json.dumps(fingerprint(model, optimizer)))
 )
 
 
+TP_SCRIPT = """
+import json, sys
+import jax, jax.numpy as jnp, optax
+from flax import nnx
+from structcast_model.flax.distributed import FlaxDistributedStrategy
+
+preset, model_devices = sys.argv[1], int(sys.argv[2]) or None
+rules = [(r"^up\\.", "column"), (r"^down\\.", "row")] if preset in ("tp", "fsdp_tp") else None
+if preset == "fsdp_tp":
+    rules = rules + [(r".*", "fsdp")]
+
+class MLP(nnx.Module):
+    def __init__(self, rngs):
+        self.up = nnx.Linear(8, 16, rngs=rngs)
+        self.down = nnx.Linear(16, 8, rngs=rngs)
+        # Named by no rule: under the tp presets it must keep the sharding it was built with.
+        self.head = nnx.Linear(8, 8, rngs=rngs)
+    def __call__(self, x):
+        return self.head(self.down(nnx.relu(self.up(x))))
+
+strategy = FlaxDistributedStrategy(preset=preset, model_devices=model_devices, rules=rules, min_size=0)
+model = MLP(nnx.Rngs(params=jax.random.key(0)))
+strategy.wrap({"model": model})
+optimizer = nnx.Optimizer(model, tx=optax.sgd(0.1), wrt=nnx.Param)
+batch = strategy.shard_batch({"x": jnp.linspace(-1.0, 1.0, 64).reshape(8, 8),
+                              "y": jnp.linspace(1.0, -1.0, 64).reshape(8, 8)})
+
+def spec(array):
+    # Canonical: JAX drops trailing replicated entries when it re-derives a spec, so P('model', None)
+    # and P('model') are the same sharding and have to compare equal across a step.
+    entries = list(array.sharding.spec)
+    while entries and entries[-1] is None:
+        entries.pop()
+    return "P(" + ", ".join("None" if e is None else repr(e) for e in entries) + ")"
+
+def specs():
+    return {jax.tree_util.keystr(p, simple=True, separator="."): spec(v)
+            for p, v in jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(nnx.state(model, nnx.Param)))[0]}
+
+def loss_fn(model, x, y):
+    return jnp.mean((model(x) - y) ** 2)
+
+def step(model, optimizer, x, y):
+    loss, grads = nnx.value_and_grad(loss_fn)(model, x, y)
+    optimizer.update(model, grads)
+    return loss
+
+placed = specs()
+# Through the strategy's own compile seam, which is how a run steps: an eager step is one program
+# per operation, and the compiler re-places every output of every one of them.
+compiled = strategy.compile(step, {})
+losses = [float(compiled(model, optimizer, batch["x"], batch["y"])) for _ in range(3)]
+print(json.dumps({
+    "mesh": dict(strategy.mesh.shape),
+    "params": placed,
+    "trained": specs(),
+    "batch": {k: str(v.sharding.spec) for k, v in batch.items()},
+    # What one device actually holds: the proof the split factor is the data axis, not the mesh.
+    "batch_shard": list(batch["x"].addressable_shards[0].data.shape),
+    "losses": losses,
+}))
+"""
+
+
 def test_the_strategy_satisfies_the_distributed_strategy_protocol() -> None:
     """The trainer and the checkpoint callbacks accept any strategy structurally, so this is the contract."""
     assert isinstance(FlaxDistributedStrategy(), DistributedStrategy)
@@ -244,6 +336,125 @@ def test_a_device_count_outside_the_available_range_is_refused() -> None:
         FlaxDistributedStrategy(preset="dp", devices=-1)
 
 
+def test_a_model_axis_tactic_is_refused_on_a_preset_without_one() -> None:
+    """`column` and `row` name a mesh axis the one-dimensional presets do not build."""
+    with pytest.raises(ValueError, match='splits a parameter along the "model" axis'):
+        FlaxDistributedStrategy(preset="fsdp", rules=[(".*", "row")])
+
+
+@pytest.mark.parametrize("preset", ["tp", "fsdp_tp"], ids=["tp", "fsdp_tp"])
+def test_a_tensor_parallel_preset_without_rules_is_refused(preset: str) -> None:
+    """The `tp` table is empty, and an empty table under these presets splits nothing at all.
+
+    Every parameter would keep its construction sharding, every device would hold the whole model
+    and run the whole batch, and the run would report success -- the one failure mode a preset named
+    after tensor parallelism must not have.
+    """
+    with pytest.raises(ValueError, match="splits the layers its rules name"):
+        FlaxDistributedStrategy(preset=preset, model_devices=1, rules=[])  # type: ignore[arg-type]  # runtime guard
+
+
+def test_a_rule_matching_no_parameter_is_refused() -> None:
+    """A typo'd rule leaves its layers on the preset's default placement and says nothing.
+
+    The torch globs are refused the same way and for the same reason: matching nothing anywhere is
+    never what the author meant, and the cost of the silence is a run that trains unsharded.
+    """
+    strategy = FlaxDistributedStrategy(preset="tp", rules=[(r"^fc\.", "column"), (r"^fcc\.", "row")])
+    model, _ = _build()
+
+    with pytest.raises(ValueError, match=r"matched no parameter"):
+        strategy.wrap(OrderedDict(model=model))
+
+
+def test_a_model_axis_option_is_refused_on_a_preset_without_one() -> None:
+    """A model-axis knob bound to `dp` or `fsdp` would do nothing at all, which is worse than an error."""
+    with pytest.raises(ValueError, match="model_devices and model_axis_mode"):
+        FlaxDistributedStrategy(preset="fsdp", model_devices=2)
+
+
+def test_the_fsdp_tp_preset_requires_a_model_axis_size() -> None:
+    """Without it the data axis would be one device wide, and the preset would shard nothing on it."""
+    with pytest.raises(ValueError, match="model_devices"):
+        FlaxDistributedStrategy(preset="fsdp_tp", rules=[(".*", "fsdp")])
+
+
+def test_a_model_axis_the_devices_do_not_divide_is_refused() -> None:
+    """A mesh needs both axes to multiply out to the devices; the leftovers would be dropped ranks."""
+    with pytest.raises(ValueError, match="must divide it"):
+        FlaxDistributedStrategy(preset="tp", devices=1, model_devices=3, rules=[(".*", "column")])
+
+
+def test_the_explicit_model_axis_mode_refuses_a_row_layer_without_its_own_dot_general() -> None:
+    """Under an Explicit axis the compiler may not place a row-parallel result, so the layer must.
+
+    The default `jax.lax.dot_general` cannot, and the failure it produces is a trace-time error deep
+    inside the first step; the check moves it to configuration time and names the template line that
+    fixes it. Only explicit mode checks: under the default Auto axis the compiler inserts the
+    reduction itself, which is what lets a plain layer row-parallelize unchanged.
+    """
+    strategy = FlaxDistributedStrategy(preset="tp", model_axis_mode="explicit", rules=[(r"^fc\.", "row")])
+    model, _ = _build()
+
+    with pytest.raises(ValueError, match="dot_general_out") as error:
+        strategy.wrap(OrderedDict(model=model))
+
+    assert "'fc.kernel'" in str(error.value)
+
+
+def test_the_explicit_model_axis_mode_refuses_a_row_parameter_owned_by_no_hooked_layer() -> None:
+    """Fail closed: a row-matched parameter whose owner cannot show a hook is refused with the rest.
+
+    A parameter held in a container rather than a layer has no `dot_general` to read at all, and the
+    check used to skip exactly those -- passing the run through with the one placement explicit mode
+    exists to verify left unverified.
+    """
+    strategy = FlaxDistributedStrategy(preset="tp", model_axis_mode="explicit", rules=[(r"^weights\.", "row")])
+    model = nnx.Dict(weights=nnx.List([nnx.Param(jnp.ones((4, 4)))]))
+
+    with pytest.raises(ValueError, match="row-parallelizes") as error:
+        strategy.wrap(OrderedDict(model=model))
+
+    assert "'weights.0'" in str(error.value)
+
+
+def test_the_tp_presets_leave_an_unmatched_parameter_on_its_construction_sharding() -> None:
+    """A model template's own annotation must survive a strategy that says nothing about it.
+
+    `dp` and `fsdp` place every parameter, replicating whatever no rule shards, which would silently
+    overwrite the annotation; under the tp presets an unmatched parameter is not placed at all. The
+    annotation asserted here is one no rule in the table could have produced, so its surviving is the
+    only reason it can still be there. (`nnx.with_partitioning` needs every mesh axis to have the same
+    type, so this is an explicit-mode template -- the mode the annotation belongs to.)
+    """
+    strategy = FlaxDistributedStrategy(preset="tp", model_axis_mode="explicit", rules=[(r"^up\.", "column")])
+    model = nnx.Dict(
+        up=nnx.Linear(8, 16, rngs=nnx.Rngs(0)),
+        head=nnx.Linear(
+            8,
+            8,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (MODEL_AXIS, None)),
+            rngs=nnx.Rngs(0),
+        ),
+    )
+
+    strategy.wrap(OrderedDict(model=model))
+
+    assert _spec(model.head.kernel) == "P('model', None)"
+    assert _spec(model.up.kernel) == "P(None, 'model')"
+
+
+def test_the_auto_model_axis_mode_places_a_plain_row_layer(tmp_path: Path) -> None:
+    """The default must not ask a model template for anything, which is why Auto is the default."""
+    strategy = FlaxDistributedStrategy(preset="tp", rules=[(r"^fc\.", "row")])
+    model, _ = _build()
+
+    strategy.wrap(OrderedDict(model=model))
+
+    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Auto)
+    assert _spec(model.fc.bias) == "P()"
+
+
 def test_wrap_returns_the_same_model_objects() -> None:
     """The step closures capture the modules handed to the learner, so wrap must not replace them."""
     strategy = FlaxDistributedStrategy()
@@ -268,9 +479,15 @@ def test_shard_batch_commits_every_entry_to_the_mesh() -> None:
 
 
 def test_shard_batch_refuses_an_entry_the_mesh_cannot_split() -> None:
-    """A scalar entry has no batch dimension to split, and the error must name the entry."""
-    with pytest.raises(ValueError, match='"y"'):
+    """A scalar entry has no batch dimension to split, and the error must name the entry.
+
+    It must also name the divisor it used: the batch is split along the data axis alone, so a
+    message pointing at "the mesh size" sends the reader of a two-axis run after the wrong number.
+    """
+    with pytest.raises(ValueError, match='"y"') as error:
         FlaxDistributedStrategy().shard_batch({"x": jnp.ones((4, 3)), "y": jnp.asarray(1.0)})
+
+    assert 'devices of the "data" axis' in str(error.value)
 
 
 def test_state_dict_carries_the_full_state_to_host_memory() -> None:
@@ -386,6 +603,93 @@ def test_a_generated_learner_trains_to_the_same_losses_on_four_devices(preset: s
     assert four["losses"] == pytest.approx(one["losses"], rel=1e-6)
     assert four["losses"][2:] == one["losses"][2:]
     assert four["accumulator"] == [four["accumulator"][0]] * 6
+
+
+@pytest.fixture(scope="module")
+def tp_reference(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """The same three steps on one device, as the yardstick every tensor-parallel mesh must match."""
+    return _run_script(TP_SCRIPT, tmp_path_factory.mktemp("tp_reference"), "single", "0", devices=1)
+
+
+def test_the_tp_preset_splits_the_layers_its_rules_name_and_pins_the_row_bias(tmp_path: Path) -> None:
+    """The tactics carry the one rule a table cannot express: a row-parallel bias stays whole.
+
+    A bias split along the model axis -- or added once per shard -- is counted as many times as the
+    axis is wide by the reduction a row-parallel layer ends in, and the run still reports a plausible
+    loss. The column bias is the opposite case: it belongs to the output dimension and splits with it.
+    """
+    result = _run_script(TP_SCRIPT, tmp_path, "tp", "0", devices=4)
+
+    assert result["mesh"] == {"data": 1, "model": 4}
+    assert result["params"]["up.kernel"] == "P(None, 'model')"
+    assert result["params"]["up.bias"] == "P('model')"
+    assert result["params"]["down.kernel"] == "P('model')"
+    assert result["params"]["down.bias"] == "P()"
+    # And the split survives training: a compiled step that gave the parameters back replicated
+    # would undo the preset after one update, at no cost to the losses that are compared below.
+    assert {k: v for k, v in result["trained"].items() if not k.startswith("head")} == {
+        k: v for k, v in result["params"].items() if not k.startswith("head")
+    }
+
+
+def test_the_tp_preset_splits_the_batch_along_the_data_axis_only(tmp_path: Path) -> None:
+    """Every device of one model-axis group runs the same items, so the mesh size is not the divisor.
+
+    With a data axis of one, an eight-row batch stays eight rows on every device; dividing by the
+    four devices of the mesh would hand each of them a quarter of it and quietly train on a fraction.
+    """
+    result = _run_script(TP_SCRIPT, tmp_path, "tp", "0", devices=4)
+
+    assert result["batch"] == {"x": "P('data',)", "y": "P('data',)"}
+    assert result["batch_shard"] == [8, 8]
+
+
+@pytest.mark.parametrize(("preset", "model_devices"), [("tp", "0"), ("fsdp_tp", "2")], ids=["tp-4", "fsdp_tp-2x2"])
+def test_a_tensor_parallel_mesh_trains_to_the_losses_of_one_device(
+    preset: str, model_devices: str, tmp_path: Path, tp_reference: dict[str, Any]
+) -> None:
+    """A split model must compute what the whole one does, or a tensor-parallel run cannot be trusted.
+
+    Splitting changes the order the products are reduced in, so the losses agree to the tolerance
+    ADR-0014 records for a mesh change rather than bitwise. The `(2, 2)` combination is the same
+    assertion with the fsdp rules composed behind the tensor-parallel ones.
+    """
+    result = _run_script(TP_SCRIPT, tmp_path, preset, model_devices, devices=4)
+
+    assert result["losses"] == pytest.approx(tp_reference["losses"], rel=1e-6)
+
+
+def test_the_fsdp_tactic_divides_by_the_data_axis_and_not_the_whole_mesh(tmp_path: Path) -> None:
+    """The `fsdp` tactic shards along the data axis, so the data axis is what has to divide the rows.
+
+    Dividing by the mesh instead leaves every parameter whose leading dimension the data axis alone
+    would have split replicated -- a preset that says it shards and quietly does not, on exactly the
+    two-axis mesh the combination exists for.
+    """
+    result = _run_script(FSDP_TP_SPEC_SCRIPT, tmp_path, devices=4)
+
+    assert result["mesh"] == {"data": 2, "model": 2}
+    assert result["params"]["two.kernel"] == "P('data', None)"
+    assert result["params"]["six.kernel"] == "P('data', None)"
+    # Three rows divide neither axis, so this one really is replicated rather than failing the run.
+    assert result["params"]["odd.kernel"] == "P()"
+
+
+def test_the_fsdp_tp_preset_shards_on_the_axis_the_first_matching_rule_names(tmp_path: Path) -> None:
+    """Precedence is the rule table's own order, so a parameter lands on one axis or the other.
+
+    The tensor-parallel rules come first and claim their layers; the catch-all `fsdp` rule behind
+    them takes everything left over onto the data axis -- which is what makes the combination two
+    axes rather than two strategies fighting over the same parameter.
+    """
+    result = _run_script(TP_SCRIPT, tmp_path, "fsdp_tp", "2", devices=4)
+
+    assert result["mesh"] == {"data": 2, "model": 2}
+    assert result["params"]["up.kernel"] == "P(None, 'model')"
+    assert result["params"]["down.bias"] == "P()"
+    assert result["params"]["head.kernel"] == "P('data')"
+    assert result["batch"] == {"x": "P('data',)", "y": "P('data',)"}
+    assert result["batch_shard"] == [4, 8]
 
 
 def _assert_same_state(saved: dict[str, Any], restored: dict[str, Any], *, devices: int) -> None:

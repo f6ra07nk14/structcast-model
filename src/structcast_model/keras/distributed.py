@@ -11,11 +11,13 @@ supports (`docs/adr/0016`):
 | `single` | nothing to activate                    | nothing to activate               | nothing to activate      |
 | `dp`     | `keras.distribution.DataParallel`      | `tf.distribute.MirroredStrategy`  | `DistributedDataParallel`|
 | `fsdp`   | `keras.distribution.ModelParallel`     | rejected                          | rejected                 |
+| `tp`     | `ModelParallel` on a 2-D mesh          | rejected                          | rejected                 |
 
 The backend is read exactly once, in `__post_init__`, and every unsupported cell is rejected there
--- before a model exists -- because each of the two rejected cells fails silently otherwise: a
-`keras.distribution` sharding on TensorFlow replicates every variable without a word, and torch
-FSDP2 rebinds the parameters a Keras variable caches, so the run keeps training the stale ones.
+-- before a model exists -- because each rejected cell fails silently otherwise: a
+`keras.distribution` sharding on TensorFlow replicates every variable without a word, torch has no
+`keras.distribution` implementation at all, and torch FSDP2 rebinds the parameters a Keras variable
+caches, so the run keeps training the stale ones.
 
 Activation is process-wide and happens before the models are built, as on the Flax side: JAX reads
 the distribution when a variable is created, and a `MirroredStrategy` mirrors only the variables
@@ -48,21 +50,29 @@ else:
     dist = LazyModuleImporter("torch.distributed")
 
 AXIS = "batch"
-"""The single mesh axis every preset builds: batches split along it, FSDP shards along it.
+"""The mesh axis every preset builds: batches split along it, FSDP shards along it.
 
 Keras' own `DEFAULT_BATCH_DIM_NAME`, so a `DataParallel` mesh and the `ModelParallel` mesh built
 here name their axis identically and a rule table reads the same under both presets.
 """
 
+MODEL_AXIS = "model"
+"""The second mesh axis the `tp` preset adds: layers split along it, batches never are."""
+
 PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
     "single": ((r".*", "replicate"),),
     "dp": ((r".*", "replicate"),),
     "fsdp": ((r".*", "fsdp"),),
+    # No default plan: which layers pair up into a column/row split is the model's own shape, and
+    # unlike the Flax twin a Keras variable carries no annotation of its own to fall back on -- so
+    # the preset is refused without rules rather than replicating everything and reporting success.
+    "tp": (),
 }
 """Ordered (variable-path regex, tactic) rules of each preset; the first matching rule wins."""
 
-TACTICS = ("replicate", "fsdp")
-"""The tactics a rule may name: keep the variable on every device, or shard it across the mesh."""
+TACTICS = ("replicate", "fsdp", "column", "row")
+"""The tactics a rule may name: keep the variable on every device, shard it along the batch axis, or
+split it along the model axis by its last dimension (`column`) or its first one (`row`)."""
 
 REJECTED: Mapping[tuple[str, str], str] = {
     ("fsdp", "tensorflow"): (
@@ -76,6 +86,19 @@ REJECTED: Mapping[tuple[str, str], str] = {
         "(keras-team/keras#23418) and torch FSDP2 replaces the parameters a Keras variable caches, so the run "
         'keeps training the stale ones without an error. Use the "dp" preset, which wraps every model in '
         "DistributedDataParallel, or run fsdp on the jax backend."
+    ),
+    ("tp", "tensorflow"): (
+        'The "tp" preset is not available on the tensorflow Keras backend: splitting a layer across devices goes '
+        "through keras.distribution, which is a no-op prototype there (its backend distribute_value does nothing "
+        "at all), so every variable would be replicated, every device would compute the whole layer, and the run "
+        'would report success. Use the "dp" preset, which runs on tf.distribute.MirroredStrategy, or run tp on '
+        "the jax backend."
+    ),
+    ("tp", "torch"): (
+        'The "tp" preset is not available on the torch Keras backend: keras.distribution has no torch '
+        "implementation at all, so the mesh and the variable layouts a split needs do not exist, and the run "
+        'would train replicated variables under a strategy that says it split them. Use the "dp" preset, which '
+        "wraps every model in DistributedDataParallel, or run tp on the jax backend."
     ),
 }
 """The unsupported (preset, backend) cells, each with the reason the run is refused for."""
@@ -98,12 +121,17 @@ class RuleModelParallel(keras.distribution.ModelParallel):
         self._rules = tuple(rules)
 
     def get_variable_layout(self, variable: Any) -> Any:
-        """Return the layout of one variable: its leading dimension sharded, or replicated.
+        """Return the layout of one variable: one of its dimensions split, or replicated.
 
-        Only the leading dimension of a variable with at least two dimensions is a candidate, and
-        only when the mesh divides it. That leaves every bias and normalization statistic replicated
-        by construction, and a variable the mesh does not divide falls back to replication rather
-        than failing the run -- the same shape the Flax twin's rules have (`docs/adr/0014`).
+        `fsdp` splits the leading dimension along the batch axis. `column` and `row` split along the
+        model axis of the two-dimensional `tp` mesh -- the last dimension for `column`, the leading
+        one for `row` -- which is the pair a tensor-parallel layer is made of. A one-dimensional
+        variable is a candidate for `column` alone, because a column-parallel bias splits with the
+        output dimension it belongs to, while a row-parallel one has to stay whole: the reduction
+        that follows a row-parallel layer would count a split bias once per shard, which is the one
+        tensor-parallel mistake that reports a plausible loss instead of an error (`docs/adr/0022`).
+        A dimension the mesh does not divide falls back to replication rather than failing the run --
+        the same shape the Flax twin's rules have (`docs/adr/0014`).
         """
         if getattr(variable, "_layout", None) is not None:
             return variable._layout  # noqa: SLF001  # The base class reads it first too; a caller may pin a layout.
@@ -111,8 +139,15 @@ class RuleModelParallel(keras.distribution.ModelParallel):
         axes: list[str | None] = [None] * len(variable.shape)
         for pattern, tactic in self._rules:
             if pattern.search(variable.path):
-                if tactic == "fsdp" and len(axes) > 1 and not variable.shape[0] % mesh.shape[0]:
-                    axes[0] = AXIS
+                rank = len(axes)
+                if tactic == "column" and rank:
+                    axis, dim = MODEL_AXIS, rank - 1
+                elif tactic in ("fsdp", "row") and rank > 1:
+                    axis, dim = AXIS if tactic == "fsdp" else MODEL_AXIS, 0
+                else:
+                    break
+                if not variable.shape[dim] % mesh.shape[mesh.axis_names.index(axis)]:
+                    axes[dim] = axis
                 break
         return keras.distribution.TensorLayout(axes, mesh)
 
@@ -129,8 +164,9 @@ class KerasDistributedStrategy:
     after, since it rewires the steps the learner built in its constructor.
     """
 
-    preset: Literal["single", "dp", "fsdp"] = "single"
-    """Which mechanism to run on: one device, replicated variables, or sharded variables."""
+    preset: Literal["single", "dp", "fsdp", "tp"] = "single"
+    """Which mechanism to run on: one device, replicated variables, variables sharded along the batch
+    axis, or layers split along a model axis."""
 
     device: str | None = None
     """Device the run is checked against, e.g. `"cpu:0"`; the first available one by default.
@@ -147,7 +183,8 @@ class KerasDistributedStrategy:
     """
 
     rules: Sequence[tuple[str, str]] | None = None
-    """Rules replacing the `fsdp` preset's table, as ordered (variable-path regex, tactic) pairs."""
+    """Rules replacing the sharding presets' tables, as ordered (variable-path regex, tactic) pairs.
+    Optional under `fsdp`, which has a table of its own, and required under `tp`, which has none."""
 
     _backend: str = field(default="", init=False, repr=False)
     _rules: tuple[tuple[Pattern[str], str], ...] = field(default=(), init=False, repr=False)
@@ -174,15 +211,26 @@ class KerasDistributedStrategy:
         self._backend = keras.backend.backend()
         if self.preset not in PRESET_RULES:
             raise ValueError(f"Unknown preset {self.preset!r}. Available presets: {', '.join(PRESET_RULES)}.")
-        if self.rules is not None and self.preset != "fsdp":
+        if self.rules is not None and self.preset not in ("fsdp", "tp"):
             raise ValueError(
-                f'Sharding rules only decide how the "fsdp" preset shards variables, but the preset is '
-                f"{self.preset!r}, which replicates them all: drop the rules, or select the fsdp preset."
+                f'Sharding rules only decide how the "fsdp" and "tp" presets split variables, but the preset '
+                f"is {self.preset!r}, which replicates them all: drop the rules, or select one of those."
+            )
+        if self.rules is None and self.preset == "tp":
+            raise ValueError(
+                'The "tp" preset splits the layers its rules name across the model axis, and has no table of '
+                "its own -- which layers pair up into a column/row split is the model's own shape. Bind rules "
+                'such as [["kernel$", column]], or select the "fsdp" preset, which shards by size.'
             )
         rules = PRESET_RULES[self.preset] if self.rules is None else self.rules
         for _, tactic in rules:
             if tactic not in TACTICS:
                 raise ValueError(f"Unknown sharding tactic {tactic!r}. Available tactics: {', '.join(TACTICS)}.")
+            if tactic in ("column", "row") and self.preset != "tp":
+                raise ValueError(
+                    f'The {tactic!r} tactic splits a variable along the "{MODEL_AXIS}" axis, which the '
+                    f"{self.preset!r} preset's mesh does not have: select the tp preset."
+                )
         self._rules = tuple((re_compile(pattern), tactic) for pattern, tactic in rules)
         # After the rule table: a mistyped tactic is wrong on every backend, so it is reported as
         # itself rather than as whatever the active backend happens to say about the preset.
@@ -218,6 +266,21 @@ class KerasDistributedStrategy:
     def is_main(self) -> bool:
         """Whether this process is the one that speaks for the run."""
         return self._rank == 0
+
+    @property
+    def data_rank(self) -> int:
+        """Which slice of the dataset this process must consume: its rank.
+
+        The same as :attr:`rank`, and a separate member because the `DistributedStrategy` protocol
+        asks for it (`docs/adr/0022`): the model axis of the `tp` preset lives inside one process, so
+        no Keras run ever has ranks that must share a slice.
+        """
+        return self._rank
+
+    @property
+    def data_world_size(self) -> int:
+        """How many distinct dataset slices the run is split into: its world size."""
+        return self._world_size
 
     @property
     def replicas(self) -> int:
@@ -268,10 +331,38 @@ class KerasDistributedStrategy:
         `DistributedDataParallel` averages the gradients straight into the `.grad` the backend
         adapter reads off it. JAX and TensorFlow variables carry their placement from the moment
         they were created under the activated distribution, so their models come back untouched.
+
+        It is also the first moment the rule table can be checked against real variables, which is
+        why the typo check below lives here rather than in `__post_init__`.
+
+        Raises:
+            ValueError: if a rule matched no variable of any model.
         """
+        self._check_rules_matched(models)
         if self._backend != "torch" or self.preset == "single":
             return models
         return OrderedDict((name, _wrap_ddp(model)) for name, model in models.items())
+
+    def _check_rules_matched(self, models: Mapping[str, Any]) -> None:
+        """Refuse a rule table holding a pattern no variable of any model matches.
+
+        A rule that matches nothing is a typo whose cost is invisible: the variables it meant to
+        split stay replicated and the run trains, larger and slower, with nothing to read. Only the
+        rules that actually decide a layout are checked -- on TensorFlow and torch the table never
+        runs, and `keras.distribution` is not what those presets are realized by.
+
+        Raises:
+            ValueError: naming the patterns that matched nothing, with real paths to write instead.
+        """
+        if not isinstance(self._distribution, RuleModelParallel):
+            return
+        paths = [variable.path for model in models.values() for variable in model.variables]
+        unmatched = [pattern.pattern for pattern, _ in self._rules if not any(pattern.search(p) for p in paths)]
+        if unmatched:
+            raise ValueError(
+                f"Sharding rule pattern(s) {unmatched} matched no variable; available variable paths "
+                f"include {paths[:10]}."
+            )
 
     def sync_initial_weights(self, models: Mapping[str, Any]) -> None:
         """Make every rank start from rank 0's weights. Call on every rank, before :meth:`wrap`.
@@ -508,11 +599,18 @@ class KerasDistributedStrategy:
         )
 
     def _jax_distribution(self) -> Any:
-        """Build the `keras.distribution` the JAX presets run on."""
+        """Build the `keras.distribution` the JAX presets run on.
+
+        The `tp` mesh is two-dimensional with a batch axis of one: every device holds a slice of the
+        split layers and runs the whole batch through it, so `num_model_replicas` -- which
+        :attr:`replicas` and `shard_batch` read -- is 1 and the batch is placed whole.
+        """
         names = self._device_names()
         if self.preset == "dp":
             return keras.distribution.DataParallel(devices=names)
-        mesh = keras.distribution.DeviceMesh(shape=(len(names),), axis_names=[AXIS], devices=names)
+        shape = (1, len(names)) if self.preset == "tp" else (len(names),)
+        axis_names = [AXIS, MODEL_AXIS] if self.preset == "tp" else [AXIS]
+        mesh = keras.distribution.DeviceMesh(shape=shape, axis_names=axis_names, devices=names)
         return RuleModelParallel(layout_map=keras.distribution.LayoutMap(mesh), rules=self._rules)
 
     def _activate_torch(self) -> None:
@@ -621,10 +719,17 @@ def _wrap_ddp(model: Any) -> Any:
     return _KerasDistributedDataParallel(model)
 
 
-# `AXIS`, `PRESET_RULES`, `REJECTED` and `TACTICS` are listed because the LazySelectedImporter tail
-# below only exposes the names in `__all__`, and a caller naming a preset or writing a rule table
-# reads them.
-__all__ = ["AXIS", "PRESET_RULES", "REJECTED", "TACTICS", "KerasDistributedStrategy", "RuleModelParallel"]
+# The module constants are listed because the LazySelectedImporter tail below only exposes the names
+# in `__all__`, and a caller naming a preset or writing a rule table reads them.
+__all__ = [
+    "AXIS",
+    "MODEL_AXIS",
+    "PRESET_RULES",
+    "REJECTED",
+    "TACTICS",
+    "KerasDistributedStrategy",
+    "RuleModelParallel",
+]
 
 
 if not TYPE_CHECKING:
