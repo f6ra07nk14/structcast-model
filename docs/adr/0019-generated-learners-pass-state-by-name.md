@@ -43,9 +43,11 @@ update and returns the comparison with the outputs; the learner does `_updates +
 and `restore_counters` seeds both counters from checkpoint meta. The host-side
 `accumulation_window` read-back, the stored window, and the uniform-window `ValueError` are gone:
 the first optimizer is the learner's clock, the stance ADR-0017 already documents for keras
-de-phased segments. The outermost-`MultiSteps` wellformedness walk moves into the
-`gradient_steps` helper the step calls, so a misconfigured chain now fails on the first traced
-step instead of in `__init__`.
+de-phased segments. The `gradient_steps` helper the step calls is deliberately minimal: it
+returns the `gradient_step` count when the optimizer's outermost `opt_state` is a
+`MultiStepsState` and `None` otherwise — ADR-0017's nested-shell `ValueError`s are gone with the
+read-back, so a `MultiSteps` buried inside a chain is simply invisible to counting (`has_updated`
+stays true every step).
 
 Keras keeps post-step detection but reads the public `iterations` property (`raw // k`) of the
 first segment's unwrapped optimizer. The private `_iterations` phase read existed for the
@@ -63,5 +65,5 @@ backend adapters and the MirroredStrategy wrapper), and segments are named attri
   the keras `_iterations` read).
 - Hand-written flax learners gain donation by following the signature convention; hand-written
   keras `InferenceFlow` implementations must accept named keyword arguments.
-- A non-outermost `MultiSteps` misconfiguration surfaces at first step trace rather than at
-  learner construction.
+- A non-outermost `MultiSteps` is no longer rejected: it accumulates on the device as configured,
+  but the counters cannot see its window.
