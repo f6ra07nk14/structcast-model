@@ -1,5 +1,10 @@
 # A distributed strategy owns the distributed lifecycle
 
+> **Amended by ADR-0022.** The strategy set grows beyond the three named here (tensor-parallel and
+> the FSDP2+TP combination), and the protocol gains `data_rank`/`data_world_size` — added under
+> this ADR's own rule, for the demonstrated defect that a TP group must consume one batch and one
+> dropout seed while datasets and seeding only knew the global rank.
+
 This ADR supersedes the "excluding … DDP wrapping" boundary and its recorded limitation in ADR-0002:
 distributed wrapping becomes part of learner assembly, ordered before learner construction, and every
 distributed concern lives behind one replaceable object.

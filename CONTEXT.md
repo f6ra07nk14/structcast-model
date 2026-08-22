@@ -64,8 +64,9 @@ is active per training run; single-device training uses a strategy too, not a sp
 _Avoid_: dist_fn, wrapper function, backend
 
 **Strategy preset**:
-A named sharding-rule table (`single`, `dp`, `fsdp`) selecting how a distributed strategy partitions
-parameters, optimizer state, and batches across the devices of one host.
+A named sharding-rule table (`single`, `dp`, `fsdp`, `tp`, and combined forms such as `fsdp_tp`)
+selecting how a distributed strategy partitions parameters, optimizer state, and batches across the
+devices of one host.
 _Avoid_: ZeRO stage, parallelism mode, sharding config
 
 **Keras backend**:
