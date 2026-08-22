@@ -303,35 +303,6 @@ def _assemble_learner(
     return models, learner, learner_outputs, tracker
 
 
-def _restore_training_state(
-    *,
-    resume: str,
-    strategy: "scm_torch.DistributedStrategy",
-    models: "OrderedDict[str, torch.nn.Module]",
-    learner: Any,
-    start_epoch: int,
-    is_main: bool,
-    logger: "scm_loggers.Logger",
-) -> int:
-    """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch.
-
-    The logger owns the reference format, and only rank 0 holds a real one: the `NullLogger` ranks
-    fetch nothing and take the state from the strategy's broadcast.
-    """
-    raw_state = logger.fetch_training_state(resume)
-    state = strategy.load_state_dict(models, learner.optimizers, learner.optimizer_models, raw_state)
-    for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
-        if state.get("grad_scalers", {}).get(scaler_name):
-            scaler.load_state_dict(state["grad_scalers"][scaler_name])
-    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
-    # continue where the saved run left off (docs/adr/0018).
-    learner.restore_counters(int(state["meta"]["step"]), int(state["meta"]["update"]))
-    resumed_epoch = state["meta"]["epoch"] + 1
-    if start_epoch != 1 and is_main:
-        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
-    return resumed_epoch
-
-
 def _build_callbacks(
     *,
     trainer: Any,
@@ -485,7 +456,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     else:
         logger = scm_loggers.NullLogger()
     if resume is not None:
-        start_epoch = _restore_training_state(
+        start_epoch = scm_torch.restore_training_state(
             resume=resume,
             strategy=strategy,
             models=models,

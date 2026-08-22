@@ -27,8 +27,9 @@ from structcast_model.base_trainer import BaseInfo
 from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import get_module_outputs as _get_module_outputs, instantiate_object
+from structcast_model.loggers.base import NullLogger
 from structcast_model.torch.distributed import SingleDeviceStrategy
-from structcast_model.torch.trainer import TorchTrainer, initial_model
+from structcast_model.torch.trainer import TorchTrainer, initial_model, restore_training_state
 from tests import CFG_DIR, FIXTURES_DIR
 import torch
 import torch.distributed as dist
@@ -842,6 +843,19 @@ def _load_generated(path: pathlib.Path, name: str) -> Any:
     return module
 
 
+class _StateLogger(NullLogger):
+    """Logger handing back one prepared state, standing in for a fetch from a tracking service."""
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        """Remember the state to hand back."""
+        self.state = state
+
+    # `Any`, not `dict[str, Any]`: `NullLogger` fetches nothing and narrows the return to None.
+    def fetch_training_state(self, reference: str) -> Any:
+        """Return the prepared state whatever the reference is."""
+        return self.state
+
+
 def test_restore_training_state_seeds_the_counters_of_a_generated_learner(tmp_path: pathlib.Path) -> None:
     """Resuming must seed the generated learner's counters so the accumulation cadence continues.
 
@@ -850,7 +864,6 @@ def test_restore_training_state_seeds_the_counters_of_a_generated_learner(tmp_pa
     weights but left the counters at zero would read (0, 0) and hold the next apply back for two
     extra steps -- the saved-but-never-restored hole `docs/adr/0018` closes.
     """
-    _restore_training_state = _CMD_GLOBALS["_restore_training_state"]
     generated = tmp_path / "generated"
     TorchBuilder.from_path(LINEAR_CFG)()(generated / "model.py")
     TorchLearnerBuilder.from_path(str(FIXTURES_DIR / "cfg" / "torch" / "LinearLearner.yaml"))(
@@ -880,14 +893,14 @@ def test_restore_training_state_seeds_the_counters_of_a_generated_learner(tmp_pa
     states["meta"] = {"epoch": 1, "step": trained.steps, "update": trained.updates}
 
     resumed = _build(7)
-    epoch = _restore_training_state(
+    epoch = restore_training_state(
         resume="whatever",
         strategy=strategy,
         models=OrderedDict(resumed.models),
         learner=resumed,
         start_epoch=1,
         is_main=True,
-        logger=SimpleNamespace(fetch_training_state=lambda reference: states),
+        logger=_StateLogger(states),
     )
 
     assert epoch == 2

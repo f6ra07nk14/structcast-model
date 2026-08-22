@@ -31,6 +31,7 @@ __all__ = [
     "matched_shard_modules",
     "resolve_input_shapes",
     "restore_requires_grad",
+    "restore_training_state",
     "set_lr_scale",
     "sync_gate",
 ]
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
         create_torch_inputs,
         initial_model,
         resolve_input_shapes,
+        restore_training_state,
     )
     from structcast_model.torch.types import DeviceLike, DType, Tensor, TensorInitializer
     from structcast_model.torch.utils import get_torch_device, get_torch_device_type
@@ -108,6 +110,7 @@ else:
             "create_torch_inputs",
             "initial_model",
             "resolve_input_shapes",
+            "restore_training_state",
         ],
         "types": ["DType", "DeviceLike", "Tensor", "TensorInitializer"],
         "utils": ["get_torch_device", "get_torch_device_type"],

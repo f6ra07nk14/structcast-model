@@ -443,7 +443,7 @@ LEARNERS:
 - `optimizer_models` (property) — `dict[str, list[str]]` naming the models each optimizer updates (optimizer name -> model names); checkpointing uses it to pair sharded optimizer state with its modules, and an empty mapping means the pairing is not declared.
 - `steps` (property) — the number of completed training Steps (batch iterations), counted by the learner.
 - `updates` (property) — the number of completed Updates (optimizer applies); it lags `steps` while gradients accumulate.
-- `has_updated` (property) — whether the just-finished step landed an Update. `update_models` runs `training_step` and then reads this flag, so every count is a retrospective "completed" count ([`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). One contract follows: during `on_training_step_begin` for step N, `info.step` reads N-1.
+- `has_updated` (property) — whether the just-finished step landed an Update. The training loop runs the step and then reads this flag, so every count is a retrospective "completed" count ([`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). One contract follows: during `on_training_step_begin` for step N, `info.step` reads N-1.
 - `restore_counters(steps, updates)` — seeds the counters after a checkpoint restore. The resume paths call it with the counts from checkpoint meta, so the counters survive a resume.
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
@@ -508,7 +508,7 @@ Key methods:
 - `train(dataset)` — runs one training pass, returns the final step logs
 - `evaluate(dataset)` — runs one validation pass, returns the final step logs
 - `fit(epochs, start_epoch=1, validation_frequency=1)` — runs the full loop over the data provider's datasets and returns the complete history dict
-- `update_models(inputs)` — performs one training step, returning `(updated, criteria)`; gradient synchronization is gated inside the generated training step, not here
+- `update_models(inputs)` — performs one training step, returning its `criteria`; whether the step landed an Update is read from `learner.has_updated` by `train()`, and gradient synchronization is gated inside the generated training step, not here
 - `sync()` — optional synchronization hook, no-op by default (overridden in `TorchTrainer`)
 
 ```python
@@ -590,6 +590,8 @@ history = trainer.fit(epochs=5)
 saver = TrainingStateSaver(logger=logger, strategy=strategy)
 trainer = TorchTrainer(device="cuda", learner=learner, tracker=tracker, data=data, callbacks=[logger, saver])
 ```
+
+**`restore_training_state(*, resume, strategy, models, learner, start_epoch, logger, is_main=True)`** — The counterpart of `TrainingStateSaver`: fetches the state through *logger*, loads it into the live models, optimizers and gradient scalers through *strategy*, seeds the learner's counters from the saved ones, and returns the epoch to continue at — the saved one plus one, which overrides *start_epoch* with a logged message ([`docs/adr/0005`](docs/adr/0005-checkpoints-through-dcp-state-dict-and-epoch-boundary-resume.md)). The logger owns the reference format and only rank 0 holds a real one: the `NullLogger` ranks fetch nothing and take the state from the strategy's broadcast.
 
 The models and the learner of a CLI run are assembled inline by `scm torch train`, not by a factory class: the models are instantiated on the training device, initialized with dummy inputs, given their initializers on the main rank, broadcast via `sync_initial_weights`, compiled and wrapped by the strategy, and handed to the learner by name.
 
