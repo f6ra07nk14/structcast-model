@@ -1,5 +1,10 @@
 # The Learner owns the training counters
 
+> **Superseded in part by ADR-0019.** The flax host-side post-step delta read moves inside the
+> traced step (first optimizer only), flax `restore_counters` now seeds both counters from meta,
+> and the keras detection reads the public `iterations` property instead of the private raw
+> counter. The counter ownership, the protocol, and the torch mechanism stand.
+
 `update(step)` was a pre-step prediction: the trainer incremented its own `step` field, asked the
 learner "will the step about to run land an apply", ran `training_step`, and incremented its own
 `update` field when the answer was yes (`update_models` in `base_trainer.py` returned the pair left

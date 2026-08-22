@@ -4,6 +4,11 @@
 > the rejection of the post-hoc read-back considered option are replaced by the learner-owned
 > retrospective counters of ADR-0018. The per-backend window mechanisms stand.
 
+> **Superseded in part by ADR-0019.** The keras private `_iterations` read (its phase was only
+> needed by the pre-step prediction), the flax `accumulation_window` read-back in `__init__`, and
+> the flax half of the "one learner, one window" validation are replaced by in-step /
+> public-property detection on the first optimizer.
+
 `ACCUMULATE_GRADIENTS` was a shared schema field on `UserDefinedLearner`, on the theory that gradient
 accumulation is portable (ADR-0012). Practice disagreed per backend: torch derives a host-side
 `(step + 1) % k` gate; keras mapped the field onto the optimizer's own `gradient_accumulation_steps`

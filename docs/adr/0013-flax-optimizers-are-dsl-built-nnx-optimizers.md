@@ -1,5 +1,8 @@
 # Flax optimizer segments build nnx.Optimizer directly from the DSL
 
+> **Superseded in part by ADR-0019.** The owned-module container clause below ("several wrapped
+> in `nnx.List`") is replaced by a plain module tuple; the rest of this ADR stands.
+
 The torch `OPTIMIZER` pattern resolves to a callable invoked with named parameters
 (`opt_inst(get_named_parameters([...]))`), and the package supplies `create_opt` because torch schedulers are
 separate stateful objects that must be married to the optimizer behind one proxy. Optax has no such split: an
