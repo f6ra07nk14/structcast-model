@@ -1,0 +1,115 @@
+# The Flax mirror of "cfg/torch/models/SmallLanguageModel.yaml": a GPT-style decoder whose causal
+# attention, rotary position embedding included, is a section of this configuration rather than a
+# package layer.
+PARAMETERS:
+  DEFAULT:
+    size: tiny
+  SHARED:
+    # "vocab_size", "max_seq_len" and "dropout" are shared instead of default parameters: the flows
+    # below select a size group with "_jinja_group_", and a group sees its own parameters merged
+    # with the shared ones, never the default ones. Overriding them on the command line therefore
+    # means overriding them on the selected size group, e.g. -p "tiny: {vocab_size: 100}".
+    vocab_size: 65 # the character vocabulary of Tiny Shakespeare
+    # Only the length of the "INPUT_SHAPES" dummy forward: the rotary position embedding below
+    # derives its angles from the sequence length of the actual input, so the model has no position
+    # table and no length it cannot run.
+    max_seq_len: 256
+    dropout: 0.0
+    norm_eps: 1.0e-5
+    mlp_ratio: 4
+    rope_base: 10000.0 # the standard RoPE frequency base
+  # model size parameters
+  tiny:
+    dim: 256
+    heads: 4
+    depth: 4
+  small:
+    dim: 512
+    heads: 8
+    depth: 8
+# The attention section computes its rotary angles with "jax.numpy" and calls the fused attention
+# kernel through "jax.nn", neither of which the generated module imports on its own.
+IMPORTS: {jax: [null], jax.numpy: [null]}
+INPUTS: [tokens]
+_jinja_yaml_: |-
+  _jinja_group_: {{size}}
+  {% raw %}
+  _jinja_yaml_: |-
+    INPUT_SHAPES:
+      tokens: {_SHAPE_: [{{max_seq_len}}], _DTYPE_: int32}
+  {% endraw %}
+OUTPUTS: [logits]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [tokens, feature, token_embedding, [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: {{vocab_size}}, features: {{dim}}, rngs: "eval: rngs"}}]]
+          - [feature, feature, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{dropout}}, rngs: "eval: rngs"}}]]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+          - [feature, logits, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{vocab_size}}, use_bias: false, rngs: "eval: rngs"}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dropout: {{dropout}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - ["eval: inp + attended", residual]
+      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.gelu}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [_, projected, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{dropout}}, rngs: "eval: rngs"}}]]
+      - ["eval: residual + projected", out]
+CausalSelfAttention:
+  # Causal self-attention with rotary position embedding, defined entirely here: two
+  # "flax.nnx.Linear" projections plus flow lines for the head split, the rotation and the fused
+  # attention kernel.
+  # There is no attention-weight dropout: "jax.nn.dot_product_attention" takes no dropout at all,
+  # and small language models train attention dropout at 0 anyway; the dropouts that matter sit in
+  # the MLP and residual paths of "Block", where "flax.nnx.Dropout" reads the module's own
+  # deterministic flag, which the inference view of a learner flips.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    {% set head_dim = dim // heads %}
+    {% set half_dim = head_dim // 2 %}
+    FLOW:
+      # (batch, seq, dim) -> (batch, seq, 3 * dim) -> (batch, seq, 3, heads, {{head_dim}}).
+      # The fused projection is laid out as q, k, v each of "dim" contiguous features, heads-major
+      # within each, so one reshape performs both the qkv split and the head split; the fused
+      # kernel below reads (batch, seq, heads, head_dim) directly, so nothing is transposed.
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"}}]]
+      - ["eval: qkv.reshape(qkv.shape[0], qkv.shape[1], 3, {{heads}}, {{head_dim}})", fused]
+      - ["eval: fused[:, :, 0]", query]
+      - ["eval: fused[:, :, 1]", key]
+      - ["eval: fused[:, :, 2]", value]
+      # Rotary position embedding: angles for the actual sequence length, shared by every head as
+      # (1, seq, 1, {{head_dim}}), so nothing here is bound to a maximum length.
+      - ["eval: jax.numpy.arange(inp.shape[1], dtype=jax.numpy.float32)", positions]
+      - ["eval: {{rope_base}} ** (-jax.numpy.arange(0, {{head_dim}}, 2, dtype=jax.numpy.float32) / {{head_dim}})", inv_freq]
+      - ["eval: positions[:, None] * inv_freq", freqs]
+      - ["eval: jax.numpy.concatenate((freqs, freqs), axis=-1)", angles]
+      - ["eval: jax.numpy.cos(angles)[None, :, None].astype(query.dtype)", cos]
+      - ["eval: jax.numpy.sin(angles)[None, :, None].astype(query.dtype)", sin]
+      # Rotate the query and the key by their position: "x * cos + rotate_half(x) * sin".
+      - ["eval: query * cos + jax.numpy.concatenate((-query[..., {{half_dim}}:], query[..., :{{half_dim}}]), axis=-1) * sin", query]
+      - ["eval: key * cos + jax.numpy.concatenate((-key[..., {{half_dim}}:], key[..., :{{half_dim}}]), axis=-1) * sin", key]
+      # "is_causal=True" masks the future inside the kernel, so no (seq x seq) mask is materialized.
+      - ["eval: jax.nn.dot_product_attention(query, key, value, is_causal=True)", attended]
+      # (batch, seq, heads, {{head_dim}}) -> (batch, seq, dim).
+      - ["eval: attended.reshape(attended.shape[0], attended.shape[1], {{dim}})", attended]
+      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"}}]]

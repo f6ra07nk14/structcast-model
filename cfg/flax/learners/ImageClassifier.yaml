@@ -1,14 +1,22 @@
-# Supervised image classification for the Flax model "cfg/flax/models/ConvNeXtV2.yaml", which reads
-# "image" and emits a structured output whose only key is "cls".
+# Supervised image classification for any Flax model whose root reads "image" and emits a structured
+# output whose only key is "cls", i.e. both "cfg/flax/models/VisionTransformer.yaml" and
+# "cfg/flax/models/ConvNeXtV2.yaml". One learner for both keeps a strategy comparison honest: the
+# "single", "dp" and "fsdp" runs differ only in the strategy configuration.
 # The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
 # learning rate, and "flax.nnx.Optimizer" only binds that chain to the module (see "docs/adr/0013").
+# There is no "CLIP" key either -- it is torch-only, and the chain below is where clipping lives.
+# "clip_grad_norm" therefore means something else than in the torch twin: here it is the "max_norm"
+# of "optax.clip_by_global_norm", i.e. the bound the global gradient norm is scaled down to, while
+# the torch template passes it to timm's clipper as "norm_type" -- the p of the norm -- and fixes
+# the bound at 1.0. A value that reads as a clipping threshold is what the committed
+# "cfg/flax/learners/ConvNeXtV2.yaml" already uses, so the Flax side stays consistent with itself.
 # The builder wraps the factory carrying "learning_rate" in "optax.inject_hyperparams" so the rate
 # stays readable at run time; writing that wrapper here by hand is equally valid.
 PARAMETERS:
   DEFAULT:
     lr: 1.0e-3
     weight_decay: 0.05
-    clip_grad_norm: 1.0
+    clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: null # set to null or a positive integer
 IMPORTS: {}
 INPUTS: [image, label]
@@ -18,11 +26,13 @@ LEARNERS:
     LOSS: ce_loss
     TRAINABLE_LAYERS: [model]
     # Clipping comes first in the chain, so it applies once per update to the accumulated gradients.
-    # "no_weight_decay_mask" exempts every bias and normalization scale -- the "kernel" arrays of the
-    # convolutions and the two projections of each block are all that is left to decay.
+    # "no_weight_decay_mask" exempts every bias, every normalization scale and every embedding table
+    # -- the "kernel" arrays of the convolutions and the projections are all that is left to decay.
+    # The embedding exemption is what makes this learner fit the Vision Transformer too: its class
+    # token and its position table are two-dimensional "flax.nnx.Embed" parameters, and timm keeps
+    # "cls_token" and "pos_embed" out of weight decay as well.
     # "accumulate_gradients", when set, wraps the whole chain in "optax.MultiSteps": accumulation
-    # gates on the device, and the generated step reads the applied count back off the outermost
-    # optimizer state across its own update, so the wrapper has to stay outermost to be seen
+    # gates on the device, and the generated step reads the applied count back across its own update
     # (see "docs/adr/0019").
     OPTIMIZER:
       - _obj_
@@ -34,7 +44,9 @@ LEARNERS:
                 - _obj_
                 - _addr_: optax.chain
                 - _call_:
+                    {% if clip_grad_norm is not none %}
                     - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                    {% endif %}
                     - - _obj_
                       - _addr_: optax.adamw
                       - _call_:
@@ -48,6 +60,7 @@ LEARNERS:
                             - _call_:
                                 - ^(?:\w+\.)*bias$
                                 - ^(?:\w+\.)*scale$
+                                - ^(?:\w+\.)*embedding$
           {% else %}
           - _bind_:
               tx:
@@ -58,7 +71,9 @@ LEARNERS:
                       - _obj_
                       - _addr_: optax.chain
                       - _call_:
+                          {% if clip_grad_norm is not none %}
                           - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                          {% endif %}
                           - - _obj_
                             - _addr_: optax.adamw
                             - _call_:
@@ -72,6 +87,7 @@ LEARNERS:
                                   - _call_:
                                       - ^(?:\w+\.)*bias$
                                       - ^(?:\w+\.)*scale$
+                                      - ^(?:\w+\.)*embedding$
                     every_k_schedule: {{accumulate_gradients}}
           {% endif %}
     EXTRA: {}
@@ -85,6 +101,8 @@ LEARNERS:
         LAYER: [_obj_, {_addr_: optax.softmax_cross_entropy_with_integer_labels}]
       - ["eval: sample_losses.mean()", ce_loss, null]
       - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      # "acc5" needs at least five classes: the slice takes whatever the last axis has, so a model
+      # with fewer simply reports 1.0 instead of raising, where the torch twin's top-k does raise.
       - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
     INFERENCE_FLOW:
       - INPUTS: image
@@ -93,6 +111,8 @@ LEARNERS:
       - [{logits: cls, labels: label}, sample_losses, cross_entropy_loss]
       - ["eval: sample_losses.mean()", ce_loss, null]
       - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      # "acc5" needs at least five classes: the slice takes whatever the last axis has, so a model
+      # with fewer simply reports 1.0 instead of raising, where the torch twin's top-k does raise.
       - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
 # "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
 # to specify the losses and models to be used during training.

@@ -1,0 +1,96 @@
+# The Keras twin of "cfg/torch/models/SmallLanguageModel.yaml": a GPT-style decoder reading "tokens"
+# and emitting "logits" over the vocabulary, with a "backbone" of pre-LN blocks named "block0" ...
+# "blockN-1".
+# Attention is "keras.layers.MultiHeadAttention" with "use_causal_mask=true", which builds its own
+# query/key/value projections and masks the future inside the layer -- there is no
+# "CausalSelfAttention" section to write. That has one consequence: the torch twin rotates the query
+# and the key with a rotary embedding, which needs the projections spelled out, so positions here
+# come from a learned table instead. The table has "max_seq_len" rows, which is therefore the longest
+# sequence this model runs, while the rotary twin runs any length.
+# The root emits a structured output, as "cfg/keras/models/ConvNeXtV2.yaml" does and as
+# "scm keras create model" forces by default, so the learner reads "logits" off the returned mapping.
+PARAMETERS:
+  DEFAULT:
+    size: tiny
+  SHARED:
+    # "vocab_size", "max_seq_len" and "dropout" are shared instead of default parameters: the flows
+    # below select a size group with "_jinja_group_", and a group sees its own parameters merged
+    # with the shared ones, never the default ones. Overriding them on the command line therefore
+    # means overriding them on the selected size group, e.g. -p "tiny: {vocab_size: 100}".
+    vocab_size: 65 # the character vocabulary of Tiny Shakespeare
+    max_seq_len: 256
+    dropout: 0.0
+    norm_eps: 1.0e-5
+    mlp_ratio: 4
+  # model size parameters
+  tiny:
+    dim: 256
+    heads: 4
+    depth: 4
+  small:
+    dim: 512
+    heads: 8
+    depth: 8
+IMPORTS: {}
+INPUTS: [tokens]
+_jinja_yaml_: |-
+  _jinja_group_: {{size}}
+  {% raw %}
+  _jinja_yaml_: |-
+    INPUT_SHAPES:
+      tokens: {_SHAPE_: [{{max_seq_len}}], _DTYPE_: int64}
+  {% endraw %}
+OUTPUTS: [logits]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          - [tokens, feature, token_embedding, [_obj_, {_addr_: keras.layers.Embedding}, {_call_: {input_dim: {{vocab_size}}, output_dim: {{dim}}}}]]
+          # The position indices of the traced sequence, looked up in a learned table and added to
+          # every batch element by broadcasting.
+          - ["eval: keras.ops.arange(feature.shape[1])", index, null]
+          - [index, position, position_embedding, [_obj_, {_addr_: keras.layers.Embedding}, {_call_: {input_dim: {{max_seq_len}}, output_dim: {{dim}}}}]]
+          - ["eval: feature + position", feature, null]
+          - [feature, feature, [_obj_, {_addr_: keras.layers.Dropout}, {_call_: {rate: {{dropout}}}}]]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+          - [feature, logits, head, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{vocab_size}}, use_bias: false}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dropout: {{dropout}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+      # Self-attention: the same tensor is the query and the value, and "use_causal_mask" masks the
+      # future inside the layer, so no (seq x seq) mask is materialized.
+      # There is deliberately no attention-weight dropout, as in the torch twin: small language
+      # models train it at 0 anyway, and the dropouts that matter sit on the MLP and residual paths
+      # below. Wiring "dropout" into this layer would silently regularize somewhere the torch twin
+      # does not the moment anyone raises it.
+      - INPUTS: {query: _, value: _, use_causal_mask: true}
+        OUTPUTS: attended
+        NAME: attention
+        LAYER:
+          - _obj_
+          - _addr_: keras.layers.MultiHeadAttention
+          - _call_: {num_heads: {{heads}}, key_dim: {{dim // heads}}}
+      - ["eval: inp + attended", residual, null]
+      - [residual, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: "eval: {{dim}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: gelu}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{dim}}}}]]
+      - [_, projected, [_obj_, {_addr_: keras.layers.Dropout}, {_call_: {rate: {{dropout}}}}]]
+      - ["eval: residual + projected", out, null]

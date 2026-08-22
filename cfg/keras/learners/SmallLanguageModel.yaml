@@ -1,0 +1,72 @@
+# Next-token prediction for the Keras model "cfg/keras/models/SmallLanguageModel.yaml", which reads
+# "tokens" and emits a structured output whose only key is "logits".
+# The loss compares those logits against "targets", the same sequence shifted by one.
+# "keras.losses.SparseCategoricalCrossentropy" reduces over every axis but the last, so unlike the
+# torch twin there is nothing to flatten: it already sees one class prediction per position.
+# There is no CLIP field on this backend and no ACCUMULATE_GRADIENTS one: a Keras optimizer clips its
+# own gradients ("global_clipnorm") and accumulates them itself ("gradient_accumulation_steps"), so
+# both are keywords of the OPTIMIZER pattern below.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.1
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the training CLI sets before it
+# builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
+# wraps every optimizer in a "keras.optimizers.LossScaleOptimizer" (a mapping here carries that
+# wrapper's keyword arguments), or "bfloat16", which shares float32's exponent range and stays
+# unscaled. Either field alone is refused, which is one difference in default precision from the
+# torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
+# bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: null
+INPUTS: [tokens, targets]
+OUTPUTS: [ce_loss]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # "create_optimizer" is only there for "no_weight_decay_names": Keras exempts variables from
+    # weight decay through a method call, not a constructor keyword. Everything else is a plain
+    # "keras.optimizers.AdamW" keyword. "embeddings" covers both lookup tables of this model, the
+    # token embedding and the position table.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: create_optimizer
+        _file_: examples/keras/optimizers.py
+      - _call_:
+          name: AdamW
+          no_weight_decay_names: [bias, gamma, beta, embeddings]
+          beta_1: 0.9
+          beta_2: 0.95
+          _jinja_yaml_: |-
+            learning_rate: {{lr}}
+            weight_decay: {{weight_decay}}
+            {% if clip_grad_norm is not none %}
+            global_clipnorm: {{clip_grad_norm}}
+            {% endif %}
+            {% if accumulate_gradients is not none %}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% endif %}
+    EXTRA: {}
+    FLOW:
+      - INPUTS: tokens
+        OUTPUTS: {logits: logits}
+        NAME: model
+      - INPUTS: {y_true: targets, y_pred: logits}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: keras.losses.SparseCategoricalCrossentropy}, {_call_: {from_logits: true}}]
+    INFERENCE_FLOW:
+      - INPUTS: tokens
+        OUTPUTS: {logits: logits}
+        NAME: model
+      - [{y_true: targets, y_pred: logits}, ce_loss, cross_entropy_loss]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

@@ -1,0 +1,143 @@
+# The Flax mirror of "cfg/torch/models/VisionTransformer.yaml": ViT-B/16, laid out over the NHWC
+# tensors Flax convolutions read. It is the semantic twin of the torch template, not a
+# state-dict-compatible one -- nothing here claims timm parity, which the torch file does assert.
+# The class token is a "flax.nnx.Embed(1, dim)" read at index 0 -- the DSL has no free parameter
+# outside a layer, but a one-row embedding table is the same parameter. The position table covers
+# {{(image_size // patch_size) ** 2 + 1}} positions, because it is added after the class token is
+# prepended.
+# The root emits "cls", exactly like "cfg/flax/models/ConvNeXtV2.yaml", so both models train through
+# "cfg/flax/learners/ImageClassifier.yaml" unchanged.
+PARAMETERS:
+  DEFAULT:
+    size: base
+  SHARED:
+    # As in "SmallLanguageModel.yaml" these are shared instead of default parameters: the flows below
+    # select a size group with "_jinja_group_", and a group sees its own parameters merged with the
+    # shared ones, never the default ones. Overriding them on the command line therefore means
+    # overriding them on the selected size group, e.g. -p "base: {num_classes: 10}".
+    patch_size: 16
+    image_size: 224
+    num_classes: 1000
+    mlp_ratio: 4
+    # Linearly ramped over the blocks, as in "ConvNeXtV2.yaml"; a single stage needs no cumulative
+    # depths, so the ramp is just "drop_path_rate * i / (depth - 1)". 0.1 is the usual supervised
+    # ImageNet recipe.
+    drop_path_rate: 0.1
+    norm_eps: 1.0e-6
+  # model size parameters
+  base:
+    dim: 768
+    heads: 12
+    depth: 12
+# The class-token index, the position index and the attention section are expressions over
+# "jax.numpy" and "jax.nn", neither of which the generated module imports on its own.
+IMPORTS: {jax: [null], jax.numpy: [null]}
+INPUTS: [image]
+_jinja_yaml_: |-
+  INPUT_SHAPES:
+    image: {_SHAPE_: [{{image_size}}, {{image_size}}, 3], _DTYPE_: float32}
+OUTPUTS: [cls]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          # (batch, {{image_size}}, {{image_size}}, 3) -> (batch, {{image_size // patch_size}}, {{image_size // patch_size}}, {{dim}})
+          # -> (batch, {{(image_size // patch_size) ** 2}}, {{dim}}). A strided convolution over the
+          # NHWC layout already emits the patches channel-last, so the flatten needs no transpose.
+          - INPUTS: image
+            OUTPUTS: feature
+            NAME: patchify
+            LAYER:
+              - _obj_
+              - _addr_: flax.nnx.Conv
+              - _call_:
+                  in_features: 3
+                  out_features: {{dim}}
+                  kernel_size: [{{patch_size}}, {{patch_size}}]
+                  strides: [{{patch_size}}, {{patch_size}}]
+                  padding: VALID
+                  rngs: "eval: rngs"
+          - ["eval: feature.reshape(feature.shape[0], -1, {{dim}})", feature]
+          # The class token, read out of a one-row embedding table at index 0 for every batch
+          # element, prepended before the position table is added.
+          - ["eval: jax.numpy.zeros((feature.shape[0], 1), dtype=jax.numpy.int32)", class_index]
+          - INPUTS: class_index
+            OUTPUTS: class_token
+            NAME: cls_token_embedding
+            LAYER: [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: 1, features: {{dim}}, rngs: "eval: rngs"}}]
+          - ["eval: jax.numpy.concatenate((class_token, feature), axis=1)", feature]
+          # A learned position table, unlike the rotary embedding of "SmallLanguageModel.yaml": the
+          # patch grid is fixed by "image_size" and "patch_size", so there is nothing to extrapolate.
+          - ["eval: jax.numpy.arange(feature.shape[1])", index]
+          - INPUTS: index
+            OUTPUTS: position
+            NAME: position_embedding
+            LAYER:
+              - _obj_
+              - _addr_: flax.nnx.Embed
+              - _call_: {num_embeddings: {{(image_size // patch_size) ** 2 + 1}}, features: {{dim}}, rngs: "eval: rngs"}
+          - ["eval: feature + position", feature]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+          # The whole sequence is normalized and only then is the class token read, so the two
+          # cannot be swapped.
+          - ["eval: feature[:, 0]", pooled]
+          - [pooled, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{num_classes}}, rngs: "eval: rngs"}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1) if depth > 1 else 0.0}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  # Pre-norm attention and pre-norm MLP, each on a residual branch, as in the torch template.
+  # "LayerScale" is left out there because "vit_base_patch16_224" sets "init_values=None", which
+  # makes it an identity; it is left out here for the same reason.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - [attended, attended, drop_path_attention, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: inp + attended", residual]
+      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.gelu}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [_, projected, drop_path_mlp, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: residual + projected", out]
+SelfAttention:
+  # The bidirectional twin of the "CausalSelfAttention" section of "SmallLanguageModel.yaml": the
+  # same fused projection and the same single reshape into (batch, tokens, heads, head_dim), without
+  # the rotary embedding (the position table in the root carries order) and with "is_causal=False",
+  # since an image patch may read every other patch.
+  # There is no attention-weight dropout: "jax.nn.dot_product_attention" takes none. ViT regularizes
+  # through "DropPath" on the residual branches instead.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    {% set head_dim = dim // heads %}
+    FLOW:
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"}}]]
+      - ["eval: qkv.reshape(qkv.shape[0], qkv.shape[1], 3, {{heads}}, {{head_dim}})", fused]
+      - ["eval: fused[:, :, 0]", query]
+      - ["eval: fused[:, :, 1]", key]
+      - ["eval: fused[:, :, 2]", value]
+      - ["eval: jax.nn.dot_product_attention(query, key, value, is_causal=False)", attended]
+      # (batch, tokens, heads, {{head_dim}}) -> (batch, tokens, dim).
+      - ["eval: attended.reshape(attended.shape[0], attended.shape[1], {{dim}})", attended]
+      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"}}]]
+DropPath:
+  # Stochastic depth: one Bernoulli draw per sample, broadcast over the token and feature axes, so a
+  # whole residual branch is dropped at once. "flax.nnx.Dropout" reads the module's own
+  # "deterministic" flag, which the inference view of a learner flips, so no INFERENCE_FLOW is
+  # needed here.
+  _jinja_yaml_: |-
+    FLOW: [[inp, out, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{drop_prob}}, broadcast_dims: [1, 2], rngs: "eval: rngs"}}]]]

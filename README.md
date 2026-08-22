@@ -159,7 +159,8 @@ The main package areas are:
 - **`cfg/torch/`** — Declarative source of truth: YAML templates for PyTorch models, learners, datasets, and runtime presets.
 - **`examples/torch/`** — Runnable example code: a programmatic training tutorial, and optimizer + scheduler compositions that templates reference by file path.
 - **`cfg/flax/`** — YAML templates for Flax models, learners, and device-mesh strategies.
-- **`cfg/keras/`** — YAML templates for Keras models and distributed strategies.
+- **`cfg/keras/`** — YAML templates for Keras models, learners, datasets, and distributed strategies.
+- **`examples/keras/`** — Runnable example code: a programmatic training tutorial, a `tf.data` input pipeline, a text corpus, and the optimizer factory templates reference by file path.
 
 ## Core Workflow
 
@@ -852,6 +853,12 @@ _obj_:
 
 **[`cfg/flax/learners/ConvNeXtV2.yaml`](cfg/flax/learners/ConvNeXtV2.yaml)** — The learner for that model. Its single `LEARNERS` entry builds an `nnx.Optimizer` over an `optax.chain` of `clip_by_global_norm` and `adamw`, masked by [`no_weight_decay_mask`](src/structcast_model/flax/optimizers.py) so biases and normalization scales are exempt from weight decay. There is no `CLIP` and no `MIXED_PRECISION` key — clipping is a stage of the chain — and the criteria are `"eval: ..."` expressions over the model output.
 
+**[`cfg/flax/models/`](cfg/flax/models/)** also ships [`VisionTransformer.yaml`](cfg/flax/models/VisionTransformer.yaml), [`SmallLanguageModel.yaml`](cfg/flax/models/SmallLanguageModel.yaml) and the [`CycleGAN_generator.yaml`](cfg/flax/models/CycleGAN_generator.yaml) / [`CycleGAN_discriminator.yaml`](cfg/flax/models/CycleGAN_discriminator.yaml) pair — NHWC, every convolution declaring `in_features` (`flax.nnx.Conv` has no lazy form), and the layers with no nnx twin folded into their neighbours (`ReflectionPad2d` into `padding: REFLECT`, `Upsample` into a row/column repeat), each fold documented in the template header.
+
+**[`cfg/flax/learners/`](cfg/flax/learners/)** — [`ImageClassifier.yaml`](cfg/flax/learners/ImageClassifier.yaml) trains both image models, [`SmallLanguageModel.yaml`](cfg/flax/learners/SmallLanguageModel.yaml) does next-token prediction, and [`CycleGAN.yaml`](cfg/flax/learners/CycleGAN.yaml) drives three optimizer segments. The accumulation window is an `optax.MultiSteps` that must be the **outermost** transformation — the generated step reads its applied count off the outermost `opt_state`, so a window buried inside `optax.chain` accumulates identically and still reports an update on every step. `clip_grad_norm` here means the clipping bound (`optax.clip_by_global_norm`), and optax schedules count optimizer applies, which is why the CycleGAN learner takes a `steps_per_epoch` parameter its torch twin does not.
+
+**[`cfg/flax/others/`](cfg/flax/others/)** — [`compile_default.yaml`](cfg/flax/others/compile_default.yaml) for `--compile` (only `backend`, `keep_unused` and `inline`: the CLI already fixes the donation contract), and [`default_tfdata.yaml`](cfg/flax/others/default_tfdata.yaml), a `tf.data` pipeline pattern over [`examples/flax/data.py`](examples/flax/data.py) whose `split` follows `training` unless overridden.
+
 **[`cfg/flax/strategies/`](cfg/flax/strategies/)** — Object patterns for `--strategy`, binding a `FlaxDistributedStrategy` preset: [`dp.yaml`](cfg/flax/strategies/dp.yaml) replicates the parameters and splits each batch across the devices, [`fsdp.yaml`](cfg/flax/strategies/fsdp.yaml) additionally shards parameters along their leading dimension, leaving the ones below `min_size` bytes replicated.
 
 ### Keras
@@ -863,7 +870,11 @@ _obj_:
 - runs on any [Keras backend](https://keras.io/getting_started/#configuring-your-backend) (JAX, PyTorch, or TensorFlow)
 - uses `keras.layers.Add` for residual connections instead of `"eval: inp + feat"` expressions
 
-**Learner templates** — The repository ships no Keras learner template yet; the schema is the shared one, written against Keras objects. A single-segment learner over a model taking `x` and returning `y`, against a label `target`, is:
+**[`cfg/keras/models/`](cfg/keras/models/)** also ships [`VisionTransformer.yaml`](cfg/keras/models/VisionTransformer.yaml), [`SmallLanguageModel.yaml`](cfg/keras/models/SmallLanguageModel.yaml) and the [`CycleGAN_generator.yaml`](cfg/keras/models/CycleGAN_generator.yaml) / [`CycleGAN_discriminator.yaml`](cfg/keras/models/CycleGAN_discriminator.yaml) pair, the Keras twins of the PyTorch templates. The two transformers use `keras.layers.MultiHeadAttention`, which owns its query/key/value projections, so neither writes an attention section of its own — and the language model therefore carries a learned position table instead of the rotary embedding of its torch twin, which needs those projections spelled out.
+
+**[`cfg/keras/learners/`](cfg/keras/learners/)** — [`ConvNeXtV2.yaml`](cfg/keras/learners/ConvNeXtV2.yaml) and [`ImageClassifier.yaml`](cfg/keras/learners/ImageClassifier.yaml) train the two image models, [`SmallLanguageModel.yaml`](cfg/keras/learners/SmallLanguageModel.yaml) does next-token prediction, and [`CycleGAN.yaml`](cfg/keras/learners/CycleGAN.yaml) drives three optimizer segments over four models. All four put the schedule, the clipping (`global_clipnorm`) and the gradient accumulation (`gradient_accumulation_steps`) inside the `OPTIMIZER` pattern, because on this backend the Keras optimizer owns all three — which is why the Keras learner schema has no `CLIP` field and no `ACCUMULATE_GRADIENTS` field, and rejects both by name. Weight-decay exemptions are the one optimizer knob no object pattern can express (Keras configures them through a method call), so the templates route them through [`create_optimizer`](examples/keras/optimizers.py) with `_file_`.
+
+The schema is the shared one, written against Keras objects. A minimal single-segment learner over a model taking `x` and returning `y`, against a label `target`, is:
 
 ```yaml
 INPUTS: [x, target]

@@ -1,0 +1,88 @@
+# Supervised image classification for any Keras model whose root reads "image" and emits a
+# structured output whose only key is "cls", i.e. both "cfg/keras/models/VisionTransformer.yaml" and
+# "cfg/keras/models/ConvNeXtV2.yaml". One learner for both keeps a strategy comparison honest:
+# single, dp and fsdp runs differ only in the strategy configuration.
+# There is no CLIP field on this backend and no ACCUMULATE_GRADIENTS one: a Keras optimizer clips its
+# own gradients ("global_clipnorm") and accumulates them itself ("gradient_accumulation_steps"), so
+# both are keywords of the OPTIMIZER pattern below.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the training CLI sets before it
+# builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
+# wraps every optimizer in a "keras.optimizers.LossScaleOptimizer" (a mapping here carries that
+# wrapper's keyword arguments), or "bfloat16", which shares float32's exponent range and stays
+# unscaled. Either field alone is refused, which is one difference in default precision from the
+# torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
+# bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: null
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # "create_optimizer" is only there for "no_weight_decay_names": Keras exempts variables from
+    # weight decay through a method call, not a constructor keyword. Everything else is a plain
+    # "keras.optimizers.AdamW" keyword. Biases, the normalization scale ("gamma") and offset
+    # ("beta"), the lookup tables ("embeddings" -- the class token and the position table of the
+    # Vision Transformer) and the "scale" of ConvNeXt V2's global response normalization are the
+    # parameters that must not be decayed; this learner serves both models, so it names both sets.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: create_optimizer
+        _file_: examples/keras/optimizers.py
+      - _call_:
+          name: AdamW
+          no_weight_decay_names: [bias, gamma, beta, scale, embeddings]
+          beta_1: 0.9
+          beta_2: 0.999
+          _jinja_yaml_: |-
+            learning_rate: {{lr}}
+            weight_decay: {{weight_decay}}
+            {% if clip_grad_norm is not none %}
+            global_clipnorm: {{clip_grad_norm}}
+            {% endif %}
+            {% if accumulate_gradients is not none %}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% endif %}
+    EXTRA: {}
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - INPUTS: {y_true: label, y_pred: cls}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: keras.losses.SparseCategoricalCrossentropy}, {_call_: {from_logits: true}}]
+      # The accuracy functions report one 0/1 value per sample, so each is averaged over the batch.
+      - INPUTS: {y_true: label, y_pred: cls}
+        OUTPUTS: correct1
+        NAME: accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - INPUTS: {y_true: label, y_pred: cls, k: 5}
+        OUTPUTS: correct5
+        NAME: top_5_accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - [{y_true: label, y_pred: cls}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: cls}, correct1, accuracy]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - [{y_true: label, y_pred: cls, k: 5}, correct5, top_5_accuracy]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

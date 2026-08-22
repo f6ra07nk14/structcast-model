@@ -1,0 +1,181 @@
+# The Flax mirror of "cfg/torch/learners/CycleGAN.yaml": three segments -- the two generators
+# together, then each discriminator -- over "cfg/flax/models/CycleGAN_generator.yaml" (twice) and
+# "cfg/flax/models/CycleGAN_discriminator.yaml" (twice).
+# Three differences from the torch template, all forced by the Flax side:
+#   * the discriminators train on the "fake_A"/"fake_B" the generator segment just produced, not on
+#     a replay-buffer sample. A Flax segment differentiates only what its own flow computes, and a
+#     value another segment computed reaches this one as a plain array, so no gradient can leak back
+#     into the generators;
+#   * "loss_G" is spelled out as a "least squares GAN" expression rather than through
+#     "torch.nn.MSELoss"/"torch.nn.L1Loss" modules. "optax.squared_error" is the one twin that
+#     exists, so it is the only criterion kept as a named layer;
+#   * the generated images are not criteria. The trainer's tracker sums every output into a scalar
+#     mean, so "fake_A" and "fake_B" -- which the torch template lists in "OUTPUTS" -- would break
+#     it; log them from a callback instead.
+# The learning rate is a schedule from "examples/flax/optimizers.py", the file-addressed counterpart
+# of the "OptimizerWithNativeScheduler" the torch template loads from "examples/torch/optimizers.py":
+# optax schedules count optimizer applies, so the epoch-based recipe needs "steps_per_epoch".
+# Nothing checks that number against the run: it is a plain template parameter, and a wrong one
+# silently stretches or collapses the decay -- a value ten times too large leaves the rate flat for
+# the whole run. Set it to len(training_dataset), which is the "Training dataset size" the command
+# prints before the first epoch, divided by the accumulation window if one is configured.
+PARAMETERS:
+  DEFAULT:
+    epochs: 200
+    decay_epoch: 100
+    offset: 0
+    steps_per_epoch: 1000 # optimizer applies per epoch, which is what turns the epochs above into steps
+    lr: 0.0002
+    b1: 0.5
+    b2: 0.999
+    lambda_cyc: 10.0
+    lambda_id: 5.0
+IMPORTS: {}
+INPUTS: [real_A, real_B]
+OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B]
+LEARNERS:
+  # ==================== Generator learner ====================
+  - NAME: optimizer_G
+    LOSS: loss_G
+    TRAINABLE_LAYERS: [G_AB, G_BA]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _bind_:
+          tx:
+            - _obj_
+            - _addr_: optax.adam
+            - _call_:
+                learning_rate:
+                  - _obj_
+                  - _addr_: linear_decay_after
+                    _file_: examples/flax/optimizers.py
+                  - _call_:
+                      _jinja_yaml_: |-
+                        init_value: {{lr}}
+                        epochs: {{epochs}}
+                        decay_epoch: {{decay_epoch}}
+                        steps_per_epoch: {{steps_per_epoch}}
+                        offset: {{offset}}
+                _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
+    EXTRA: {}
+    FLOW:
+      # Identity loss
+      - [real_A, {id_A: out}, G_BA]
+      - [real_B, {id_B: out}, G_AB]
+      - ["eval: jax.numpy.abs(id_A - real_A).mean()", loss_id_A]
+      - ["eval: jax.numpy.abs(id_B - real_B).mean()", loss_id_B]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity]
+      # GAN loss: the discriminator should call the generated image real, i.e. score it 1.
+      - [real_A, {fake_B: out}, G_AB]
+      - [fake_B, {pred_fake_B: out}, D_B]
+      - INPUTS: {predictions: pred_fake_B, targets: "eval: jax.numpy.ones_like(pred_fake_B)"}
+        OUTPUTS: errors_GAN_AB
+        NAME: criterion_GAN
+        LAYER: [_obj_, {_addr_: optax.squared_error}]
+      - ["eval: errors_GAN_AB.mean()", loss_GAN_AB]
+      - [real_B, {fake_A: out}, G_BA]
+      - [fake_A, {pred_fake_A: out}, D_A]
+      - [{predictions: pred_fake_A, targets: "eval: jax.numpy.ones_like(pred_fake_A)"}, errors_GAN_BA, criterion_GAN]
+      - ["eval: errors_GAN_BA.mean()", loss_GAN_BA]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN]
+      # Cycle loss
+      - [fake_B, {recov_A: out}, G_BA]
+      - ["eval: jax.numpy.abs(recov_A - real_A).mean()", loss_cycle_A]
+      - [fake_A, {recov_B: out}, G_AB]
+      - ["eval: jax.numpy.abs(recov_B - real_B).mean()", loss_cycle_B]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle]
+      # Total generator loss
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G]'
+    # Spelled out, rather than left to fall back to "FLOW", because this is the only segment that
+    # builds "criterion_GAN": a fallback would run its layer definition a second time and collide.
+    # The two discriminator segments below reference it by name and can fall back.
+    INFERENCE_FLOW:
+      - [real_A, {id_A: out}, G_BA]
+      - [real_B, {id_B: out}, G_AB]
+      - ["eval: jax.numpy.abs(id_A - real_A).mean()", loss_id_A]
+      - ["eval: jax.numpy.abs(id_B - real_B).mean()", loss_id_B]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity]
+      - [real_A, {fake_B: out}, G_AB]
+      - [fake_B, {pred_fake_B: out}, D_B]
+      - [{predictions: pred_fake_B, targets: "eval: jax.numpy.ones_like(pred_fake_B)"}, errors_GAN_AB, criterion_GAN]
+      - ["eval: errors_GAN_AB.mean()", loss_GAN_AB]
+      - [real_B, {fake_A: out}, G_BA]
+      - [fake_A, {pred_fake_A: out}, D_A]
+      - [{predictions: pred_fake_A, targets: "eval: jax.numpy.ones_like(pred_fake_A)"}, errors_GAN_BA, criterion_GAN]
+      - ["eval: errors_GAN_BA.mean()", loss_GAN_BA]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN]
+      - [fake_B, {recov_A: out}, G_BA]
+      - ["eval: jax.numpy.abs(recov_A - real_A).mean()", loss_cycle_A]
+      - [fake_A, {recov_B: out}, G_AB]
+      - ["eval: jax.numpy.abs(recov_B - real_B).mean()", loss_cycle_B]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle]
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G]'
+  # ==================== Discriminator A learner ====================
+  - NAME: optimizer_D_A
+    LOSS: loss_D_A
+    TRAINABLE_LAYERS: [D_A]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _bind_:
+          tx:
+            - _obj_
+            - _addr_: optax.adam
+            - _call_:
+                learning_rate:
+                  - _obj_
+                  - _addr_: linear_decay_after
+                    _file_: examples/flax/optimizers.py
+                  - _call_:
+                      _jinja_yaml_: |-
+                        init_value: {{lr}}
+                        epochs: {{epochs}}
+                        decay_epoch: {{decay_epoch}}
+                        steps_per_epoch: {{steps_per_epoch}}
+                        offset: {{offset}}
+                _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
+    EXTRA: {}
+    FLOW:
+      - [real_A, {pred_real_A: out}, D_A]
+      - [{predictions: pred_real_A, targets: "eval: jax.numpy.ones_like(pred_real_A)"}, errors_real_A, criterion_GAN]
+      - ["eval: errors_real_A.mean()", loss_real_A]
+      - [fake_A, {pred_fake_A: out}, D_A]
+      - [{predictions: pred_fake_A, targets: "eval: jax.numpy.zeros_like(pred_fake_A)"}, errors_fake_A, criterion_GAN]
+      - ["eval: errors_fake_A.mean()", loss_fake_A]
+      - ["eval: (loss_real_A + loss_fake_A) / 2", loss_D_A]
+  # ==================== Discriminator B learner ====================
+  - NAME: optimizer_D_B
+    LOSS: loss_D_B
+    TRAINABLE_LAYERS: [D_B]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _bind_:
+          tx:
+            - _obj_
+            - _addr_: optax.adam
+            - _call_:
+                learning_rate:
+                  - _obj_
+                  - _addr_: linear_decay_after
+                    _file_: examples/flax/optimizers.py
+                  - _call_:
+                      _jinja_yaml_: |-
+                        init_value: {{lr}}
+                        epochs: {{epochs}}
+                        decay_epoch: {{decay_epoch}}
+                        steps_per_epoch: {{steps_per_epoch}}
+                        offset: {{offset}}
+                _jinja_yaml_: "{b1: {{b1}}, b2: {{b2}}}"
+    EXTRA: {}
+    FLOW:
+      - [real_B, {pred_real_B: out}, D_B]
+      - [{predictions: pred_real_B, targets: "eval: jax.numpy.ones_like(pred_real_B)"}, errors_real_B, criterion_GAN]
+      - ["eval: errors_real_B.mean()", loss_real_B]
+      - [fake_B, {pred_fake_B: out}, D_B]
+      - [{predictions: pred_fake_B, targets: "eval: jax.numpy.zeros_like(pred_fake_B)"}, errors_fake_B, criterion_GAN]
+      - ["eval: errors_fake_B.mean()", loss_fake_B]
+      - ["eval: (loss_real_B + loss_fake_B) / 2", loss_D_B]
+LOSSES: []
+MODELS: []

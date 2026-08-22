@@ -206,6 +206,33 @@ def test_flax_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> No
     assert len(built.scripts) > 0
 
 
+@pytest.mark.parametrize(
+    ("name", "parameters", "outputs", "layer"),
+    [
+        ("CycleGAN_generator", {"DEFAULT": {"n_residual_blocks": 1, "init_features": 4}}, ["out"], "res_block0"),
+        ("CycleGAN_discriminator", {}, ["out"], "head"),
+        ("SmallLanguageModel", {"tiny": {"dim": 16, "heads": 2, "depth": 2}}, ["logits"], "backbone"),
+        ("VisionTransformer", {"base": {"dim": 16, "heads": 2, "depth": 2}}, ["cls"], "backbone"),
+    ],
+)
+def test_flax_builder_builds_every_shipped_model_template(
+    name: str, parameters: dict[str, dict[str, Any]], outputs: list[str], layer: str
+) -> None:
+    """Every model template under cfg/flax has to emit a module, whatever else it is asserted to do.
+
+    A template is only reachable through this builder, so a section that renders to invalid YAML or
+    names a layer the DSL cannot resolve fails nowhere else -- and the shipped templates are what a
+    validation run trains. The named layer of each is what a later flow line or a sharding rule
+    addresses it by, so it is pinned here rather than left to the emitted text.
+    """
+    built = FlaxBuilder.from_path(CFG_DIR / "flax" / "models" / f"{name}.yaml")(parameters=parameters)
+
+    assert built.outputs == outputs
+    assert built.structured_output is True
+    assert layer in built.layers
+    assert "class Model(flax.nnx.Module):" in built.scripts[-1]
+
+
 def _render(pattern: ObjectPattern) -> tuple[str, dict[str, set[str | None]]]:
     """Render a pattern the way the learner builder does, returning the code and collected imports."""
     imports: defaultdict[str, set[str | None]] = defaultdict(set)
@@ -626,6 +653,44 @@ def test_flax_convnext_learner_cfg_keeps_its_rate_readable_and_its_norms_undecay
         "(learning_rate=0.001, weight_decay=0.05, b1=0.9, b2=0.999, "
         "mask=no_weight_decay_mask('^(?:\\\\w+\\\\.)*bias$', '^(?:\\\\w+\\\\.)*scale$'))"
     ) in script
+
+
+@pytest.mark.parametrize("name", ["ImageClassifier", "SmallLanguageModel"])
+def test_flax_single_segment_learner_cfgs_wrap_the_whole_chain_in_multi_steps(name: str) -> None:
+    """Accumulation only counts when `optax.MultiSteps` is the outermost transformation.
+
+    The generated step reads its update gate off the optimizer's outermost `opt_state`, so a window
+    nested inside the `optax.chain` would accumulate exactly the same and still report an update on
+    every step (`docs/adr/0019`). Both templates offer clipping and accumulation as independent
+    parameters, so the combination is where a misplaced wrapper would hide.
+    """
+    parameters = {"DEFAULT": {"clip_grad_norm": 1.0, "accumulate_gradients": 4}}
+    script = _learner_script(CFG_DIR / "flax" / "learners" / f"{name}.yaml", parameters)
+
+    assert "tx=MultiSteps(opt=chain(clip_by_global_norm(max_norm=1.0), inject_hyperparams(" in script
+    assert "every_k_schedule=4" in script
+    # Without the clip the chain is the adamw alone, and the window still wraps the whole chain.
+    plain = _learner_script(CFG_DIR / "flax" / "learners" / f"{name}.yaml", {"DEFAULT": {"accumulate_gradients": 4}})
+    assert "tx=MultiSteps(opt=chain(inject_hyperparams(" in plain
+    assert "clip_by_global_norm" not in plain
+
+
+def test_flax_cycle_gan_learner_cfg_hands_the_generated_images_to_the_discriminators() -> None:
+    """The three segments are one program: what the generator flow computes is what the critics see.
+
+    The torch template feeds its discriminators a replay-buffer sample it takes as an input; a Flax
+    segment differentiates only what its own flow computes, so this template carries "fake_A" and
+    "fake_B" out of the generator closure and passes them in as plain values instead -- which is
+    also why no gradient can leak back into the generators from a discriminator step.
+    """
+    script = _learner_script(CFG_DIR / "flax" / "learners" / "CycleGAN.yaml")
+
+    assert "def __init__(self, G_AB, G_BA, D_A, D_B, **kwargs):" in script
+    # The generators are the leading parameters of their flow, so their positions are the argnums;
+    # the discriminators follow as read-only models.
+    assert "flax.nnx.value_and_grad(_flow_optimizer_G, argnums=(0, 1), has_aux=True)(G_AB, G_BA, D_B, D_A," in script
+    assert "_flow_optimizer_D_A, has_aux=True)(D_A, real_A=real_A, fake_A=fake_A)" in script
+    assert "_flow_optimizer_D_B, has_aux=True)(D_B, real_B=real_B, fake_B=fake_B)" in script
 
 
 def test_flax_learner_keeps_only_the_values_that_leave_the_closure_in_the_aux_tuple() -> None:

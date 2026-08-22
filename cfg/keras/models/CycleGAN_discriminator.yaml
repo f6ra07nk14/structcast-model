@@ -1,0 +1,36 @@
+# The Keras twin of "cfg/torch/models/CycleGAN_discriminator.yaml": a 70x70 PatchGAN reading
+# "image" and emitting a map of real/fake scores under "out".
+# Instance normalization is "keras.layers.GroupNormalization(groups=-1)" with center and scale off
+# and "epsilon" set to torch's 1e-5 rather than the Keras default of 1e-3, which is the affine-free
+# "torch.nn.InstanceNorm2d" the torch twin builds. The blocks' stride-2 4x4
+# convolutions pad symmetrically under "same", exactly torch's padding=1; the stride-1 output
+# convolution does not, so torch's ZeroPad2d((1, 0, 1, 0)) and the convolution's own padding=1 are
+# folded into one asymmetric "keras.layers.ZeroPadding2D" before a "valid" convolution.
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: true
+FLOW:
+  # Block 1 (no normalization)
+  - [image, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 64, normalize: false}}}]
+  # Block 2
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 128, normalize: true}}}]
+  # Block 3
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 256, normalize: true}}}]
+  # Block 4
+  - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fout: 512, normalize: true}}}]
+  # Output: ((top, bottom), (left, right)), so the score map keeps the size of the last block's.
+  - [_, _, [_obj_, {_addr_: keras.layers.ZeroPadding2D}, {_call_: {padding: [[2, 1], [2, 1]], data_format: channels_last}}]]
+  - [_, out, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: 1, kernel_size: 4, padding: valid, data_format: channels_last}}]]
+DiscriminatorBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{fout}}, kernel_size: 4, strides: 2, padding: same, data_format: channels_last}}]]
+      {% if normalize %}
+      - [_, _, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+      {% endif %}
+      - [_, out, [_obj_, {_addr_: keras.layers.LeakyReLU}, {_call_: {negative_slope: 0.2}}]]

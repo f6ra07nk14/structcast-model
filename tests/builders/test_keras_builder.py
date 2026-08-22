@@ -155,6 +155,35 @@ def test_keras_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> N
     assert len(built.scripts) > 0
 
 
+MODEL_TEMPLATES = {
+    "ConvNeXtV2": ({"SHARED": {"num_classes": 10}, "atto": {"dims": [4, 8, 8, 16], "depths": [1, 1, 1, 1]}}, ["cls"]),
+    "CycleGAN_generator": ({"DEFAULT": {"n_residual_blocks": 1, "init_features": 4}}, ["out"]),
+    "CycleGAN_discriminator": ({}, ["out"]),
+    "SmallLanguageModel": ({"tiny": {"dim": 16, "heads": 2, "depth": 1}}, ["logits"]),
+    "VisionTransformer": ({"base": {"dim": 16, "heads": 2, "depth": 1}}, ["cls"]),
+}
+"""Every shipped Keras model template, with parameters small enough to render quickly."""
+
+
+@pytest.mark.parametrize(("name", "parameters", "outputs"), [(n, p, o) for n, (p, o) in MODEL_TEMPLATES.items()])
+def test_every_shipped_keras_model_template_renders_a_layer_class(
+    name: str, parameters: dict[str, Any], outputs: list[str]
+) -> None:
+    """A template nobody can build is not a template: parsing it proves nothing about its flow.
+
+    Rendering is where a layer address that does not exist, a jinja expression over a missing
+    parameter or a flow line reading an unbound name is caught, so every shipped template is
+    rendered here rather than only the one the older tests happen to use.
+    """
+    built = KerasBuilder.from_path(CFG_DIR / "keras" / "models" / f"{name}.yaml")(parameters=parameters)
+
+    assert built.outputs == outputs
+    # Structured, as "scm keras create model" forces by default: the learner templates below read
+    # the model output as a mapping, so a template emitting a bare tensor would break them.
+    assert built.structured_output is True
+    assert "class Model(keras.layers.Layer):" in built.scripts[-1]
+
+
 LEARNER_YAML = FIXTURES_DIR / "cfg" / "keras" / "LinearLearner.yaml"
 SEGMENTS_YAML = FIXTURES_DIR / "cfg" / "keras" / "TwoSegmentLearner.yaml"
 
@@ -521,3 +550,48 @@ def test_keras_learner_scripts_are_byte_identical_across_builds() -> None:
     scripts and defeat any "already generated" check.
     """
     assert _learner_script(SEGMENTS_YAML) == _learner_script(SEGMENTS_YAML)
+
+
+LEARNER_TEMPLATES = {
+    "ConvNeXtV2": (["image", "label"], ["optimizer"]),
+    "CycleGAN": (["real_A", "real_B"], ["optimizer_G", "optimizer_D_A", "optimizer_D_B"]),
+    "ImageClassifier": (["image", "label"], ["optimizer"]),
+    "SmallLanguageModel": (["tokens", "targets"], ["optimizer"]),
+}
+"""Every shipped Keras learner template, with the batch it reads and the segments it emits."""
+
+
+@pytest.mark.parametrize(("name", "inputs", "segments"), [(n, i, s) for n, (i, s) in LEARNER_TEMPLATES.items()])
+def test_every_shipped_keras_learner_template_renders_one_flow_per_segment(
+    name: str, inputs: list[str], segments: list[str]
+) -> None:
+    """The batch a template declares and the segments it emits are its contract with a run.
+
+    The training CLI calls the generated steps with the dataset's keys, and the checkpoints are
+    keyed by segment name, so both are pinned here: a template that quietly renamed an input would
+    only fail on the first batch of a real run.
+    """
+    script = _learner_script(CFG_DIR / "keras" / "learners" / f"{name}.yaml")
+
+    assert script.startswith("class Learner:")
+    assert f"self.inputs = {inputs!r}" in script
+    for segment in segments:
+        assert f"def _flow_{segment}(self, *, {', '.join(inputs)}):" in script
+    assert f"def _flow_inference(self, *, {', '.join(inputs)}):" in script
+
+
+@pytest.mark.parametrize("name", ["ConvNeXtV2", "ImageClassifier", "SmallLanguageModel"])
+def test_the_keras_learner_templates_put_clipping_and_accumulation_in_the_optimizer(name: str) -> None:
+    """Both knobs are Keras optimizer keywords, and the templates are what has to know that.
+
+    `CLIP` and `ACCUMULATE_GRADIENTS` are refused by the Keras learner schema (`docs/adr/0016`), so
+    a template offering the parameters but dropping them anywhere else would silently train
+    unclipped and unaccumulated -- which is what these two parameters exist to prevent.
+    """
+    parameters = {"DEFAULT": {"clip_grad_norm": 1.5, "accumulate_gradients": 4}}
+
+    script = _learner_script(CFG_DIR / "keras" / "learners" / f"{name}.yaml", parameters)
+
+    assert "global_clipnorm=1.5" in script
+    assert "gradient_accumulation_steps=4" in script
+    assert "CLIP" not in script

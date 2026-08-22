@@ -1,0 +1,6 @@
+# Keyword arguments for "keras.Model.compile", which "scm keras time --compile" calls with
+# "optimizer=None" ("optimizer" cannot be set here). This is Keras run configuration, not graph
+# compilation: "jit_compile" is what asks the backend for an XLA-compiled step.
+jit_compile: auto # "auto" (XLA where the backend supports it), true or false
+run_eagerly: false
+steps_per_execution: 1

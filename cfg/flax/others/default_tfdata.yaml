@@ -1,0 +1,47 @@
+PARAMETERS:
+  DEFAULT:
+    training: false
+    # The split follows "training", as in "default_timm.yaml", so a validation loader can never be
+    # pointed at the training split by forgetting one of the two. Set it to override the derived
+    # name, e.g. -p "DEFAULT: {split: test}" for a dataset whose evaluation split is called that.
+    split: null
+    batch_size: 128
+    # A "tensorflow_datasets" name, e.g. "cifar10". Empty serves the deterministic synthetic split
+    # of "examples/flax/data.py", which needs neither a download nor the tensorflow_datasets package.
+    dataset: ""
+    dataset_dir: data
+    download: false
+    num_classes: 1000
+    image_size: 224
+    image_dtype: float32 # "float32", "float16", or "bfloat16"
+    crop_pct: 0.875 # images are resized to image_size / crop_pct before being cropped
+    hflip: true # random horizontal flip, training split only
+    seed: 42
+    synthetic_samples: 256 # size of the synthetic split, ignored once "dataset" names a real one
+_obj_:
+  - _addr_: TFDataLoader
+    _file_: examples/flax/data.py
+  - _attr_: model_validate
+  - - _call_
+    # A plain mapping, not the FlexSpec of "default_timm.yaml": the loader yields NumPy batches and
+    # builds the dictionary itself, so the strategy places each entry in one transfer.
+    - spec: {image: 0, label: 1}
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      shuffle_buffer: 1024
+      # A batch is split across the strategy's mesh, so a short final batch would not divide.
+      drop_remainder: true
+      _jinja_yaml_: |-
+        name: "{{dataset}}"
+        split: {{split if split is not none else ("train" if training else "validation")}}
+        data_dir: {{dataset_dir}}
+        download: {{download}}
+        is_training: {{training}}
+        batch_size: {{batch_size}}
+        image_size: {{image_size}}
+        image_dtype: {{image_dtype}}
+        crop_pct: {{crop_pct}}
+        hflip: {{hflip}}
+        seed: {{seed}}
+        num_classes: {{num_classes}}
+        synthetic_samples: {{synthetic_samples}}

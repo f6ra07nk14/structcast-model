@@ -8,6 +8,14 @@ Two ways to build the same training program, plus the integrations a configurati
 | [`torch/optimizers.py`](torch/optimizers.py)     | Optimizer + scheduler compositions referenced from YAML by file path      |
 | [`torch/data.py`](torch/data.py)                 | timm dataset and dataloader wrappers, referenced from YAML by file path   |
 | [`torch/corpus.py`](torch/corpus.py)             | A character-level text corpus, referenced from the CLI by file path       |
+| [`flax/simple_training.py`](flax/simple_training.py) | The same tutorial against the Flax trainer, run standalone or by `scm flax train` |
+| [`flax/optimizers.py`](flax/optimizers.py)       | optax schedules written in epochs, referenced from YAML by file path      |
+| [`flax/data.py`](flax/data.py)                   | A `tf.data` input pipeline, referenced from YAML by file path             |
+| [`flax/corpus.py`](flax/corpus.py)               | The same character-level corpus, as NumPy batches                         |
+| [`keras/simple_training.py`](keras/simple_training.py) | A complete Keras training program written by hand, run standalone or by `scm keras train` |
+| [`keras/optimizers.py`](keras/optimizers.py)     | The one optimizer knob no object pattern can express, referenced from YAML by file path |
+| [`keras/data.py`](keras/data.py)                 | A `tf.data` image pipeline with core Keras augmentation, referenced from YAML by file path |
+| [`keras/corpus.py`](keras/corpus.py)             | The NumPy twin of `torch/corpus.py`, referenced from the CLI by file path |
 
 Run the tutorial:
 
@@ -317,3 +325,115 @@ the trainer scans the provider datasets for event protocols — on every rank, s
 `TimmDataLoaderWrapper.on_epoch_begin` reaches the `DistributedSampler` of each process — and
 `on_training_begin` applies the mixup cutoff. `TimmDataProvider` in the same file is the
 programmatic wiring when you build a trainer by hand instead.
+
+## The Flax side
+
+`examples/flax/` is the same four files against `flax.nnx`, and the differences are the interesting
+part.
+
+```bash
+uv run python examples/flax/simple_training.py
+```
+
+`SimpleLearner` there implements the same `Learner` protocol, but its `flow_functions` are the two
+**steps**, not a flow inside them: `nnx.jit` owns the state transfer, so the optimizer apply belongs
+inside the traced region, where `torch.compile` wants it outside (`docs/adr/0004`). The signature is
+the donation contract — `_training_step(model, optimizer, *, x, y, **kwargs)`, every model and
+optimizer positional-or-keyword and the batch keyword-only — and `scm flax train` reads
+`donate_argnames` straight off it (`docs/adr/0019`). A hand-written learner opts into donation by
+writing that signature and nothing else. There is no `on_epoch_end`: the schedule is an optax
+schedule counting updates, and `optax.inject_hyperparams` is what keeps its current value readable
+for `Printer`.
+
+Gradient accumulation is the same story. The Flax learner schema has no `ACCUMULATE_GRADIENTS`; the
+window is an `optax.MultiSteps` wrapping the whole `tx`, and it must be the **outermost**
+transformation — the generated step reads its applied count off the outermost `opt_state`, so a
+window buried inside `optax.chain` would accumulate identically and still report an update every
+step. `CLIP` is torch-only too: clipping is an `optax.clip_by_global_norm` at the head of the chain.
+
+[`flax/optimizers.py`](flax/optimizers.py) is much shorter than its torch twin, and deliberately:
+optax already ships `chain`, `adamw`, `clip_by_global_norm` and `MultiSteps`, and `nnx.Optimizer`
+only binds the result to a module, so no wrapper class is needed. What optax does not do is count
+epochs, so the two helpers there convert a recipe written in epochs into a schedule over optimizer
+applies. They are not the same curve as their torch counterparts, only the same envelope: a torch
+scheduler holds one rate for a whole epoch, an optax schedule is read on every update, so the two
+agree exactly at epoch boundaries and drift inside an epoch. It is also why the CycleGAN learner
+takes a `steps_per_epoch` parameter the torch one does not — an unguarded number; set it to the
+"Training dataset size" the command prints before the first epoch.
+
+[`flax/data.py`](flax/data.py) is a `tf.data` pipeline: resize, then a random crop and flip while
+training or a central crop while evaluating, then normalization — all on CPU threads. Constructing
+a loader takes every GPU out of TensorFlow's sight, so it never reserves the memory JAX needs;
+importing the module does not, because importing is something a test collector may do incidentally.
+The draws are stateless and keyed by each item's position in the shuffled stream, so epochs differ
+while a seed still replays a whole run. There is no epoch hook and no rank sharding: `tf.data`
+reshuffles by itself, and JAX is single-controller, so the strategy splits each batch across the
+mesh. Leaving `name` empty serves a deterministic synthetic split, which makes the file runnable
+with no download and no `tensorflow_datasets` installed.
+
+[`flax/corpus.py`](flax/corpus.py) is the same Tiny Shakespeare corpus as NumPy: no device
+placement and no `DistributedSampler`, since the trainer places batches itself and one process
+reads the whole batch.
+
+## The Keras side
+
+`examples/keras/` is the same four files against Keras 3.
+
+```bash
+uv run python examples/keras/simple_training.py
+```
+
+It trains a two-layer MLP on a synthetic dataset for three epochs and finishes in a few seconds on
+the CPU, on whichever backend `KERAS_BACKEND` selects. Or run the very same objects under the CLI,
+which adds the experiment logger and the checkpoint savers:
+
+```bash
+FILE=examples/keras/simple_training.py
+
+uv run scm keras train "model: [_obj_, {_addr_: build_model, _file_: $FILE}, _call_]" \
+    --backend tensorflow \
+    --learner "[_obj_, {_addr_: SimpleLearner, _file_: $FILE}]" \
+    --training-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 20, seed: 0}}]" \
+    --validation-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 5, seed: 1}}]" \
+    --epochs 3 --ci -LC val_loss -HC val_accuracy -E simple-training
+```
+
+`--backend` has no default: Keras resolves its backend once, while it is first imported, so the
+command states it rather than inheriting `~/.keras/keras.json`.
+
+`SimpleLearner` implements the same `Learner` protocol, with three Keras-shaped differences:
+
+- **The backend adapter owns the mechanics.** `select_backend_adapter()` returns the adapter of the
+  active backend, `prepare` builds the optimizer against the segment's variables, and
+  `build_train_step` / `build_inference_step` return the compiled steps. `prepare` has to run first:
+  JAX refuses an unbuilt optimizer inside a jitted step (`docs/adr/0016`).
+- **There is no compile stage.** `flow_functions` names the two compiled steps rather than a flow
+  the CLI would wrap, because the adapter already compiled them with `tf.function` or `jax.jit`;
+  it is the mapping a distributed strategy rebinds when it replicates a step.
+- **The counters are read, not incremented.** `training_step` counts itself and then reads the
+  optimizer's `iterations` back, so an accumulation window or a float16 loss-scale skip reports
+  `has_updated is False` truthfully, without a line of the learner changing (`docs/adr/0019`).
+
+Gradient clipping, weight decay, the learning-rate schedule and gradient accumulation are all
+keywords of the Keras optimizer, which is why the Keras learner schema has no `CLIP` field and no
+`ACCUMULATE_GRADIENTS` field and rejects both with the substitute named.
+
+[`keras/data.py`](keras/data.py) applies `RandomFlip`, `RandomCrop`, `Resizing` and `Rescaling`
+inside the `tf.data` pipeline and never inside the model: Keras' image preprocessing layers fall
+back to TensorFlow operations when a `tf.data` pipeline traces them, so one pipeline feeds a run on
+any backend, while a layer built into the model would augment whatever loads that model afterwards.
+Building the pipeline therefore needs `tensorflow` installed even for a `jax` or `torch` run. The
+batches leave as NumPy, keyed by `image_key` and `label_key` — which is where a learner whose inputs
+are named differently is served. `dataset: synthetic` downloads nothing.
+
+[`keras/optimizers.py`](keras/optimizers.py) exists for one knob: weight-decay exemptions are
+configured by `optimizer.exclude_from_weight_decay(...)` after construction and before the optimizer
+is built, which an object pattern cannot express. Keras names its parameters `kernel`, `bias`,
+`gamma`, `beta` and `embeddings`, so those anchor words are the "no decay on biases, normalization
+scales and lookup tables" rule.
+
+[`keras/corpus.py`](keras/corpus.py) supplies `{"tokens", "targets"}` NumPy blocks for
+[`cfg/keras/models/SmallLanguageModel.yaml`](../cfg/keras/models/SmallLanguageModel.yaml), whose
+`keras.layers.MultiHeadAttention(use_causal_mask=true)` owns its projections — so unlike the torch
+twin there is no attention section, and positions come from a learned table whose `max_seq_len`
+rows bound the longest sequence the model runs.
