@@ -1,5 +1,6 @@
 """Main entry point for the StructCast Model CLI application."""
 
+import logging
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,21 @@ app = Typer(invoke_without_command=True, no_args_is_help=True, help="StructCast 
 app.add_typer(cmd_torch.app, name="torch", help="PyTorch related commands.")
 app.add_typer(cmd_keras.app, name="keras", help="Keras related commands.")
 app.add_typer(cmd_flax.app, name="flax", help="Flax nnx related commands.")
+
+
+@app.callback()
+def configure_logging(
+    log_level: str = Option(
+        "INFO",
+        "--log-level",
+        help="Lowest severity of log message the run prints, e.g. DEBUG, INFO, WARNING, ERROR.",
+    ),
+) -> None:
+    """Set the logging level every command below runs with."""
+    logging.basicConfig(level=log_level.upper())
+    # `basicConfig` only sets the level when it installs the handler, so anything that configured
+    # logging first (a library imported on the way, a test harness) would keep its own level.
+    logging.getLogger().setLevel(log_level.upper())
 
 
 @app.command(name="format")

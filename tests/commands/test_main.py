@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterator
 import inspect
+import logging
 import subprocess
 import sys
 from typing import Any
@@ -94,6 +95,58 @@ def test_app_help(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "torch" in result.output
+
+
+@pytest.mark.parametrize(("flags", "expected"), [([], logging.INFO), (["--log-level", "DEBUG"], logging.DEBUG)])
+def test_log_level_is_applied_before_a_group_runs(cli_runner: CliRunner, flags: list[str], expected: int) -> None:
+    """The commands report progress through `logging`, which the root level decides the visibility of.
+
+    The default has to stay INFO, or notices such as the resume "Ignoring --start-epoch" line are dropped
+    by the root logger's WARNING default and a run silently looks like it obeyed an ignored option.
+
+    The root starts at WARNING here on purpose: `log_level = "INFO"` in `pyproject.toml` already leaves
+    it at INFO, so asserting against that default would pass with the callback deleted entirely.
+    """
+    root = logging.getLogger()
+    original = root.level
+    try:
+        root.setLevel(logging.WARNING)
+        result = cli_runner.invoke(app, [*flags, "torch", "--help"])
+        assert result.exit_code == 0, result.output
+        assert root.level == expected
+    finally:
+        root.setLevel(original)
+
+
+LOG_PROBE = """
+import logging, sys
+from structcast_model.commands.main import app
+
+@app.command(name="probe")
+def probe() -> None:
+    logging.getLogger("structcast_model.torch.trainer").info("INFO-MARKER")
+    logging.getLogger("structcast_model.torch.trainer").debug("DEBUG-MARKER")
+
+app([*sys.argv[1:], "probe"], standalone_mode=False)
+"""
+
+
+@pytest.mark.parametrize(
+    ("flags", "printed"),
+    [([], {"INFO"}), (["--log-level", "DEBUG"], {"INFO", "DEBUG"}), (["--log-level", "WARNING"], set())],
+)
+def test_log_level_decides_which_records_a_real_run_prints(flags: list[str], printed: set[str]) -> None:
+    """Setting the root level is only half of it: a run with no handler prints nothing whatever the level is.
+
+    `basicConfig` installs the stderr handler as well as setting the level. Without it the records reach
+    `logging.lastResort`, which drops everything below WARNING, so `--log-level DEBUG` would be accepted
+    and then print nothing. A subprocess is the only honest check: `log_level = "INFO"` in
+    `pyproject.toml` has pytest configure the root logger long before this runs.
+    """
+    result = subprocess.run([sys.executable, "-c", LOG_PROBE, *flags], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {level for level in ("INFO", "DEBUG") if f"{level}-MARKER" in result.stderr} == printed, result.stderr
 
 
 def test_app_torch_help(cli_runner: CliRunner) -> None:
