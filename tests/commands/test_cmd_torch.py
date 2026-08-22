@@ -177,6 +177,11 @@ class SimpleLearner:
         return {}
 
     @property
+    def flow_functions(self) -> dict[str, Any]:
+        """Declare no separable flows: the whole step is written out by hand here."""
+        return {}
+
+    @property
     def grad_scalers(self) -> dict[str, Any]:
         """Return empty grad scalers dict."""
         return {}
@@ -229,6 +234,11 @@ class GradientLearner:
     @property
     def optimizer_models(self) -> dict[str, list[str]]:
         """Return no pairing, there being no optimizer."""
+        return {}
+
+    @property
+    def flow_functions(self) -> dict[str, Any]:
+        """Return no separable flows: the whole step is written out by hand here."""
         return {}
 
     @property

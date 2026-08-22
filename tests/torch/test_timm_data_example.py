@@ -40,6 +40,7 @@ class _StubLearner:
     models: dict[str, Any] = {}
     optimizers: dict[str, Any] = {}
     optimizer_models: dict[str, list[str]] = {}
+    flow_functions: dict[str, Any] = {}
     learning_rates: dict[str, float] = {}
     steps: int = 0
     updates: int = 0

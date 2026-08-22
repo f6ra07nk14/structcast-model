@@ -27,6 +27,11 @@ class _LearningRateLearner:
         return {}
 
     @property
+    def flow_functions(self) -> dict[str, Any]:
+        """No separable flows: nothing here compiles or replicates a step."""
+        return {}
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The rate the finished epoch is logged with."""
         return {"lr": 0.1}

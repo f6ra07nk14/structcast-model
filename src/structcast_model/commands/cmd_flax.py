@@ -328,8 +328,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         # and the argnums form would renumber what the argnames form fixes.
         fixed = {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"}
         extra = {key: value for key, value in compile_kw.items() if key not in fixed}
-        # `flow_functions` is what a generated learner exposes, not part of the Learner protocol:
-        # a hand-written learner has nothing to bind, as in `cmd_torch`.
+        # `flow_functions` is a protocol member, but an empty one is allowed here: a hand-written
+        # learner declaring no separable flows has nothing to bind, as in `cmd_torch`.
         for flow_name in list(getattr(learner, "flow_functions", ())):
             # The generated learner names its steps after the contract they follow: only the training
             # one takes the static flag and the donated state (`docs/adr/0015`).

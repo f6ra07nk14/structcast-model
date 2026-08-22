@@ -269,6 +269,11 @@ class NamelessLearner:
         """The optimizer owns the only model."""
         return {"optimizer": ["model"]}
 
+    @property
+    def flow_functions(self) -> dict[str, Any]:
+        """No separable flows: the whole step is written out by hand here, so nothing is compiled."""
+        return {}
+
     def restore_counters(self, steps: int, updates: int) -> None:
         """Seed the counters, the way a resume path would."""
         self.steps = steps

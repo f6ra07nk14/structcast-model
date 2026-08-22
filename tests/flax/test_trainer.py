@@ -43,6 +43,11 @@ class _StubLearner:
         """No pairing."""
         return {}
 
+    @property
+    def flow_functions(self) -> dict[str, Any]:
+        """No separable flows: these tests drive the loop, never a strategy."""
+        return {}
+
     def restore_counters(self, steps: int, updates: int) -> None:
         """Seed the counters, the way a resume path would."""
         self.steps = steps

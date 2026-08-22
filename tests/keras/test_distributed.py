@@ -454,6 +454,37 @@ def test_the_training_command_builds_the_learner_under_the_mirrored_scope(tmp_pa
     assert result == {"model": "MirroredVariable", "optimizer": "MirroredVariable"}
 
 
+@pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow path needs the inner flows.")
+def test_the_mirrored_path_refuses_a_learner_exposing_no_flow_functions() -> None:
+    """Wrapping the public steps instead would trace the counters, so an empty mapping is an error.
+
+    A generated learner hands its inner flows over and keeps `training_step` eager, so the host-side
+    counters of `docs/adr/0018` keep running in Python. Wrapping a public step instead traces that
+    bookkeeping into a `tf.function`, where the increments freeze at trace time and the run reports
+    counts that never move -- silently. `flow_functions` is part of the `Learner` protocol for
+    exactly this reason, and a mapping that is empty here is refused rather than worked around. One
+    device is enough: what is asserted is the refusal, not the reduction.
+    """
+
+    class _Learner:
+        """The smallest learner reaching the check: public steps, and no flows to replicate."""
+
+        flow_functions: dict[str, Any] = {}
+
+        def training_step(self, **batch: Any) -> dict[str, Any]:
+            return batch
+
+        def inference_step(self, **batch: Any) -> dict[str, Any]:
+            return batch
+
+    strategy = KerasDistributedStrategy(preset="dp", devices=1)
+    with strategy.activate():
+        pass
+
+    with pytest.raises(ValueError, match="needs the learner's flow_functions"):
+        strategy.wrap_steps(_Learner())
+
+
 # ---------------------------------------------------------------------------
 # torch: DistributedDataParallel, in a subprocess spawning two gloo ranks
 # ---------------------------------------------------------------------------

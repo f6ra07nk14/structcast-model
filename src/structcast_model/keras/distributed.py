@@ -305,6 +305,9 @@ class KerasDistributedStrategy:
         TensorFlow optimizer all-reduces the per-replica gradients with `ReduceOp.SUM`
         (`_all_reduce_sum_gradients`, the behaviour of `Model.fit` under a strategy too) and an
         unscaled run would therefore take a step as many times larger as it has replicas.
+
+        Raises:
+            ValueError: under `MirroredStrategy`, if the learner exposes no `flow_functions`.
         """
         if self.preset == "single":
             return
@@ -313,8 +316,8 @@ class KerasDistributedStrategy:
             # a synchronization point TensorFlow refuses to nest inside `strategy.run`. The traced
             # steps are therefore unwrapped back to the Python functions they were built from, and
             # re-traced below inside the one graph that wraps the replicated call. `flow_functions`
-            # is what a generated learner exposes for exactly this rebinding (as in `cmd_flax`); a
-            # hand-written learner has nothing to unwrap.
+            # is what a learner exposes for exactly this rebinding (as in `cmd_flax`), and what the
+            # check below requires here.
             for name in getattr(learner, "flow_functions", ()):
                 traced = getattr(learner, name)
                 if hasattr(traced, "python_function"):
@@ -336,6 +339,11 @@ class KerasDistributedStrategy:
                 for name in flows:
                     setattr(learner, name, self._replicated_flow(getattr(learner, name)))
                 return
+            raise ValueError(
+                "A MirroredStrategy needs the learner's flow_functions to keep the host bookkeeping eager: the "
+                "public steps own the training counters (docs/adr/0018), which a replicated graph cannot run, so "
+                "a hand-written learner must expose its flow callables the way a generated one does."
+            )
         for name in ("training_step", "inference_step"):
             setattr(learner, name, self._replicated(getattr(learner, name)))
 
@@ -434,9 +442,10 @@ class KerasDistributedStrategy:
     def _replicated_flow(self, flow: Any) -> Any:
         """Wrap one inner flow step -- taking the batch mapping -- across the TensorFlow replicas.
 
-        The counterpart of :meth:`_replicated` for a generated learner under `MirroredStrategy`:
-        the learner's public steps keep their host-side counter bookkeeping outside the graph, and
-        the replication wraps the flow attribute the public step calls through.
+        `MirroredStrategy`'s answer to what :meth:`_replicated` does on the other two backends, one
+        level further in: the learner's public steps keep their host-side counter bookkeeping
+        outside the graph, so the replication wraps the flow attribute the public step calls
+        through.
         """
 
         @tf.function
@@ -453,25 +462,15 @@ class KerasDistributedStrategy:
         return flow_step
 
     def _replicated(self, step: Any) -> Any:
-        """Wrap one learner step so it runs across the replicas and reports reduced criteria."""
-        if self._mirrored is not None:
-            # One `tf.function` around the whole replicated call, which is what makes it legal at
-            # all: the adapter already traced the step, and a `tf.function` containing an optimizer
-            # application is a synchronization point TensorFlow refuses to nest inside
-            # `strategy.run` unless the run itself is being traced.
-            @tf.function
-            def replicated(batch: Mapping[str, Any]) -> dict[str, Any]:
-                criteria = self._mirrored.run(step, kwargs=batch)
-                return {
-                    name: self._mirrored.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
-                    for name, value in criteria.items()
-                }
+        """Wrap one public learner step so it runs across the replicas and reports reduced criteria.
 
-            def tensorflow_step(**batch: Any) -> dict[str, Any]:
-                return dict(replicated(self.shard_batch(batch)))
-
-            return tensorflow_step
-
+        What :meth:`_replicated_flow` is for TensorFlow, this is for the other two backends -- and
+        neither of them needs a graph around the replicated call, so the wrapper stays an eager
+        Python function: JAX shards the batch and lets the compiled step reduce it globally, torch
+        runs the rank's own slice and all-reduces the criteria afterwards. Wrapping the public step
+        is therefore harmless here, and the host bookkeeping it owns (`docs/adr/0018`) still runs
+        where it did.
+        """
         if self._distribution is not None:
 
             def jax_step(**batch: Any) -> dict[str, Any]:

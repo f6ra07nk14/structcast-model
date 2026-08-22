@@ -101,6 +101,11 @@ class _StubLearner:
         """Pair every optimizer with every model, which is the pairing a single-model learner reports."""
         return {name: list(self._models) for name in self._optimizers}
 
+    @property
+    def flow_functions(self) -> dict[str, Any]:
+        """No separable flows: these tests never compile or replicate a step."""
+        return {}
+
     def restore_counters(self, steps: int, updates: int) -> None:
         """Seed the counters, the way a resume path would."""
         self.steps = steps

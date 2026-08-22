@@ -201,6 +201,7 @@ class _FakeLearner:
         self._inference_loss = inference_loss
         self.optimizers = dict(optimizers) if optimizers is not None else {}
         self.optimizer_models: dict[str, list[str]] = {}
+        self.flow_functions: dict[str, Any] = {}
         self.learning_rates = {"lr": 0.1}
         self.named_models: dict[str, Any] = {"model": "the-model"}
         self.steps = 0

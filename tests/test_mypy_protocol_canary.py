@@ -49,6 +49,10 @@ class Conforming:
         return {{}}
 
     @property
+    def flow_functions(self) -> dict[str, Any]:
+        return {{}}
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         return {{}}
 

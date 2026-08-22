@@ -56,8 +56,8 @@ class SimpleLearner:
     """A hand-written learner: it owns the model and the optimizer and defines both steps.
 
     This is the object the redesign asks you to customize per model. It implements the `Learner`
-    protocol -- the `models`, `optimizers`, `optimizer_models`, `learning_rates`, `steps`,
-    `updates`, and `has_updated` properties plus `restore_counters`, `training_step`, and
+    protocol -- the `models`, `optimizers`, `optimizer_models`, `flow_functions`, `learning_rates`,
+    `steps`, `updates`, and `has_updated` properties plus `restore_counters`, `training_step`, and
     `inference_step`. Extra methods named after a lifecycle event, such as `on_epoch_end` below,
     are picked up by the trainer automatically.
     """
@@ -96,6 +96,11 @@ class SimpleLearner:
     def optimizer_models(self) -> dict[str, list[str]]:
         """The models each optimizer updates, so checkpointing can key its state by parameter names."""
         return {"optimizer": ["model"]}
+
+    @property
+    def flow_functions(self) -> dict[str, Any]:
+        """No separable flows: the steps below are written whole, so there is nothing to compile apart."""
+        return {}
 
     @property
     def learning_rates(self) -> dict[str, float]:

@@ -441,6 +441,7 @@ LEARNERS:
 
 - `models` (property) — `dict[str, ModelT]` of the models to train, where `ModelT` is the model type the trainer is specialized to (`torch.nn.Module` for `TorchTrainer`); the trainer exposes them to every event as `info.models`.
 - `optimizer_models` (property) — `dict[str, list[str]]` naming the models each optimizer updates (optimizer name -> model names); checkpointing uses it to pair sharded optimizer state with its modules, and an empty mapping means the pairing is not declared.
+- `flow_functions` (property) — `dict[str, Any]` of the named flow callables a strategy or trainer may compile or rebind (attribute name -> callable); a caller that compiles or replicates one rebinds the attribute the key names, leaving the public steps eager. Empty when the learner has no separable flows.
 - `steps` (property) — the number of completed training Steps (batch iterations), counted by the learner.
 - `updates` (property) — the number of completed Updates (optimizer applies); it lags `steps` while gradients accumulate.
 - `has_updated` (property) — whether the just-finished step landed an Update. The training loop runs the step and then reads this flag, so every count is a retrospective "completed" count ([`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). One contract follows: during `on_training_step_begin` for step N, `info.step` reads N-1.
@@ -448,7 +449,7 @@ LEARNERS:
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
 
-One caveat for hand-written learners: under the tensorflow `MirroredStrategy` path a hand-written learner's `training_step` is traced whole into a `tf.function`, so host-side counter bookkeeping must live outside the traced flow (generated learners keep `training_step` eager and let the strategy wrap only their inner flow functions).
+One caveat for hand-written learners: under the tensorflow `MirroredStrategy` path the strategy replicates the learner's inner flow functions, not its public steps, so that `training_step` stays eager and its host-side counter bookkeeping keeps running in Python. `flow_functions` is what it replicates, which is why the member is part of the protocol rather than a generated-learner extra: a learner reaching that path with an empty mapping is an error, not a fallback to wrapping the public step.
 
 Three required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer), `optimizer_models` (read whenever checkpointing saves or restores optimizer state, as described above), and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
 

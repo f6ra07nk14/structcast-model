@@ -73,6 +73,15 @@ class Learner(Protocol, Generic[ModelT]):
         """
 
     @property
+    def flow_functions(self) -> dict[str, Any]:
+        """The named flow callables a strategy or trainer may compile or rebind (attribute name -> callable).
+
+        A caller that compiles or replicates one rebinds the attribute the key names to its wrapper,
+        which leaves the public steps eager and their host-owned counters running in Python. Empty
+        when the learner has no separable flows, which the keras `MirroredStrategy` path refuses.
+        """
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The current learning rate of each optimizer, for display and logging."""
 
