@@ -14,6 +14,7 @@ from warnings import catch_warnings, simplefilter
 
 import jax
 import jax.numpy as jnp
+import optax
 import pytest
 
 from flax import nnx
@@ -465,3 +466,77 @@ def test_a_chained_clip_bounds_what_a_generated_update_actually_moves(tmp_path: 
     # The bound is the clip's, up to the float32 error of summing the squared deltas back up.
     assert _step_distance(clipped) <= 1e-3 * (1 + 1e-4)
     assert _step_distance(plain) > 1.0
+
+
+def _multi_steps_tx(**arguments: Any) -> list[Any]:
+    """Build a `MultiSteps` tx pattern over the fixture's sgd, with *arguments* as extra keywords."""
+    inner = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]
+    return ["_obj_", {"_addr_": "optax.MultiSteps"}, {"_call_": {"opt": inner, **arguments}}]
+
+
+def chained_multi_steps() -> Any:
+    """Chain a `MultiSteps` so only its state stays reachable, never its instance.
+
+    Public and addressable: the rejected learner builds it through an object pattern, as a real
+    transformation is built.
+    """
+    return optax.chain(optax.clip_by_global_norm(1.0), optax.MultiSteps(optax.sgd(0.1), 2).gradient_transformation())
+
+
+def test_a_window_that_is_not_a_literal_fails_when_the_learner_is_built(tmp_path: Path) -> None:
+    """Only an int literal window can be read back into the learner's host gate.
+
+    A schedule computes the window on the device, where the host formula cannot follow it. The
+    pattern is never parsed: the generated `__init__` reads the built optimizer back, so the
+    refusal is a ValueError at instantiation, mirroring the keras learners (`docs/adr/0017`).
+    """
+    schedule = [
+        "_obj_",
+        {"_addr_": "optax.linear_schedule"},
+        {"_call_": {"init_value": 2, "end_value": 4, "transition_steps": 10}},
+    ]
+    learner_type = _tx_learner(tmp_path, "scheduled", _multi_steps_tx(every_k_schedule=schedule))
+
+    with pytest.raises(ValueError, match="int literal"):
+        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
+
+
+def test_a_skip_predicate_fails_when_the_learner_is_built(tmp_path: Path) -> None:
+    """`should_skip_update_fn` breaks the call-count identity the host `update` gate relies on."""
+    predicate = ["_obj_", {"_addr_": "optax.skip_not_finite"}]
+    tx = _multi_steps_tx(every_k_schedule=2, should_skip_update_fn=predicate)
+    learner_type = _tx_learner(tmp_path, "skipping", tx)
+
+    with pytest.raises(ValueError, match="should_skip_update_fn"):
+        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
+
+
+def test_a_multi_steps_nested_inside_a_chain_fails_when_the_learner_is_built(tmp_path: Path) -> None:
+    """A `MultiSteps` hidden inside `optax.chain` cannot be read, so it has to be refused.
+
+    Reading the window as one while the device accumulated would desynchronize every update event:
+    the generated `__init__` walks the optimizer state for the accumulator and demands the wrapper
+    be outermost.
+    """
+    tx = ["_obj_", {"_addr_": f"{__name__}.chained_multi_steps"}, "_call_"]
+    learner_type = _tx_learner(tmp_path, "chained", tx)
+
+    with pytest.raises(ValueError, match="outermost"):
+        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
+
+
+def test_windows_that_disagree_across_segments_fail_when_the_learner_is_built(tmp_path: Path) -> None:
+    """One learner, one update window: the trainer's update counter answers for the whole learner.
+
+    A segment without `MultiSteps` counts as a window of one, so wrapping only the first optimizer
+    has to be refused with the two values named -- at instantiation, where the windows are read
+    back from the built optimizers (`docs/adr/0017`).
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=2)}}
+    FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()(tmp_path / "disagreeing.py")
+    model_type = _model_type(tmp_path)
+    learner_type = _load(tmp_path / "disagreeing.py", "disagreeing_learner").Learner
+
+    with pytest.raises(ValueError, match=r"disagree.*\[1, 2\]"):
+        learner_type(*[model_type(rngs=nnx.Rngs(seed)) for seed in range(3)])

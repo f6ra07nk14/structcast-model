@@ -70,6 +70,72 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     return jnp.asarray(jnp.nan if rate is None else rate, dtype=jnp.float32)
 
 
+def _count_multi_steps_states(node: Any) -> int:
+    """Count the `MultiStepsState` shells hiding anywhere inside an optimizer state tree.
+
+    A plain container walk suffices: the nnx wrappers replace the array leaves of `opt_state`, but
+    the NamedTuple shells -- `MultiStepsState` included -- survive untouched, and a found state is
+    itself a tuple the walk descends into, so a second state nested inside the first is counted too.
+    """
+    values = node.values() if isinstance(node, dict) else node if isinstance(node, tuple) else ()
+    return int(isinstance(node, optax.MultiStepsState)) + sum(_count_multi_steps_states(value) for value in values)
+
+
+def accumulation_window(optimizer: Any) -> int:
+    """Return the accumulation window of the optimizer's outermost `optax.MultiSteps`, 1 without one.
+
+    The generated flax learners call this after building their optimizers, so the host-side
+    `update` gate is read back from the transformation the device actually applies instead of being
+    parsed out of the optimizer pattern (see `docs/adr/0017`). Optax offers no public accessor for
+    either `MultiSteps` argument, so two normalized private attributes are read: `__init__` wraps an
+    int `every_k_schedule` in a local lambda -- `_every_k_schedule` then carries that lambda's
+    qualname and calling it returns the int -- and replaces a `None` `should_skip_update_fn` with a
+    local default, likewise identified by `_should_skip_update_fn`'s qualname. A user-passed
+    callable keeps its own qualname in either slot, which is how the two rejections below tell the
+    readable window apart; tests pin both dependencies across the supported optax range.
+
+    Args:
+        optimizer (Any): The `flax.nnx.Optimizer` whose transformation to inspect.
+
+    Returns:
+        int: The `every_k_schedule` of the outermost `MultiSteps`, or 1 when the transformation
+            carries none.
+
+    Raises:
+        ValueError: When a `MultiSteps` hides inside the transformation instead of being its
+            outermost wrapper, when the outermost `MultiSteps` nests a second one, when it carries
+            a `should_skip_update_fn`, or when its `every_k_schedule` is a callable rather than an
+            int literal.
+    """
+    tx = optimizer.tx
+    states = _count_multi_steps_states(optimizer.opt_state)
+    if not isinstance(tx, optax.MultiSteps):
+        if states:
+            raise ValueError(
+                "MultiSteps must be the outermost transformation for the learner to read its "
+                "accumulation window: the optimizer state carries a MultiStepsState, but the "
+                "instance hides inside a wrapper such as optax.chain."
+            )
+        return 1
+    if states > 1:
+        raise ValueError(
+            "MultiSteps nests a second MultiSteps: the optimizer state carries another "
+            "MultiStepsState inside the outermost one, so the device would apply at the product of "
+            "the windows while the learner gates on the outermost window alone."
+        )
+    if getattr(tx._should_skip_update_fn, "__qualname__", "") != "MultiSteps.__init__.<locals>.should_skip_update_fn":
+        raise ValueError(
+            "MultiSteps carries a should_skip_update_fn: a skipped update would desynchronize the "
+            "device counter from the update gate the learner derives from the window."
+        )
+    if getattr(tx._every_k_schedule, "__qualname__", "") != "MultiSteps.__init__.<locals>.<lambda>":
+        raise ValueError(
+            "MultiSteps has no int literal every_k_schedule: only a literal window can be read back "
+            "into the learner's update gate, not a schedule or callable."
+        )
+    return int(tx._every_k_schedule(0))
+
+
 def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     r"""Build an optax mask excluding the parameters whose path matches any of the regexes.
 
@@ -101,7 +167,7 @@ def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     return mask
 
 
-__all__ = ["get_learning_rate", "no_weight_decay_mask", "unwrap_variables"]
+__all__ = ["accumulation_window", "get_learning_rate", "no_weight_decay_mask", "unwrap_variables"]
 
 
 if not TYPE_CHECKING:

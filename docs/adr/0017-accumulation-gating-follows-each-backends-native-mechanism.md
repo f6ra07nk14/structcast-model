@@ -17,8 +17,8 @@ from it.
 - **keras** — the window is `gradient_accumulation_steps` declared as a kwarg of the `OPTIMIZER`
   pattern, exactly where clipping already lives (ADR-0016); the learner reads the optimizer's own
   step counter to predict when the apply lands.
-- **flax** — the window is `optax.MultiSteps` in the user's optax chain inside the `OPTIMIZER`
-  pattern; the builder statically parses it and bakes the gate as a compile-time constant.
+- **flax** — the window is `optax.MultiSteps` as the outermost transformation of the `OPTIMIZER`
+  pattern; the generated `__init__` reads it back from each built optimizer and gates on it.
 
 ## The keras clock is the optimizer's private step counter
 
@@ -45,19 +45,30 @@ misreports for that one step; and under multi-segment float16, segments whose sc
 steps can de-phase — the first optimizer's counter is the learner's clock, documented rather than
 reconciled.
 
-## Flax accumulation is `optax.MultiSteps`, statically parsed
+## Flax accumulation is `optax.MultiSteps`, read back after construction
 
-The builder parses the `OPTIMIZER` pattern for a `MultiSteps` wrapper: `every_k_schedule` must be an
-int literal (a callable is a `SpecError`) and `should_skip_update_fn` is rejected (`SpecError`) —
-either would break the identity that `mini_step` is a pure function of the update-call count, which
-is what lets `update()` bake `step % k == 0` as a compile-time constant with no device read — the
-trainer's step counter is 1-based and increments before it asks, so the step *is* the call count,
-and the apply lands on the k-th call. The cadence therefore follows the native mechanism (windows
-of exactly `k`), not the torch learners' historically short first window, whose `(step + 1)` gate
-is self-consistent only because it also drives the apply.
-No `MultiSteps` in the pattern means `update()` returns true. This reverses ADR-0013 because the
-constraints dissolve its objections: with no skip predicate the device counter can never disagree
-with the host constant, the `use_grad_mean` default replaces the previously emitted `loss / k`
+The generated `__init__` reads the window from each optimizer it just built —
+`accumulation_window` in `structcast_model.flax.optimizers` — instead of the builder parsing the
+pattern: `optimizer.tx` must be the `MultiSteps` instance itself (`isinstance`, which no address
+spelling can fake), so the wrapper must be outermost — a `MultiSteps` nested inside `optax.chain`
+leaves only its `MultiStepsState` reachable, and walking the state for that shell is what turns the
+silent window-of-one misread into a `ValueError`. The same walk runs under an outermost
+`MultiSteps`: a second `MultiStepsState` nested inside it means the device applies at the product
+of the windows, and that misread is likewise a `ValueError`. Optax has no public accessor for
+either argument,
+so two normalized privates are read, both pinned by tests across the supported optax range: an int
+`every_k_schedule` is wrapped by `MultiSteps.__init__` in a local lambda whose qualname identifies
+it (calling it returns the int), and a `None` `should_skip_update_fn` becomes a local default
+likewise identified by qualname. A user callable keeps its own qualname in either slot and is
+rejected (`ValueError`) — either would break the identity that `mini_step` is a pure function of
+the update-call count, which is what lets `update()` return `step % self._accumulate == 0` with no
+device read — the trainer's step counter is 1-based and increments before it asks, so the step *is*
+the call count, and the apply lands on the k-th call. The cadence therefore follows the native
+mechanism (windows of exactly `k`), not the torch learners' historically short first window, whose
+`(step + 1)` gate is self-consistent only because it also drives the apply.
+No `MultiSteps` means a window of one, and the same formula holds. This reverses ADR-0013 because
+the constraints dissolve its objections: with no skip predicate the device counter can never disagree
+with the host formula, the `use_grad_mean` default replaces the previously emitted `loss / k`
 scaling, `has_updated` is never called, and the `inject_learning_rate` rewrite recurses to the innermost
 factory (wrapping it in `inject_hyperparams`) so an LR schedule inside `MultiSteps` still advances
 per real update. The manual accumulator, the
@@ -68,9 +79,10 @@ memory against bf16 params — users who care pass `accumulator_dtype`.
 ## One learner, one window
 
 All optimizers of a learner must share the same `k`: the trainer's update counter is learner-scoped
-and `update()` answers for the whole learner. Keras validates in the generated `__init__` — a
-`ValueError`, the runtime convention of the adapters, since generated scripts do not import builder
-errors — and flax at build time, a `SpecError`. The `Learner` protocol and `base_trainer` are
+and `update()` answers for the whole learner. Both backends validate in the generated `__init__` —
+a `ValueError`, the runtime convention, since generated scripts do not import builder errors: keras
+compares the `gradient_accumulation_steps` of the prepared optimizers, flax the windows
+`accumulation_window` reads back. The `Learner` protocol and `base_trainer` are
 untouched — `update()` keeps its pre-step position and signature.
 
 Migration is documentation, not validators: in-repo configs and test fixtures move to the new form,

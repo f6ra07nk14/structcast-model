@@ -384,114 +384,33 @@ def test_flax_learner_never_reads_a_variable_value_or_an_update_result() -> None
 
 
 def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
-    """The generated steps call `get_learning_rate` and the `flax.nnx`/`jax` APIs directly."""
+    """The generated steps call `get_learning_rate` and `accumulation_window` directly."""
     imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
 
-    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate"}
+    assert imports["structcast_model.flax.optimizers"] == {"accumulation_window", "get_learning_rate"}
     assert imports["flax.nnx"] == {None, "Param", "Optimizer"}
     assert imports["jax"] == {None}
     assert imports["jax.numpy"] == {None}
 
 
-def test_flax_learner_bakes_the_multi_steps_window_into_the_update_gate() -> None:
+def test_flax_learner_reads_the_window_back_from_the_built_optimizers() -> None:
     """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and `update` predicts it.
 
-    The builder statically parses the wrapper's int-literal window and bakes `step % k == 0`
-    as a pure host formula, so the generated step carries no accumulator buffer and no static flag
-    (`docs/adr/0017`).
+    The pattern is never parsed for the window: the generated `__init__` reads it back from every
+    optimizer it just built with `accumulation_window`, refuses optimizers that disagree, and
+    `update` gates on the stored attribute -- a pure host formula, no accumulator buffer and no
+    static flag (`docs/adr/0017`).
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "MultiSteps(" in script
-    assert "def update(self, step: int) -> bool:\n        return step % 3 == 0" in script
+    assert "windows = sorted({accumulation_window(optimizer) for optimizer in self._optimizers.values()})" in script
+    assert "One learner, one update window" in script
+    assert "self._accumulate = windows[0]" in script
+    assert "def update(self, step: int) -> bool:" in script
+    assert "return step % self._accumulate == 0" in script
     assert "acc_grads" not in script
     assert "need_update" not in script
-
-
-def test_flax_learner_without_multi_steps_updates_every_step() -> None:
-    """A learner without the wrapper updates every step and pays for no buffer or gate arithmetic."""
-    script = _learner_script(LEARNER_YAML)
-
-    assert "MultiSteps(" not in script
-    assert "def update(self, step: int) -> bool:\n        return True" in script
-    assert "acc_grads" not in script
-    assert "need_update" not in script
-
-
-def _multi_steps_tx(**arguments: Any) -> list[Any]:
-    """Build a `MultiSteps` tx pattern over the fixture's sgd, with *arguments* as extra keywords."""
-    inner = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]
-    return ["_obj_", {"_addr_": "optax.MultiSteps"}, {"_call_": {"opt": inner, **arguments}}]
-
-
-def test_flax_learner_rejects_a_multi_steps_window_that_is_not_a_literal() -> None:
-    """Only an int literal window can be baked into the generated `update` at build time.
-
-    A schedule (or any pattern) computes the window on the device, where the host formula cannot
-    follow it, so the mismatch is refused while the script is still being generated.
-    """
-    raw = load_any(LEARNER_YAML)
-    schedule = [
-        "_obj_",
-        {"_addr_": "optax.linear_schedule"},
-        {"_call_": {"init_value": 2, "end_value": 4, "transition_steps": 10}},
-    ]
-    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=schedule)}}
-
-    with pytest.raises(SpecError, match="int literal"):
-        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
-
-
-def test_flax_learner_rejects_a_multi_steps_skip_predicate() -> None:
-    """`should_skip_update_fn` breaks the call-count identity the baked `update` gate relies on."""
-    raw = load_any(LEARNER_YAML)
-    predicate = ["_obj_", {"_addr_": "optax.skip_not_finite"}]
-    raw["LEARNERS"][0]["OPTIMIZER"][2] = {
-        "_bind_": {"tx": _multi_steps_tx(every_k_schedule=2, should_skip_update_fn=predicate)}
-    }
-
-    with pytest.raises(SpecError, match="should_skip_update_fn"):
-        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
-
-
-def test_flax_learner_ignores_an_address_that_merely_ends_in_multi_steps() -> None:
-    """Only an address whose last segment is `MultiSteps` declares a window, not any suffix match."""
-    raw = load_any(LEARNER_YAML)
-    inner = ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]
-    lookalike = ["_obj_", {"_addr_": "mylib.NotMultiSteps"}, {"_call_": {"opt": inner, "every_k_schedule": 2}}]
-    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": lookalike}}
-
-    scripts = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
-
-    assert "def update(self, step: int) -> bool:\n        return True" in "".join(scripts)
-
-
-def test_flax_learner_rejects_nested_multi_steps_wrappers() -> None:
-    """Two wrappers declare two windows, so the one the gate should bake is ambiguous."""
-    raw = load_any(LEARNER_YAML)
-    doubled = [
-        "_obj_",
-        {"_addr_": "optax.MultiSteps"},
-        {"_call_": {"opt": _multi_steps_tx(every_k_schedule=2), "every_k_schedule": 2}},
-    ]
-    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": doubled}}
-
-    with pytest.raises(SpecError, match="ambiguous"):
-        FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
-
-
-def test_flax_learner_rejects_windows_that_disagree_across_segments() -> None:
-    """One learner, one window: the trainer's update counter answers for the whole learner.
-
-    A segment without `MultiSteps` counts as a window of one, so wrapping only the first optimizer
-    has to be refused with the two values named.
-    """
-    raw = load_any(SEGMENTS_YAML)
-    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=2)}}
-
-    with pytest.raises(SpecError, match=r"disagree.*\[1, 2\]"):
-        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
-        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
 def test_flax_learner_wraps_several_owned_models_in_one_persistent_list() -> None:

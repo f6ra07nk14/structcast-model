@@ -312,7 +312,7 @@ OPTIMIZER:
       gradient_accumulation_steps: 4
 ```
 
-In Flax the window is an [`optax.MultiSteps`](https://optax.readthedocs.io/) wrapping the entry's `tx`. The builder statically parses the wrapper and bakes its window into `update()` as a compile-time constant, so `every_k_schedule` must be an int literal (a callable is a `SpecError`), `should_skip_update_fn` is rejected (`SpecError`), and every entry of a learner must declare the same window — an entry without `MultiSteps` counts as 1 (`SpecError` at build time). `MultiSteps` accumulates in float32 by default, which doubles accumulator memory against bfloat16 parameters; pass `accumulator_dtype` when that matters.
+In Flax the window is an [`optax.MultiSteps`](https://optax.readthedocs.io/) wrapping the entry's `tx`; it must be the outermost transformation (one nested inside e.g. `optax.chain` is rejected, as is a `MultiSteps` nested inside another). The generated `__init__` reads the window back from each built optimizer and `update()` gates on it, so `every_k_schedule` must be an int literal (a callable is rejected), `should_skip_update_fn` is rejected, and every entry of a learner must declare the same window — an entry without `MultiSteps` counts as 1. Each rejection is a `ValueError` when the learner is instantiated, as in Keras. `MultiSteps` accumulates in float32 by default, which doubles accumulator memory against bfloat16 parameters; pass `accumulator_dtype` when that matters.
 
 ```yaml
 OPTIMIZER:

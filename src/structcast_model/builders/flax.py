@@ -220,94 +220,6 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     return ObjectPattern.model_validate(rewritten), True
 
 
-def _is_multi_steps(key: Any, value: Any) -> bool:
-    """Report whether one serialized entry is an address whose last segment is `MultiSteps`."""
-    if key not in ("_addr_", "_file_") or not isinstance(value, str):
-        return False
-    return value.rpartition(".")[2].rpartition(":")[2] == "MultiSteps"
-
-
-def _names_multi_steps(part: Any) -> bool:
-    """Report whether one part of a serialized pattern is an address naming `MultiSteps`."""
-    if isinstance(part, dict):
-        return any(_is_multi_steps(key, value) for key, value in part.items())
-    if isinstance(part, (list, tuple)) and part:
-        # Addresses serialize either as `{"_addr_": ...}` or as the `["_addr_", ...]` list form.
-        return any(_is_multi_steps(part[0], value) for value in part[1:])
-    return False
-
-
-def _find_multi_steps(node: Any, found: list[list[Any]]) -> None:
-    """Collect the parts of every `MultiSteps` call nested anywhere under a serialized pattern node."""
-    try:
-        dumped = cast(list[Any], ObjectPattern.model_validate(node).model_dump(by_alias=True))
-    except ValidationError:
-        values = node.values() if isinstance(node, dict) else node if isinstance(node, (list, tuple)) else ()
-        for value in values:
-            _find_multi_steps(value, found)
-        return
-    parts = dumped[1:]
-    if any(_names_multi_steps(part) for part in parts):
-        found.append(parts)
-    for part in parts:
-        _find_multi_steps(part, found)
-
-
-def _call_arguments(parts: list[Any]) -> tuple[list[Any], dict[str, Any]]:
-    """Split the `_call_`/`_bind_` parts of one serialized call into positional and keyword arguments."""
-    positional: list[Any] = []
-    keywords: dict[str, Any] = {}
-    for part in parts:
-        if isinstance(part, dict):
-            for key in ("_call_", "_bind_"):
-                value = part.get(key)
-                if isinstance(value, dict):
-                    keywords |= value
-                elif isinstance(value, (list, tuple)):
-                    positional += value
-        elif isinstance(part, (list, tuple)) and part and part[0] in ("_call_", "_bind_"):
-            positional += part[1:]
-    return positional, keywords
-
-
-def _accumulation_window(optimizer: ObjectPattern, opt_name: str) -> int:
-    """Statically parse the accumulation window one `OPTIMIZER` pattern declares, 1 without one.
-
-    The window is the `every_k_schedule` of the pattern's `optax.MultiSteps` wrapper, and it is baked
-    into the generated `update` as a compile-time constant, so only an int literal can be honored.
-    A skip predicate would let the device counter fall behind that constant, so it is rejected too
-    (see `docs/adr/0017`).
-    """
-    found: list[list[Any]] = []
-    _find_multi_steps(optimizer, found)
-    if not found:
-        return 1
-    if len(found) > 1:
-        raise SpecError(
-            f'Optimizer "{opt_name}" nests {len(found)} MultiSteps wrappers, so its accumulation window '
-            "is ambiguous: keep exactly one."
-        )
-    positional, keywords = _call_arguments(found[0])
-    # `MultiSteps(opt, every_k_schedule, use_grad_mean, should_skip_update_fn)`: positional index 1
-    # is the window, and a fourth positional can only be the skip predicate.
-    if "should_skip_update_fn" in keywords or len(positional) > 3:
-        raise SpecError(
-            f'Optimizer "{opt_name}" passes should_skip_update_fn to MultiSteps: a skipped update would '
-            "desynchronize the device counter from the update gate the builder bakes into update()."
-        )
-    window = (
-        keywords["every_k_schedule"]
-        if "every_k_schedule" in keywords
-        else (positional[1] if len(positional) > 1 else None)
-    )
-    if isinstance(window, bool) or not isinstance(window, int):
-        raise SpecError(
-            f'Optimizer "{opt_name}" gives MultiSteps no int literal every_k_schedule: the builder can '
-            "only bake a literal window into the generated update(), not a schedule or callable."
-        )
-    return window
-
-
 def _container(trainable_layers: list[str]) -> str:
     """Return the name of the variable holding the modules one optimizer owns.
 
@@ -327,9 +239,6 @@ class FlaxOptimizerSegment(OptimizerSegment):
     optimizer_hash: str
     """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES` in the learner."""
 
-    window: int
-    """The accumulation window the pattern's `optax.MultiSteps` declares, 1 without one."""
-
 
 class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     """Intermediate representation of a Flax (nnx) learner.
@@ -338,8 +247,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     arguments -- never as closures or bound methods -- so that a trainer can wrap them in
     `flax.nnx.jit` (both state arguments donated) and rebind each attribute `flow_functions` names,
     exactly as the PyTorch learners are compiled. Gradient accumulation is the optimizer pattern's
-    own `optax.MultiSteps`, statically parsed at build time so the generated `update` bakes its
-    window as a host constant (`docs/adr/0017`). Each segment differentiates
+    own `optax.MultiSteps`, read back from the built optimizers in the generated `__init__` so the
+    `update` gate shares the window the device applies on (`docs/adr/0017`). Each segment
+    differentiates
     its own closure with `flax.nnx.value_and_grad`, whose first argument is the container of the
     modules that segment owns; the models it only reads are passed as further, non-differentiated
     arguments. The closure returns as auxiliary output only what the enclosing step reads back --
@@ -355,7 +265,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         "jax": {None},
         "jax.numpy": {None},
         "flax.nnx": {None, "Param"},
-        "structcast_model.flax.optimizers": {"get_learning_rate"},
+        "structcast_model.flax.optimizers": {"accumulation_window", "get_learning_rate"},
     }
     """Default imports for Flax learners; the generated steps and properties call these directly."""
 
@@ -452,18 +362,6 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         lines += [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
         return [*lines, f"return {self._forward_outputs}"]
 
-    @cached_property
-    def _window(self) -> int:
-        """The accumulation window every segment shares, from the static `MultiSteps` parse."""
-        windows = {segment.window for _, segment in self._segments}
-        if len(windows) > 1:
-            raise SpecError(
-                "One learner, one update window: the optimizers disagree on their MultiSteps windows "
-                f"{sorted(windows)}. Give every segment the same every_k_schedule; a segment without "
-                "MultiSteps counts as 1."
-            )
-        return windows.pop() if windows else 1
-
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner: its flow layers, the two steps and the learner class."""
         indent = " " * 4
@@ -478,11 +376,6 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         )
         models_repr = ", ".join(f"{m!r}: self._models[{m!r}]" for m in self.models)
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
-        # A pure host formula: `MultiSteps` gates the apply on the device, and this predicts it.
-        # The trainer increments its step before asking, so the 1-based step is the number of
-        # `optimizer.update` calls made once this one runs -- exactly the count `MultiSteps` gates
-        # on. `(step + 1)` here would fire one step before the on-device apply (`docs/adr/0017`).
-        gate = f"return step % {self._window} == 0" if self._window > 1 else "return True"
         body = [f"{name} = flax.nnx.List([{', '.join(owned)}])" for name, owned in self._module_lists.items()]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
         layers = [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]
@@ -512,6 +405,15 @@ class {self.classname}:
         {sep2.join(body)}
         self._models = {{{", ".join(f"{n!r}: {n}" for n in [*self.models, *self._module_lists])}}}
         self._optimizers = {{{", ".join(f"{n!r}: {n}" for n in self.optimizers)}}}
+        # `update` answers for the whole learner, so the optimizers just built must agree on one
+        # window (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
+        windows = sorted({{accumulation_window(optimizer) for optimizer in self._optimizers.values()}})
+        if len(windows) > 1:
+            raise ValueError(
+                "One learner, one update window: "
+                f"the optimizers disagree on their MultiSteps windows {{windows}}."
+            )
+        self._accumulate = windows[0]
         self._learning_rates = {{{", ".join(f"{n!r}: float('nan')" for n in self.optimizers)}}}
         self._views = {views}
         self._training_step = _training_step
@@ -528,7 +430,11 @@ class {self.classname}:
         return self._inference_step(self._views, {passed}**kwargs)
 
     def update(self, step: int) -> bool:
-        {gate}
+        # A pure host formula: `MultiSteps` gates the apply on the device, and this predicts it.
+        # The trainer increments its step before asking, so the 1-based step is the number of
+        # `optimizer.update` calls made once this one runs -- exactly the count `MultiSteps` gates
+        # on. `(step + 1)` here would fire one step before the on-device apply (`docs/adr/0017`).
+        return step % self._accumulate == 0
 
     @property
     def models(self):
@@ -596,8 +502,6 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             optimizer=base.optimizer,
             trainable_layers=base.trainable_layers,
             optimizer_hash=optimizer_hash(learner.OPTIMIZER),
-            # Parsed from the pattern as written, before `inject_learning_rate` rewrites it.
-            window=_accumulation_window(learner.OPTIMIZER, opt_name),
         )
 
     def _get_optimizer(

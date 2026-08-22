@@ -187,10 +187,10 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     module = _load(out, "generated_learner")
     assert hasattr(module, "MyLearner")
     # The parameter reached the template: the MultiSteps wrapper carries the window on the device,
-    # and the baked host gate agrees with it.
+    # and the generated __init__ reads it back for the host gate.
     text = out.read_text()
     assert "MultiSteps" in text
-    assert "return step % 2 == 0" in text
+    assert "return step % self._accumulate == 0" in text
 
 
 # ---------------------------------------------------------------------------
