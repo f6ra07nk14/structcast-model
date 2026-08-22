@@ -534,10 +534,17 @@ def build(directory, preset, seed):
         strategy.sync_initial_weights({"model": model, "norm": norm})
         kernels["synced_kernel"] = kernel_of(model)
         models = strategy.wrap({"model": model})
-        learner = load(directory + "/learner.py", "generated_learner").Learner(**models)
-    # The two loose layers are handed to the learner, since a saver reads the models off it.
-    learner.models["norm"] = norm
-    learner.models["drop"] = drop
+        base = load(directory + "/learner.py", "generated_learner").Learner
+
+        # The two loose layers are handed to the learner, since a saver reads the models off it.
+        # `models` is a view the generated class assembles from its own attributes on every read,
+        # so they are added by overriding it rather than by mutating what one read returned.
+        class Learner(base):
+            @property
+            def models(self):
+                return {**super().models, "norm": norm, "drop": drop}
+
+        learner = Learner(**models)
     strategy.wrap_steps(learner)
     return strategy, model, norm, learner, kernels
 

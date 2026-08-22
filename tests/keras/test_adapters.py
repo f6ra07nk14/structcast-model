@@ -57,10 +57,14 @@ def _model(*layers: Any, seed: int = 0) -> Any:
 
 
 def _flow(model: Any, *, training: bool = True) -> Flow:
-    """The mean squared error of `model` on the batch, as a training flow."""
+    """The mean squared error of `model` on the batch, as a training flow.
 
-    def flow(batch: Any) -> tuple[Any, dict[str, Any]]:
-        loss = keras.ops.mean(keras.ops.square(keras.ops.subtract(model(batch["x"], training=training), batch["y"])))
+    Keyword-only, as a generated flow is: an adapter that handed the batch over positionally, or as
+    one mapping, would fail here instead of binding a learner's inputs by declaration order.
+    """
+
+    def flow(*, x: Any, y: Any) -> tuple[Any, dict[str, Any]]:
+        loss = keras.ops.mean(keras.ops.square(keras.ops.subtract(model(x, training=training), y)))
         return loss, {"loss": loss}
 
     return flow
@@ -69,9 +73,9 @@ def _flow(model: Any, *, training: bool = True) -> Flow:
 def _inference_flow(model: Any) -> InferenceFlow:
     """The same criterion without a loss to differentiate."""
 
-    def flow(batch: Any) -> dict[str, Any]:
-        prediction = model(batch["x"], training=False)
-        return {"loss": keras.ops.mean(keras.ops.square(keras.ops.subtract(prediction, batch["y"])))}
+    def flow(*, x: Any, y: Any) -> dict[str, Any]:
+        prediction = model(x, training=False)
+        return {"loss": keras.ops.mean(keras.ops.square(keras.ops.subtract(prediction, y)))}
 
     return flow
 
@@ -94,7 +98,7 @@ def _value(variable: Any) -> np.ndarray:
 
 def _run(step: InferenceFlow, batch: dict[str, Any], times: int) -> list[float]:
     """Run a step repeatedly on the same batch and collect its losses."""
-    return [float(_value(step(batch)["loss"])) for _ in range(times)]
+    return [float(_value(step(**batch)["loss"])) for _ in range(times)]
 
 
 def test_training_step_decreases_the_loss_and_moves_the_weights(adapter: BackendAdapter) -> None:
@@ -168,14 +172,14 @@ def test_each_segment_updates_only_its_own_variables(adapter: BackendAdapter) ->
     segments = [_segment(first, name="first"), _segment(second, name="second")]
     adapter.prepare(segments)
     before = [_value(model.trainable_variables[0]) for model in (first, second)]
-    adapter.build_train_step(segments)(_batch())
+    adapter.build_train_step(segments)(**_batch())
     assert all(
         np.abs(_value(model.trainable_variables[0]) - snapshot).max() > 0
         for model, snapshot in zip((first, second), before, strict=True)
     )
 
     untouched = _value(second.trainable_variables[0])
-    adapter.build_train_step(segments[:1])(_batch())
+    adapter.build_train_step(segments[:1])(**_batch())
     assert np.array_equal(_value(second.trainable_variables[0]), untouched)
 
 

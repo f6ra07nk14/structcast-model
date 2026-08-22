@@ -244,33 +244,30 @@ def _cap_torch_gpu_memory(backend: str, fraction: float | None) -> None:
 
 
 def _mixed_precision_policy(factory: Any) -> str | None:
-    """Return the global policy the generated learner's module asks for, or None for a plain run.
+    """Return the global policy the generated learner asks for, or None for a plain run.
 
-    A generated learner class is loaded from a file rather than imported by name, so its module
-    never lands in `sys.modules`: the globals its methods were defined in are the only handle on the
-    constants next to it, as in `cmd_flax._optimizer_hashes`. A hand-written learner declares none
-    and gets no policy.
+    The factory this reads is the generated class itself, which carries the two constants as class
+    attributes (`docs/adr/0019`): the policy has to be set before the models the learner is built
+    over exist, and a class attribute is readable before anything is instantiated. A hand-written
+    learner declares none and gets no policy.
     """
-    namespace = getattr(getattr(factory, "__init__", None), "__globals__", {})
-    raw = namespace.get("MIXED_PRECISION")
+    raw = getattr(factory, "MIXED_PRECISION", None)
     # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
     # included, so that a run is not loss-scaled by the adapter while computing in float32.
     enabled = raw if isinstance(raw, bool) else isinstance(raw, Mapping)
     if not enabled:
         return None
-    return f"mixed_{namespace['MIXED_PRECISION_TYPE']}"
+    return f"mixed_{factory.MIXED_PRECISION_TYPE}"
 
 
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
-    """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
+    """Return the `OPTIMIZER_HASHES` the learner's class declares, empty for anything else.
 
-    Read off the globals the learner's methods were defined in, as `_mixed_precision_policy` reads
-    the mixed precision constants: a generated learner is loaded from a file, so its module never
-    lands in `sys.modules`. A hand-written learner declares none, and the resume check skips what is
+    Read off the class, as `_mixed_precision_policy` reads the mixed precision constants
+    (`docs/adr/0019`). A hand-written learner declares none, and the resume check skips what is
     missing.
     """
-    namespace = getattr(type(learner).__init__, "__globals__", {})
-    return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
+    return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 
 
 def _resolve_strategy(strategy: Any, device: str | None) -> "scm_keras.KerasDistributedStrategy":

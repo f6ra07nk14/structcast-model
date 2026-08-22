@@ -137,6 +137,25 @@ def test_training_step_lowers_the_loss_it_reports_and_moves_the_weights(tmp_path
     assert _moved(before, _values(model.trainable_variables)) > 0.0
 
 
+def test_the_flows_and_the_built_steps_take_the_batch_by_name(tmp_path: Path) -> None:
+    """Everything under `training_step` is called with keyword arguments, on every backend.
+
+    The adapters spread the batch over the flow's own parameters, and the MirroredStrategy wrapper
+    forwards the same keywords into `strategy.run`: a flow taking one mapping would fail there,
+    inside a traced graph and a process away from the learner, rather than here.
+    """
+    learner = _learner_type(tmp_path)(_models(tmp_path)[0])
+
+    loss, criteria = learner._flow_optimizer(**BATCH)
+
+    assert sorted(criteria) == ["loss"]
+    assert float(keras.ops.convert_to_numpy(loss)) == float(keras.ops.convert_to_numpy(criteria["loss"]))
+    assert sorted(learner._training_step(**BATCH)) == ["loss"]
+    assert sorted(learner._inference_step(**BATCH)) == ["loss"]
+    with pytest.raises(TypeError):
+        learner._flow_optimizer(BATCH)
+
+
 def test_each_optimizer_moves_only_the_models_it_owns(tmp_path: Path) -> None:
     """Two segments, two variable lists: each optimizer applies its own rate to its own variables.
 
@@ -160,26 +179,30 @@ def test_accumulated_gradients_reach_the_optimizer_and_has_updated_detects_the_a
     """`gradient_accumulation_steps: 3` in the OPTIMIZER pattern is the window, and the learner detects it.
 
     Keras accumulates the gradients and gates the apply inside `optimizer.apply`, so the variables
-    may only move on every third step; the learner reads the optimizer's own private step counter
-    back after each step -- pinned here so a Keras upgrade that renames `_iterations` fails loudly --
-    and `has_updated` must answer False on the two buffering steps and True exactly when the step
-    that just ran landed the apply (`docs/adr/0018`).
+    may only move on every third step; the learner reads the optimizer's public `iterations` back
+    after each step -- pinned here against the applies that actually landed, so a Keras release
+    where the property counted something else (the raw call count, or a window ahead of the apply)
+    fails loudly -- and `has_updated` must answer False on the two buffering steps and True exactly
+    when the step that just ran landed the apply.
     """
     model = _models(tmp_path)[0]
     learner = _learner_type(tmp_path, name="accumulated", parameters={"DEFAULT": {"accumulate_gradients": 3}})(model)
+    optimizer = learner.optimizers["optimizer"]
     before = _values(model.trainable_variables)
 
-    assert learner.optimizers["optimizer"].gradient_accumulation_steps == 3
+    assert optimizer.gradient_accumulation_steps == 3
     for _ in range(2):
         learner.training_step(**BATCH)
         assert learner.has_updated is False
         assert _moved(before, _values(model.trainable_variables)) == 0.0
+        assert int(keras.ops.convert_to_numpy(optimizer.iterations)) == 0
 
     learner.training_step(**BATCH)
 
     assert learner.has_updated is True
     assert _moved(before, _values(model.trainable_variables)) > 0.0
     assert (learner.steps, learner.updates) == (3, 1)
+    assert int(keras.ops.convert_to_numpy(optimizer.iterations)) == 1
 
 
 def test_the_trainer_update_counter_counts_real_optimizer_applies(tmp_path: Path) -> None:
@@ -301,6 +324,43 @@ def test_float16_skip_steps_are_reported_truthfully_by_has_updated(tmp_path: Pat
     assert flags == moves
     assert learner.steps == 40
     assert learner.updates == sum(moves)
+
+
+def test_a_wrapped_optimizer_still_counts_on_its_accumulation_window(tmp_path: Path) -> None:
+    """Loss scaling and accumulation compose, and the clock stays the wrapped inner optimizer's.
+
+    `prepare` replaces the optimizer with a `LossScaleOptimizer`, so the counter the learner reads
+    has to be the wrapped one's: the wrapper's own call count would report an update on every step,
+    and the raw call count three times too many. The scale is small enough that nothing overflows,
+    which leaves the accumulation window as the only thing that can gate an update -- and the flags
+    are compared with the variables actually moving, the same agreement a loss-scale skip has to
+    keep.
+    """
+    policy = keras.mixed_precision.global_policy()
+    keras.mixed_precision.set_global_policy("mixed_float16")
+    try:
+        model = _models(tmp_path)[0]
+        raw = {**load_any(LEARNER_YAML), "MIXED_PRECISION": {"initial_scale": 128.0}, "MIXED_PRECISION_TYPE": "float16"}
+        KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))(
+            parameters={"DEFAULT": {"accumulate_gradients": 3}}
+        )(tmp_path / "scaled_window.py")
+        learner = _load(tmp_path / "scaled_window.py", "scaled_window_learner").Learner(model)
+
+        flags, moves, counts = [], [], []
+        for _ in range(6):
+            before = _values(model.trainable_variables)
+            learner.training_step(**BATCH)
+            flags.append(learner.has_updated)
+            moves.append(_moved(before, _values(model.trainable_variables)) > 0.0)
+            counts.append(learner.updates)
+    finally:
+        keras.mixed_precision.set_global_policy(policy)
+
+    assert isinstance(learner.optimizers["optimizer"], keras.optimizers.LossScaleOptimizer)
+    assert flags == [False, False, True, False, False, True]
+    assert flags == moves
+    assert counts == [0, 0, 1, 1, 1, 2]
+    assert learner.steps == 6
 
 
 def test_inference_step_reports_the_criteria_and_mutates_nothing(tmp_path: Path) -> None:

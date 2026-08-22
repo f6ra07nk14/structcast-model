@@ -1,5 +1,6 @@
 """API-level tests for keras builder classes."""
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -169,21 +170,24 @@ def _built(raw: dict[str, Any], path: Path = LEARNER_YAML) -> str:
 
 
 def test_keras_learner_emits_one_flow_method_per_segment() -> None:
-    """Each segment is one `keras.ops` function the adapter calls with the batch alone.
+    """Each segment is one `keras.ops` function the adapter calls with the batch entries by name.
 
-    Nothing in it may name a backend: the same method has to differentiate under `tf.GradientTape`,
-    under `jax.value_and_grad` and under torch autograd.
+    The batch parameters are keyword-only, so a caller that handed the entries over positionally --
+    the strategy replicating a step, a hand-written trainer -- fails instead of binding them in
+    declaration order; nothing unpacks a mapping any more. Nothing in a flow may name a backend
+    either: the same method has to differentiate under `tf.GradientTape`, under
+    `jax.value_and_grad` and under torch autograd.
     """
     script = _learner_script(SEGMENTS_YAML)
 
-    assert "def _flow_optimizer_ab(self, batch):" in script
-    assert "        x = batch['x']" in script
+    assert "def _flow_optimizer_ab(self, *, x, y):" in script
     assert "        out_a = self.a(x, training=True)" in script
     assert "        return loss_ab, {'loss_ab': loss_ab}" in script
-    assert "def _flow_optimizer_c(self, batch):" in script
+    assert "def _flow_optimizer_c(self, *, x, y):" in script
     assert "        return loss_c, {'loss_c': loss_c}" in script
-    assert "def _flow_inference(self, batch):" in script
+    assert "def _flow_inference(self, *, x, y):" in script
     assert "        out_c = self.c(x, training=False)" in script
+    assert "batch[" not in script
     for backend in ("import tensorflow", "import jax", "import torch", "keras.backend.backend()"):
         assert backend not in script
 
@@ -193,16 +197,17 @@ def test_keras_learner_prepares_the_segments_before_it_builds_the_steps() -> Non
 
     `prepare` builds every optimizer against its variables; TensorFlow and torch would happily build
     one inside the compiled step instead, so a learner that compiled first would only break on JAX.
-    The optimizers are read back off the segments afterwards for the same reason: `prepare` replaces
-    the optimizer of a segment it wraps for loss scaling.
+    The `optimizers` property reads through the segment for a related reason: `prepare` replaces the
+    optimizer of a segment it wraps for loss scaling, and a dictionary built before that would
+    report the optimizer that never applied anything.
     """
     script = _learner_script(LEARNER_YAML)
 
-    prepare = script.index("adapter.prepare(self._segments")
+    prepare = script.index("adapter.prepare([self._segment_optimizer]")
     assert script.index("adapter = select_backend_adapter()") < prepare
-    assert prepare < script.index("self._optimizers = {segment.name: segment.optimizer")
-    assert script.index("self._optimizers = {segment.name") < script.index("adapter.build_train_step(self._segments)")
+    assert prepare < script.index("adapter.build_train_step([self._segment_optimizer])")
     assert "self._inference_step = adapter.build_inference_step(self._flow_inference, models=[self.model])" in script
+    assert "return {'optimizer': self._segment_optimizer.optimizer}" in script
 
 
 def test_keras_learner_hands_each_segment_the_variables_of_the_models_it_owns() -> None:
@@ -237,47 +242,54 @@ def test_keras_learner_runs_a_model_another_segment_owns_in_inference_mode() -> 
 def test_keras_learner_counts_updates_from_the_optimizers_own_counter() -> None:
     """The window is the OPTIMIZER pattern's `gradient_accumulation_steps`, and the learner reads it back.
 
-    The generated `__init__` unwraps a possible `LossScaleOptimizer`, refuses optimizers that
-    disagree on the window, and captures the first inner optimizer's private step counter;
-    `training_step` counts itself on the host and reads that counter back after the step, so
-    `has_updated` is detection, not prediction -- under a float16 loss-scale skip the frozen
-    counter truthfully reports no update (`docs/adr/0018`).
+    The generated `__init__` refuses optimizers that disagree on the window, and the first segment
+    is the learner's clock: `training_step` counts itself on the host and reads that optimizer's
+    public `iterations` -- the count of completed windows, whatever the window is -- back after the
+    step, so `has_updated` is detection, not prediction. Under a float16 loss-scale skip the frozen
+    counter truthfully reports no update, and the read goes through the segment because `prepare`
+    may have wrapped the optimizer since.
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "optimizer = SGD(learning_rate=0.1, gradient_accumulation_steps=3)" in script
     assert (
-        'inners = [getattr(segment.optimizer, "inner_optimizer", segment.optimizer) '
-        "for segment in self._segments]" in script
+        'inners = [getattr(s.optimizer, "inner_optimizer", s.optimizer) for s in (self._segment_optimizer,)]' in script
     )
     assert "windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})" in script
     assert "if len(windows) > 1:" in script
     assert "raise ValueError" in script
-    assert "self._window = windows[0]" in script
-    assert "self._counter = inners[0]._iterations" in script
     assert "self._steps += 1" in script
-    # `convert_to_numpy`, not a bare `int()`: under `tf.distribute` the counter's value is a
-    # `MirroredVariable`, which `int()` refuses to read.
-    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in script
+    # One expression and no local of the template's own: every other name in a step's namespace is
+    # a batch input the user named, and `convert_to_numpy` rather than a bare `int()` because under
+    # `tf.distribute` the counter's value is a `MirroredVariable`, which `int()` refuses to read.
+    assert "current = int(keras.ops.convert_to_numpy(" in script
+    assert (
+        'getattr(self._segment_optimizer.optimizer, "inner_optimizer", self._segment_optimizer.optimizer).iterations'
+        in script
+    )
     assert "self._has_updated = current > self._last_updates" in script
     assert "def restore_counters(self, steps: int, updates: int) -> None:" in script
     assert "def update(" not in script
+    # The public property already divides the raw call count by the window, so neither the private
+    # counter nor a stored window is read any more.
+    assert "_iterations" not in script
+    assert "self._window" not in script
 
 
 def test_keras_learner_leaves_a_window_of_one_to_the_plain_optimizer() -> None:
     """An unset window emits no optimizer keyword, and the counter read stays the truth source.
 
     Keras refuses `gradient_accumulation_steps=1` outright, so nothing may be added to the pattern;
-    the window read falls back to one, and there is deliberately no short-circuit around the
-    post-step counter read: under a float16 loss-scale skip the counter freezes, and only the read
-    reports the skipped step truthfully (`docs/adr/0018`).
+    `iterations` is then the raw call count, and there is deliberately no short-circuit around the
+    post-step read: under a float16 loss-scale skip the counter freezes, and only the read reports
+    the skipped step truthfully.
     """
     script = _learner_script(LEARNER_YAML)
 
     assert "optimizer = SGD(learning_rate=0.1)" in script
     assert ".gradient_accumulation_steps = " not in script
-    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in script
-    assert "if self._window == 1" not in script
+    assert "current = int(keras.ops.convert_to_numpy(" in script
+    assert ".iterations" in script
 
 
 @pytest.mark.parametrize(
@@ -294,7 +306,7 @@ def test_keras_learner_forwards_the_mixed_precision_fields_to_the_adapter(mixed_
 
     script = _built(raw)
 
-    assert f"adapter.prepare(self._segments, {expected})" in script
+    assert f"adapter.prepare([self._segment_optimizer], {expected})" in script
 
 
 def test_keras_learner_never_sets_the_global_mixed_precision_policy() -> None:
@@ -315,35 +327,33 @@ def test_keras_learner_never_sets_the_global_mixed_precision_policy() -> None:
 @pytest.mark.parametrize(
     ("raw_fields", "expected"),
     [
-        ({}, "MIXED_PRECISION = False\nMIXED_PRECISION_TYPE = None"),
+        ({}, "    MIXED_PRECISION = False\n    MIXED_PRECISION_TYPE = None"),
         (
             {"MIXED_PRECISION": True, "MIXED_PRECISION_TYPE": "bfloat16"},
-            "MIXED_PRECISION = True\nMIXED_PRECISION_TYPE = 'bfloat16'",
+            "    MIXED_PRECISION = True\n    MIXED_PRECISION_TYPE = 'bfloat16'",
         ),
         (
             {"MIXED_PRECISION": {"initial_scale": 128.0}, "MIXED_PRECISION_TYPE": "float16"},
-            "MIXED_PRECISION = {'initial_scale': 128.0}\nMIXED_PRECISION_TYPE = 'float16'",
+            "    MIXED_PRECISION = {'initial_scale': 128.0}\n    MIXED_PRECISION_TYPE = 'float16'",
         ),
         (
             {"MIXED_PRECISION": {}, "MIXED_PRECISION_TYPE": "float16"},
-            "MIXED_PRECISION = {}\nMIXED_PRECISION_TYPE = 'float16'",
+            "    MIXED_PRECISION = {}\n    MIXED_PRECISION_TYPE = 'float16'",
         ),
     ],
     ids=["disabled", "enabled", "keyword-arguments", "empty-keyword-arguments"],
 )
-def test_keras_learner_declares_its_mixed_precision_next_to_the_class(
-    raw_fields: dict[str, Any], expected: str
-) -> None:
-    """The training CLI reads the policy off the module before it instantiates the class.
+def test_keras_learner_declares_its_mixed_precision_on_the_class(raw_fields: dict[str, Any], expected: str) -> None:
+    """The training CLI reads the policy off the class before it instantiates it.
 
     It cannot ask the learner: the policy has to be set before the models the learner is built over
-    exist, so it has to be readable from the imported module alone -- as the flax learner's
-    `OPTIMIZER_HASHES` is, whose naming these follow. An empty mapping is emitted as it was written,
-    because it enables the policy here as it does in the adapter: only `False` disables it.
+    exist, so it has to be readable from the class the CLI already holds. An empty mapping is
+    emitted as it was written, because it enables the policy here as it does in the adapter: only
+    `False` disables it.
     """
     script = _built({**load_any(LEARNER_YAML), **raw_fields})
 
-    assert script.startswith("#")
+    assert script.startswith("class Learner:")
     assert expected in script
 
 
@@ -461,6 +471,39 @@ def test_keras_learner_rejects_a_segment_that_reads_what_another_segment_compute
     with pytest.raises(SpecError, match='reads "out_a" before its own FLOW stores it'):
         # `scripts` is a cached property: binding it is what runs the emission being rejected here.
         _ = KerasLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+def test_keras_learner_module_holds_only_imports_and_the_class(tmp_path: Path) -> None:
+    """Every module-level name a template emits is a collision with whatever the configuration names.
+
+    A learner's layers, losses and metrics are the user's, and the builder imports them into this
+    same module scope, so a constant beside the class is one configuration away from being
+    overwritten -- silently, since the CLI would then read whatever landed there. The three
+    constants it reads live on the class instead, which is also what it holds before it instantiates
+    anything.
+    """
+    KerasLearnerBuilder.from_path(SEGMENTS_YAML)()(tmp_path / "learner.py")
+    module = ast.parse((tmp_path / "learner.py").read_text(encoding="utf-8"))
+
+    assert [type(node).__name__ for node in module.body if not isinstance(node, ast.Import | ast.ImportFrom)] == [
+        "ClassDef"
+    ]
+    learner = module.body[-1]
+    assert isinstance(learner, ast.ClassDef)
+    declared = {t.id for n in learner.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert declared == {"MIXED_PRECISION", "MIXED_PRECISION_TYPE", "OPTIMIZER_HASHES"}
+
+
+def test_keras_learner_cites_no_repository_document(tmp_path: Path) -> None:
+    """A generated file is read where it was written, without the repository that produced it.
+
+    Its comments therefore have to carry the constraint itself: a reader who cannot open the
+    document a citation names is left with a rule and no reason for it. The whole written file, not
+    just the learner class, since the layer scripts travel in it.
+    """
+    KerasLearnerBuilder.from_path(SEGMENTS_YAML)()(tmp_path / "learner.py")
+
+    assert "docs/adr" not in (tmp_path / "learner.py").read_text(encoding="utf-8")
 
 
 def test_keras_learner_imports_only_keras_and_the_adapter_helpers() -> None:

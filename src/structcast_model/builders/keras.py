@@ -210,8 +210,13 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     how the step is compiled -- lives in the backend adapter the generated learner selects once
     (`docs/adr/0016`), so the emitted script imports no framework beyond `keras` and branches on no
     backend. Each optimizer segment becomes one `_flow_<optimizer>` method written in `keras.ops`,
-    handed to the adapter as the `flow` of an `AdapterSegment`; the adapter turns them into the
-    compiled training step.
+    handed to the adapter as the `flow` of a `_segment_<optimizer>` attribute; the adapter turns
+    them into the compiled training step.
+
+    The emitted module holds imports and the class alone, and the class keeps no anonymous
+    collection: the constants are class attributes, every segment is a named attribute, the batch
+    travels as named parameters and the views are properties assembling literal dictionaries
+    (`docs/adr/0019`).
     """
 
     mixed_precision: bool | dict[str, Any]
@@ -270,6 +275,16 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             criteria[segment.optimizer] = names
         return criteria
 
+    @property
+    def _flow_parameters(self) -> str:
+        """The batch parameters of a flow method: one keyword-only parameter per input name.
+
+        Keyword-only because every caller of a flow -- the adapters, the distributed strategy --
+        passes the batch by name, and a positional batch would silently take the entries in
+        declaration order.
+        """
+        return f", *, {self._forward_inputs}" if self.inputs else ""
+
     def _flow_step(self, inputs: str, output: str, layer: str | None, *, training: bool) -> str:
         """Emit one flow step, running a model in the mode this flow needs it in.
 
@@ -290,8 +305,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         lines: list[str] = []
         for units, segment in self._segments:
             owned = segment.trainable_layers
-            body = [f"{name} = batch[{name!r}]" for name in self.inputs]
-            body += [self._flow_step(i, o, L, training=L in owned) for i, o, L in units]
+            body = [self._flow_step(i, o, L, training=L in owned) for i, o, L in units]
             bound = set(self.inputs)
             for line in body:
                 loads, stores = statement_names(line)
@@ -304,15 +318,14 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
                 bound |= stores
             criteria = ", ".join(f"{name!r}: {name}" for name in self._criteria[segment.optimizer])
             body.append(f"return {segment.loss}, {{{criteria}}}")
-            lines.append(f"def _flow_{segment.optimizer}(self, batch):")
+            lines.append(f"def _flow_{segment.optimizer}(self{self._flow_parameters}):")
             lines += [f"{indent}{line}" for line in body]
             lines.append("")
         return lines
 
     def _get_forward_inference_flow(self) -> list[str]:
         """Get the body of the `_flow_inference` method, which runs every model in inference mode."""
-        lines = [f"{name} = batch[{name!r}]" for name in self.inputs]
-        lines += [self._flow_step(i, o, L, training=False) for i, o, L in self.inference_flow]
+        lines = [self._flow_step(i, o, L, training=False) for i, o, L in self.inference_flow]
         return [*lines, f"return {self._forward_outputs}"]
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
@@ -320,13 +333,17 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         indent = " " * 4
         sep2 = "\n" + indent * 2
         sep3 = "\n" + indent * 3
-        sep4 = "\n" + indent * 4
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
-        batch = f"{{{', '.join(f'{name!r}: {name}' for name in self.inputs)}}}"
+        named = ", ".join(f"{name}={name}" for name in self.inputs)
         every_model = ", ".join(f"self.{name}" for name in self.models)
         flows = "\n".join(indent + line if line else "" for line in self._forward_training_flow)
-        segments: list[str] = []
+        attributes = [f"self._segment_{segment.optimizer}" for _, segment in self._segments]
+        listed = f"[{', '.join(attributes)}]"
+        tupled = f"({', '.join(attributes)},)"
+        body = [f"self.{name} = {name}" for name in self.models]
+        body += [f"self.{k} = {v}" for k, v in initialized_layers.items()]
+        body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
         for _, segment in self._segments:
             owned = ", ".join(f"self.{name}" for name in segment.trainable_layers)
             variables = (
@@ -341,24 +358,15 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
                 f"variables={variables},",
                 f"models=[{owned}],",
             ]
-            segments.append(f"AdapterSegment({sep4}{sep4.join(fields)}{sep3}),")
-        body = [f"self.{name} = {name}" for name in self.models]
-        body += [f"self.{k} = {v}" for k, v in initialized_layers.items()]
-        body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
-        body.append(f"self._models = {{{', '.join(f'{n!r}: self.{n}' for n in self.models)}}}")
-        body.append(f"self._segments = [{sep3}{sep3.join(segments)}{sep2}]")
+            body.append(f"self._segment_{segment.optimizer} = AdapterSegment({sep3}{sep3.join(fields)}{sep2})")
         body.append("adapter = select_backend_adapter()")
         body.append(
-            f"adapter.prepare(self._segments, mixed_precision={self.mixed_precision!r}, "
+            f"adapter.prepare({listed}, mixed_precision={self.mixed_precision!r}, "
             f"mixed_precision_type={self.mixed_precision_type!r})"
         )
-        # After `prepare`: it replaces the optimizer of a segment it wrapped for loss scaling.
-        body.append("self._optimizers = {segment.name: segment.optimizer for segment in self._segments}")
-        # After `prepare` for the same reason: under a float16 policy the accumulation window and
-        # the step counter are the wrapped inner optimizer's, and the wrapping is final by now.
-        body.append(
-            'inners = [getattr(segment.optimizer, "inner_optimizer", segment.optimizer) for segment in self._segments]'
-        )
+        # After `prepare`: under a float16 policy the accumulation window is the wrapped inner
+        # optimizer's, and the wrapping is final by now.
+        body.append(f'inners = [getattr(s.optimizer, "inner_optimizer", s.optimizer) for s in {tupled}]')
         # The counters answer for the whole learner, so the optimizers must agree on one window
         # (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
         body.append("windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})")
@@ -366,42 +374,39 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             f'if len(windows) > 1:{sep3}raise ValueError(f"One learner, one update window: the optimizers '
             'disagree on gradient_accumulation_steps {windows}.")'
         )
-        # The first inner optimizer's private `_iterations` is the learner's clock: the raw call
-        # count the post-step read needs, where the public `iterations` floor-divides the window
-        # away (`docs/adr/0017`). The captured variable stays live on every backend -- the jax
-        # adapter assigns the optimizer state back onto these same variables each step.
-        body.append("self._window = windows[0]")
-        body.append("self._counter = inners[0]._iterations")
         body.append("self._steps = 0")
         body.append("self._last_updates = 0")
         body.append("self._has_updated = False")
-        body.append("self._training_step = adapter.build_train_step(self._segments)")
+        body.append(f"self._training_step = adapter.build_train_step({listed})")
         body.append(
             f"self._inference_step = adapter.build_inference_step(self._flow_inference, models=[{every_model}])"
         )
         body.append(f"self.inputs = {self.inputs}")
         body.append(f"self.outputs = {self.outputs}")
+        # The first segment is the learner's clock, read through the segment because `prepare`
+        # replaced the optimizer of a segment it wrapped for loss scaling (`docs/adr/0019`). One
+        # expression, no local: every name in a step's namespace is a batch input the user named.
+        clock = (
+            f"int(keras.ops.convert_to_numpy({sep3}getattr({attributes[0]}.optimizer, "
+            f'"inner_optimizer", {attributes[0]}.optimizer).iterations{sep2}))'
+        )
+        models = ", ".join(f"{name!r}: self.{name}" for name in self.models)
+        optimizers = ", ".join(f"{s.optimizer!r}: self._segment_{s.optimizer}.optimizer" for _, s in self._segments)
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
         hashes = ", ".join(f"{s.optimizer!r}: {s.optimizer_hash!r}" for _, s in self._segments)
         return f"""\
-# Read by the training CLI after this module is imported and before the class below is
-# instantiated: the `keras.mixed_precision` global policy has to be in place before the models the
-# learner receives are built (`docs/adr/0016`).
-MIXED_PRECISION = {self.mixed_precision!r}
-MIXED_PRECISION_TYPE = {self.mixed_precision_type!r}
-# Read by the training CLI when a run resumes: the digest of each segment's OPTIMIZER pattern, so a
-# state saved under another optimizer is reported instead of silently continued (`docs/adr/0015`).
-OPTIMIZER_HASHES = {{{hashes}}}
-
-
 class {self.classname}:
     \"\"\"Learner generated from a Keras learner template.
 
     One learner drives every Keras backend: the flows below are written in `keras.ops` alone, and
     the backend adapter selected in `__init__` owns the gradients, the optimizer application and the
-    step compilation (`docs/adr/0016`). The steps are built once here, so `prepare` -- which builds
-    every optimizer against its variables and wraps it in a `keras.optimizers.LossScaleOptimizer`
-    under a float16 policy -- has run before the training step is compiled, as it must.
+    step compilation. The steps are built once here, so `prepare` -- which builds every optimizer
+    against its variables and wraps it in a `keras.optimizers.LossScaleOptimizer` under a float16
+    policy -- has run before the training step is compiled, as it must.
+
+    The batch travels by name: the flows and the steps below take one keyword argument per input, so
+    whoever rebinds a step -- the distributed strategy replicating it across devices, above all --
+    hands the batch on as keyword arguments too.
 
     The `keras.mixed_precision` global policy is deliberately not set here: it has to be in place
     before the models are built, which happens before this learner exists, so the training CLI sets
@@ -414,39 +419,49 @@ class {self.classname}:
     freeze at its first value on the JAX backend.
 
     Gradient accumulation is the optimizer's (`gradient_accumulation_steps` in the OPTIMIZER
-    pattern). The learner owns the training counters (`docs/adr/0018`): `steps` counts every
-    `training_step` call on the host, while `updates` and `has_updated` come from a post-step read
-    of the inner optimizer's own counter -- detection, not prediction, so a float16 loss-scale
-    skip, which freezes the counter, truthfully reports no update. `restore_counters` re-seeds
-    `steps` after a checkpoint restore and re-baselines the counter read.
+    pattern). The learner owns the training counters: `steps` counts every `training_step` call on
+    the host, while `updates` and `has_updated` come from a post-step read of the first segment's
+    optimizer counter -- detection, not prediction, so a float16 loss-scale skip, which freezes the
+    counter, truthfully reports no update. `restore_counters` re-seeds `steps` after a checkpoint
+    restore and re-baselines the counter read.
     \"\"\"
+
+    # Read by the training CLI off the class, after this module is imported and before the class is
+    # instantiated: the `keras.mixed_precision` global policy has to be in place before the models
+    # the learner receives are built.
+    MIXED_PRECISION = {self.mixed_precision!r}
+    MIXED_PRECISION_TYPE = {self.mixed_precision_type!r}
+    # Read by the training CLI when a run resumes: the digest of each segment's OPTIMIZER pattern,
+    # so a state saved under another optimizer is reported instead of silently continued.
+    OPTIMIZER_HASHES = {{{hashes}}}
 
     def __init__(self, {self._learner_models}, **kwargs):
         {sep2.join(body)}
 
 {flows}
-    def _flow_inference(self, batch):
+    def _flow_inference(self{self._flow_parameters}):
         {sep2.join(self._forward_inference_flow)}
 
     def training_step(self, {inputs}**kwargs):
         self._steps += 1
-        res = self._training_step({batch})
-        # A genuine post-step read: the adapter has assigned the optimizer variables back by now,
-        # so under a float16 loss-scale skip the frozen counter truthfully reports no update
-        # (`docs/adr/0018`). The tracker syncs the host every step anyway, so this costs nothing.
-        current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window
+        res = self._training_step({named})
+        # A genuine post-step read: the adapter has assigned the optimizer variables back by now, so
+        # under a float16 loss-scale skip the frozen counter truthfully reports no update. The
+        # public `iterations` already counts completed windows, accumulated or not. The tracker
+        # syncs the host every step anyway, so this costs nothing.
+        current = {clock}
         self._has_updated = current > self._last_updates
         self._last_updates = current
         return res
 
     def inference_step(self, {inputs}**kwargs):
-        return self._inference_step({batch})
+        return self._inference_step({named})
 
     def restore_counters(self, steps: int, updates: int) -> None:
         # `updates` is ignored on purpose: the restored optimizer variables already carry the
         # count, and re-reading it here keeps the two sources from ever disagreeing.
         self._steps = steps
-        self._last_updates = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window
+        self._last_updates = {clock}
 
     @property
     def steps(self):
@@ -462,11 +477,11 @@ class {self.classname}:
 
     @property
     def models(self):
-        return self._models
+        return {{{models}}}
 
     @property
     def optimizers(self):
-        return self._optimizers
+        return {{{optimizers}}}
 
     @property
     def optimizer_models(self):
@@ -478,7 +493,7 @@ class {self.classname}:
 
     @property
     def learning_rates(self):
-        return {{k: float(keras.ops.convert_to_numpy(v.learning_rate)) for k, v in self._optimizers.items()}}
+        return {{s.name: float(keras.ops.convert_to_numpy(s.optimizer.learning_rate)) for s in {tupled}}}
 """
 
 

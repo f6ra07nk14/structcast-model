@@ -30,6 +30,7 @@ from re import Pattern, compile as re_compile
 from typing import TYPE_CHECKING, Any, Literal
 
 import keras
+from structcast_model.keras.adapters import AdapterSegment
 from structcast_model.keras.utils import apply_state_dict, collect_state_dict, get_keras_device
 
 if TYPE_CHECKING:
@@ -326,10 +327,13 @@ class KerasDistributedStrategy:
             # the segment's flow being what the adapter differentiates, and dividing it by the
             # replica count turns the optimizer's SUM all-reduce into the mean of the per-replica
             # gradients. The criteria the flow reports beside it are untouched, and still reduced
-            # with `ReduceOp.MEAN` below. `_segments` is the generated learner's, as `prepare`
-            # already treats it: a hand-written learner has none and scales its own loss.
-            for segment in getattr(learner, "_segments", ()):
-                segment.flow = _mean_flow(segment.flow, self.replicas)
+            # with `ReduceOp.MEAN` below. What is scaled here is exactly what the generated shape
+            # exposes: one `AdapterSegment` per instance attribute (`docs/adr/0019`). Segments kept
+            # any other way -- inside a list, behind `__slots__`, built on the fly -- are invisible
+            # to this scan, so a learner holding them like that has to scale its own loss.
+            for segment in getattr(learner, "__dict__", {}).values():
+                if isinstance(segment, AdapterSegment):
+                    segment.flow = _mean_flow(segment.flow, self.replicas)
             flows = list(learner.flow_functions)
             if flows:
                 # The generated learner's public steps stay eager: `training_step` owns the host
@@ -440,24 +444,25 @@ class KerasDistributedStrategy:
         return state
 
     def _replicated_flow(self, flow: Any) -> Any:
-        """Wrap one inner flow step -- taking the batch mapping -- across the TensorFlow replicas.
+        """Wrap one inner flow step -- taking the batch by name -- across the TensorFlow replicas.
 
         `MirroredStrategy`'s answer to what :meth:`_replicated` does on the other two backends, one
         level further in: the learner's public steps keep their host-side counter bookkeeping
         outside the graph, so the replication wraps the flow attribute the public step calls
-        through.
+        through. The batch stays keyword arguments the whole way down, which is what the step
+        expects (`docs/adr/0019`).
         """
 
         @tf.function
-        def replicated(batch: Mapping[str, Any]) -> dict[str, Any]:
-            criteria = self._mirrored.run(flow, args=(batch,))
+        def replicated(**batch: Any) -> dict[str, Any]:
+            criteria = self._mirrored.run(flow, kwargs=batch)
             return {
                 name: self._mirrored.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
                 for name, value in criteria.items()
             }
 
-        def flow_step(batch: Mapping[str, Any]) -> dict[str, Any]:
-            return dict(replicated(self.shard_batch(batch)))
+        def flow_step(**batch: Any) -> dict[str, Any]:
+            return dict(replicated(**self.shard_batch(batch)))
 
         return flow_step
 
@@ -584,8 +589,8 @@ class KerasDistributedStrategy:
 def _mean_flow(flow: Any, replicas: int) -> Any:
     """Return *flow* with the loss it hands the tape divided by *replicas*, its criteria untouched."""
 
-    def mean(batch: Mapping[str, Any]) -> tuple[Any, dict[str, Any]]:
-        loss, criteria = flow(batch)
+    def mean(**batch: Any) -> tuple[Any, dict[str, Any]]:
+        loss, criteria = flow(**batch)
         return loss / replicas, criteria
 
     return mean

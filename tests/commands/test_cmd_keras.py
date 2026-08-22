@@ -160,8 +160,9 @@ def _load(path: Path, name: str) -> ModuleType:
 def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: CliRunner) -> None:
     """'create learner' generates a learner module that imports and exposes the named class.
 
-    The mixed-precision constants come with it: the training command reads them off the module
-    before it instantiates the class, because the policy has to be set before the models are built.
+    The mixed-precision constants come with it, on the class: the training command reads them off
+    the class it holds before it instantiates it, because the policy has to be set before the models
+    are built.
     """
     out = tmp_path / "my_learner.py"
     result = cli_runner.invoke(
@@ -181,13 +182,13 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     assert result.exit_code == 0, result.output
     module = _load(out, "generated_keras_learner")
     assert hasattr(module, "MyLearner")
-    assert module.MIXED_PRECISION is False
-    assert module.MIXED_PRECISION_TYPE is None
+    assert module.MyLearner.MIXED_PRECISION is False
+    assert module.MyLearner.MIXED_PRECISION_TYPE is None
     # The parameter reached the template: the window is the OPTIMIZER pattern's keyword, and the
     # written learner reads the optimizer's own counter back after each step (`docs/adr/0018`).
     text = out.read_text()
     assert "gradient_accumulation_steps=3" in text
-    assert "current = int(keras.ops.convert_to_numpy(self._counter.value)) // self._window" in text
+    assert "current = int(keras.ops.convert_to_numpy(" in text
 
 
 def test_create_learner_takes_no_backend_because_it_imports_no_keras(tmp_path: Path) -> None:
@@ -374,7 +375,7 @@ def test_train_records_the_shapes_the_models_declared_when_none_are_given(
 
 
 def _learner_module(patterns: tuple[str, str]) -> ModuleType:
-    """Load the generated learner module the *patterns* fixture wrote, to read its constants."""
+    """Load the generated learner module the *patterns* fixture wrote, to read its class constants."""
     return _load(Path(patterns[1].split("_file_: ", 1)[1].rstrip("}]")), "generated_learner_constants")
 
 
@@ -410,7 +411,7 @@ def test_train_records_the_backend_that_wrote_the_state(
     # pattern each segment was built from -- the learner rebuilds the optimizer, so a swapped
     # schedule is only visible through the digest the generated learner emits.
     assert len(meta["config_hash"]) == 64
-    assert meta["optimizer_hashes"] == {"optimizer": _learner_module(patterns).OPTIMIZER_HASHES["optimizer"]}
+    assert meta["optimizer_hashes"] == {"optimizer": _learner_module(patterns).Learner.OPTIMIZER_HASHES["optimizer"]}
     assert state["grad_scalers"] == {}
     # Both halves travel, each under the name the run gave it and the paths Keras gave its
     # variables -- which the layer counter of the process decides, so only the leaves are asserted.

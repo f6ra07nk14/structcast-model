@@ -39,15 +39,20 @@ else:
     tf = LazyModuleImporter("tensorflow")
     torch = LazyModuleImporter("torch")
 
-Flow = Callable[[Mapping[str, Any]], tuple[Any, dict[str, Any]]]
-"""A training flow: it takes the batch and returns the loss to differentiate and the criteria.
+Flow = Callable[..., tuple[Any, dict[str, Any]]]
+"""A training flow: it returns the loss to differentiate and the criteria.
+
+The batch reaches it as keyword arguments, one per input name (`docs/adr/0019`), which is also how
+the steps built here take it: a positional batch mapping would bind the entries by declaration
+order instead. `Callable[..., ...]` because the names are the learner's, so no signature can spell
+them.
 
 The flow closes over its models and is written in `keras.ops`, so the same closure runs on every
 backend; the adapter decides how the loss is differentiated and how the update is applied.
 """
 
-InferenceFlow = Callable[[Mapping[str, Any]], dict[str, Any]]
-"""An inference flow: it takes the batch and returns the criteria, differentiating nothing."""
+InferenceFlow = Callable[..., dict[str, Any]]
+"""An inference flow: it takes the batch by name and returns the criteria, differentiating nothing."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -103,7 +108,7 @@ class BackendAdapter(Protocol):
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Compile the training step running every segment: its flow, its gradients, its update.
 
-        The returned step takes the batch and returns the merged criteria of every segment. A
+        The returned step takes the batch by name and returns the merged criteria of every segment. A
         single-process adapter reduces nothing: `docs/adr/0016` obliges whoever runs a distributed
         cell to reduce the criteria across replicas before they reach the tracker, since the Keras
         tracker -- unlike its torch twin -- never all-reduces, and a strategy that skips this must
@@ -177,11 +182,11 @@ class TensorFlowAdapter(_Adapter):
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Trace one `tf.function` running every segment's tape, gradients and update."""
 
-        def step(batch: Mapping[str, Any]) -> dict[str, Any]:
+        def step(**batch: Any) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
             for segment in segments:
                 with tf.GradientTape() as tape:
-                    loss, values = segment.flow(batch)
+                    loss, values = segment.flow(**batch)
                     # Outside `fit()` nobody scales the loss for us. `scale_loss` returns the loss
                     # untouched on an optimizer without a loss scale, so no branch is needed.
                     scaled = segment.optimizer.scale_loss(loss)
@@ -239,7 +244,7 @@ class JaxAdapter(_Adapter):
             ) -> tuple[Any, tuple[dict[str, Any], list[Any]]]:
                 trainables = [*trainables[:index], own, *trainables[index + 1 :]]
                 with keras.StatelessScope(state_mapping=mapping(trainables, states, optimizers)) as scope:
-                    loss, values = segment.flow(batch)
+                    loss, values = segment.flow(**batch)
                     scaled = segment.optimizer.scale_loss(loss)
                 # `mapping` seeds the scope with every state variable, so each one has a current
                 # value: the one the flow wrote, or the one threaded in.
@@ -267,7 +272,10 @@ class JaxAdapter(_Adapter):
 
         jitted = jax.jit(step)
 
-        def train_step(batch: Mapping[str, Any]) -> dict[str, Any]:
+        # The batch is gathered back into one mapping for the jitted call: the state lists are the
+        # positional arguments the trace is built around, and a batch spread over keywords there
+        # would move with every learner's input names.
+        def train_step(**batch: Any) -> dict[str, Any]:
             criteria, trainables, states, optimizers = jitted(
                 [[variable.value for variable in segment.variables] for segment in segments],
                 [variable.value for variable in state_variables],
@@ -300,11 +308,11 @@ class JaxAdapter(_Adapter):
 
         def inference(values: list[Any], batch: Mapping[str, Any]) -> dict[str, Any]:
             with keras.StatelessScope(state_mapping=list(zip(variables, values, strict=True))):
-                return flow(batch)
+                return flow(**batch)
 
         jitted = jax.jit(inference)
 
-        def inference_step(batch: Mapping[str, Any]) -> dict[str, Any]:
+        def inference_step(**batch: Any) -> dict[str, Any]:
             return jitted([variable.value for variable in variables], batch)
 
         return inference_step
@@ -324,7 +332,7 @@ class TorchAdapter(_Adapter):
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
         """Build the step reading each segment's gradients off its own variables."""
 
-        def step(batch: Mapping[str, Any]) -> dict[str, Any]:
+        def step(**batch: Any) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
             for segment in segments:
                 # Autograd accumulates into `.grad`, so a step that did not clear it would apply
@@ -332,7 +340,7 @@ class TorchAdapter(_Adapter):
                 # left behind on a shared variable.
                 for variable in segment.variables:
                     variable.value.grad = None
-                loss, values = segment.flow(batch)
+                loss, values = segment.flow(**batch)
                 segment.optimizer.scale_loss(loss).backward()
                 gradients = [variable.value.grad for variable in segment.variables]
                 with torch.no_grad():
