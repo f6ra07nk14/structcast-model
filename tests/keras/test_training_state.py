@@ -55,20 +55,25 @@ def make_learner(tmp_path_factory: pytest.TempPathFactory) -> Callable[..., Any]
     directory = tmp_path_factory.mktemp("generated")
     KerasBuilder.from_path(CFG_DIR / "Linear.yaml")()(directory / "model.py")
     KerasLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")()(directory / "learner.py")
+    KerasLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(parameters={"DEFAULT": {"accumulate_gradients": 2}})(
+        directory / "windowed.py"
+    )
     model_type = _load(directory / "model.py", "generated_model").Model
     learner_type = _load(directory / "learner.py", "generated_learner").Learner
+    windowed_type = _load(directory / "windowed.py", "generated_windowed").Learner
 
-    def _build(seed: int = 0) -> Any:
+    def _build(seed: int = 0, window: bool = False) -> Any:
         """Build a learner over a model initialized from *seed*, as the training CLI builds it.
 
         The session is cleared first because a Keras state is keyed by `variable.path`, and a path
         carries the layer counter of the *process*: a second model built in the same one is named
         `model_1/dense_1/...` and would not line up with a state saved from the first. A resumed run
-        is a fresh process, where the counter starts over -- which is what this reproduces.
+        is a fresh process, where the counter starts over -- which is what this reproduces. With
+        *window*, the optimizer accumulates gradients over two steps.
         """
         keras.backend.clear_session()
         keras.utils.set_random_seed(seed)
-        return learner_type(model=initial_model(model_type(), {"x": (4,)}))
+        return (windowed_type if window else learner_type)(model=initial_model(model_type(), {"x": (4,)}))
 
     return _build
 
@@ -183,11 +188,12 @@ def _restore(learner: Any, state: dict[str, Any], **kwargs: Any) -> int:
 
 
 def test_restoring_continues_the_run_the_saved_state_left_off(make_learner: Callable[..., Any]) -> None:
-    """A resumed run must continue the old one: same weights, same optimizer counter, next epoch.
+    """A resumed run must continue the old one: same weights, same counters, next epoch.
 
-    The counter matters as much as the weights: it is what the optimizer's schedule and its
-    accumulation window are indexed by, so a run that restored the weights alone would take its
-    next step as if it were the first.
+    The counters matter as much as the weights: they are what the optimizer's schedule, its
+    accumulation window and every `on_update` consumer are indexed by, so a run that restored the
+    weights alone would take its next step as if it were the first -- the saved-but-never-restored
+    hole `docs/adr/0018` closes.
     """
     recorder = _RecordingLogger()
     trained = make_learner()
@@ -204,6 +210,38 @@ def test_restoring_continues_the_run_the_saved_state_left_off(make_learner: Call
     for restored, original in zip(resumed.models["model"].variables, trained.models["model"].variables, strict=True):
         assert np.array_equal(keras.ops.convert_to_numpy(restored.value), keras.ops.convert_to_numpy(original.value))
     assert int(keras.ops.convert_to_numpy(resumed.optimizers["optimizer"].iterations)) == 2
+    # The trainer views delegate to the learner, so the counts the meta carried continue too.
+    resumed_trainer = _trainer(resumed, [])
+    assert (resumed_trainer.step, resumed_trainer.update) == (2, 2)
+
+
+def test_restoring_rebaselines_the_update_detection_of_a_windowed_learner(
+    make_learner: Callable[..., Any],
+) -> None:
+    """The first post-resume step of a mid-window run must not misfire `has_updated`.
+
+    The `updates` count self-restores through the optimizer counter the state round-trips, so the
+    resume path seeds `steps` and re-baselines the cached last read instead (`docs/adr/0018`). A
+    skipped re-baseline would leave the fresh baseline at zero, and the first delta against the
+    restored count would report an update no step landed.
+    """
+    recorder = _RecordingLogger()
+    trained = make_learner(window=True)
+    _trainer(trained, [KerasTrainingStateSaver(logger=recorder, strategy=KerasDistributedStrategy())]).fit(epochs=2)
+    saved, _ = recorder.states[-1]
+    assert (saved["meta"]["step"], saved["meta"]["update"]) == (2, 1)
+
+    resumed = make_learner(seed=7, window=True)
+    _restore(resumed, saved)
+
+    assert (resumed.steps, resumed.updates) == (2, 1)
+    resumed.training_step(x=X, y=Y)
+    # Step 3 buffers: the restored window of two closes on step 4, not on a restarted clock.
+    assert resumed.has_updated is False
+    assert (resumed.steps, resumed.updates) == (3, 1)
+    resumed.training_step(x=X, y=Y)
+    assert resumed.has_updated is True
+    assert (resumed.steps, resumed.updates) == (4, 2)
 
 
 def test_the_saved_epoch_overrides_start_epoch_and_says_so(

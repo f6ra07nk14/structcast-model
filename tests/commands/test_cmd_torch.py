@@ -7,6 +7,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import pathlib
@@ -23,9 +24,11 @@ from typer import Typer
 from typer.testing import CliRunner
 
 from structcast_model.base_trainer import BaseInfo
+from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
 from structcast_model.commands.cmd_torch import app
 from structcast_model.commands.utils import get_module_outputs as _get_module_outputs, instantiate_object
-from structcast_model.torch.trainer import TorchTrainer
+from structcast_model.torch.distributed import SingleDeviceStrategy
+from structcast_model.torch.trainer import TorchTrainer, initial_model
 from tests import CFG_DIR, FIXTURES_DIR
 import torch
 import torch.distributed as dist
@@ -807,7 +810,12 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
 
 
 def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
-    """--resume must continue at the epoch after the saved one instead of training the run again."""
+    """--resume must continue at the epoch after the saved one, with the loop counters seeded.
+
+    The step and update counts were saved into the meta but never restored -- the pre-existing hole
+    `docs/adr/0018` closes -- so the resumed run's own saved state must count on from the first
+    run's six steps instead of restarting at zero.
+    """
     _invoke_train(tmp_path, epochs=2)
     (state,) = (tmp_path / "mlruns").rglob("training_state.pt")
     _invoke_train(tmp_path, epochs=3, resume=str(state))
@@ -816,6 +824,76 @@ def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> No
     resumed = max(runs, key=lambda run: run.info.start_time)
     history = MlflowClient().get_metric_history(resumed.info.run_id, "val_loss")
     assert [metric.step for metric in history] == [3]
+    resumed_state = next(
+        path for path in (tmp_path / "mlruns").rglob("training_state.pt") if resumed.info.run_id in str(path)
+    )
+    # 2 epochs of 3 batches ran before the save; the resumed epoch adds 3 more on top of them.
+    meta = torch.load(resumed_state, map_location="cpu", weights_only=True)["meta"]
+    assert (meta["epoch"], meta["step"], meta["update"]) == (3, 9, 9)
+
+
+def _load_generated(path: pathlib.Path, name: str) -> Any:
+    """Load a generated module by file path, the way a configuration does: not by import name."""
+    spec = spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_restore_training_state_seeds_the_counters_of_a_generated_learner(tmp_path: pathlib.Path) -> None:
+    """Resuming must seed the generated learner's counters so the accumulation cadence continues.
+
+    With `ACCUMULATE_GRADIENTS: 3` the gate lands the updates on steps 2, 5, 8, ...: after four
+    steps the counts read (4, 1) and the next window closes on step 5. A resume that restored the
+    weights but left the counters at zero would read (0, 0) and hold the next apply back for two
+    extra steps -- the saved-but-never-restored hole `docs/adr/0018` closes.
+    """
+    _restore_training_state = _CMD_GLOBALS["_restore_training_state"]
+    generated = tmp_path / "generated"
+    TorchBuilder.from_path(LINEAR_CFG)()(generated / "model.py")
+    TorchLearnerBuilder.from_path(str(FIXTURES_DIR / "cfg" / "torch" / "LinearLearner.yaml"))(
+        parameters={"DEFAULT": {"accumulate_gradients": 3}}
+    )(generated / "learner.py")
+    model_type = _load_generated(generated / "model.py", "generated_model").Model
+    learner_type = _load_generated(generated / "learner.py", "generated_learner").Learner
+
+    def _build(seed: int) -> Any:
+        """Build a learner over a seeded model, materializing the lazy layer before the optimizer scans it."""
+        torch.manual_seed(seed)
+        model = model_type()
+        initial_model(model, {"x": (4,)})
+        return learner_type(model)
+
+    batch = {
+        "x": torch.tensor([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0]]),
+        "y": torch.tensor([[1.0, -1.0], [0.5, 0.25]]),
+    }
+    strategy = SingleDeviceStrategy(device="cpu")
+    trained = _build(0)
+    for _ in range(4):
+        trained.training_step(**batch)
+    assert (trained.steps, trained.updates) == (4, 1)
+    states = strategy.state_dict(dict(trained.models), trained.optimizers, trained.optimizer_models)
+    states["grad_scalers"] = {}
+    states["meta"] = {"epoch": 1, "step": trained.steps, "update": trained.updates}
+
+    resumed = _build(7)
+    epoch = _restore_training_state(
+        resume="whatever",
+        strategy=strategy,
+        models=OrderedDict(resumed.models),
+        learner=resumed,
+        start_epoch=1,
+        is_main=True,
+        logger=SimpleNamespace(fetch_training_state=lambda reference: states),
+    )
+
+    assert epoch == 2
+    assert (resumed.steps, resumed.updates) == (4, 1)
+    resumed.training_step(**batch)
+    assert (resumed.steps, resumed.updates, resumed.has_updated) == (5, 2, True)
 
 
 def test_train_ci_mode_with_learner_outputs_fallback(tmp_path: pathlib.Path) -> None:

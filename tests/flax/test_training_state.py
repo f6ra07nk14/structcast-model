@@ -74,12 +74,16 @@ def make_learner(tmp_path_factory: pytest.TempPathFactory) -> Callable[..., Any]
     directory = tmp_path_factory.mktemp("generated")
     FlaxBuilder.from_path(CFG_DIR / "Linear.yaml")()(directory / "model.py")
     FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")()(directory / "learner.py")
+    FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(parameters={"DEFAULT": {"accumulate_gradients": 2}})(
+        directory / "windowed.py"
+    )
     model_type = _load(directory / "model.py", "generated_model").Model
     learner_type = _load(directory / "learner.py", "generated_learner").Learner
+    windowed_type = _load(directory / "windowed.py", "generated_windowed").Learner
 
-    def _build(seed: int = 0) -> Any:
-        """Build a learner over a model initialized from *seed*."""
-        return learner_type(model_type(rngs=nnx.Rngs(seed)))
+    def _build(seed: int = 0, window: bool = False) -> Any:
+        """Build a learner over a model initialized from *seed*; with *window*, a `MultiSteps` of two."""
+        return (windowed_type if window else learner_type)(model_type(rngs=nnx.Rngs(seed)))
 
     return _build
 
@@ -180,7 +184,12 @@ def test_the_best_criterion_saves_the_models_alone(
 def test_restoring_continues_the_run_the_saved_state_left_off(
     make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
 ) -> None:
-    """A resumed run must continue the old one: same weights, same optimizer step, next epoch."""
+    """A resumed run must continue the old one: same weights, same counters, next epoch.
+
+    The counters matter as much as the weights: they are what every `on_update` consumer and save
+    gate is indexed by, so a resume that restored the weights alone would count its next step as
+    the first -- the saved-but-never-restored hole `docs/adr/0018` closes.
+    """
     recorder = _RecordingLogger()
     trained = make_learner()
     _trainer(trained, [FlaxTrainingStateSaver(logger=recorder, strategy=strategy)]).fit(epochs=2)
@@ -199,6 +208,46 @@ def test_restoring_continues_the_run_the_saved_state_left_off(
     assert epoch == 3
     assert jnp.array_equal(resumed.models["model"].fc.kernel[...], trained.models["model"].fc.kernel[...])
     assert nnx.state(resumed.optimizers["optimizer"]).step[...] == nnx.state(trained.optimizers["optimizer"]).step[...]
+    # The trainer views delegate to the learner, so the counts the meta carried continue too.
+    resumed_trainer = _trainer(resumed, [])
+    assert (resumed_trainer.step, resumed_trainer.update) == (2, 2)
+
+
+def test_restoring_rebaselines_the_update_detection_of_a_windowed_learner(
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
+) -> None:
+    """The first post-resume step of a mid-window run must not misfire `has_updated`.
+
+    The `updates` count self-restores through the `MultiStepsState.gradient_step` the state
+    round-trips, so the resume path seeds `steps` and re-baselines the cached last read instead
+    (`docs/adr/0018`). A skipped re-baseline would leave the fresh baseline at zero, and the first
+    delta against the restored count would report an update no step landed.
+    """
+    recorder = _RecordingLogger()
+    trained = make_learner(window=True)
+    _trainer(trained, [FlaxTrainingStateSaver(logger=recorder, strategy=strategy)]).fit(epochs=2)
+    saved, _ = recorder.states[-1]
+    assert saved["meta"] == {"epoch": 2, "step": 2, "update": 1}
+
+    resumed = make_learner(seed=7, window=True)
+    epoch = restore_training_state(
+        resume="whatever",
+        strategy=strategy,
+        models=resumed.models,
+        learner=resumed,
+        start_epoch=1,
+        logger=_StateLogger(saved),
+    )
+
+    assert epoch == 3
+    assert (resumed.steps, resumed.updates) == (2, 1)
+    resumed.training_step(x=X, y=Y)
+    # Step 3 buffers: the restored window of two closes on step 4, not on a restarted clock.
+    assert resumed.has_updated is False
+    assert (resumed.steps, resumed.updates) == (3, 1)
+    resumed.training_step(x=X, y=Y)
+    assert resumed.has_updated is True
+    assert (resumed.steps, resumed.updates) == (4, 2)
 
 
 def test_the_saved_epoch_overrides_start_epoch_and_says_so(

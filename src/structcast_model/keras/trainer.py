@@ -324,6 +324,9 @@ def restore_training_state(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
             "are restored into whatever the current one built, wherever the two still line up."
         )
+    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
+    # continue where the saved run left off (docs/adr/0018).
+    learner.restore_counters(int(meta["step"]), int(meta["update"]))
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:
         _logger.info("Ignoring --start-epoch %s: the resumed state continues at epoch %s.", start_epoch, resumed_epoch)

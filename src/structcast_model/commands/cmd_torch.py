@@ -323,6 +323,9 @@ def _restore_training_state(
     for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
         if state.get("grad_scalers", {}).get(scaler_name):
             scaler.load_state_dict(state["grad_scalers"][scaler_name])
+    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
+    # continue where the saved run left off (docs/adr/0018).
+    learner.restore_counters(int(state["meta"]["step"]), int(state["meta"]["update"]))
     resumed_epoch = state["meta"]["epoch"] + 1
     if start_epoch != 1 and is_main:
         print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
