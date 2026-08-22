@@ -179,23 +179,19 @@ class BaseInfo(Generic[ModelT]):
 
     @property
     def step(self) -> int:
-        """The number of completed training Steps, read from the learner (docs/adr/0018).
+        """The number of completed training Steps; a bare info counts none, a trainer reads its learner's.
 
-        Read-only: the learner owns the counters. An info without a ``learner`` attribute (a bare
-        ``BaseInfo`` outside a trainer) reads 0.
+        Read-only: the learner owns the counters (docs/adr/0018).
         """
-        learner: Learner[ModelT] | None = getattr(self, "learner", None)
-        return 0 if learner is None else learner.steps
+        return 0
 
     @property
     def update(self) -> int:
-        """The number of completed Updates, read from the learner (docs/adr/0018).
+        """The number of completed Updates; a bare info counts none, a trainer reads its learner's.
 
-        Read-only: the learner owns the counters. An info without a ``learner`` attribute (a bare
-        ``BaseInfo`` outside a trainer) reads 0.
+        Read-only: the learner owns the counters (docs/adr/0018).
         """
-        learner: Learner[ModelT] | None = getattr(self, "learner", None)
-        return 0 if learner is None else learner.updates
+        return 0
 
     @property
     def models(self) -> dict[str, ModelT]:
@@ -367,6 +363,16 @@ class BaseTrainer(BaseInfo[ModelT]):
         """Extension hook kept for subclasses; the participant scan runs lazily via ``_scan``."""
 
     @property
+    def step(self) -> int:
+        """The learner's count of completed training Steps, read on every access (docs/adr/0018)."""
+        return self.learner.steps
+
+    @property
+    def update(self) -> int:
+        """The learner's count of completed Updates, read on every access (docs/adr/0018)."""
+        return self.learner.updates
+
+    @property
     def models(self) -> dict[str, ModelT]:
         """The learner's models, read on every access rather than snapshotted."""
         return self.learner.models
@@ -435,21 +441,19 @@ class BaseTrainer(BaseInfo[ModelT]):
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
 
-    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
+    def update_models(self, __inputs__: Any) -> dict[str, Any]:
         """Perform a training step and update the models.
 
-        The update flag is a post-step read of the learner's ``has_updated``: the learner owns the
-        training counters (docs/adr/0018).
+        Whether the step landed an update is not returned here: the learner owns the training
+        counters, so the loop reads ``learner.has_updated`` after this call (docs/adr/0018).
 
         Args:
             __inputs__ (Any): The inputs for the training step.
 
         Returns:
-            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
-                a dictionary of criteria for tracking.
+            dict[str, Any]: The criteria for tracking.
         """
-        res = self.learner.training_step(**__inputs__)
-        return self.learner.has_updated, res
+        return self.learner.training_step(**__inputs__)
 
     def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
         """Train the model on the given dataset.
@@ -466,7 +470,8 @@ class BaseTrainer(BaseInfo[ModelT]):
         for index, inputs in enumerate(get_dataset(dataset), start=1):
             self._dispatch("on_training_step_begin")
             elapsed_time -= time()
-            updated, criteria = self.update_models(inputs)
+            criteria = self.update_models(inputs)
+            updated = self.learner.has_updated
             logs = self.tracker(**criteria)
             self.sync()
             elapsed_time += time()

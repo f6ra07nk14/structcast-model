@@ -8,8 +8,8 @@ framework-agnostic training loop specialized for PyTorch, Keras, and Flax.
 ### Training loop
 
 **Learner**:
-The object that owns the models being trained and defines how they learn: when an update should happen, how a
-training step runs, and how an inference step runs.
+The object that owns the models being trained and the training counters: how a training step runs, how an
+inference step runs, and whether the just-finished step landed an Update.
 _Avoid_: Backward, backward class, backward pass configuration
 
 **Pairing**:

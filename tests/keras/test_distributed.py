@@ -319,11 +319,15 @@ x = np.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.
 y = np.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]], "float32")
 kernel = np.asarray(keras.ops.convert_to_numpy(model.variables[0].value))
 bias = np.asarray(keras.ops.convert_to_numpy(model.variables[1].value))
-losses = [float(keras.ops.convert_to_numpy(learner.training_step(x=x, y=y)["loss"])) for _ in range(3)]
+losses, counters = [], []
+for _ in range(3):
+    losses.append(float(keras.ops.convert_to_numpy(learner.training_step(x=x, y=y)["loss"])))
+    counters.append([learner.steps, learner.updates, learner.has_updated])
 print(json.dumps({
     "replicas": strategy.replicas,
     "mirrored": type(model.variables[0].value).__name__,
     "losses": losses,
+    "counters": counters,
     # The whole batch's error, computed off the initial weights without TensorFlow: the value the
     # first step has to report if the two replicas' criteria were reduced rather than picked from.
     "expected": float(np.mean((x @ kernel + bias - y) ** 2)),
@@ -354,6 +358,9 @@ def test_the_tensorflow_dp_preset_trains_under_mirrored_strategy(
     JAX presets are: `dp` means the mean of the per-replica gradients on every backend, and the
     Keras TensorFlow optimizer all-reduces them with `ReduceOp.SUM` -- so without the strategy's
     scaling this run would take steps twice the size and diverge from the reference by the second.
+
+    The counters are asserted beside them because the replicated wrapper must leave the learner's
+    host bookkeeping eager (`docs/adr/0018`): it wraps the inner flow, not the public step.
     """
     result = _run(TENSORFLOW_SCRIPT, tmp_path, str(generated), "dp", backend="tensorflow")
 
@@ -362,6 +369,8 @@ def test_the_tensorflow_dp_preset_trains_under_mirrored_strategy(
     assert result["losses"][0] == pytest.approx(result["expected"], rel=1e-5)
     assert result["losses"][1] < result["losses"][0]
     assert result["inference"] < result["losses"][0]
+    # No accumulation window here, so every step lands an update: [steps, updates, has_updated].
+    assert result["counters"] == [[1, 1, True], [2, 2, True], [3, 3, True]]
     assert result["losses"] == pytest.approx(tensorflow_reference["losses"], rel=1e-5)
     assert np.allclose(result["kernel"], tensorflow_reference["kernel"], rtol=1e-5)
 
