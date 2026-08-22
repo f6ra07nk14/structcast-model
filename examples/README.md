@@ -38,9 +38,12 @@ The keys of each dictionary become the keyword arguments of the learner's steps:
 protocol — nothing is subclassed, nothing is registered:
 
 - **`models`** — the models by name. Every callback reads them from `info.models`.
-- **`update(step)`** — whether this step applied the optimizers. Returning `True` on every step means
-  "one step, one update"; a learner accumulating gradients over N batches returns `True` only every
-  N-th step, and the trainer fires `on_update` that often.
+- **`steps` / `updates` / `has_updated`** — the training counters the learner owns
+  (`docs/adr/0018`): completed steps, completed optimizer applies, and whether the step that just
+  ran applied the optimizers. Here all three advance together — one step, one update; a learner
+  accumulating gradients over N batches reports `has_updated` only after every N-th step, and the
+  trainer fires `on_update` that often. `restore_counters(steps, updates)` seeds them when a run
+  resumes from a checkpoint.
 - **`training_step(**inputs)`** — forward, backward, optimizer step. Returns the criteria of the step.
 - **`inference_step(**inputs)`** — the validation counterpart, returning the same criteria.
 

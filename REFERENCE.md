@@ -292,16 +292,16 @@ MIXED_PRECISION:
 MIXED_PRECISION_TYPE: bfloat16
 ```
 
-**`ACCUMULATE_GRADIENTS`** *(torch only, `TorchUserDefinedLearner`)* — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, each loss is divided by `n` before `backward()`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches, and the generated `update(step)` returns `True` only on those steps — which is what makes the trainer fire `on_update` once per update rather than once per step.
+**`ACCUMULATE_GRADIENTS`** *(torch only, `TorchUserDefinedLearner`)* — The number of forward–backward steps to accumulate before calling the optimizer. Set to `null` to disable accumulation (optimizer steps every batch). When set to a positive integer `n`, each loss is divided by `n` before `backward()`, `optimizer.step()` and `optimizer.zero_grad()` are called once every `n` batches, and the generated `training_step` computes that gate from the learner's own step counter so `has_updated` reads `True` only after those steps — which is what makes the trainer fire `on_update` once per update rather than once per step.
 
 ```yaml
 ACCUMULATE_GRADIENTS: null   # disabled
 ACCUMULATE_GRADIENTS: 4      # accumulate over 4 steps
 ```
 
-The Keras and Flax schemas carry no such field: each backend declares the accumulation window through the mechanism its framework already owns, inside the `OPTIMIZER` pattern, and the generated `update()` gates on it — so the trainer's update counter tracks real optimizer applies (see [`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md)).
+The Keras and Flax schemas carry no such field: each backend declares the accumulation window through the mechanism its framework already owns, inside the `OPTIMIZER` pattern, and the generated learner reads its `updates` and `has_updated` back from that mechanism after each step — so the update count tracks real optimizer applies (see [`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md) and [`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)).
 
-In Keras the window is the optimizer's own `gradient_accumulation_steps` keyword argument. The generated `update()` reads the optimizer's step counter to predict whether the step about to run lands an apply, which keeps the gate in phase even when a float16 `LossScaleOptimizer` skips a step. All optimizers of a learner must share the same window — the generated `__init__` raises a `ValueError` otherwise.
+In Keras the window is the optimizer's own `gradient_accumulation_steps` keyword argument. After each step the generated learner reads the inner optimizer's counter and reports `has_updated` by delta against the previous read — detection rather than prediction, so when a float16 `LossScaleOptimizer` skips a step the frozen counter truthfully reports no update. All optimizers of a learner must share the same window — the generated `__init__` raises a `ValueError` otherwise.
 
 ```yaml
 OPTIMIZER:
@@ -312,7 +312,7 @@ OPTIMIZER:
       gradient_accumulation_steps: 4
 ```
 
-In Flax the window is an [`optax.MultiSteps`](https://optax.readthedocs.io/) wrapping the entry's `tx`; it must be the outermost transformation (one nested inside e.g. `optax.chain` is rejected, as is a `MultiSteps` nested inside another). The generated `__init__` reads the window back from each built optimizer and `update()` gates on it, so `every_k_schedule` must be an int literal (a callable is rejected), `should_skip_update_fn` is rejected, and every entry of a learner must declare the same window — an entry without `MultiSteps` counts as 1. Each rejection is a `ValueError` when the learner is instantiated, as in Keras. `MultiSteps` accumulates in float32 by default, which doubles accumulator memory against bfloat16 parameters; pass `accumulator_dtype` when that matters.
+In Flax the window is an [`optax.MultiSteps`](https://optax.readthedocs.io/) wrapping the entry's `tx`; it must be the outermost transformation (one nested inside e.g. `optax.chain` is rejected, as is a `MultiSteps` nested inside another). The generated `__init__` reads the window back from each built optimizer to validate it, and after each step the learner reads `MultiStepsState.gradient_step` to report `updates` and `has_updated`, so `every_k_schedule` must be an int literal (a callable is rejected), `should_skip_update_fn` is rejected, and every entry of a learner must declare the same window — an entry without `MultiSteps` counts as 1. Each rejection is a `ValueError` when the learner is instantiated, as in Keras. `MultiSteps` accumulates in float32 by default, which doubles accumulator memory against bfloat16 parameters; pass `accumulator_dtype` when that matters.
 
 ```yaml
 OPTIMIZER:
@@ -437,13 +437,18 @@ LEARNERS:
 
 ### Protocols
 
-**`Learner`** — The object that owns the models and defines how they learn. Members:
+**`Learner`** — The object that owns the models, the training counters, and defines how they learn. Members:
 
 - `models` (property) — `dict[str, ModelT]` of the models to train, where `ModelT` is the model type the trainer is specialized to (`torch.nn.Module` for `TorchTrainer`); the trainer exposes them to every event as `info.models`.
 - `optimizer_models` (property) — `dict[str, list[str]]` naming the models each optimizer updates (optimizer name -> model names); checkpointing uses it to pair sharded optimizer state with its modules, and an empty mapping means the pairing is not declared.
-- `update(step) -> bool` — whether the given training step applied the optimizers. `False` means gradients are still accumulating.
+- `steps` (property) — the number of completed training Steps (batch iterations), counted by the learner.
+- `updates` (property) — the number of completed Updates (optimizer applies); it lags `steps` while gradients accumulate.
+- `has_updated` (property) — whether the just-finished step landed an Update. `update_models` runs `training_step` and then reads this flag, so every count is a retrospective "completed" count ([`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). One contract follows: during `on_training_step_begin` for step N, `info.step` reads N-1.
+- `restore_counters(steps, updates)` — seeds the counters after a checkpoint restore. The resume paths call it with the counts from checkpoint meta, so the counters survive a resume.
 - `training_step(**inputs) -> dict[str, Any]` — runs one training batch and returns its criteria.
 - `inference_step(**inputs) -> dict[str, Any]` — runs one validation batch and returns its criteria.
+
+One caveat for hand-written learners: under the tensorflow `MirroredStrategy` path a hand-written learner's `training_step` is traced whole into a `tf.function`, so host-side counter bookkeeping must live outside the traced flow (generated learners keep `training_step` eager and let the strategy wrap only their inner flow functions).
 
 Three required members are also read elsewhere in the toolkit: `optimizers` (a mapping, additionally scanned for event protocols by the trainer), `optimizer_models` (read whenever checkpointing saves or restores optimizer state, as described above), and `learning_rates` (shown by `ProgressBar` / `Printer` and logged by the loggers). Optional members: `grad_scalers` and `param_group_names` (saved and logged by the CLI), and `weight_decays` (per-group decay metrics merged into the logged epoch metrics; generated learners flatten it from `create_opt`'s parameter groups via `get_decays`).
 
@@ -470,8 +475,8 @@ Every handler has the signature `(info: BaseInfo) -> None`, where `info` is the 
 
 **`BaseInfo`** — Dataclass holding mutable training state:
 
-- `step` — total training steps taken
-- `update` — optimizer update count
+- `step` (property) — completed training steps, a read-only view of the learner's `steps` (0 on a bare info)
+- `update` (property) — completed optimizer updates, a read-only view of the learner's `updates` (0 on a bare info)
 - `epoch` — current epoch number
 - `history` — per-epoch log dictionaries
 - `logs(epoch=None)` — returns the log dict for the current (or given) epoch
