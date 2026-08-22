@@ -14,6 +14,7 @@ __all__ = [
     "ShardedDataset",
     "TensorInitializer",
     "create_jax_inputs",
+    "donate_argnames",
     "get_jax_device",
     "get_jax_devices",
     "get_learning_rate",
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
         resolve_input_shapes,
         restore_training_state,
     )
-    from structcast_model.flax.utils import get_jax_device, get_jax_devices
+    from structcast_model.flax.utils import donate_argnames, get_jax_device, get_jax_devices
 else:
     import sys
 
@@ -64,6 +65,6 @@ else:
             "resolve_input_shapes",
             "restore_training_state",
         ],
-        "utils": ["get_jax_device", "get_jax_devices"],
+        "utils": ["donate_argnames", "get_jax_device", "get_jax_devices"],
     }
     sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

@@ -70,70 +70,32 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     return jnp.asarray(jnp.nan if rate is None else rate, dtype=jnp.float32)
 
 
-def _count_multi_steps_states(node: Any) -> int:
-    """Count the `MultiStepsState` shells hiding anywhere inside an optimizer state tree.
+def gradient_steps(optimizer: Any) -> jax.Array | None:
+    """Return the updates the optimizer's outermost `optax.MultiSteps` has applied, None without one.
 
-    A plain container walk suffices: the nnx wrappers replace the array leaves of `opt_state`, but
-    the NamedTuple shells -- `MultiStepsState` included -- survive untouched, and a found state is
-    itself a tuple the walk descends into, so a second state nested inside the first is counted too.
-    """
-    values = node.values() if isinstance(node, dict) else node if isinstance(node, tuple) else ()
-    return int(isinstance(node, optax.MultiStepsState)) + sum(_count_multi_steps_states(value) for value in values)
+    Accumulation gates on the device (see `docs/adr/0017`), so the generated training step detects an
+    update by comparing this count across its own `update` call rather than predicting one from a
+    window read at construction (see `docs/adr/0019`). The read is a plain indexed read of the
+    state, so calling it inside a traced step compiles to a reference to the counter array rather
+    than to a host read; without a `MultiSteps` there is no counter, and the None reported here is
+    what tells the step that every update applies.
 
-
-def accumulation_window(optimizer: Any) -> int:
-    """Return the accumulation window of the optimizer's outermost `optax.MultiSteps`, 1 without one.
-
-    The generated flax learners call this after building their optimizers, so the host-side
-    `update` gate is read back from the transformation the device actually applies instead of being
-    parsed out of the optimizer pattern (see `docs/adr/0017`). Optax offers no public accessor for
-    either `MultiSteps` argument, so two normalized private attributes are read: `__init__` wraps an
-    int `every_k_schedule` in a local lambda -- `_every_k_schedule` then carries that lambda's
-    qualname and calling it returns the int -- and replaces a `None` `should_skip_update_fn` with a
-    local default, likewise identified by `_should_skip_update_fn`'s qualname. A user-passed
-    callable keeps its own qualname in either slot, which is how the two rejections below tell the
-    readable window apart; tests pin both dependencies across the supported optax range.
+    Only the outermost state is examined: the nnx wrappers replace the array leaves of `opt_state`
+    but leave its NamedTuple shell intact, so a `MultiSteps` wrapping the whole transformation is
+    exactly the case this identifies. One buried inside a `chain` is invisible here and reads as no
+    accumulation at all, which the step reports as an update on every call.
 
     Args:
-        optimizer (Any): The `flax.nnx.Optimizer` whose transformation to inspect.
+        optimizer (Any): The `flax.nnx.Optimizer` whose state to read.
 
     Returns:
-        int: The `every_k_schedule` of the outermost `MultiSteps`, or 1 when the transformation
-            carries none.
-
-    Raises:
-        ValueError: When a `MultiSteps` hides inside the transformation instead of being its
-            outermost wrapper, when the outermost `MultiSteps` nests a second one, when it carries
-            a `should_skip_update_fn`, or when its `every_k_schedule` is a callable rather than an
-            int literal.
+        jax.Array | None: The `gradient_step` of the outermost `MultiSteps`, or None when the
+            transformation is not wrapped in one.
     """
-    tx = optimizer.tx
-    states = _count_multi_steps_states(optimizer.opt_state)
-    if not isinstance(tx, optax.MultiSteps):
-        if states:
-            raise ValueError(
-                "MultiSteps must be the outermost transformation for the learner to read its "
-                "accumulation window: the optimizer state carries a MultiStepsState, but the "
-                "instance hides inside a wrapper such as optax.chain."
-            )
-        return 1
-    if states > 1:
-        raise ValueError(
-            "MultiSteps nests a second MultiSteps: the optimizer state carries another "
-            "MultiStepsState inside the outermost one, so the device would apply at the product of "
-            "the windows while the learner gates on the outermost window alone."
-        )
-    if getattr(tx._should_skip_update_fn, "__qualname__", "") != "MultiSteps.__init__.<locals>.should_skip_update_fn":
-        raise ValueError(
-            "MultiSteps carries a should_skip_update_fn: a skipped update would desynchronize the "
-            "device counter from the update gate the learner derives from the window."
-        )
-    if getattr(tx._every_k_schedule, "__qualname__", "") != "MultiSteps.__init__.<locals>.<lambda>":
-        raise ValueError(
-            "MultiSteps has no int literal every_k_schedule: only a literal window can be read back "
-            "into the learner's update gate, not a schedule or callable."
-        )
-    return int(tx._every_k_schedule(0))
+    state = optimizer.opt_state
+    if isinstance(state, optax.MultiStepsState):
+        return state.gradient_step[...]
+    return None
 
 
 def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
@@ -167,7 +129,7 @@ def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     return mask
 
 
-__all__ = ["accumulation_window", "get_learning_rate", "no_weight_decay_mask", "unwrap_variables"]
+__all__ = ["get_learning_rate", "gradient_steps", "no_weight_decay_mask", "unwrap_variables"]
 
 
 if not TYPE_CHECKING:

@@ -37,6 +37,13 @@ LINEAR_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "Linear.yaml")
 LEARNER_CFG = str(FIXTURES_DIR / "cfg" / "flax" / "LinearLearner.yaml")
 MODEL_CFG = str(CFG_DIR / "flax" / "models" / "ConvNeXtV2.yaml")
 
+# The module is published through a lazy importer exposing `__all__` alone, so the private helper
+# under test is reached through the globals its command callbacks were defined in, as in cmd_torch.
+_FIRST_CALLBACK = app.registered_commands[0].callback
+assert _FIRST_CALLBACK is not None, "cmd_flax registers every command with a callback"
+_CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
+_optimizer_hashes = _CMD_GLOBALS["_optimizer_hashes"]
+
 # ---------------------------------------------------------------------------
 # app structure
 # ---------------------------------------------------------------------------
@@ -188,11 +195,11 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     module = _load(out, "generated_learner")
     assert hasattr(module, "MyLearner")
     # The parameter reached the template: the MultiSteps wrapper carries the window on the device,
-    # and the generated __init__ reads it back for the post-step counter read (`docs/adr/0018`).
+    # and the step detects the updates it applies by reading the count back across its own update.
     text = out.read_text()
     assert "MultiSteps" in text
-    assert "self._window = windows[0]" in text
-    assert "applied = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])" in text
+    assert "_before = gradient_steps(optimizer)" in text
+    assert "_has_updated = True if _before is None else gradient_steps(optimizer) > _before" in text
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +640,10 @@ def test_train_names_the_criteria_from_learner_outputs(
 def test_train_compiles_each_flow_under_its_own_contract(
     tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], recwarn: pytest.WarningsRecorder
 ) -> None:
-    """--compile is what binds the steps, and the training step alone is donated.
+    """--compile is what binds the steps, and the training step's state parameters alone are donated.
 
+    The donated names are read off the step's signature, so they are exactly the models and
+    optimizers the generated learner names there -- the keyword-only batch is never donated.
     Comparing losses cannot see any of this: an ignored --compile reaches the same numbers eagerly.
     Donating the inference views -- which share their arrays with the models -- or failing to donate
     the training state shows up only as a JAX warning, so the recorded warnings are checked too.
@@ -645,13 +654,31 @@ def test_train_compiles_each_flow_under_its_own_contract(
 
     contracts = dict(COMPILE_CALLS)
     assert contracts["_training_step"] == {
-        "donate_argnames": ("models", "optimizers"),
+        "donate_argnames": ("model", "optimizer"),
     }
     # Every other flow is an inference one: no static flag, and nothing donated.
     assert [arguments for name, arguments in COMPILE_CALLS if name != "_training_step"] == [{}] * (
         len(COMPILE_CALLS) - 1
     )
     assert not [warning for warning in recwarn.list if "donated" in str(warning.message)]
+
+
+def test_the_optimizer_digests_are_read_off_the_learner_class(patterns: tuple[str, str]) -> None:
+    """The generated learner declares its digests as a class attribute, and nothing else may be read.
+
+    A generated learner class is loaded from a file rather than imported by name, so its module
+    never lands in `sys.modules`; the class is the only handle on the digests a resume compares.
+    A hand-written learner declares none, and the resume check skips what it cannot find.
+    """
+    _, learner_pattern = patterns
+    path = Path(learner_pattern.split("_file_: ", 1)[1].rstrip("}]"))
+    learner_type = _load(path, "digest_learner").Learner
+
+    hashes = _optimizer_hashes(learner_type.__new__(learner_type))
+
+    assert hashes == learner_type.OPTIMIZER_HASHES
+    assert set(hashes) == {"optimizer"}
+    assert _optimizer_hashes(NamelessLearner.__new__(NamelessLearner)) == {}
 
 
 def test_train_without_compilation_binds_nothing(

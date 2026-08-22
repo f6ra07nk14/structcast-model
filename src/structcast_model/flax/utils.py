@@ -1,8 +1,10 @@
-"""Shared JAX device helpers."""
+"""Shared JAX device helpers and the compilation contract of a generated step."""
 
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from inspect import Parameter, signature
+from typing import TYPE_CHECKING, Any
 
 import jax
 
@@ -41,7 +43,41 @@ def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
-__all__ = ["get_jax_device", "get_jax_devices"]
+def donate_argnames(function: Callable[..., Any]) -> tuple[str, ...]:
+    """Return the arguments of a training step to donate when compiling it, its batch excluded.
+
+    The signature of a step is its donation contract (see `docs/adr/0019`): a generated training
+    step takes every model and optimizer as its own positional-or-keyword parameter and the batch as
+    keyword-only parameters, so the state it rewrites in place is exactly what it declares
+    positionally. Donating that state is what keeps a compiled run from copying every parameter
+    buffer once per step, and leaving the batch out of the donation is what keeps the caller's own
+    arrays usable afterwards. A hand-written step following the same convention is donated the same
+    way; one taking a non-state argument positionally sees it donated too, which is harmless for a
+    per-step batch. `inspect.signature` follows `__wrapped__`, so a step another layer already
+    wrapped still reports the parameters underneath. A positional-only parameter is not donated
+    either: it has no name to donate by, and a step declaring one is outside the contract.
+
+    Args:
+        function (Callable[..., Any]): The step about to be compiled.
+
+    Returns:
+        tuple[str, ...]: The names of its positional-or-keyword parameters, empty when the callable
+            has no readable signature -- donating nothing only costs the copy donation would save.
+
+    Example:
+        >>> from structcast_model.flax.utils import donate_argnames
+        >>> def _training_step(model, optimizer, *, x, **kwargs): ...
+        >>> donate_argnames(_training_step)
+        ('model', 'optimizer')
+    """
+    try:
+        parameters = signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return ()
+    return tuple(p.name for p in parameters if p.kind is Parameter.POSITIONAL_OR_KEYWORD)
+
+
+__all__ = ["donate_argnames", "get_jax_device", "get_jax_devices"]
 
 
 if not TYPE_CHECKING:

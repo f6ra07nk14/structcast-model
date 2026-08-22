@@ -161,17 +161,6 @@ def measure_inference_time(
 MATMUL_PRECISIONS: Mapping[str, str] = {"highest": "highest", "high": "high", "medium": "bfloat16"}
 """JAX spelling of the shared precision names; its lowest float32 setting is named after the dtype."""
 
-TRAINING_COMPILE_KW: Mapping[str, Any] = {
-    "donate_argnames": ("models", "optimizers"),
-}
-"""The compilation arguments the generated training step's contract fixes (see `docs/adr/0017`).
-
-The models and the optimizers are rewritten in place every step, so their buffers are donated;
-gradient accumulation lives inside the optimizer state (`optax.MultiSteps`), so it travels with the
-donated optimizers and the step needs no static gate. The batch is never donated, and the inference
-step -- which runs against views sharing the models' arrays -- donates nothing.
-"""
-
 
 def _compile_parser(value: str) -> dict[str, Any] | None:
     """Parse `--compile`, where "none" and "false" disable compilation.
@@ -189,15 +178,14 @@ def _compile_parser(value: str) -> dict[str, Any] | None:
 
 
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
-    """Return the `OPTIMIZER_HASHES` the learner's own module declares, empty for anything else.
+    """Return the `OPTIMIZER_HASHES` the learner's own class declares, empty for anything else.
 
-    A generated learner class is loaded from a file rather than imported by name, so its module never
-    lands in `sys.modules`: the globals its methods were defined in are the only handle on the
-    constant next to it. A hand-written learner declares none, and the resume check skips what is
-    missing.
+    A generated learner carries the digests as a class attribute (see `docs/adr/0019`), which is the
+    only handle on them: the class is loaded from a file rather than imported by name, so its module
+    never lands in `sys.modules`. A hand-written learner declares none, and the resume check skips
+    what is missing.
     """
-    namespace = getattr(type(learner).__init__, "__globals__", {})
-    return cast(Mapping[str, str], namespace.get("OPTIMIZER_HASHES") or {})
+    return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 
 
 def _resolve_strategy(strategy: Any, device: str | None) -> "scm_flax.FlaxDistributedStrategy":
@@ -330,9 +318,11 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         extra = {key: value for key, value in compile_kw.items() if key not in fixed}
         for flow_name in list(learner.flow_functions):
             # The generated learner names its steps after the contract they follow: only the training
-            # one takes the static flag and the donated state (`docs/adr/0015`).
-            arguments = {**TRAINING_COMPILE_KW, **extra} if flow_name == "_training_step" else extra
-            setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), arguments))
+            # one rewrites state, so only its parameters are donated (`docs/adr/0015`). The inference
+            # step runs against views sharing the models' arrays and donates nothing.
+            step = getattr(learner, flow_name)
+            donated = {"donate_argnames": scm_flax.donate_argnames(step)} if flow_name == "_training_step" else {}
+            setattr(learner, flow_name, strategy.compile(step, {**donated, **extra}))
     provider = scm.SimpleDataProvider(
         training_dataset=scm_flax.ShardedDataset(instantiate_object(training_dataset_pattern), strategy),
         validation_dataset=(

@@ -1,6 +1,8 @@
 """API-level tests for flax builder classes."""
 
+import ast
 from collections import defaultdict
+from collections.abc import Callable
 import logging
 from pathlib import Path
 from re import findall, search
@@ -343,22 +345,63 @@ def _learner_script(path: Path, parameters: dict[str, dict[str, Any]] | None = N
     return FlaxLearnerBuilder.from_path(path)(parameters=parameters).scripts[-1]
 
 
-def test_flax_learner_emits_the_steps_as_module_level_functions() -> None:
-    """The steps must be plain module functions over explicit state arguments.
+def test_flax_learner_emits_the_steps_as_functions_over_named_state() -> None:
+    """The steps must be plain functions taking every model and optimizer as its own parameter.
 
     That is the whole compile seam: `flax.nnx.jit` may not close over models or optimizers, and a
-    bound method cannot be wrapped, so a step that read `self` would be uncompilable.
+    bound method cannot be wrapped, so a step that read `self` would be uncompilable. The batch is
+    keyword-only, which is what tells the caller donating the state apart from the batch.
     """
     script = _learner_script(LEARNER_YAML)
 
-    assert "def _training_step(models, optimizers, *, x, y, **kwargs):" in script
-    assert "def _inference_step(models, *, x, y, **kwargs):" in script
-    assert "(_, (loss,)), _grads = flax.nnx.value_and_grad(_flow_optimizer, has_aux=True)(model)" in script
-    assert "lrs = {'optimizer': get_learning_rate(optimizers['optimizer'])}" in script
-    assert "return {'loss': loss}, lrs\n" in script
+    assert "def _training_step(model, optimizer, *, x, y, **kwargs):" in script
+    assert "def _inference_step(model, *, x, y, **kwargs):" in script
+    assert "(_, (loss,)), _grads = flax.nnx.value_and_grad(_flow_optimizer, has_aux=True)(model, x=x, y=y)" in script
+    assert "lrs = {'optimizer': get_learning_rate(optimizer)}" in script
+    assert "return {'loss': loss}, lrs, _has_updated\n" in script
     # The keys are attribute names: a trainer compiles a step by rebinding the attribute it names.
     assert 'return {"_training_step": self._training_step, "_inference_step": self._inference_step}' in script
     assert "self._training_step = _training_step" in script
+    assert "criteria, learning_rates, has_updated = self._training_step(self.model, self.optimizer, x=x, y=y" in script
+
+
+def test_flax_learner_module_scope_holds_the_imports_and_the_class_alone() -> None:
+    """Every generated module-level name is a collision waiting for the right configuration.
+
+    The learner imports whatever the user's patterns reference into this module, so a flow layer or
+    a step left at module scope could be shadowed by -- or shadow -- one of those imports. Keeping
+    module scope to imports and the class itself is what makes that impossible.
+    """
+    script = FlaxLearnerBuilder.from_path(SEGMENTS_YAML)()
+    module = ast.parse("\n".join(script.scripts))
+
+    assert [type(node).__name__ for node in module.body] == ["ClassDef"]
+    # The flow layers, the flows and the steps are all built where only the learner can see them.
+    assert "mse = squared_error" in script.scripts[-1]
+    assert "def _flow_optimizer_ab(a, b, x, y):" in script.scripts[-1]
+
+
+def test_flax_learner_comments_describe_behavior_and_cite_no_repository_documents() -> None:
+    """A generated learner is read where this repository is not, so a citation there names nothing.
+
+    Its comments and docstring have to carry the caveat itself -- the flow layers being captured,
+    the rates being read at trace time -- rather than point at a document the reader cannot open.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "docs/adr" not in script
+    assert "they must be stateless" in script
+    assert "Read at trace time" in script
+
+
+def test_flax_learner_emits_the_optimizer_digests_as_a_class_attribute() -> None:
+    """The digests are read off the class by the CLI, so they may not sit next to it at module scope."""
+    (learner,) = ast.parse(_learner_script(LEARNER_YAML)).body
+    assert isinstance(learner, ast.ClassDef)
+
+    annotated = [node for node in learner.body if isinstance(node, ast.AnnAssign)]
+
+    assert [ast.unparse(node.target) for node in annotated] == ["OPTIMIZER_HASHES"]
 
 
 def test_flax_learner_applies_the_optimizer_pattern_to_the_models_it_owns() -> None:
@@ -366,7 +409,7 @@ def test_flax_learner_applies_the_optimizer_pattern_to_the_models_it_owns() -> N
     script = _learner_script(LEARNER_YAML)
 
     assert ")(model, wrt=Param)" in script
-    assert "optimizers['optimizer'].update(model, _grads)" in script
+    assert "optimizer.update(model, _grads)" in script
 
 
 def test_flax_learner_never_reads_a_variable_value_or_an_update_result() -> None:
@@ -380,58 +423,142 @@ def test_flax_learner_never_reads_a_variable_value_or_an_update_result() -> None
 
     # `.value_and_grad` is the transform, not a variable read, hence the word boundary.
     assert search(r"\.value(?!\w)", script) is None
-    assert "= optimizers[" not in script
+    assert search(r"=\s*\w+\.update\(", script) is None
 
 
 def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
-    """The generated steps call `get_learning_rate` and `accumulation_window` directly."""
+    """The generated steps call `get_learning_rate` and `gradient_steps` directly."""
     imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
 
-    assert imports["structcast_model.flax.optimizers"] == {"accumulation_window", "get_learning_rate"}
+    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
     assert imports["flax.nnx"] == {None, "Param", "Optimizer"}
     assert imports["jax"] == {None}
     assert imports["jax.numpy"] == {None}
 
 
-def test_flax_learner_reads_the_window_back_from_the_built_optimizers() -> None:
-    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and the learner reads it back.
+def test_flax_learner_detects_its_updates_inside_the_step() -> None:
+    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and the step reads it back.
 
-    The pattern is never parsed for the window: the generated `__init__` reads it back from every
-    optimizer it just built with `accumulation_window` and refuses optimizers that disagree.
-    `training_step` counts itself on the host and, with a window, reads the applied count back from
-    `MultiStepsState.gradient_step` after the step -- detection, not prediction (`docs/adr/0018`).
+    The pattern is never parsed for a window, and no window is stored: the step compares the count
+    the first optimizer advanced across its own update and hands the answer back with the criteria,
+    so the learner counts updates without a host read of its own -- detection, not prediction.
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "MultiSteps(" in script
-    assert "windows = sorted({accumulation_window(optimizer) for optimizer in self._optimizers.values()})" in script
-    assert "One learner, one update window" in script
-    assert "self._window = windows[0]" in script
+    assert "_before = gradient_steps(optimizer)" in script
+    assert "_has_updated = True if _before is None else gradient_steps(optimizer) > _before" in script
     assert "self._steps += 1" in script
-    assert "applied = int(next(iter(self._optimizers.values())).opt_state.gradient_step[...])" in script
-    assert "self._has_updated = applied > self._last_updates" in script
+    assert "self._has_updated = bool(has_updated)" in script
+    assert "self._updates += int(self._has_updated)" in script
     assert "def restore_counters(self, steps: int, updates: int) -> None:" in script
+    assert "accumulation_window" not in script
+    assert "self._window" not in script
     assert "def update(" not in script
     assert "acc_grads" not in script
     assert "need_update" not in script
 
 
-def test_flax_learner_wraps_several_owned_models_in_one_persistent_list() -> None:
-    """One optimizer over several models needs a single container built once.
+def test_flax_learner_detects_on_the_first_optimizer_alone() -> None:
+    """One learner, one update count, and the first segment is the clock it runs on.
 
-    The same `flax.nnx.List` instance has to be the optimizer's module and the differentiated
-    argument; a fresh list per step would be a fresh graph node.
+    Segments need not share a window, so a second comparison would answer a question no counter of
+    the learner asks; the later segments emit their update and nothing else.
     """
     script = _learner_script(SEGMENTS_YAML)
 
-    assert "_seg_a_b = flax.nnx.List([a, b])" in script
-    assert "self._models = {'a': a, 'b': b, 'c': c, '_seg_a_b': _seg_a_b}" in script
-    assert "def _flow_optimizer_ab(_seg_a_b):\n        a, b = _seg_a_b" in script
-    assert ")(_seg_a_b, wrt=Param)" in script
+    assert "_before = gradient_steps(optimizer_ab)" in script
+    assert "gradient_steps(optimizer_c)" not in script
+
+
+def test_flax_learner_passes_several_owned_models_as_a_plain_tuple() -> None:
+    """One optimizer over several models owns them as a tuple, wherever they are named.
+
+    The optimizer state, the differentiated arguments and the update have to key off the same module
+    paths, and the tuple is what gives all three the same structure without a container node the
+    learner would have to keep among its models.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "def _flow_optimizer_ab(a, b, x, y):" in script
+    assert "flax.nnx.value_and_grad(_flow_optimizer_ab, argnums=(0, 1), has_aux=True)(a, b, x=x, y=y)" in script
+    assert "optimizer_ab.update((a, b), _grads)" in script
+    assert ")((a, b), wrt=Param)" in script
     assert ")(c, wrt=Param)" in script
-    # The container is state, not a model: the trainer must not see it among the models.
-    assert "return {'a': self._models['a'], 'b': self._models['b'], 'c': self._models['c']}" in script
+    # No container: the models a trainer sees are the ones the learner was built over.
+    assert "return {'a': self.a, 'b': self.b, 'c': self.c}" in script
     assert "return {'optimizer_ab': ['a', 'b'], 'optimizer_c': ['c']}" in script
+    assert "flax.nnx.List" not in script
+
+
+def test_flax_learner_passes_a_model_a_segment_only_reads_as_a_parameter() -> None:
+    """A model is state wherever a flow names it, not only where the flow calls it as its layer.
+
+    The flows are built in `__init__`, where every model is also a local: a model read in an
+    expression and not passed in would be captured from there and frozen into the compiled step,
+    so the segment would keep computing with the values that model had when the learner was built.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].insert(0, ["eval: a.fc.kernel[...].mean()", "reg_c", None])
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "def _flow_optimizer_c(c, a, x, y):" in script
+    assert "flax.nnx.value_and_grad(_flow_optimizer_c, has_aux=True)(c, a, x=x, y=y)" in script
+
+
+def test_flax_learner_carries_out_the_values_a_later_update_reads() -> None:
+    """`EXTRA` is evaluated in the step, so a later one reads an earlier flow's values there.
+
+    Those values only exist in the step if the flow that computed them returned them, and a keyword
+    naming one that did not emits a step that fails on the first batch.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["EXTRA"] = {"value": "eval: errors_a"}
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "return loss_ab, (errors_a, loss_ab,)" in script
+    assert "optimizer_c.update(c, _grads, value=errors_a)" in script
+
+
+NO_INPUT_LEARNER: dict[str, Any] = {
+    "INPUTS": [],
+    "OUTPUTS": ["loss"],
+    "LEARNERS": [
+        {
+            "NAME": "optimizer",
+            "LOSS": "loss",
+            "TRAINABLE_LAYERS": ["model"],
+            "OPTIMIZER": [
+                "_obj_",
+                {"_addr_": "flax.nnx.Optimizer"},
+                {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]}},
+            ],
+            "FLOW": [
+                ["eval: jax.numpy.ones((2, 4))", "prediction", "model"],
+                ["eval: jax.numpy.mean(prediction ** 2)", "loss", None],
+            ],
+        }
+    ],
+}
+"""A learner whose flow needs no batch at all, as a generative or a replay-buffer one does."""
+
+
+def test_flax_learner_emits_steps_without_a_batch() -> None:
+    """A learner declaring no inputs must still emit valid signatures and call sites.
+
+    The batch is a keyword-only section of every step, and an empty one may not leave a dangling
+    `*,` behind or a stray comma in the calls the learner makes.
+    """
+    script = FlaxLearnerBuilder(raw=NO_INPUT_LEARNER)().scripts[-1]
+
+    assert "def _training_step(model, optimizer, **kwargs):" in script
+    assert "def _inference_step(model, **kwargs):" in script
+    assert "def training_step(self, **kwargs):" in script
+    assert "self._training_step(self.model, self.optimizer, **kwargs)" in script
+    assert "return self._inference_step(self._view_model, **kwargs)" in script
+    compile(script, "<learner>", "exec")
 
 
 def test_flax_learner_builds_inference_views_of_every_model() -> None:
@@ -442,10 +569,10 @@ def test_flax_learner_builds_inference_views_of_every_model() -> None:
     script = _learner_script(LEARNER_YAML)
 
     assert (
-        "self._views = {k: flax.nnx.view(v, raise_if_not_found=False, training=False, "
-        "deterministic=True, use_running_average=True) for k, v in self.models.items()}"
+        "self._view_model = flax.nnx.view(model, raise_if_not_found=False, training=False, "
+        "deterministic=True, use_running_average=True)"
     ) in script
-    assert "return self._inference_step(self._views, x=x, y=y, **kwargs)" in script
+    assert "return self._inference_step(self._view_model, x=x, y=y, **kwargs)" in script
 
 
 def test_flax_learner_keeps_a_hand_bound_wrt() -> None:
@@ -532,22 +659,91 @@ def test_flax_learner_rejects_a_segment_that_reads_a_name_it_stores_later() -> N
         _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
-def test_flax_learner_rejects_a_layer_named_like_a_module_container() -> None:
-    """The container of a multi-module segment is a generated name a user layer may already hold.
+def _rename_model(raw: dict[str, Any], name: str) -> None:
+    """Rename the single model of the linear fixture everywhere its learner names it."""
+    raw["LEARNERS"][0]["TRAINABLE_LAYERS"] = [name]
+    for key in ("FLOW", "INFERENCE_FLOW"):
+        raw["LEARNERS"][0][key][0][2] = name
 
-    Both would key the same entry of the generated model dictionary, and the loser -- the user's
-    model -- would silently never be trained.
+
+def _rename_input(raw: dict[str, Any], name: str) -> None:
+    """Rename the `y` input of the linear fixture, which its flows read as the regression target."""
+    raw["INPUTS"] = ["x", name]
+    raw["LEARNERS"][0]["FLOW"][1]["INPUTS"]["targets"] = name
+    raw["LEARNERS"][0]["INFERENCE_FLOW"][1][0]["targets"] = name
+
+
+def _build(raw: dict[str, Any]) -> None:
+    """Emit the learner of a mutated linear fixture, which is what runs the checks under test."""
+    # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+    _ = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda raw: raw["LEARNERS"][0].update(NAME="x"), 'Name "x" is both an input of the learner'),
+        (lambda raw: _rename_model(raw, "inputs"), 'Name "inputs" is reserved'),
+        (lambda raw: _rename_model(raw, "training_step"), 'Name "training_step" is reserved'),
+        (lambda raw: _rename_input(raw, "kwargs"), 'Name "kwargs" is reserved'),
+        (lambda raw: raw["LEARNERS"][0].update(NAME="self"), 'Name "self" is reserved'),
+    ],
+    ids=["optimizer-named-like-an-input", "model-named-inputs", "model-named-training-step", "input-kwargs", "self"],
+)
+def test_flax_learner_rejects_a_name_the_generated_class_cannot_carry(
+    mutate: Callable[[dict[str, Any]], Any], message: str
+) -> None:
+    """The steps name every model, every optimizer and every batch entry in one signature.
+
+    A name serving as two of those is emitted twice there -- a script that fails to import -- and one
+    equal to a member of the class is worse: `self.inputs = model` in `__init__` overwrites what the
+    trainer reads off the learner afterwards, or shadows a property with an attribute, and neither
+    failure points back at the name that caused it.
+    """
+    raw = load_any(LEARNER_YAML)
+    mutate(raw)
+
+    with pytest.raises(SpecError, match=message):
+        _build(raw)
+
+
+def test_flax_learner_rejects_a_model_named_like_the_view_of_another() -> None:
+    """Each model gets a `_view_<name>` attribute, which another model's name must not already be.
+
+    The two would be one attribute, and whichever `__init__` wrote last would be the one the
+    inference step runs against -- a model trained in place, or a view nobody can train.
     """
     raw = load_any(SEGMENTS_YAML)
-    raw["LEARNERS"][1]["TRAINABLE_LAYERS"] = ["_seg_a_b"]
-    raw["LEARNERS"][1]["FLOW"] = [
-        [{"predictions": "x", "targets": "y"}, "errors_c", "mse"],
-        ["eval: errors_c.mean()", "loss_c", None],
-    ]
-    raw["LEARNERS"][1]["INFERENCE_FLOW"] = raw["LEARNERS"][1]["FLOW"]
+    raw["LEARNERS"][0]["TRAINABLE_LAYERS"] = ["a", "_view_a"]
+    for key in ("FLOW", "INFERENCE_FLOW"):
+        raw["LEARNERS"][0][key][1][2] = "_view_a"
 
-    with pytest.raises(SpecError, match='Duplicate variable name "_seg_a_b" for the module container'):
-        FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()
+    with pytest.raises(SpecError, match='Name "_view_a" is reserved'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "lrs", None]),
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_grads", None]),
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "model", None]),
+    ],
+    ids=["learning-rates", "gradients", "model"],
+)
+def test_flax_learner_rejects_a_flow_output_the_step_already_binds(mutate: Callable[[dict[str, Any]], Any]) -> None:
+    """The step binds the flow results next to the names it computes itself, so the two may not meet.
+
+    An output named `lrs` would be returned in place of the learning rates it overwrote, and one
+    named like a model would rebind the module before the optimizer is handed it -- both silent,
+    both only visible in criteria nobody can explain.
+    """
+    raw = load_any(LEARNER_YAML)
+    mutate(raw)
+
+    with pytest.raises(SpecError, match="which the generated training step already binds"):
+        _build(raw)
 
 
 def test_inject_learning_rate_ignores_a_plain_string_that_looks_like_the_wrapper() -> None:
@@ -585,7 +781,7 @@ def test_flax_learner_forwards_extra_keywords_to_the_update() -> None:
 
     script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
 
-    assert "optimizers['optimizer'].update(model, _grads, value=loss)" in script
+    assert "optimizer.update(model, _grads, value=loss)" in script
 
 
 def test_the_learner_builder_never_uses_the_zero_argument_super() -> None:

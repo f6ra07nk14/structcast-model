@@ -218,10 +218,9 @@ def test_restoring_rebaselines_the_update_detection_of_a_windowed_learner(
 ) -> None:
     """The first post-resume step of a mid-window run must not misfire `has_updated`.
 
-    The `updates` count self-restores through the `MultiStepsState.gradient_step` the state
-    round-trips, so the resume path seeds `steps` and re-baselines the cached last read instead
-    (`docs/adr/0018`). A skipped re-baseline would leave the fresh baseline at zero, and the first
-    delta against the restored count would report an update no step landed.
+    Both counts are seeded from the meta, while the window's own phase rides along in the restored
+    optimizer state: detection compares the count across each update, so the resumed run keeps
+    accumulating into the window the saved one left open instead of restarting it.
     """
     recorder = _RecordingLogger()
     trained = make_learner(window=True)

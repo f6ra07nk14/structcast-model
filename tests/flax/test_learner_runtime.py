@@ -5,7 +5,9 @@ The generated script is exec'd from a file, the way a run would import it, and d
 what the reported rate is -- is only decided when the emitted code actually runs.
 """
 
+from functools import wraps
 from importlib.util import module_from_spec, spec_from_file_location
+from inspect import Parameter, signature
 import logging
 from pathlib import Path
 from types import ModuleType
@@ -14,7 +16,6 @@ from warnings import catch_warnings, simplefilter
 
 import jax
 import jax.numpy as jnp
-import optax
 import pytest
 
 from flax import nnx
@@ -109,37 +110,42 @@ def test_training_step_lowers_the_loss_it_reports(tmp_path: Path) -> None:
     assert losses[-1] < losses[0]
 
 
-def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path) -> None:
-    """With a `MultiSteps` window of 3 the parameters may move on every third step and no other.
+@pytest.mark.parametrize(
+    ("window", "gates"),
+    [(3, [False, False, True]), (2, [False, True, False, True])],
+    ids=["window-of-three", "window-of-two"],
+)
+def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path, window: int, gates: list[bool]) -> None:
+    """With a `MultiSteps` window the parameters may move on every k-th step and on no other.
 
-    The accumulation lives inside the optimizer state on the device; the learner reads the applied
-    count back from `MultiStepsState.gradient_step` after each step (`docs/adr/0018`), so
-    `has_updated` must agree, step by step, with which step the parameters actually moved on.
+    The accumulation lives inside the optimizer state on the device, and the step compares the count
+    it advanced across its own `update` call, so `has_updated` must agree, step by step, with which
+    step the parameters actually moved on -- and `updates` must count exactly those steps.
     """
-    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": 3}})(
+    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": window}})(
         _model_type(tmp_path)(rngs=nnx.Rngs(0))
     )
-    before = _parameters(learner.models["model"])
+    previous = _parameters(learner.models["model"])
 
-    gates = []
-    for step in range(1, 4):
+    reported, moved = [], []
+    for _ in gates:
         learner.training_step(x=X, y=Y)
-        gates.append(learner.has_updated)
-        moved = not all(
-            jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True)
-        )
-        assert moved == (step == 3)
+        reported.append(learner.has_updated)
+        current = _parameters(learner.models["model"])
+        moved.append(not all(jnp.array_equal(a, b) for a, b in zip(previous, current, strict=True)))
+        previous = current
 
-    assert gates == [False, False, True]
-    assert (learner.steps, learner.updates) == (3, 1)
-    assert not any(jnp.array_equal(a, b) for a, b in zip(before, _parameters(learner.models["model"]), strict=True))
+    assert reported == gates
+    assert moved == gates
+    assert (learner.steps, learner.updates) == (len(gates), sum(gates))
 
 
 def test_each_optimizer_moves_only_the_models_it_owns(tmp_path: Path) -> None:
-    """Two segments, two containers: each optimizer applies its own rate to its own parameters.
+    """Two segments: each optimizer applies its own rate to the parameters it owns, and to no other.
 
-    The first optimizer owns a two-model `flax.nnx.List`, the second a single model; a container
-    that leaked into the other segment would show up as the wrong rate on the wrong model.
+    The first optimizer owns two models, passed to it and to its update as a plain tuple, the second
+    a single model; a segment reaching into the other would show up as the wrong rate on the wrong
+    model.
     """
     model_type = _model_type(tmp_path)
     models = [model_type(rngs=nnx.Rngs(seed)) for seed in range(3)]
@@ -197,7 +203,7 @@ def test_inference_views_see_the_trained_parameters(tmp_path: Path) -> None:
     learner.training_step(x=X, y=Y)
 
     trained = _parameters(learner.models["model"])
-    viewed = _parameters(learner._views["model"])
+    viewed = _parameters(learner._view_model)
 
     assert all(jnp.array_equal(a, b) for a, b in zip(trained, viewed, strict=True))
 
@@ -266,9 +272,9 @@ def test_compiled_training_step_never_retraces_across_the_window(
     the accumulating and the applying step: a second trace would mean the window leaked back into
     the step's signature. The seam is the one the trainers already use: every key of
     `flow_functions` is an attribute holding the current implementation, so compiling is
-    `setattr(learner, name, compile(getattr(learner, name)))`. Donating the two state arguments has
-    to be safe there, on every segment count -- a buffer the caller still holds would make XLA warn
-    and silently copy instead.
+    `setattr(learner, name, compile(getattr(learner, name)))`. Donating every state parameter the
+    step declares has to be safe there, on every segment count -- a buffer the caller still holds
+    would make XLA warn and silently copy instead.
     """
     model_type = _model_type(tmp_path)
     learner = _learner_type(tmp_path, path, parameters={"DEFAULT": {"accumulate_gradients": accumulate}})(
@@ -277,16 +283,18 @@ def test_compiled_training_step_never_retraces_across_the_window(
     step = learner._training_step
     traces: list[bool] = []
 
-    def counted(models: Any, optimizers: Any, **kwargs: Any) -> Any:
+    @wraps(step)
+    def counted(*state: Any, **kwargs: Any) -> Any:
         """Record one entry per trace: the body of a compiled function runs only when it is traced."""
         traces.append(True)
-        return step(models, optimizers, **kwargs)
+        return step(*state, **kwargs)
 
     def compiled(name: str, function: Any) -> Any:
-        """Compile one step the way a trainer does: the two state arguments donated."""
+        """Compile one step the way the CLI does: every positional-or-keyword parameter donated."""
         if name == "_inference_step":
             return nnx.jit(function)
-        return nnx.jit(function, donate_argnames=("models", "optimizers"))
+        donated = [p.name for p in signature(function).parameters.values() if p.kind is Parameter.POSITIONAL_OR_KEYWORD]
+        return nnx.jit(function, donate_argnames=tuple(donated))
 
     learner._training_step = counted
     for name, function in learner.flow_functions.items():
@@ -467,69 +475,80 @@ def _multi_steps_tx(**arguments: Any) -> list[Any]:
     return ["_obj_", {"_addr_": "optax.MultiSteps"}, {"_call_": {"opt": inner, **arguments}}]
 
 
-def chained_multi_steps() -> Any:
-    """Chain a `MultiSteps` so only its state stays reachable, never its instance.
+READING_SEGMENT = [
+    ["eval: a.fc.kernel[...].mean()", "reg_c", None],
+    ["x", "out_c", "c"],
+    [{"predictions": "out_c", "targets": "y"}, "errors_c", "mse"],
+    ["eval: errors_c.mean() + reg_c", "loss_c", None],
+]
+"""A second segment whose loss reads a parameter of the model the first segment trains."""
 
-    Public and addressable: the rejected learner builds it through an object pattern, as a real
-    transformation is built.
+
+def test_a_model_a_segment_only_reads_is_not_frozen_into_the_compiled_step(tmp_path: Path) -> None:
+    """A model read in an expression has to reach the flow as an argument, not from `__init__`.
+
+    Read from the enclosing scope, it is a constant to the tracer: the compiled step would keep
+    using the values that model had when the learner was built, while the eager one follows the
+    updates the other segment applies. Nothing but running both says which one happened, and they
+    can only part once the first segment has moved the model -- from the second step on.
     """
-    return optax.chain(optax.clip_by_global_norm(1.0), optax.MultiSteps(optax.sgd(0.1), 2).gradient_transformation())
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"] = READING_SEGMENT
+    raw["LEARNERS"][1]["INFERENCE_FLOW"] = READING_SEGMENT
+    FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()(tmp_path / "reading.py")
+    learner_type = _load(tmp_path / "reading.py", "reading_learner").Learner
+    model_type = _model_type(tmp_path)
+
+    def _run(compiled: bool) -> list[float]:
+        """Run two steps of a fresh learner, its training step compiled or not."""
+        learner = learner_type(*[model_type(rngs=nnx.Rngs(seed)) for seed in range(3)])
+        if compiled:
+            learner._training_step = nnx.jit(
+                learner._training_step, donate_argnames=("a", "b", "c", "optimizer_ab", "optimizer_c")
+            )
+        return [float(learner.training_step(x=X, y=Y)["loss_c"]) for _ in range(2)]
+
+    eager, jitted = _run(compiled=False), _run(compiled=True)
+
+    assert jitted == pytest.approx(eager, rel=1e-6)
+    assert eager[1] != eager[0]
 
 
-def test_a_window_that_is_not_a_literal_fails_when_the_learner_is_built(tmp_path: Path) -> None:
-    """Only an int literal window can be read back into the learner's host gate.
+def test_the_first_optimizer_is_the_clock_of_a_learner_whose_segments_are_out_of_phase(tmp_path: Path) -> None:
+    """One learner, one update count: the first segment decides what an Update is for the whole run.
 
-    A schedule computes the window on the device, where the host formula cannot follow it. The
-    pattern is never parsed: the generated `__init__` reads the built optimizer back, so the
-    refusal is a ValueError at instantiation, mirroring the keras learners (`docs/adr/0017`).
-    """
-    schedule = [
-        "_obj_",
-        {"_addr_": "optax.linear_schedule"},
-        {"_call_": {"init_value": 2, "end_value": 4, "transition_steps": 10}},
-    ]
-    learner_type = _tx_learner(tmp_path, "scheduled", _multi_steps_tx(every_k_schedule=schedule))
-
-    with pytest.raises(ValueError, match="int literal"):
-        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
-
-
-def test_a_skip_predicate_fails_when_the_learner_is_built(tmp_path: Path) -> None:
-    """`should_skip_update_fn` breaks the call-count identity the host `update` gate relies on."""
-    predicate = ["_obj_", {"_addr_": "optax.skip_not_finite"}]
-    tx = _multi_steps_tx(every_k_schedule=2, should_skip_update_fn=predicate)
-    learner_type = _tx_learner(tmp_path, "skipping", tx)
-
-    with pytest.raises(ValueError, match="should_skip_update_fn"):
-        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
-
-
-def test_a_multi_steps_nested_inside_a_chain_fails_when_the_learner_is_built(tmp_path: Path) -> None:
-    """A `MultiSteps` hidden inside `optax.chain` cannot be read, so it has to be refused.
-
-    Reading the window as one while the device accumulated would desynchronize every update event:
-    the generated `__init__` walks the optimizer state for the accumulator and demands the wrapper
-    be outermost.
-    """
-    tx = ["_obj_", {"_addr_": f"{__name__}.chained_multi_steps"}, "_call_"]
-    learner_type = _tx_learner(tmp_path, "chained", tx)
-
-    with pytest.raises(ValueError, match="outermost"):
-        learner_type(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
-
-
-def test_windows_that_disagree_across_segments_fail_when_the_learner_is_built(tmp_path: Path) -> None:
-    """One learner, one update window: the trainer's update counter answers for the whole learner.
-
-    A segment without `MultiSteps` counts as a window of one, so wrapping only the first optimizer
-    has to be refused with the two values named -- at instantiation, where the windows are read
-    back from the built optimizers (`docs/adr/0017`).
+    The trainer's update counter answers for the learner, and the segments need not share a window:
+    here the first optimizer accumulates over two steps while the second applies on every one, and
+    the counted updates follow the first alone.
     """
     raw = load_any(SEGMENTS_YAML)
     raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": _multi_steps_tx(every_k_schedule=2)}}
-    FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()(tmp_path / "disagreeing.py")
+    FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))()(tmp_path / "dephased.py")
     model_type = _model_type(tmp_path)
-    learner_type = _load(tmp_path / "disagreeing.py", "disagreeing_learner").Learner
+    learner_type = _load(tmp_path / "dephased.py", "dephased_learner").Learner
+    learner = learner_type(*[model_type(rngs=nnx.Rngs(seed)) for seed in range(3)])
 
-    with pytest.raises(ValueError, match=r"disagree.*\[1, 2\]"):
-        learner_type(*[model_type(rngs=nnx.Rngs(seed)) for seed in range(3)])
+    gates = []
+    for _ in range(4):
+        learner.training_step(x=X, y=Y)
+        gates.append(learner.has_updated)
+
+    assert gates == [False, True, False, True]
+    assert (learner.steps, learner.updates) == (4, 2)
+
+
+def test_restore_counters_seeds_both_counts_from_the_checkpoint(tmp_path: Path) -> None:
+    """A resumed run continues its own clocks, which only the saved meta knows.
+
+    Neither count is recoverable from the optimizer state -- a window of one leaves no counter at
+    all -- so both are seeded as given, and the next step continues from them.
+    """
+    learner = _learner_type(tmp_path)(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
+
+    learner.restore_counters(7, 3)
+
+    assert (learner.steps, learner.updates) == (7, 3)
+
+    learner.training_step(x=X, y=Y)
+
+    assert (learner.steps, learner.updates) == (8, 4)

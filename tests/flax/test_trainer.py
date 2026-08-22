@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Iterator
-from functools import partial
+from functools import partial, wraps
 import logging
 from typing import Any
 
@@ -14,7 +14,7 @@ import pytest
 
 from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider
 from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer, ShardedDataset, create_jax_inputs
-from structcast_model.flax.utils import get_jax_device, get_jax_devices
+from structcast_model.flax.utils import donate_argnames, get_jax_device, get_jax_devices
 from tests.fakes import CountingLearner
 
 
@@ -237,6 +237,31 @@ def test_get_jax_device_invalid_raises() -> None:
     """get_jax_device raises ValueError for a non-existent device string."""
     with pytest.raises(ValueError, match="not available"):
         get_jax_device("nonexistent:99")
+
+
+# ---------------------------------------------------------------------------
+# donate_argnames
+# ---------------------------------------------------------------------------
+
+
+def test_donate_argnames_reads_the_state_parameters_a_step_declares() -> None:
+    """The step signature is the donation contract, and nothing else decides what is donated.
+
+    Reading it back is what extends donation to a hand-written step following the convention, and
+    what keeps the batch -- whose arrays the caller still holds afterwards -- out of the donation.
+    A step another layer already wrapped has to report the parameters underneath, or a compiled run
+    would donate nothing at all.
+    """
+
+    def _training_step(model: Any, optimizer: Any, *, x: Any, y: Any, **kwargs: Any) -> None:
+        """A generated training step: state positionally, batch keyword-only."""
+
+    @wraps(_training_step)
+    def wrapped(*args: Any, **kwargs: Any) -> None:
+        """The same step behind a wrapper, as a strategy or a profiler hands it over."""
+
+    assert donate_argnames(_training_step) == ("model", "optimizer")
+    assert donate_argnames(wrapped) == ("model", "optimizer")
 
 
 # ---------------------------------------------------------------------------

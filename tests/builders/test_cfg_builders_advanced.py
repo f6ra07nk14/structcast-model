@@ -81,6 +81,29 @@ def test_learner_class_documents_the_compile_seam_and_update_gating() -> None:
     assert "`has_updated`" in docstring
 
 
+def test_learner_script_explains_itself_without_citing_repository_documents() -> None:
+    """A generated learner is read where this repository is not, so a citation there names nothing.
+
+    The float16 caveat is the one that has to survive as prose: `has_updated` reports the intent to
+    apply, which the gradient scaler may still skip.
+    """
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
+
+    assert "docs/adr" not in script
+    assert "# Intent, not detection: under float16" in script
+
+
+def test_learner_script_leaves_no_commented_out_layer_assignments() -> None:
+    """The layers are locals the flow functions close over; nothing reads them off the learner.
+
+    A commented-out assignment for each of them is noise a reader has to rule out as a leftover,
+    and the trainers scan a learner's attributes for the events it handles, never for its layers.
+    """
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
+
+    assert "# self." not in script
+
+
 def test_learner_script_contains_autocast() -> None:
     """Default bfloat16 config wraps forward in autocast."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]

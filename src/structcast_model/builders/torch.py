@@ -308,7 +308,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         ] + [f"{n} = self.{n}" for n in used]
         return defs, binds + step + [
             "# Intent, not detection: under float16 the gradient scaler may skip the apply this flag reports,",
-            "# and a torch optimizer exposes no counter to check it against (docs/adr/0018).",
+            "# and a torch optimizer exposes no counter to check it against.",
             "if __need_update__:",
             f"{' ' * 4}self._updates += 1",
             "self._has_updated = __need_update__",
@@ -339,8 +339,8 @@ class {self.classname}:
     `training_step` runs backward every call -- dividing the loss by the accumulation divisor inside the
     backward expression -- and gates clipping, the optimizer step, `zero_grad()` and, under mixed precision,
     the gradient scaler's unscale and update behind the accumulation gate it computes from its own `_steps`
-    counter, while `inference_step` runs under `torch.no_grad()`. The learner owns the training counters
-    (docs/adr/0018): `steps`, `updates` and `has_updated` report completed counts after each step, and
+    counter, while `inference_step` runs under `torch.no_grad()`. The learner owns the training counters:
+    `steps`, `updates` and `has_updated` report completed counts after each step, and
     `restore_counters` seeds them after a checkpoint restore. Under float16 the gate keeps intent semantics:
     `has_updated` reports that an apply was attempted, not that the gradient scaler let it land. `outputs`
     names the criteria the steps return, and `models`, `optimizers`, `optimizer_models`, `grad_scalers`,
@@ -354,7 +354,6 @@ class {self.classname}:
         {sep.join([f"{k} = {v}" for k, v in self.others.items() if k != v])}
         {sep.join(self._forward_training_flow)}
         {sep.join(self._forward_inference_flow)}
-        {sep.join([f"# self.{k} = {k}" for k in initialized_layers])}
         {sep.join([f"self.{k} = {k}" for k in self.others])}
         self._requires_grad_defaults = {{{defaults}}}
         self._steps = 0
