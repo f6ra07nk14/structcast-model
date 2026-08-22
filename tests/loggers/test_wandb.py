@@ -26,6 +26,9 @@ def wandb_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     yield wandb
     if wandb.run is not None:
         wandb.finish()
+    # wandb caches its settings (WANDB_DIR among them) in a process-global singleton and exports
+    # WANDB_SERVICE, so a later test would write into this test's directory; teardown() resets both.
+    wandb.teardown()
 
 
 def test_wandb_logger_run_lifecycle_and_content(wandb_offline: Any, tmp_path: Path, epoch_info: TorchTrainer) -> None:
