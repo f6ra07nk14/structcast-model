@@ -18,6 +18,7 @@ from structcast_model.builders.base import (
     LearnerIntermediate,
     OptimizerSegment,
 )
+from structcast_model.builders.constants import BOUND_CALLABLE_PREFIX
 from structcast_model.builders.schema import Parameters, UserLayer
 from structcast_model.builders.torch import TorchBuilder, TorchLayerIntermediate, TorchLearnerBuilder
 from structcast_model.builders.utils import resolve_getter, resolve_object
@@ -42,15 +43,51 @@ def test_resolve_object_collects_import_and_class_name() -> None:
     assert imports["torch.nn"] == {"Linear"}
 
 
+def _bound_callables(imports: "defaultdict[str, set[str | None]]") -> dict[str, set[str | None]]:
+    """The module-level constants a resolution collected, keyed by the name they are bound under."""
+    return {
+        key.removeprefix(BOUND_CALLABLE_PREFIX): value
+        for key, value in imports.items()
+        if key.startswith(BOUND_CALLABLE_PREFIX)
+    }
+
+
 def test_resolve_object_with_bind_pattern() -> None:
-    """Resolve an object pattern containing a bind operation."""
+    """A binding of literals resolves to one module-level constant shared by every use of it.
+
+    The closure is what makes this worth pinning: nnx reads a callable attribute as part of a
+    module's graphdef and compares it by identity, so a lambda built per instance would give two
+    instances of one generated class two graphdefs -- and two `flax.nnx.jit` traces of one step.
+    """
     imports: defaultdict[str, set[str | None]] = defaultdict(set)
     raw = {"_obj_": [["_addr_", "timm.utils.clip_grad.dispatch_clip_grad"], ["_bind_", {"value": 1.0, "mode": "norm"}]]}
     resolved, class_name = resolve_object(imports, ObjectPattern.model_validate(raw))
-    assert "lambda" in resolved
-    assert "'value': 1.0" in resolved
-    assert "'mode': 'norm'" in resolved
+    # A second layer binding the same callable to the same arguments must reuse the same constant.
+    again, _ = resolve_object(imports, ObjectPattern.model_validate(raw))
+
     assert class_name == "dispatch_clip_grad"
+    assert resolved.isidentifier()
+    assert again == resolved
+    ((name, expressions),) = _bound_callables(imports).items()
+    assert name == resolved
+    (expression,) = expressions
+    assert "lambda" in expression
+    assert "'value': 1.0" in expression
+    assert "'mode': 'norm'" in expression
+
+
+def test_resolve_object_keeps_an_evaluated_bind_pattern_at_the_instance() -> None:
+    """An `eval:` value is written to be read where the object is built, so its binding stays there.
+
+    `rngs` is the standing example: hoisting a binding that reads it to module level would be a
+    NameError at import, and the same holds for every flow name an expression can reach.
+    """
+    imports: defaultdict[str, set[str | None]] = defaultdict(set)
+    raw = {"_obj_": [{"_addr_": "flax.nnx.Linear"}, {"_bind_": {"rngs": "eval: rngs"}}]}
+    resolved, _ = resolve_object(imports, ObjectPattern.model_validate(raw))
+
+    assert resolved == "(lambda *_arg0, **_kw0: Linear(*_arg0, rngs=rngs, **_kw0))"
+    assert _bound_callables(imports) == {}
 
 
 def test_resolve_object_rejects_secondary_address_pattern() -> None:
@@ -345,10 +382,11 @@ def test_resolve_object_with_list_bind_pattern() -> None:
     imports: defaultdict[str, set[str | None]] = defaultdict(set)
     raw = {"_obj_": [["_addr_", "torch.nn.Identity"], ["_bind_", [1, 2, 3]]]}
     resolved, class_name = resolve_object(imports, ObjectPattern.model_validate(raw))
-    assert "lambda" in resolved
     assert class_name == "Identity"
+    (expression,) = _bound_callables(imports)[resolved]
+    assert "lambda" in expression
     # list bind places positional args before *args
-    assert "1, 2, 3" in resolved
+    assert "1, 2, 3" in expression
 
 
 # ---------------------------------------------------------------------------

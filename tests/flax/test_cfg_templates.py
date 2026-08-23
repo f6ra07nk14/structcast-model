@@ -9,7 +9,7 @@ module-scoped, so the whole file stays a CPU-seconds affair.
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from re import findall as re_findall, search as re_search
+from re import MULTILINE, findall as re_findall, search as re_search
 from types import ModuleType
 from typing import Any
 
@@ -588,15 +588,47 @@ def test_the_model_templates_activate_through_the_exact_gelu(name: str, tmp_path
     the same weights -- a divergence neither a shape nor a falling loss can see. The probe is what
     makes the keyword worth reading back: the two forms agree to about three decimals, so a test
     that only found `approximate=False` in the emitted module would not say it changed any number.
+    It is read off the constant the binding is hoisted to, which is the one object every block of
+    every instance activates through.
     """
     probe = jnp.linspace(-3.0, 3.0, 7)
     assert not bool(jnp.allclose(jax.nn.gelu(probe, approximate=False), jax.nn.gelu(probe), atol=1e-5))
 
-    _model_type(tmp_path, name, GELU_MODELS[name])
+    path = tmp_path / f"{name.lower()}.py"
+    FlaxBuilder.from_path(MODELS / f"{name}.yaml")(parameters=GELU_MODELS[name])(path)
 
-    calls = re_findall(r"gelu\([^)]*\)", (tmp_path / f"{name.lower()}.py").read_text())
-    assert calls, "the template stopped emitting a gelu call at all"
-    assert all("approximate=False" in call for call in calls)
+    code = path.read_text()
+    constants = re_findall(r"^(_bound_\w+) = .*approximate=False.*$", code, flags=MULTILINE)
+    assert len(constants) == 1, "the exact GELU must be one module-level constant, shared by every block"
+    assert code.count("lambda") == 1, "a bound callable survived as a per-instance closure"
+    assert re_findall(rf"^\s+self\.\w+ = {constants[0]}$", code, flags=MULTILINE), "no block activates through it"
+    activated = getattr(_load(path, path.stem), constants[0])(probe)
+    assert bool(jnp.allclose(activated, jax.nn.gelu(probe, approximate=False), atol=1e-6))
+
+
+def test_two_instances_of_a_bound_activation_share_one_traced_step(tmp_path: Path) -> None:
+    """Two instances of one generated class must share a graphdef, and a jit trace with it.
+
+    A callable attribute is part of the static half nnx compares, and neither a lambda nor a
+    `functools.partial` defines `__eq__`: built per instance, the bound activation would give every
+    instance its own graphdef, so an EMA shadow or a second model would pay a full recompile of a
+    step it should have shared. Counting the traces is what says it -- each one is a compile.
+    """
+    model_type = _model_type(tmp_path, "SmallLanguageModel", GELU_MODELS["SmallLanguageModel"])
+    first, second = model_type(rngs=nnx.Rngs(0)), model_type(rngs=nnx.Rngs(1))
+    traces: list[int] = []
+
+    @nnx.jit
+    def _logits(model: Any, tokens: jax.Array) -> jax.Array:
+        traces.append(1)
+        return model(tokens)["logits"]
+
+    tokens = jnp.arange(8, dtype=jnp.int32)[None] % 11
+    _logits(first, tokens)
+    _logits(second, tokens)
+
+    assert nnx.graphdef(first) == nnx.graphdef(second)
+    assert len(traces) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ from structcast.utils.base import resolve_address, split_attribute
 from structcast.utils.types import PathLike
 
 from structcast_model.builders.auto_name import AutoName
-from structcast_model.builders.constants import FILE_IMPORT_PREFIX
+from structcast_model.builders.constants import BOUND_CALLABLE_PREFIX, FILE_IMPORT_PREFIX
 from structcast_model.builders.schema import (
     LayerBehavior,
     LearnerBehavior,
@@ -72,11 +72,17 @@ class _Intermediate(Serializable):
 
     def __call__(self, module_path: PathLike | None = None) -> None:
         """Save the script for the layer to the given path."""
-        module_imports = {p: i for p, i in self.collected_imports.items() if not p.startswith(FILE_IMPORT_PREFIX)}
+        collected = self.collected_imports
+        module_imports = {
+            p: i for p, i in collected.items() if not p.startswith((FILE_IMPORT_PREFIX, BOUND_CALLABLE_PREFIX))
+        }
         file_imports = {
-            p.removeprefix(FILE_IMPORT_PREFIX): i
-            for p, i in self.collected_imports.items()
-            if p.startswith(FILE_IMPORT_PREFIX)
+            p.removeprefix(FILE_IMPORT_PREFIX): i for p, i in collected.items() if p.startswith(FILE_IMPORT_PREFIX)
+        }
+        bound_callables = {
+            p.removeprefix(BOUND_CALLABLE_PREFIX): i
+            for p, i in collected.items()
+            if p.startswith(BOUND_CALLABLE_PREFIX)
         }
         from_imports = {p: {m for m in i if m} for p, i in module_imports.items()}
         imported_code = "\n".join(
@@ -106,7 +112,13 @@ class _Intermediate(Serializable):
                 rendered_file = str(Path(file).resolve()) if Path(file).exists() else file
                 binding_lines.append(f"{leaf} = import_from_address({address!r}, module_file={rendered_file!r})")
         file_bindings = "\n".join(binding_lines)
-        code = "\n\n".join([s for s in [(imported_code + "\n"), file_bindings, *self.scripts] if s])
+        # Module level, so every instance of every generated class shares one bound callable object.
+        hoisted = "\n".join(
+            f"{name} = {expression}"
+            for name, expressions in sorted(bound_callables.items())
+            for expression in sorted(e for e in expressions if e)
+        )
+        code = "\n\n".join([s for s in [(imported_code + "\n"), file_bindings, hoisted, *self.scripts] if s])
         if module_path is None:
             module_path = Path(f"{to_snake(self.classname)}.py")
         elif not isinstance(module_path, Path):

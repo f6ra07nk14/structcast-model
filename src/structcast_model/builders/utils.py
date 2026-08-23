@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 from hashlib import sha256
 from json import dumps as json_dumps
+from re import compile as re_compile
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -14,8 +15,41 @@ from structcast.core.instantiator import AddressPattern, AttributePattern, BindP
 from structcast.core.specifier import SPEC_CONSTANT, SpecIntermediate
 from structcast.utils.base import resolve_address
 
-from structcast_model.builders.constants import FILE_IMPORT_PREFIX
+from structcast_model.builders.constants import BOUND_CALLABLE_PREFIX, FILE_IMPORT_PREFIX
 from structcast_model.builders.schema import SPEC_EVAL
+
+_MODULE_LEVEL_NAME = re_compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+"""A resolved expression that is nothing but a name: everything `_resolve` names lives at module level."""
+
+
+def _hoist(imports: defaultdict[str, set[str | None]], expression: str, leaf: str) -> str:
+    """Collect one closure-free expression as a module-level constant and return the name it takes.
+
+    The name carries the digest of the expression, so it is the same in every script the same
+    binding is resolved for -- deterministic across processes, and one constant however many layers,
+    classes or learners bind that callable to those arguments.
+    """
+    name = f"_bound_{leaf}_{sha256(expression.encode()).hexdigest()[:8]}"
+    imports[f"{BOUND_CALLABLE_PREFIX}{name}"].add(expression)
+    return name
+
+
+def _literal_arguments(rendered: str) -> bool:
+    """Whether a rendered argument list carries build-time literals and nothing else.
+
+    Read off the rendered arguments rather than the pattern, because that is where an `eval:` value,
+    a nested pattern or a source reference has already turned into a name or a call: anything that
+    survives `ast.literal_eval` was a constant in the configuration file.
+    """
+    try:
+        call = ast.parse(f"_({rendered})", mode="eval").body
+        if not isinstance(call, ast.Call):
+            return False
+        for node in [*call.args, *(keyword.value for keyword in call.keywords)]:
+            ast.literal_eval(node)
+    except (SyntaxError, ValueError):
+        return False
+    return True
 
 
 def statement_names(line: str) -> tuple[set[str], set[str]]:
@@ -54,6 +88,8 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             the name of the top-level class or function.
     """
     classes: list[str] = []
+    # Every `eval:` value rendered so far, so a binding can tell whether it read one of them.
+    evaluated: list[str] = []
 
     def _repr(raw: Any) -> str:
         if isinstance(raw, (int, float, bool, bytes, type(None))):
@@ -64,6 +100,7 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             pass
         if isinstance(raw, str):
             if raw.startswith("eval:"):
+                evaluated.append(raw)
                 return raw[5:].strip()
             return repr(raw)
         if isinstance(raw, dict):
@@ -112,11 +149,20 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
                 # pattern always renders the same script. Reuse across nesting levels is safe: a
                 # nested lambda only ever references its own arguments, shadowing any outer ones.
                 aname, kwname = f"_arg{bind_index}", f"_kw{bind_index}"
+                seen, target = len(evaluated), res
                 args = _args(ptn.bind)
                 if isinstance(ptn.bind, dict):
-                    res = f"(lambda *{aname}, **{kwname}: {res}(*{aname}, {args}, **{kwname}))"
+                    res = f"(lambda *{aname}, **{kwname}: {target}(*{aname}, {args}, **{kwname}))"
                 else:
-                    res = f"(lambda *{aname}, **{kwname}: {res}({args}, *{aname}, **{kwname}))"
+                    res = f"(lambda *{aname}, **{kwname}: {target}({args}, *{aname}, **{kwname}))"
+                # A closure over nothing but constants and one module-level name is hoisted, so that
+                # every layer binding that callable to those arguments shares the one object: built
+                # per instance instead, it would be a per-instance leaf of the Flax graphdef, and two
+                # instances of the generated class would no longer hit the same `flax.nnx.jit` trace.
+                # An `eval:` value is written to be read where the object is built -- `rngs` is the
+                # standing example -- so a binding that read one stays where the reading works.
+                if len(evaluated) == seen and _MODULE_LEVEL_NAME.fullmatch(target) and _literal_arguments(args):
+                    res = _hoist(imports, res, target.rsplit(".", 1)[-1])
             else:
                 raise SpecError(
                     "Patterns after the first pattern of an ObjectPattern must be AttributePattern, CallPattern, "

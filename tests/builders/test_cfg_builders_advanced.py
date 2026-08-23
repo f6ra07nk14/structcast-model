@@ -23,6 +23,16 @@ def fp16_builder() -> TorchLearnerBuilder:
     return TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))
 
 
+def rendered_module(built: Any, tmp_path: Path) -> str:
+    """Render one built learner to the whole module, not just the class script.
+
+    What a binding of literal arguments renders to lives above the class, next to the imports: the
+    builder hoists it there so every instance shares the one callable object.
+    """
+    built(path := tmp_path / "learner.py")
+    return path.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # TorchLearnerBuilder: basic build
 # ---------------------------------------------------------------------------
@@ -134,15 +144,18 @@ def test_learner_script_gates_model_invocations() -> None:
     assert "def _restore" not in script  # the package helper, never an inline copy
 
 
-def test_learner_script_bind_arguments_are_deterministic() -> None:
+def test_learner_script_bind_arguments_are_deterministic(tmp_path: Path) -> None:
     """Bind-lambda argument names derive from the pattern position, never from id().
 
     An id()-derived suffix changes with every process, so the same template rendered twice would
     differ byte-for-byte -- phantom diffs for committed scripts and no way to hash-check "already
-    generated". The template's single bind must therefore always render as `_arg0`.
+    generated". The template's binds must therefore always render as `_arg0`, and the name each one
+    is hoisted under must come from the expression, which is stable for the same reason.
     """
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert set(findall(r"_arg\d+", script)) == {"_arg0"}
+    module = rendered_module(TorchLearnerBuilder.from_path(LEARNER_YAML)(), tmp_path)
+
+    assert set(findall(r"_arg\d+", module)) == {"_arg0"}
+    assert module == rendered_module(TorchLearnerBuilder.from_path(LEARNER_YAML)(), tmp_path)
 
 
 def test_learner_script_defines_steps_as_methods() -> None:
@@ -279,18 +292,18 @@ def test_learner_mp_scale_backward_with_accumulation() -> None:
 
 
 @pytest.mark.parametrize("decay_type", ["single", "group"])
-def test_learner_layer_decay_types_produce_regexes(decay_type: str) -> None:
+def test_learner_layer_decay_types_produce_regexes(decay_type: str, tmp_path: Path) -> None:
     """Both single and group layer decay types produce layer_group_regexes."""
     params = {"DEFAULT": {"layer_decay_type": decay_type}}
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
-    assert "layer_group_regexes" in script
+    module = rendered_module(TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params), tmp_path)
+    assert "layer_group_regexes" in module
 
 
-def test_learner_no_layer_decay_produces_empty_regexes() -> None:
+def test_learner_no_layer_decay_produces_empty_regexes(tmp_path: Path) -> None:
     """Null layer_decay_type produces empty layer_group_regexes."""
     params = {"DEFAULT": {"layer_decay_type": None}}
-    script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
-    assert "'layer_group_regexes': []" in script
+    module = rendered_module(TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params), tmp_path)
+    assert "'layer_group_regexes': []" in module
 
 
 def test_learner_invalid_layer_decay_type_raises() -> None:
@@ -338,12 +351,10 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
     raises NameError at construction time.
     """
     built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
-    assert "AdamWWithCosine(" in built.scripts[0]
     # The module is imported for `get_decays`, but the file-referenced class must not ride along.
     assert "AdamWWithCosine" not in built.collected_imports["structcast_model.torch.optimizers"]
-    script_path = tmp_path / "learner.py"
-    built(script_path)
-    code = script_path.read_text(encoding="utf-8")
+    code = rendered_module(built, tmp_path)
+    assert "AdamWWithCosine(" in code
     resolved = str(Path("examples/torch/optimizers.py").resolve())
     assert f"AdamWWithCosine = import_from_address('AdamWWithCosine', module_file={resolved!r})" in code
     assert "from structcast.utils.base import import_from_address" in code

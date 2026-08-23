@@ -141,10 +141,10 @@ Block:
           - {_addr_: flax.nnx.Linear}
           - {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"}}
       # "approximate=False" is the exact erf GELU the torch and Keras twins use; the jax default is
-      # the tanh approximation, and the two agree to no more than about three decimals. The keyword
-      # is why this is a flow expression and not an object pattern: a pattern binding it would build
-      # a fresh closure per instance, which two models of this class could no longer share a trace on.
-      - ["eval: flax.nnx.{{activation}}(_, approximate=False)", _]
+      # the tanh approximation, and the two agree to no more than about three decimals. Every value
+      # bound here is a literal, which is what lets the builder hoist the bound callable to a
+      # module-level constant, so two instances of this class still share one graphdef and one trace.
+      - [_, _, [_obj_, {_addr_: "flax.nnx.{{activation}}"}, {_bind_: {approximate: false}}]]
       - INPUTS: _
         OUTPUTS: _
         LAYER:
