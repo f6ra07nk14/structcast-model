@@ -4,10 +4,12 @@ Everything here is loaded by file path, the way a configuration reaches it with 
 `_file_`: an example that only works when it is imported as a module is an example the configuration
 form cannot use.
 
-Nothing downloads anything. The corpus reads a local file through `data_path`, and the image
-pipeline gets its arrays through the `arrays` fixture below, which replaces the module-level
-`load_arrays` -- the one place the pipeline reaches for data, so everything under test between that
-call and the batch is the real code.
+Nothing downloads anything, and the image pipeline's two sources are each covered on their own
+terms. The in-memory one is fed through the `arrays` fixture, which replaces the module-level
+`load_arrays` -- the one place that path reaches for data, so everything between that call and the
+batch is the real code. The directory one is given a real tree of tiny PNGs under `tmp_path`, since
+listing and decoding files is precisely what it is being asked to do. The corpus reads a local file
+through `data_path`.
 """
 
 from importlib.util import module_from_spec, spec_from_file_location
@@ -144,6 +146,95 @@ def test_the_validation_split_yields_the_same_epoch_every_time(arrays: None) -> 
     assert np.array_equal(next(iter(validation))["label"], next(iter(validation))["label"])
 
 
+def _image_tree(root: Path, classes: int = 2, per_class: int = 4) -> Path:
+    """Write a class-per-folder tree of tiny PNGs, the layout the timm loader reads too.
+
+    Every image is one flat colour and no two share it, so the pixel value of a decoded batch says
+    exactly which files produced it -- which is what the sharding assertions below rest on.
+    """
+    for label in range(classes):
+        folder = root / f"class{label}"
+        folder.mkdir(parents=True)
+        for index in range(per_class):
+            colour = 10 * (label * per_class + index) + 1
+            keras.utils.save_img(folder / f"{index}.png", np.full((8, 8, 3), colour, "uint8"), scale=False)
+    return root
+
+
+def _colours(batches: Any) -> list[int]:
+    """The flat colour of every image an epoch yielded, recovered from the rescaled pixels."""
+    return [round(float(image[0, 0, 0]) * 255) for batch in batches for image in batch["image"]]
+
+
+def test_the_streaming_source_yields_the_same_batch_contract_as_the_array_source(tmp_path: Path) -> None:
+    """A directory and a `keras.datasets` name must be interchangeable from the learner's side.
+
+    They are not interchangeable underneath -- a directory hands over float32 images in 0..255 and
+    int32 labels where an array set hands over uint8 and int64 -- so the keys, the shapes and above
+    all the dtypes are pinned here: a run that swapped a small set for the real one would otherwise
+    only find out inside the loss, where an int32 label is a different error message.
+    """
+    data = DATA.KerasImageData(dataset=_image_tree(tmp_path), batch_size=2, image_size=(8, 8))
+
+    batch = next(iter(data))
+
+    assert sorted(batch) == ["image", "label"]
+    assert batch["image"].shape == (2, 8, 8, 3)
+    assert batch["image"].dtype == np.float32
+    assert batch["image"].min() >= 0.0
+    assert batch["image"].max() <= 1.0
+    assert batch["label"].shape == (2,)
+    assert batch["label"].dtype == np.int64
+    # Per-item, not per-set: the source decodes as the pipeline pulls, which is what lets a set of
+    # ImageNet's size through at all. A source that had read the tree into one array would spec (n, ...).
+    assert tuple(data.source.element_spec[0].shape) == (8, 8, 3)
+    assert (data.items, len(data)) == (8, 4)
+
+
+def test_the_streaming_source_shards_its_files_across_the_launcher_ranks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sharding has to cut the file list, not the decoded images, or every rank decodes the lot.
+
+    Same contract as the in-memory path -- disjoint, covering the split between them, equal length,
+    stable for a rank -- asserted on the directory source because the cut happens somewhere else
+    there: on the `tf.data` pipeline rather than on a NumPy slice.
+    """
+    root = _image_tree(tmp_path)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    shards = []
+    for rank in ("0", "1"):
+        monkeypatch.setenv("RANK", rank)
+        data = DATA.KerasImageData(dataset=root, batch_size=2, image_size=(8, 8))
+        assert len(data) == 2, "four files per rank, two to a batch"
+        shards.append(_colours(data))
+
+    assert not set(shards[0]) & set(shards[1])
+    assert sorted(shards[0] + shards[1]) == [10 * index + 1 for index in range(8)]
+    assert len(shards[0]) == len(shards[1])
+    assert _colours(DATA.KerasImageData(dataset=root, batch_size=2, image_size=(8, 8))) == shards[1]
+
+
+def test_the_streaming_source_shuffles_the_same_way_for_the_same_seed(tmp_path: Path) -> None:
+    """A run has to be replayable, and the shuffle is the only thing here that could stop it being.
+
+    Asserted on the labels, one per file here, because they are what the shuffle reorders and the
+    augmentation cannot touch: an image would answer for the random crop as well and say nothing
+    about the item order. Two pipelines built from one seed must agree epoch for epoch; two seeds
+    must not, or the seed is ignored and every run is silently the file order.
+    """
+    root = _image_tree(tmp_path, classes=8, per_class=1)
+
+    def _epoch(seed: int) -> list[int]:
+        data = DATA.KerasImageData(dataset=root, batch_size=2, image_size=(8, 8), training=True, seed=seed)
+        return [int(label) for batch in data for label in batch["label"]]
+
+    assert _epoch(0) == _epoch(0)
+    assert _epoch(0) != _epoch(7)
+    assert sorted(_epoch(0)) == list(range(8))
+
+
 def _labels_of_rank(rank: int, monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
     """Every label one rank of a two-process launch sees in an epoch, in order."""
     monkeypatch.setenv("RANK", str(rank))
@@ -208,7 +299,7 @@ def test_the_shipped_dataset_template_refuses_to_render_without_a_dataset() -> N
     """
     template: Template[Any] = Template.from_path(CFG_DIR / "keras" / "others" / "default_keras.yaml")
 
-    with pytest.raises(ValueError, match="dataset is required and has no default"):
+    with pytest.raises(ValueError, match="A source is required and has no default"):
         template({})
 
     pattern = template({"DEFAULT": {"dataset": "cifar100", "batch_size": 8}}).model_dump(mode="json")

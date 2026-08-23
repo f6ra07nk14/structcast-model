@@ -15,9 +15,12 @@ _obj_:
     - {dataset: cifar10, training: true, batch_size: 32, image_size: [32, 32]}
 ```
 
-The arrays come from `keras.datasets`, downloaded once into the Keras cache directory, through the
-module-level `load_arrays` below -- which is also where a corpus of your own is plugged in, without
-touching the pipeline.
+`dataset` is either the name of a `keras.datasets` set, which is downloaded once into the Keras
+cache directory and read into memory through the module-level `load_arrays` below, or the path of
+one split's directory laid out one folder per class -- the same tree
+`cfg/torch/others/default_timm.yaml` points timm at, so one dataset directory on the host serves
+both. The path is the only form that scales: a set of ImageNet's size never becomes an array, and
+the directory form decodes one batch at a time.
 
 Augmentation happens here, in the `tf.data` pipeline, and never inside the model: Keras' image
 preprocessing layers fall back to TensorFlow operations when a `tf.data` pipeline traces them, so
@@ -34,10 +37,11 @@ on a NumPy array.
 from collections.abc import Iterator
 from functools import cached_property
 import os
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, DirectoryPath
 import tensorflow as tf
 
 import keras
@@ -83,8 +87,17 @@ class KerasImageData(BaseModel):
     usable on the `jax` and `torch` backends.
     """
 
-    dataset: Literal["mnist", "cifar10", "cifar100"]
-    """The `keras.datasets` set to read. Required: a default would download something unasked."""
+    dataset: Literal["mnist", "cifar10", "cifar100"] | DirectoryPath
+    """The `keras.datasets` set to read, or the directory of one split, one folder per class.
+
+    One field rather than a name plus a separate directory, because the two are alternatives and a
+    pair of fields would let a configuration set both and silently honor one. Pydantic discriminates
+    them -- a value that is neither a known name nor an existing directory is refused at
+    construction, naming both possibilities -- so nothing here sniffs for a path separator.
+
+    Required: a default would download something unasked. It names one split's directory, not the
+    dataset root, so `training` decides how that split is read and not which one it is.
+    """
 
     training: bool = False
     """Whether this is the training split: it is shuffled and augmented, the other one is not."""
@@ -95,12 +108,25 @@ class KerasImageData(BaseModel):
     image_size: tuple[int, int] = (32, 32)
     """The (height, width) the model sees.
 
-    A training image larger than this is randomly cropped to it and a validation image is resized to
-    it, the usual pair.
+    A directory's images are decoded straight to this size. An in-memory image larger than this is
+    randomly cropped to it when training and resized to it when not, the usual pair.
     """
 
     crop_padding: int = 4
-    """Pixels of zero padding added on each side before the random crop; 0 disables the crop."""
+    """Pixels of zero padding added on each side before the random crop; 0 disables the crop.
+
+    Pad-then-crop is the small-image recipe. It is not the scale-and-aspect jitter an ImageNet run
+    usually trains under -- a directory's images are resized to `image_size` outright, aspect ratio
+    and all -- so a run reproducing a published ImageNet number replaces this with a random resized
+    crop of its own.
+    """
+
+    shuffle_buffer: int = 1024
+    """Items the training shuffle holds at once, capped by the number this rank owns.
+
+    A full-split buffer is what a shuffle wants and what a set of ImageNet's size cannot afford, so
+    the buffer is bounded and the shuffle is local to a window of the file order.
+    """
 
     seed: int = 42
     """Seed of the shuffle and of the augmentation draws."""
@@ -112,28 +138,44 @@ class KerasImageData(BaseModel):
     """The batch key the labels are stored under."""
 
     @cached_property
-    def arrays(self) -> tuple[np.ndarray, np.ndarray]:
-        """This process's share of the split, as (uint8 images, int64 labels), loaded once.
+    def source(self) -> tf.data.Dataset:
+        """The whole split as unbatched, unshuffled `(image, label)` pairs.
 
-        Under a multi-process launch each rank takes every `WORLD_SIZE`-th item starting at its own
-        rank, so the shards are disjoint and every rank sees the same number of batches; the tail
-        the world size does not divide is dropped, as `DistributedSampler` plus `drop_last` does on
-        the torch side. Which items a rank owns is fixed for the whole run and only their order is
-        reshuffled each epoch -- the same thing `DistributedSampler` does when nobody calls
-        `set_epoch`, and what the torch example accepts too. `examples/keras/corpus.py` shards after
-        its shuffle instead, so there a rank's items do change between epochs.
+        Unbatched and unshuffled on purpose, in both forms: the sharding below has to cut the split
+        by item, before anything groups or reorders it, so this stage only decides where the items
+        come from.
 
-        Outside such a launch -- the tensorflow and jax backends, and any single-process run --
-        every rank is rank 0 and the whole split is served. That is not an oversight: those backends
-        run one process and the distributed strategy splits each batch across the replicas itself,
-        so a loader that sharded here as well would hand each replica a shard of a shard.
+        A directory is read with `keras.utils.image_dataset_from_directory`, which lists the files
+        once and decodes them as the pipeline pulls them -- so a set of ImageNet's size costs a list
+        of paths, not a copy of the images. A `keras.datasets` name is loaded into memory instead,
+        which is the whole point of the small sets.
+
+        The two differ in what they hand over -- a directory yields float32 images in 0..255 and
+        int32 labels, an array set uint8 and int64 -- and `_prepare` below is what makes the batch
+        contract identical either way.
         """
-        images, labels = load_arrays(self.dataset, self.training)
-        rank, world = rank_and_world()
-        if world > 1:
-            usable = len(labels) - len(labels) % world
-            images, labels = images[rank:usable:world], labels[rank:usable:world]
-        return images, labels
+        if isinstance(self.dataset, Path):
+            return keras.utils.image_dataset_from_directory(
+                self.dataset,
+                labels="inferred",
+                label_mode="int",
+                image_size=self.image_size,
+                batch_size=None,
+                shuffle=False,
+                verbose=False,
+            )
+        return tf.data.Dataset.from_tensor_slices(load_arrays(self.dataset, self.training))
+
+    @property
+    def items(self) -> int:
+        """Number of items in the whole split, from the file listing or the array length."""
+        return int(self.source.cardinality())
+
+    @property
+    def shard_items(self) -> int:
+        """Number of items this rank owns: an equal share of the split, the indivisible tail cut."""
+        _, world = rank_and_world()
+        return self.items // world
 
     @cached_property
     def augmentation(self) -> list[keras.layers.Layer]:
@@ -153,7 +195,12 @@ class KerasImageData(BaseModel):
         return layers
 
     def _prepare(self, images: Any, labels: Any) -> dict[str, Any]:
-        """Augment one batch of images and key it by the model's input names."""
+        """Augment one batch of images and key it by the model's input names.
+
+        The labels are cast because the two sources disagree on their width; the images need no
+        cast, since `Rescaling` ends the chain in float32 either way. Both sources therefore leave
+        one batch contract, which is what lets a run swap a small set for a directory unchanged.
+        """
         if self.training and self.crop_padding:
             # `tf.pad`, not a Keras layer: the pad-then-crop recipe needs a padding Keras has no
             # preprocessing layer for, and a plain layer would run its own backend's operations
@@ -162,21 +209,43 @@ class KerasImageData(BaseModel):
             images = tf.pad(images, [[0, 0], [pad, pad], [pad, pad], [0, 0]])
         for layer in self.augmentation:
             images = layer(images)
-        return {self.image_key: images, self.label_key: labels}
+        return {self.image_key: images, self.label_key: tf.cast(labels, "int64")}
 
     @cached_property
     def pipeline(self) -> tf.data.Dataset:
-        """The batched, augmented and prefetched pipeline over this process's share of the split."""
-        images, labels = self.arrays
-        data = tf.data.Dataset.from_tensor_slices((images, labels))
+        """The sharded, batched, augmented and prefetched pipeline over this rank's share.
+
+        Under a multi-process launch each rank takes every `WORLD_SIZE`-th item starting at its own
+        rank, so the shards are disjoint and every rank sees the same number of batches; the tail
+        the world size does not divide is dropped first, as `DistributedSampler` plus `drop_last`
+        does on the torch side. Which items a rank owns is fixed for the whole run and only their
+        order is reshuffled each epoch -- the same thing `DistributedSampler` does when nobody calls
+        `set_epoch`, and what the torch example accepts too. `examples/keras/corpus.py` shards after
+        its shuffle instead, so there a rank's items do change between epochs.
+
+        Outside such a launch -- the tensorflow and jax backends, and any single-process run --
+        every rank is rank 0 and the whole split is served. That is not an oversight: those backends
+        run one process and the distributed strategy splits each batch across the replicas itself,
+        so a loader that sharded here as well would hand each replica a shard of a shard.
+
+        The sharding comes before the shuffle and the batching, so it cuts the split by item however
+        the items are stored, and the decode of a directory happens after it -- a rank never reads a
+        file another rank owns.
+        """
+        data = self.source
+        rank, world = rank_and_world()
+        if world > 1:
+            data = data.take(self.items - self.items % world).shard(world, rank)
         if self.training:
-            data = data.shuffle(len(labels), seed=self.seed, reshuffle_each_iteration=True)
+            data = data.shuffle(
+                min(self.shard_items, self.shuffle_buffer), seed=self.seed, reshuffle_each_iteration=True
+            )
         data = data.batch(self.batch_size, drop_remainder=True)
         return data.map(self._prepare, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
 
     def __len__(self) -> int:
         """Number of batches one rank sees per epoch, the short final batch being dropped."""
-        return len(self.arrays[1]) // self.batch_size
+        return self.shard_items // self.batch_size
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         """The batches of one epoch, as NumPy arrays keyed by `image_key` and `label_key`."""

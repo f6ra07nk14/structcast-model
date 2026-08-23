@@ -523,6 +523,23 @@ LEARNERS:
 
 ---
 
+**Precision (Flax)** — Flax carries precision on the model, not on the learner: each `flax.nnx`
+layer takes a `dtype` (compute) and a `param_dtype` (storage).
+[`cfg/flax/models/VisionTransformer.yaml`](cfg/flax/models/VisionTransformer.yaml) parameterizes the
+first as a `SHARED` template parameter, defaulting to `null`:
+
+```bash
+scm flax create model cfg/flax/models/VisionTransformer.yaml -p 'SHARED: {dtype: bfloat16}' -o model.py
+```
+
+That threads `dtype` onto every parameterized layer — `Conv`, `Embed`, `LayerNorm`, `Linear` — and
+leaves `param_dtype` at float32, so the weights, the gradients and the optax moments stay fp32 while
+the matmuls and the normalizations run in bf16. It is *mixed* precision, the Flax spelling of the
+torch `MIXED_PRECISION_TYPE: bfloat16` autocast over fp32 master weights, which is what makes the two
+backends' bf16 runs comparable; pure bf16 storage would be a `param_dtype` too and is deliberately
+not offered. Left unset the template emits byte-identical code to a build that never mentions it.
+
+
 ## API Reference: `base_trainer.py`
 
 [`src/structcast_model/base_trainer.py`](src/structcast_model/base_trainer.py) provides the framework-agnostic training loop, state management, and the protocol-routed callback system. Concrete trainers such as `TorchTrainer` build on top of these abstractions.

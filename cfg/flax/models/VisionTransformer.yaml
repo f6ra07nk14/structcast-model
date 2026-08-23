@@ -31,6 +31,19 @@ PARAMETERS:
     # body; "nnx.remat" threads that state in as an argument, so the recomputation replays the same
     # draw. Nothing checks that for a layer that writes its own variables -- keep such state out.
     gradient_checkpointing: false
+    # Compute precision of every parameterized layer below, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on with -p "SHARED: {dtype: bfloat16}".
+    # This is *mixed* precision, not pure bf16: it sets the "dtype" of each layer and leaves
+    # "param_dtype" at its float32 default, so the weights, the gradients and the optimizer moments
+    # stay fp32 while the matmuls and the normalizations run in bf16 -- the Flax spelling of what
+    # torch does with "MIXED_PRECISION_TYPE: bfloat16" autocast over fp32 master weights, which is
+    # what makes the two backends' bf16 runs comparable. Pure bf16 storage would be a "param_dtype"
+    # too, and is deliberately not offered: an fp32 master copy is what keeps a long run's small
+    # updates from rounding away.
+    # "flax.nnx" promotes an input against the layer's "dtype", so feeding bf16 batches
+    # (-p "DEFAULT: {image_dtype: bfloat16}" on the dataset template) is neither necessary nor
+    # sufficient on its own -- without this knob those batches are promoted back up to fp32.
+    dtype: null
   # model size parameters
   base:
     dim: 768
@@ -50,6 +63,7 @@ FLOW:
       - _jinja_group_: {{size}}
       {% raw %}
         _jinja_yaml_: |-
+          {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
           # (batch, {{image_size}}, {{image_size}}, 3) -> (batch, {{image_size // patch_size}}, {{image_size // patch_size}}, {{dim}})
           # -> (batch, {{(image_size // patch_size) ** 2}}, {{dim}}). A strided convolution over the
           # NHWC layout already emits the patches channel-last, so the flatten needs no transpose.
@@ -66,6 +80,11 @@ FLOW:
                   strides: [{{patch_size}}, {{patch_size}}]
                   padding: VALID
                   rngs: "eval: rngs"
+                  # A line of its own, unlike the "{{dt}}" suffix the flow-style layers below take:
+                  # this "_call_" is a block mapping, where a trailing ", dtype: ..." is not a key.
+                  {% if dtype is not none %}
+                  dtype: {{dtype}}
+                  {% endif %}
           - ["eval: feature.reshape(feature.shape[0], -1, {{dim}})", feature]
           # The class token, read out of a one-row embedding table at index 0 for every batch
           # element, prepended before the position table is added.
@@ -73,7 +92,7 @@ FLOW:
           - INPUTS: class_index
             OUTPUTS: class_token
             NAME: cls_token_embedding
-            LAYER: [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: 1, features: {{dim}}, rngs: "eval: rngs"}}]
+            LAYER: [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: 1, features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]
           - ["eval: jax.numpy.concatenate((class_token, feature), axis=1)", feature]
           # A learned position table, unlike the rotary embedding of "SmallLanguageModel.yaml": the
           # patch grid is fixed by "image_size" and "patch_size", so there is nothing to extrapolate.
@@ -84,14 +103,14 @@ FLOW:
             LAYER:
               - _obj_
               - _addr_: flax.nnx.Embed
-              - _call_: {num_embeddings: {{(image_size // patch_size) ** 2 + 1}}, features: {{dim}}, rngs: "eval: rngs"}
+              - _call_: {num_embeddings: {{(image_size // patch_size) ** 2 + 1}}, features: {{dim}}, rngs: "eval: rngs"{{dt}}}
           - ["eval: feature + position", feature]
           - [feature, feature, backbone, {TYPE: Backbone}]
-          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
           # The whole sequence is normalized and only then is the class token read, so the two
           # cannot be swapped.
           - ["eval: feature[:, 0]", pooled]
-          - [pooled, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{num_classes}}, rngs: "eval: rngs"}}]]
+          - [pooled, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{num_classes}}, rngs: "eval: rngs"{{dt}}}}]]
       {% endraw %}
 Backbone:
   OUTPUTS: [feature]
@@ -110,16 +129,17 @@ Block:
   # makes it an identity; it is left out here for the same reason.
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     GRADIENT_CHECKPOINTING: {{gradient_checkpointing}}
     FLOW:
-      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
       - [attended, attended, drop_path_attention, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
       - ["eval: inp + attended", residual]
-      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"}}]]
+      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"{{dt}}}}]]
       - [_, _, [_obj_, {_addr_: flax.nnx.gelu}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, projected, drop_path_mlp, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
       - ["eval: residual + projected", out]
 SelfAttention:
@@ -132,8 +152,9 @@ SelfAttention:
   OUTPUTS: [out]
   _jinja_yaml_: |-
     {% set head_dim = dim // heads %}
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     FLOW:
-      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"}}]]
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"{{dt}}}}]]
       - ["eval: qkv.reshape(qkv.shape[0], qkv.shape[1], 3, {{heads}}, {{head_dim}})", fused]
       - ["eval: fused[:, :, 0]", query]
       - ["eval: fused[:, :, 1]", key]
@@ -141,7 +162,7 @@ SelfAttention:
       - ["eval: jax.nn.dot_product_attention(query, key, value, is_causal=False)", attended]
       # (batch, tokens, heads, {{head_dim}}) -> (batch, tokens, dim).
       - ["eval: attended.reshape(attended.shape[0], attended.shape[1], {{dim}})", attended]
-      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
 DropPath:
   # Stochastic depth: one Bernoulli draw per sample, broadcast over the token and feature axes, so a
   # whole residual branch is dropped at once. "flax.nnx.Dropout" reads the module's own

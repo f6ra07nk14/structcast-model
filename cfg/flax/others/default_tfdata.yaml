@@ -1,15 +1,34 @@
+# The Flax counterpart of "cfg/torch/others/default_timm.yaml": one rendered dataset pattern for
+# "scm flax train --training-dataset" / "--validation-dataset".
+# The source is given one of two ways, and one of them must be:
+#   - "data_dir": the root of a dataset laid out one directory per split and one folder per class
+#     inside it, which is the tree the timm loader and "cfg/keras/others/default_keras.yaml" read
+#     too, so one dataset directory on the host serves all three frameworks. The images are decoded
+#     a batch at a time, so this is the form a run at ImageNet's size uses; "split" names the
+#     directory under the root, and "training" is what derives it.
+#   - "dataset": a "tensorflow_datasets" name, e.g. "cifar10", loaded through that package.
+# Render it twice, once per split, e.g.
+#   scm format cfg/flax/others/default_tfdata.yaml -o dataset_train.yaml \
+#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true, image_size: 224}'
+#   scm format cfg/flax/others/default_tfdata.yaml -o dataset_valid.yaml \
+#       -p 'DEFAULT: {dataset: cifar10, split: test}'
 PARAMETERS:
   DEFAULT:
     training: false
     # The split follows "training", as in "default_timm.yaml", so a validation loader can never be
-    # pointed at the training split by forgetting one of the two. Set it to override the derived
-    # name, e.g. -p "DEFAULT: {split: test}" for a dataset whose evaluation split is called that.
+    # pointed at the training split by forgetting one of the two. It is both the tfds split and the
+    # directory under "data_dir". Set it to override the derived name, e.g.
+    # -p "DEFAULT: {split: test}" for a dataset whose evaluation split is called that.
     split: null
     batch_size: 128
-    # Required: the "tensorflow_datasets" name to load, e.g. -p "DEFAULT: {dataset: cifar10}".
-    # The catalogue is at https://www.tensorflow.org/datasets/catalog.
+    # One of these two is required.
+    # "data_dir" is the root of a class-per-folder tree; the split directory under it is what the
+    # loader is pointed at.
+    data_dir: null
+    # "dataset" is a "tensorflow_datasets" name; the catalogue is at
+    # https://www.tensorflow.org/datasets/catalog.
     dataset: null
-    dataset_dir: data
+    dataset_dir: data # where tensorflow_datasets caches and downloads; unused by "data_dir"
     download: false
     image_size: 224
     image_dtype: float32 # "float32", "float16", or "bfloat16"
@@ -30,11 +49,15 @@ _obj_:
       # A batch is split across the strategy's mesh, so a short final batch would not divide.
       drop_remainder: true
       _jinja_yaml_: |-
-        {% if dataset is none %}
-        {{ 'A dataset is required, e.g. -p "DEFAULT: {dataset: cifar10}".' | raise_error }}
-        {% endif %}
+        {% set split_name = split if split is not none else ("train" if training else "validation") %}
+        {% if data_dir is not none %}
+        name: {{data_dir}}/{{split_name}}
+        {% elif dataset is not none %}
         name: "{{dataset}}"
-        split: {{split if split is not none else ("train" if training else "validation")}}
+        {% else %}
+        {{ 'A source is required and has no default: pass -p "DEFAULT: {data_dir: /path/to/dataset}" for a directory of class folders, or -p "DEFAULT: {dataset: cifar10}" for a tensorflow_datasets set.' | raise_error }}
+        {% endif %}
+        split: {{split_name}}
         data_dir: {{dataset_dir}}
         download: {{download}}
         is_training: {{training}}

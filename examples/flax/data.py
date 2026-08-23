@@ -17,9 +17,16 @@ _obj_:
       is_training: true
 ```
 
-The dataset is loaded through `tensorflow_datasets`, which is not a dependency of this package:
-install it with `uv pip install tensorflow-datasets`, or point `--training-dataset` at a dataset
-object of your own, since the training loop takes any iterable of dictionaries.
+`name` is either a `tensorflow_datasets` set, downloaded and cached by that package, or the path of
+one split's directory laid out one folder per class -- the same tree `cfg/torch/others/default_timm.yaml`
+points timm at and `examples/keras/data.py` reads, so one dataset directory on the host serves all
+three frameworks. The path is the form that scales: a set of ImageNet's size never becomes an array,
+and the directory form lists the files once and decodes one batch at a time.
+
+`tensorflow_datasets` is not a dependency of this package: install it with
+`uv pip install tensorflow-datasets` for the name form, use the directory form, or point
+`--training-dataset` at a dataset object of your own, since the training loop takes any iterable of
+dictionaries.
 
 The pipeline is big_vision-shaped and host-side: resize, then a random crop and a horizontal flip
 while training or a central crop while evaluating, then the channel-wise normalization. `tf.data`
@@ -35,9 +42,10 @@ also sharded per rank would double-shard (see `examples/flax/corpus.py` for the 
 
 from collections.abc import Iterator
 from functools import cached_property
-from typing import Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, DirectoryPath, Field, field_validator
 from structcast.utils.lazy_import import try_import
 import tensorflow as tf
 
@@ -80,14 +88,27 @@ class TFDataLoader(BaseModel):
     elementwise comparison rather than a truth value.
     """
 
-    name: str
-    """The `tensorflow_datasets` name to load, e.g. "cifar10"; required, and it may not be empty."""
+    name: Annotated[DirectoryPath | str, Field(union_mode="left_to_right")]
+    """The `tensorflow_datasets` set to read, e.g. "cifar10", or the directory of one split, one
+    folder per class.
+
+    One field rather than a name plus a separate directory, as in `examples/keras/data.py`: the two
+    are alternatives, and a pair of fields would let a configuration set both and silently honor
+    one. The keras twin discriminates them by a `Literal` of the three set names it knows; a tfds
+    name is any string, so the union is resolved left to right instead -- an existing directory
+    wins, anything else is a tfds name. A tfds set whose name is also a directory in the working
+    directory would therefore read the directory; nothing else here sniffs for a path separator.
+
+    It names one split's directory, not the dataset root, so `is_training` decides how that split
+    is read and not which one it is. Required either way: a default would download something
+    unasked, and an empty string is refused at construction.
+    """
 
     split: str = "train"
-    """The split to read, in `tensorflow_datasets` split syntax."""
+    """The split to read, in `tensorflow_datasets` split syntax. Ignored by a directory."""
 
     data_dir: str | None = None
-    """Directory the dataset is read from and downloaded into; the tfds default when None."""
+    """Directory tfds reads from and downloads into; its default when None. Ignored by a directory."""
 
     download: bool = False
     """Whether a missing dataset may be downloaded."""
@@ -128,12 +149,13 @@ class TFDataLoader(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _reject_an_unnamed_dataset(cls, name: str) -> str:
+    def _reject_an_unnamed_dataset(cls, name: Path | str) -> Path | str:
         """Refuse an empty name here rather than let tfds fail on it much later."""
-        if not name.strip():
+        if isinstance(name, str) and not name.strip():
             raise ValueError(
                 'A dataset name is required, e.g. name="cifar10": it is looked up with '
-                "tensorflow_datasets, whose catalogue is at https://www.tensorflow.org/datasets/catalog."
+                "tensorflow_datasets, whose catalogue is at https://www.tensorflow.org/datasets/catalog. "
+                "A path to one split's directory, one folder per class, is read from disk instead."
             )
         return name
 
@@ -148,11 +170,35 @@ class TFDataLoader(BaseModel):
 
     @cached_property
     def source(self) -> tf.data.Dataset:
-        """The undecoded `(uint8 image, int32 label)` pairs of this split, loaded through tfds.
+        """The unbatched, unshuffled `(image, label)` pairs of this split.
+
+        A directory is listed once with `keras.utils.image_dataset_from_directory` -- reached here
+        as `tf.keras`, which is the same function and spares this file an import it would otherwise
+        need for one call -- and its images are decoded as the pipeline pulls them, so a set of
+        ImageNet's size costs a list of paths rather than a copy of the pixels. The listing is what
+        `num_examples` counts, and the decode happens after everything downstream of this property.
+        The labels come from the folder names, sorted, so a rerun over the same tree numbers the
+        classes the same way. A tfds name is loaded through `tfds.load` instead.
+
+        The two hand over different things -- a directory float32 images in 0..255 and int32 labels,
+        tfds uint8 and int64 -- and `_preprocess` is what makes the batch contract identical either
+        way. Images are decoded at `resize_size`, not at `image_size`: the crop that `crop_pct`
+        exists for happens in `_preprocess`, and a source that had already resized to the final size
+        would leave it nothing to crop.
 
         Raises:
-            ImportError: If `tensorflow_datasets` is not installed.
+            ImportError: If `tensorflow_datasets` is not installed and a tfds name was asked for.
         """
+        if isinstance(self.name, Path):
+            return tf.keras.utils.image_dataset_from_directory(
+                self.name,
+                labels="inferred",
+                label_mode="int",
+                image_size=(self.resize_size, self.resize_size),
+                batch_size=None,
+                shuffle=False,
+                verbose=False,
+            )
         if not _tfds_imports.is_successful:
             raise ImportError(
                 f'Loading the dataset "{self.name}" needs the tensorflow_datasets package, which is not '

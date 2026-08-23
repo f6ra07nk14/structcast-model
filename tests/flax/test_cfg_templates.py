@@ -505,9 +505,9 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
     stay the same module -- its variable paths are what a sharding rule and a checkpoint address --
     so the paths and the forward pass are asserted against the same model built without it.
 
-    Mixed precision has no counterpart here: it is a `dtype`/`param_dtype` on the model's layers on
-    this backend, which the shipped template does not parameterize, and the showcase learner says so
-    rather than pretending otherwise.
+    Mixed precision is left out of this pair on purpose: it is a `dtype` on the model's layers on
+    this backend rather than anything the learner carries, so it is pinned on the template next to
+    the other model-side knob instead of here.
     """
 
     def _build(remat: bool) -> Any:
@@ -552,14 +552,15 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
 # ---------------------------------------------------------------------------
 
 
-def test_default_tfdata_template_renders_into_the_example_loader() -> None:
+def test_default_tfdata_template_renders_into_the_example_loader(tmp_path: Path) -> None:
     """`scm format` plus an object pattern is the whole path from that template to a dataset.
 
     The template is the only thing tying `examples/flax/data.py` to a run, by file path and by
     field name, so a renamed field would only fail here -- at the start of a training run that
     already built its models. The split follows `training`, so that no single forgotten parameter
-    can point a validation loader at the training data, and the dataset itself is required, so that
-    nothing silently trains on a placeholder.
+    can point a validation loader at the training data; it also names the directory under
+    `data_dir`, which is what lets one host tree serve a run at ImageNet's size; and a source is
+    required either way, so that nothing silently trains on a placeholder.
     """
     # Instantiating the pattern imports the example, which imports TensorFlow: not installed in the
     # floor environment, where this integration is not what is being pinned.
@@ -575,7 +576,13 @@ def test_default_tfdata_template_renders_into_the_example_loader() -> None:
     assert instantiate_object(_render(OTHERS / "default_tfdata.yaml", {"DEFAULT": {"dataset": "cifar10"}})).split == (
         "validation"
     )
-    with pytest.raises(ValueError, match="A dataset is required"):
+    # The directory form: the split is appended to the root, so one render per split covers a tree.
+    (tmp_path / "train").mkdir()
+    directory = instantiate_object(
+        _render(OTHERS / "default_tfdata.yaml", {"DEFAULT": {"data_dir": str(tmp_path), "training": True}})
+    )
+    assert directory.name == tmp_path / "train"
+    with pytest.raises(ValueError, match="A source is required"):
         _render(OTHERS / "default_tfdata.yaml", {})
 
 
@@ -590,3 +597,55 @@ def test_compile_default_template_only_carries_arguments_nnx_jit_accepts() -> No
 
     assert not {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"} & set(compile_kw)
     assert float(nnx.jit(lambda value: value + 1, **compile_kw)(jnp.asarray(1.0))) == 2.0
+
+
+def _vit_script(parameters: dict[str, Any], directory: Path) -> str:
+    """Emit the Vision Transformer template for *parameters* and return the generated module text."""
+    path = directory / "vit.py"
+    FlaxBuilder.from_path(MODELS / "VisionTransformer.yaml")(parameters=parameters)(path)
+    return path.read_text()
+
+
+def test_vision_transformer_emits_the_same_module_until_a_dtype_is_asked_for(tmp_path: Path) -> None:
+    """The precision knob must be invisible to every run that does not set it.
+
+    A `-p` knob threaded into eleven layer patterns is exactly the kind of change that shifts a
+    keyword or a default nobody asked to move, and the generated module is what a run trains and
+    what a checkpoint is keyed against. Byte equality against the same template with the knob
+    absent is the only assertion that catches all of that at once -- the same discipline the
+    `gradient_checkpointing` pair follows, which is set both ways here so the two knobs are proven
+    independent.
+    """
+    absent = _vit_script(VIT_PARAMETERS, tmp_path / "absent")
+    explicit_none = _vit_script({**VIT_PARAMETERS, "SHARED": {"dtype": None}}, tmp_path / "none")
+    remat: dict[str, Any] = {**VIT_PARAMETERS, "SHARED": {"gradient_checkpointing": True}}
+    checkpointed = _vit_script(remat, tmp_path / "remat")
+    checkpointed_none = _vit_script({**remat, "SHARED": {**remat["SHARED"], "dtype": None}}, tmp_path / "remat-none")
+
+    assert absent == explicit_none
+    assert checkpointed == checkpointed_none
+    # Layer constructions only: the class-token index is a "jax.numpy.zeros(..., dtype=...)"
+    # expression that has always been there, so a bare "dtype=" would not mean what it looks like.
+    assert not [line for line in absent.splitlines() if line.lstrip().startswith("self.") and "dtype=" in line]
+    assert "gradient_checkpointing = True" in checkpointed
+
+
+def test_vision_transformer_computes_in_bfloat16_over_float32_weights(tmp_path: Path) -> None:
+    """`-p "SHARED: {dtype: bfloat16}"` is the flax-native counterpart of torch bf16 autocast.
+
+    Mixed, not pure: only `dtype` is threaded, so `param_dtype` stays float32 and the weights -- and
+    with them the gradients and the optax moments -- keep an fp32 master copy while the matmuls and
+    the normalizations run in bf16. A template that also narrowed `param_dtype` would train a
+    different, and over a long run a worse, model; one that narrowed neither would report bf16
+    nowhere. Both halves are therefore asserted, and on every parameterized layer type the template
+    builds, since a keyword threaded onto four of five is the failure that looks like it worked.
+    """
+    parameters = {**VIT_PARAMETERS, "SHARED": {"dtype": "bfloat16"}}
+    script = _vit_script(parameters, tmp_path / "bf16")
+    model = _model_type(tmp_path, "VisionTransformer", parameters)(rngs=nnx.Rngs(0))
+
+    for layer in ("Conv", "Embed", "LayerNorm", "Linear"):
+        assert f"{layer}(" in script
+        assert all("dtype='bfloat16'" in line for line in script.splitlines() if f"= {layer}(" in line)
+    assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
+    assert model(jnp.zeros((2, 16, 16, 3)))["cls"].dtype == jnp.bfloat16

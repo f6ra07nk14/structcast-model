@@ -144,16 +144,6 @@ def test_the_image_element_type_is_the_one_that_was_asked_for(dtype: str) -> Non
     assert batch["label"].dtype == np.int32
 
 
-def test_an_unnamed_dataset_is_refused_where_it_is_written() -> None:
-    """There is no default dataset, so an empty name has to fail at construction, not at first read.
-
-    A loader that accepted it would only raise deep inside `tfds.load`, one training run and one
-    model build later, with a message about a dataset nobody asked for.
-    """
-    with pytest.raises(ValueError, match="A dataset name is required"):
-        TFDataLoader(name="   ")
-
-
 @pytest.mark.skipif(find_spec("tensorflow_datasets") is not None, reason="tensorflow_datasets is installed")
 def test_a_missing_tensorflow_datasets_says_what_to_install() -> None:
     """The one optional dependency of this file must name itself and its install command.
@@ -164,3 +154,106 @@ def test_a_missing_tensorflow_datasets_says_what_to_install() -> None:
     """
     with pytest.raises(ImportError, match="uv pip install tensorflow-datasets"):
         _ = TFDataLoader(name="cifar10").source
+
+
+def _image_tree(root: Path, classes: int = 2, per_class: int = 4) -> Path:
+    """Write a class-per-folder tree of tiny PNGs, the layout the timm and keras loaders read too.
+
+    Every image is one flat colour and no two share it, so the pixel value of a decoded batch says
+    exactly which files produced it -- which is what the ordering assertions below rest on.
+    """
+    for label in range(classes):
+        folder = root / f"class{label}"
+        folder.mkdir(parents=True)
+        for index in range(per_class):
+            colour = 10 * (label * per_class + index) + 1
+            image = tf.fill((8, 8, 3), tf.constant(colour, tf.uint8))
+            tf.io.write_file(str(folder / f"{index}.png"), tf.io.encode_png(image))
+    return root
+
+
+def _directory_loader(root: Path, **kwargs: Any) -> Any:
+    """Build a loader over a class-per-folder tree, at the size the tree was written in."""
+    return TFDataLoader(name=root, batch_size=2, image_size=8, crop_pct=1.0, **kwargs)
+
+
+def test_a_directory_is_told_apart_from_a_dataset_name_by_the_field_itself() -> None:
+    """One field carries both sources, so the discrimination has to be the field's, not a sniff.
+
+    A tfds name is any string, unlike the three-name `Literal` the keras twin can discriminate
+    against, so the union is resolved left to right: an existing directory wins and everything else
+    is a name. A pair of fields would let a configuration set both and silently honor one.
+
+    There is also no default, so an empty name has to fail at construction rather than deep inside
+    `tfds.load`, one training run and one model build later.
+    """
+    with pytest.raises(ValueError, match="A dataset name is required"):
+        TFDataLoader(name="   ")
+
+    assert isinstance(TFDataLoader(name="cifar10").name, str)
+
+
+def test_a_directory_source_yields_the_same_batch_contract_as_a_dataset_name(tmp_path: Path) -> None:
+    """A directory and a tfds name must be interchangeable from the learner's side.
+
+    They are not interchangeable underneath -- a directory hands over float32 images in 0..255 where
+    tfds hands over uint8 -- so the keys, the shapes and the dtypes are pinned here: a run that
+    swapped a small set for the real one would otherwise only find out inside the loss.
+    """
+    data = _directory_loader(_image_tree(tmp_path))
+
+    batch = next(iter(data()))
+
+    assert sorted(batch) == ["image", "label"]
+    assert batch["image"].shape == (2, 8, 8, 3)
+    assert batch["image"].dtype == np.float32
+    assert batch["label"].shape == (2,)
+    assert batch["label"].dtype == np.int32
+    assert (data.num_examples, len(data)) == (8, 4)
+
+
+def test_a_directory_source_decodes_as_the_pipeline_pulls(tmp_path: Path) -> None:
+    """The listing is what is read up front; the pixels are not, or ImageNet would not fit.
+
+    A per-item element spec is the proof: a source that had read the tree into one array would
+    report `(n, ...)` instead, and `num_examples` would be counting something already in memory.
+    Nothing between the listing and the decode reorders or groups the items, so a rank -- or, here,
+    the strategy's mesh -- still cuts the split by item.
+    """
+    data = _directory_loader(_image_tree(tmp_path))
+
+    assert tuple(data.source.element_spec[0].shape) == (8, 8, 3)
+    assert data.num_examples == 8
+
+
+def test_a_directory_source_numbers_its_classes_by_the_sorted_folder_names(tmp_path: Path) -> None:
+    """A rerun over the same tree has to give a class the same index, or a checkpoint means nothing.
+
+    The label of an item is its folder's position in sorted order, which is also what the timm and
+    keras loaders do over the same tree -- so a model trained through one can be evaluated by
+    another without a relabelling table.
+    """
+    data = _directory_loader(_image_tree(tmp_path, classes=2, per_class=4))
+
+    labels = [int(label) for batch in data() for label in batch["label"]]
+
+    assert sorted(labels) == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert labels == [int(label) for batch in data() for label in batch["label"]]
+
+
+def test_a_directory_source_shuffles_the_same_way_for_the_same_seed(tmp_path: Path) -> None:
+    """A run has to be replayable, and the shuffle is the only thing here that could stop it being.
+
+    Asserted on the labels, one per file here, because they are what the shuffle reorders and the
+    augmentation cannot touch. Two pipelines built from one seed must agree epoch for epoch; two
+    seeds must not, or the seed is ignored and every run is silently the file order.
+    """
+    root = _image_tree(tmp_path, classes=8, per_class=1)
+
+    def _epoch(seed: int) -> list[int]:
+        data = _directory_loader(root, is_training=True, seed=seed)
+        return [int(label) for batch in data() for label in batch["label"]]
+
+    assert _epoch(0) == _epoch(0)
+    assert _epoch(0) != _epoch(7)
+    assert sorted(_epoch(0)) == list(range(8))

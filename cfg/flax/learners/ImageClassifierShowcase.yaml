@@ -5,23 +5,26 @@
 #   scm flax train \
 #     --model cfg/flax/models/VisionTransformer.yaml \
 #     --learner cfg/flax/learners/ImageClassifierShowcase.yaml \
-#     -p "SHARED: {gradient_checkpointing: true}"
+#     -p "SHARED: {gradient_checkpointing: true, dtype: bfloat16}"
 #
 # 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
 #    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section, which then
 #    inherits "structcast_model.flax.layers.GradientCheckpointingModule" and emits its body as
 #    "_forward" (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020").
 # 2. Accumulation is the "optax.MultiSteps" below.
-# 3. Mixed precision has no learner field on this backend, and no "-p" reaches it either.
-#    Flax carries precision on the model, as the "dtype" (compute) and "param_dtype" (storage)
-#    keywords of each "flax.nnx" layer, and "cfg/flax/models/VisionTransformer.yaml" does not
-#    parameterize them: bf16 there is an edit to that template's layer patterns, e.g.
-#      [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {..., dtype: "eval: jax.numpy.bfloat16"}}]
-#    which leaves "param_dtype" at float32 -- fp32 weights, bf16 matmuls. What "-p" does reach is
-#    the dtype of the batch, on the dataset template:
+# 3. Mixed precision has no learner field on this backend either: Flax carries precision on the
+#    model, as the "dtype" (compute) and "param_dtype" (storage) keywords of each "flax.nnx" layer.
+#    It is the second "-p" above that turns it on -- "SHARED: {dtype: bfloat16}" threads "dtype"
+#    onto every parameterized layer of "cfg/flax/models/VisionTransformer.yaml" and leaves
+#    "param_dtype" at float32, so the weights, the gradients and the "optax" moments stay fp32 while
+#    the matmuls and the normalizations run in bf16. That is the Flax spelling of the torch
+#    "MIXED_PRECISION_TYPE: bfloat16" autocast, which is what makes the two backends' bf16 runs
+#    comparable; pure bf16 storage is deliberately not offered.
+#    Setting the batch dtype instead --
 #      --training-dataset cfg/flax/others/default_tfdata.yaml -p "DEFAULT: {image_dtype: bfloat16}"
-#    and that alone is not mixed precision: "flax.nnx" promotes a bf16 input against fp32 parameters
-#    back up to fp32. The one precision knob that does belong here is "accumulator_dtype" below.
+#    -- is neither necessary nor sufficient: "flax.nnx" promotes a bf16 input against fp32
+#    parameters back up to fp32 unless the layer's own "dtype" says otherwise. The other precision
+#    knob that belongs here is "accumulator_dtype" below.
 # 4. EMA is the "EMA" field below.
 PARAMETERS:
   DEFAULT:
