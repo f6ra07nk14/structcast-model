@@ -434,6 +434,7 @@ Key arguments:
 - positional model patterns: one or more named model definitions
 - `-s/--shape`: dummy input shapes used for model initialization
 - `-d/--device`: `cpu` or `cuda`
+- `--gpu-memory-fraction`: share of the resolved device's memory the run may take, greater than 0 and at most 1, applied with [`torch.cuda.set_per_process_memory_fraction`](https://docs.pytorch.org/docs/stable/generated/torch.cuda.set_per_process_memory_fraction.html) — under `torchrun` each rank caps its own GPU, a CPU run caps nothing, and omitting it leaves the run uncapped
 - `-L/--learner`: StructCast pattern for the learner class; it is called with the instantiated models as keyword arguments
 - `-LO/--learner-outputs`: criterion names to track, when the learner exposes no `outputs` attribute
 - `-c/--compile`: boolean, YAML file, or inline dict for `torch.compile`
@@ -629,6 +630,7 @@ Where it differs from `scm torch train`:
 - `-c/--compile`: wraps the learner's generated step functions in [`nnx.jit`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) and is **on by default**, unlike `scm torch train`'s `--compile`, which is off unless given. Pass `--compile none` to run them eagerly, or a dict of extra `nnx.jit` keyword arguments; what is static and what is donated is the generated step's contract and cannot be overridden
 - `--strategy`: the preset name `single`, `dp`, `fsdp`, `tp`, or `fsdp_tp`, or an object pattern — the templates under [`cfg/flax/strategies/`](cfg/flax/strategies/) bind the remaining knobs. Every batch is placed across the mesh before it reaches the learner, so each entry needs a leading dimension the mesh size divides
 - `-d/--device`: names the device of the `single` preset only (`cpu:0`, `gpu:0`, …); the multi-device presets span the devices themselves
+- `--gpu-memory-fraction`: the same cap as `scm torch train`'s, but applied by XLA rather than by an API call — the value is exported as `XLA_PYTHON_CLIENT_MEM_FRACTION`, with preallocation turned off beside it, before anything starts JAX; the variable is also read when the flag is omitted
 - `--matmul-precision`: sets `jax_default_matmul_precision` and defaults to `high`
 - there is no `--dist-backend`, `--dist-url`, or `-I/--initializer`, and no gradient-scaler options: `FlaxDistributedStrategy` refuses to build a scaler
 - training states are saved as `training_state.tar.gz` — an [orbax](https://orbax.readthedocs.io/) checkpoint packed into one archive — instead of the torch `.pt` file, and `--resume` reads that format back
@@ -679,6 +681,7 @@ Where it differs from `scm torch train`:
 - `--backend`: required, `tensorflow`, `jax`, or `torch`. Keras resolves its backend once, while it is first imported, so the command sets `KERAS_BACKEND` before importing anything that would; if Keras is already running on another backend it refuses rather than pretending to switch
 - `-s/--shape`: channel-last, and used to trace each model into existence; when omitted, every model is traced with the `INPUT_SHAPES` it declares itself
 - `--strategy`: the preset name `single`, `dp`, `fsdp`, or `tp`, or an object pattern — the templates under [`cfg/keras/strategies/`](cfg/keras/strategies/) bind the remaining knobs. `dp` runs on each backend's own data parallelism (`keras.distribution` on JAX, `tf.distribute.MirroredStrategy` on TensorFlow, `DistributedDataParallel` under `torchrun` on torch), while `fsdp` is refused anywhere but JAX instead of silently replicating
+- `--gpu-memory-fraction`: what the cap means follows `--backend` — JAX takes the fraction through `XLA_PYTHON_CLIENT_MEM_FRACTION`, torch through `torch.cuda.set_per_process_memory_fraction` on every visible device, and TensorFlow has no fraction knob at all, so it is only switched to growth on demand
 - `-d/--device`: named as `keras.distribution.list_devices()` spells it (`cpu:0`, `gpu:0`, …), it places nothing — which devices a backend computes on is the backend's own choice (restrict it with `CUDA_VISIBLE_DEVICES`) — so the name is validated and recorded with the run
 - training states are saved as `training_state.npz`, tagged with the backend that wrote them: `--resume` continues at the saved epoch plus one and refuses a state written on another backend, since normalization statistics and RNG trajectories are not verified equivalent across backends
 

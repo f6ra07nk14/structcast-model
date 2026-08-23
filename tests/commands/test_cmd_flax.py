@@ -8,6 +8,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import json
 import logging
 from math import isfinite
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -649,6 +650,117 @@ def test_train_refuses_a_learner_that_names_no_criteria(cli_runner: CliRunner, p
 
     assert isinstance(error, ValueError)
     assert 'Module "learner" does not have an "outputs" attribute' in str(error)
+
+
+# ---------------------------------------------------------------------------
+# 'train' command — --gpu-memory-fraction
+# ---------------------------------------------------------------------------
+
+
+XLA_MEMORY_VARIABLES = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE")
+"""The pair `--gpu-memory-fraction` writes, which the tests below own for their duration."""
+
+
+class _JaxTouched(Exception):
+    """Ends the run at its first `jax` attribute access, once the probe has read the environment."""
+
+
+class _JaxProbe:
+    """Stands in for cmd_flax's `jax`, recording the environment as it was when JAX is first used.
+
+    JAX reads the memory-fraction variables while it brings up a backend, which cannot happen before
+    the module is first used for anything -- so the environment at the first attribute access is
+    exactly what XLA gets to see, and a cap written after this point would reach nothing.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.environment: dict[str, str] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        """Record the environment, then stop the run before it reaches the real JAX."""
+        self.environment = dict(os.environ)
+        raise _JaxTouched(name)
+
+
+@pytest.fixture
+def xla_memory_environment() -> Iterator[None]:
+    """Run the test with both XLA memory variables unset, restoring whatever was there afterwards."""
+    saved = {name: os.environ.pop(name, None) for name in XLA_MEMORY_VARIABLES}
+    yield
+    for name, value in saved.items():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ[name] = value
+
+
+@pytest.mark.parametrize(
+    ("preset", "flag", "expected"),
+    [
+        pytest.param(None, "0.25", "0.25", id="flag-alone"),
+        pytest.param("0.3", None, "0.3", id="environment-alone"),
+        pytest.param("0.3", "0.25", "0.25", id="flag-over-environment"),
+        pytest.param(None, None, None, id="neither"),
+    ],
+)
+def test_train_exports_the_xla_cap_before_anything_touches_jax(
+    cli_runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    xla_memory_environment: None,
+    preset: str | None,
+    flag: str | None,
+    expected: str | None,
+) -> None:
+    """The cap has to be in the environment before JAX is used, and the flag has to win over it.
+
+    Written afterwards it would be read by nothing and the run would take XLA's default share of
+    every device while reporting the cap it was given, so the probe standing in for `jax` snapshots
+    the environment at the first access and ends the run there. Preallocation is turned off with the
+    fraction, which is also what tells a cap the command applied apart from one it merely inherited.
+    """
+    if preset is not None:
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = preset
+    probe = _JaxProbe()
+    monkeypatch.setitem(_CMD_GLOBALS, "jax", probe)
+    fraction = [] if flag is None else ["--gpu-memory-fraction", flag]
+
+    result = cli_runner.invoke(
+        app,
+        ["train", f"model: {UNUSED_PATTERN}", "--learner", UNUSED_PATTERN, "--training-dataset", DATASET, *fraction],
+    )
+
+    assert isinstance(result.exception, _JaxTouched), result.output
+    if expected is None:
+        assert not [name for name in XLA_MEMORY_VARIABLES if name in probe.environment]
+    else:
+        assert probe.environment["XLA_PYTHON_CLIENT_MEM_FRACTION"] == expected
+        assert probe.environment["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
+
+
+@pytest.mark.parametrize("fraction", ["0", "-0.5", "1.5"])
+def test_train_refuses_a_memory_fraction_outside_the_unit_interval(
+    cli_runner: CliRunner, xla_memory_environment: None, fraction: str
+) -> None:
+    """A fraction at 0 or outside (0, 1] caps nothing, and would otherwise be exported as if it did.
+
+    XLA silently ignores a value it cannot use, so a run given one would take its default share of
+    every device while reporting the cap it was asked for.
+    """
+    error = _train_error(
+        cli_runner,
+        [
+            f"model: {UNUSED_PATTERN}",
+            "--learner",
+            UNUSED_PATTERN,
+            "--training-dataset",
+            DATASET,
+            f"--gpu-memory-fraction={fraction}",
+        ],
+    )
+
+    assert isinstance(error, ValueError)
+    assert "must be in (0, 1]" in str(error)
+    assert "XLA_PYTHON_CLIENT_MEM_FRACTION" not in os.environ
 
 
 def test_train_names_the_criteria_from_learner_outputs(

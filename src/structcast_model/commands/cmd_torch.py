@@ -17,6 +17,7 @@ from typer import Argument, Option, Typer
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
+    check_gpu_memory_fraction,
     dict_parser,
     get_module_outputs,
     instantiate_object,
@@ -245,6 +246,29 @@ def call_calflops(
     print(f"Parameters: {params}")
 
 
+def _cap_gpu_memory(device: str, fraction: float | None) -> None:
+    """Cap the run's CUDA device at *fraction* of its memory.
+
+    torch has no environment variable for this, so the cap is an API call, and it is applied to the
+    one device the run resolved to rather than to every visible one: under a distributed launch that
+    device is the process's own ``cuda:<LOCAL_RANK>``, so each rank caps what it allocates on and
+    none of them touches a sibling's share. A CPU run has nothing to cap, and the fraction is still
+    validated there so a bad value fails the same way on any machine.
+
+    Args:
+        device (str): The device the run resolved to, e.g. "cuda:1" or "cpu".
+        fraction (float | None): The share of the device the run may take, None to leave it uncapped.
+
+    Raises:
+        ValueError: If the fraction is not greater than 0 and at most 1.
+    """
+    check_gpu_memory_fraction(fraction)
+    if fraction is None or "cuda" not in device:
+        return
+    # A bare "cuda" carries no index; torch then caps the current device, which is the same one.
+    torch.cuda.set_per_process_memory_fraction(fraction, torch.device(device).index)
+
+
 def _resolve_strategy(
     strategy_pattern: Any, device: str, local_rank: int, distributed: bool
 ) -> "scm_torch.DistributedStrategy":
@@ -375,6 +399,15 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "-d",
         help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
     ),
+    gpu_memory_fraction: float | None = Option(
+        None,
+        "--gpu-memory-fraction",
+        help="Share of its GPU's memory the run may take, greater than 0 and at most 1. It is applied with "
+        "torch.cuda.set_per_process_memory_fraction to the --device the run resolved to, so under a distributed "
+        "launch each rank caps its own and a CPU run caps nothing. It bounds the caching allocator, which is what "
+        "a run's tensors come from, and not what the driver context or NCCL reserve beside it. Uncapped when "
+        "omitted.",
+    ),
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
     compile_pattern: dict[str, Any] | None = compile_pattern,
@@ -426,6 +459,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     device, global_rank, local_rank, world_size, distributed = scm_torch.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
+    # After the resolution above, which is what decides the device the cap applies to, and before
+    # anything allocates on it.
+    _cap_gpu_memory(device, gpu_memory_fraction)
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
     # Before the seeding, which is derived from the strategy's data coordinates rather than the
@@ -501,6 +537,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "initializers": initializer_patterns,
         "shapes": input_shapes,
         "device": device,
+        "gpu_memory_fraction": gpu_memory_fraction,
         "distributed": distributed,
         "world_size": world_size,
         "learner": learner_pattern,

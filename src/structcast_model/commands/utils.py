@@ -156,6 +156,23 @@ def config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mappin
     return sha256(dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def check_gpu_memory_fraction(fraction: float | None) -> None:
+    """Reject a `--gpu-memory-fraction` outside (0, 1], where it would cap nothing while reading as a cap.
+
+    Each framework applies the fraction through whatever mechanism it actually has, but they all
+    reject the same values with the same sentence, so what an operator reads does not depend on which
+    `train` they ran.
+
+    Args:
+        fraction (float | None): The option's value, None when it was omitted.
+
+    Raises:
+        ValueError: If the fraction is given and is not greater than 0 and at most 1.
+    """
+    if fraction is not None and not 0 < fraction <= 1:
+        raise ValueError(f"--gpu-memory-fraction must be in (0, 1]. Got: {fraction}.")
+
+
 def strategy_parser(value: str) -> Any:
     """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one.
 
@@ -182,6 +199,7 @@ def instantiate_object(raw: Any) -> Any:
 
 __all__ = [
     "bool_or_path_or_dict_parser",
+    "check_gpu_memory_fraction",
     "config_hash",
     "dict_parser",
     "get_module_outputs",

@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
+import os
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -16,6 +17,7 @@ import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    check_gpu_memory_fraction,
     config_hash,
     dict_parser,
     get_module_outputs,
@@ -177,6 +179,29 @@ def _compile_parser(value: str) -> dict[str, Any] | None:
     return bool_or_path_or_dict_parser(value) or {}
 
 
+def _cap_gpu_memory(fraction: float | None) -> None:
+    """Ask XLA to keep to *fraction* of each GPU, before anything touches JAX.
+
+    XLA sizes its device allocation from these variables while JAX initializes its backend, which is
+    the first time a `jax` attribute is used for anything -- so they are written before the first
+    such access in `train`, and never after: set afterwards they would be read by nothing and the run
+    would take XLA's default share while reporting the cap it was given.
+
+    Args:
+        fraction (float | None): The share of each GPU the run may take, None to leave them uncapped.
+
+    Raises:
+        ValueError: If the fraction is not greater than 0 and at most 1.
+    """
+    check_gpu_memory_fraction(fraction)
+    if fraction is None:
+        return
+    # Preallocation is turned off alongside the fraction so the share is taken as the run needs it;
+    # `setdefault`, because an operator who set the variable deliberately keeps their choice.
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(fraction)
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's own class declares, empty for anything else.
 
@@ -221,6 +246,15 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         help='Device the "single" strategy runs on, named "<platform>:<index>" as listed by JAX (e.g. "cpu:0", '
         '"gpu:0"). If not specified, the first available JAX device is used. The multi-device strategies span the '
         "devices themselves and ignore it.",
+    ),
+    gpu_memory_fraction: float | None = Option(
+        None,
+        "--gpu-memory-fraction",
+        envvar="XLA_PYTHON_CLIENT_MEM_FRACTION",
+        help="Share of each GPU's memory the run may take, greater than 0 and at most 1. XLA is what applies it: "
+        "the value is exported as XLA_PYTHON_CLIENT_MEM_FRACTION before JAX starts, with preallocation turned off "
+        "(XLA_PYTHON_CLIENT_PREALLOCATE) so the share is taken as the run needs it rather than up front. Uncapped "
+        "when omitted.",
     ),
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
@@ -284,6 +318,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train Flax (nnx) models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
+    # Before the line below, which is the first `jax` attribute access of the run and therefore what
+    # imports JAX: the variables it writes are read once, while JAX brings up its backend.
+    _cap_gpu_memory(gpu_memory_fraction)
     jax.config.update("jax_default_matmul_precision", MATMUL_PRECISIONS[matmul_precision])
     # First: constructing the strategy activates its mesh process-wide, and every array allocated
     # afterwards -- the model parameters above all -- is placed against it.
@@ -385,6 +422,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         },
         "shapes": input_shapes,
         "device": device,
+        "gpu_memory_fraction": gpu_memory_fraction,
         "strategy": strategy_pattern,
         # A plain dict: the mesh reports its shape as an OrderedDict, which YAML tags as Python.
         "mesh": dict(strategy.mesh.shape),

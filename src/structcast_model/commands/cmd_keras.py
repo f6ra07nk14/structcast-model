@@ -18,6 +18,7 @@ import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
     bool_or_path_or_dict_parser,
+    check_gpu_memory_fraction,
     config_hash,
     dict_parser,
     get_module_outputs,
@@ -218,10 +219,9 @@ def _cap_gpu_memory(backend: str, fraction: float | None) -> None:
     Raises:
         ValueError: If the fraction is not greater than 0 and at most 1.
     """
+    check_gpu_memory_fraction(fraction)
     if fraction is None:
         return
-    if not 0 < fraction <= 1:
-        raise ValueError(f"--gpu-memory-fraction must be in (0, 1]. Got: {fraction}.")
     if backend == "jax":
         # Preallocation is turned off alongside the fraction so the share is taken as the run needs
         # it; `setdefault`, because an operator who set the variable deliberately keeps their choice.

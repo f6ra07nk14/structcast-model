@@ -49,6 +49,7 @@ _CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
 
 # Access private functions from cmd_torch via its module globals
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
+_cap_gpu_memory = _CMD_GLOBALS["_cap_gpu_memory"]
 
 
 @contextmanager
@@ -638,6 +639,7 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=None,
             learner_pattern=_learner_pattern(),
             learner_outputs=None,
             compile_pattern=None,
@@ -673,6 +675,7 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=None,
             learner_pattern=_learner_pattern("LearnerWithoutOutputs"),
             learner_outputs=None,
             compile_pattern=None,
@@ -748,6 +751,7 @@ def _invoke_train(
     log_artifacts: list[pathlib.Path] | None = None,
     epochs: int = 2,
     resume: str | None = None,
+    gpu_memory_fraction: float | None = None,
 ) -> None:
     """Invoke the ``train`` callback with real modules, patching only the dataset instantiation."""
     if training_data is None:
@@ -765,6 +769,7 @@ def _invoke_train(
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=gpu_memory_fraction,
             learner_pattern=_learner_pattern(learner_classname),
             learner_outputs=learner_outputs,
             compile_pattern=None,
@@ -1062,6 +1067,57 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
 
 
 # ---------------------------------------------------------------------------
+# `train` — --gpu-memory-fraction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.5, 1.5])
+def test_train_refuses_a_memory_fraction_outside_the_unit_interval(tmp_path: pathlib.Path, fraction: float) -> None:
+    """A fraction at 0 or outside (0, 1] caps nothing, and would otherwise be applied as if it did.
+
+    torch itself only refuses a negative one, so a 0 would hand the run an allocator it can never
+    allocate from and a 1.5 would read as a cap while raising the limit above the device.
+    """
+    with pytest.raises(ValueError, match=r"must be in \(0, 1\]"):
+        _invoke_train(tmp_path, epochs=1, gpu_memory_fraction=fraction)
+
+
+def test_cap_gpu_memory_caps_the_device_the_run_resolved_to(monkeypatch: Any) -> None:
+    """The cap must land on the run's own device, and on nothing at all without CUDA or a fraction.
+
+    Every rank of a torchrun launch runs this command against its own "cuda:<LOCAL_RANK>", so a cap
+    aimed anywhere else would either leave the rank uncapped or claim a share of a sibling's device.
+    The torch call is stubbed because the machine running the suite need not have a GPU: what the cap
+    is asked to do is under test, not CUDA. A CPU run must reach neither.
+    """
+    capped: list[tuple[float, Any]] = []
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction", lambda fraction, device: capped.append((fraction, device))
+    )
+
+    _cap_gpu_memory("cuda:1", 0.5)
+    assert capped == [(0.5, 1)]
+
+    _cap_gpu_memory("cpu", 0.5)
+    _cap_gpu_memory("cuda:1", None)
+    assert capped == [(0.5, 1)]
+
+
+def test_train_caps_the_device_it_resolved_rather_than_the_one_asked_for(tmp_path: pathlib.Path) -> None:
+    """The fraction has to be applied to the device the run resolved to, before anything allocates.
+
+    Under a distributed launch the resolved device is the rank's own, and a CUDA device requested on
+    a machine without CUDA resolves to the CPU -- so passing the raw --device through would cap the
+    wrong device, or a device that is not being used at all.
+    """
+    calls: list[tuple[str, float | None]] = []
+    with patch_cmd_globals(_cap_gpu_memory=lambda device, fraction: calls.append((device, fraction))):
+        _invoke_train(tmp_path, epochs=1, gpu_memory_fraction=0.5)
+
+    assert calls == [("cpu", 0.5)]
+
+
+# ---------------------------------------------------------------------------
 # DDP distributed training tests via torch.multiprocessing.spawn
 # ---------------------------------------------------------------------------
 
@@ -1108,6 +1164,7 @@ def _ddp_train_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1173,6 +1230,7 @@ def _ddp_rank_gating_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1239,6 +1297,7 @@ def _ddp_seed_offset_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1302,6 +1361,7 @@ def _run_train_on_rank(
         "initializer_patterns": None,
         "shapes": [{"x": (4,)}],
         "device": "cpu",
+        "gpu_memory_fraction": None,
         "learner_pattern": _learner_pattern(),
         "learner_outputs": None,
         "compile_pattern": None,
