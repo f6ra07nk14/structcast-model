@@ -8,13 +8,16 @@ Two ways to build the same training program, plus the integrations a configurati
 | [`torch/optimizers.py`](torch/optimizers.py)     | Optimizer + scheduler compositions referenced from YAML by file path      |
 | [`torch/data.py`](torch/data.py)                 | timm dataset and dataloader wrappers, referenced from YAML by file path   |
 | [`torch/corpus.py`](torch/corpus.py)             | A character-level text corpus, referenced from the CLI by file path       |
+| [`torch/cyclegan.py`](torch/cyclegan.py)         | An unpaired two-domain image loader and the generated-image replay buffer |
 | [`flax/simple_training.py`](flax/simple_training.py) | The same tutorial against the Flax trainer, run standalone or by `scm flax train` |
 | [`flax/data.py`](flax/data.py)                   | A `tf.data` input pipeline, referenced from YAML by file path             |
 | [`flax/corpus.py`](flax/corpus.py)               | The same character-level corpus, as NumPy batches                         |
+| [`flax/cyclegan.py`](flax/cyclegan.py)           | The `tf.data` twin of the unpaired two-domain image loader                |
 | [`keras/simple_training.py`](keras/simple_training.py) | A complete Keras training program written by hand, run standalone or by `scm keras train` |
 | [`keras/optimizers.py`](keras/optimizers.py)     | The one optimizer knob no object pattern can express, referenced from YAML by file path |
 | [`keras/data.py`](keras/data.py)                 | A `tf.data` image pipeline with core Keras augmentation, referenced from YAML by file path |
 | [`keras/corpus.py`](keras/corpus.py)             | The NumPy twin of `torch/corpus.py`, referenced from the CLI by file path |
+| [`keras/cyclegan.py`](keras/cyclegan.py)         | The rank-sharded `tf.data` twin of the unpaired two-domain image loader   |
 
 Run the tutorial:
 
@@ -1312,3 +1315,87 @@ shard of a shard. The tail the world size does not divide is dropped, so every r
 number of batches. `keras/data.py` shards before its shuffle, so a rank's items are fixed for the
 run and only their order changes — `DistributedSampler` without `set_epoch`, as in the torch twin;
 `keras/corpus.py` shards after, so a rank's items change each epoch.
+
+## Unpaired image translation with CycleGAN
+
+The three `CycleGAN` learner templates train four models over three optimizer segments, and every
+one of them reads its batch by name. `cyclegan.py` in each framework directory supplies those names
+from two directories of images — `trainA` and `trainB` of the horse2zebra set, or any other pair —
+drawn independently, since "unpaired" means nothing aligns them. An epoch is the longer directory,
+each image is resized to `load_size`, cropped to `crop_size` and scaled to **[-1, 1]**, which is the
+range the generators' closing `tanh` emits and therefore the only range the identity and cycle
+losses can compare a real image against.
+
+```bash
+scm torch create model cfg/torch/models/CycleGAN_generator.yaml -o generator.py
+scm torch create model cfg/torch/models/CycleGAN_discriminator.yaml -o discriminator.py
+scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
+
+scm torch train \
+    'G_AB: [_obj_, {_addr_: Model, _file_: generator.py}, _call_]' \
+    'G_BA: [_obj_, {_addr_: Model, _file_: generator.py}, _call_]' \
+    'D_A: [_obj_, {_addr_: Model, _file_: discriminator.py}, _call_]' \
+    'D_B: [_obj_, {_addr_: Model, _file_: discriminator.py}, _call_]' \
+    -L '[_obj_, {_addr_: Learner, _file_: learner.py}]' \
+    -s 'image: [3, 256, 256]' \
+    --training-dataset '[_obj_, {_addr_: UnpairedImageLoader, _file_: examples/torch/cyclegan.py},
+                         {_call_: {root_A: data/horse2zebra/trainA, root_B: data/horse2zebra/trainB}}]' \
+    --trainer '[_obj_, {_addr_: CycleGANTrainer, _file_: examples/torch/cyclegan.py}]' \
+    -LO loss_G -LO loss_GAN -LO loss_cycle -LO loss_identity -LO loss_D_A -LO loss_D_B \
+    -d cuda -e 200 -LC loss_G -E cyclegan
+```
+
+Two flags in that command are load-bearing, and only on the torch side.
+
+`--trainer` is the replay buffer. [`cfg/torch/learners/CycleGAN.yaml`](../cfg/torch/learners/CycleGAN.yaml)
+is the only one of the three templates whose discriminators train on `fake_A_sample` /
+`fake_B_sample` — the paper's pool of fifty *earlier* generated images, which damps the oscillation
+between the two networks — and no dataset can produce those: they are the generators' own output.
+`BaseTrainer.update_models` is the one place that sees both the batch on its way to the learner and
+the criteria on the way back, so `CycleGANTrainer` overrides it, adds the two pooled samples and
+keeps the `fake_A` / `fake_B` the step returned. The buffer is therefore fed the previous step's
+images rather than the current step's — one step of lag inside a buffer that already reaches fifty
+back. `pool_size: 0` turns it off and feeds the last step's images straight through.
+
+`-LO` names the six scalar criteria. The torch template outputs `fake_A` and `fake_B` as well — it
+has to, that is how the generated images reach the buffer — and the tracker sums every criterion it
+is handed into a one-element buffer, which a `[batch, 3, height, width]` image does not broadcast
+into. Leaving `-LO` off fails on the first step.
+
+Neither applies to Flax or Keras: their templates carry no buffer at all (a Flax segment
+differentiates only what its own flow computes, and a Keras segment is called with the batch alone,
+so both discriminate a fake image they generate themselves), they declare `INPUTS: [real_A, real_B]`,
+and they keep the images out of `OUTPUTS`. Their commands are the plain ones — no `--trainer`, no
+`-LO` — over [`flax/cyclegan.py`](flax/cyclegan.py) and [`keras/cyclegan.py`](keras/cyclegan.py),
+whose `UnpairedImageLoader` is the same contract as a `tf.data` pipeline yielding NHWC NumPy arrays:
+
+```bash
+scm flax create model cfg/flax/models/CycleGAN_generator.yaml -o generator.py
+scm flax create model cfg/flax/models/CycleGAN_discriminator.yaml -o discriminator.py
+# steps_per_epoch is what turns the template's epoch counts into the step counts an optax or Keras
+# schedule reads: len(training_dataset), which the command prints before the first epoch.
+scm flax create learner cfg/flax/learners/CycleGAN.yaml -p 'DEFAULT: {steps_per_epoch: 1334}' -o learner.py
+
+scm flax train \
+    'G_AB: [_obj_, {_addr_: Model, _file_: generator.py}]' \
+    'G_BA: [_obj_, {_addr_: Model, _file_: generator.py}]' \
+    'D_A: [_obj_, {_addr_: Model, _file_: discriminator.py}]' \
+    'D_B: [_obj_, {_addr_: Model, _file_: discriminator.py}]' \
+    -L '[_obj_, {_addr_: Learner, _file_: learner.py}]' \
+    -s 'image: [256, 256, 3]' \
+    --training-dataset '[_obj_, {_addr_: UnpairedImageLoader, _file_: examples/flax/cyclegan.py},
+                         {_call_: {root_A: data/horse2zebra/trainA, root_B: data/horse2zebra/trainB}}]' \
+    -e 200 -LC loss_G -E cyclegan
+```
+
+The Keras command is the same one with `keras` in place of `flax`, `KERAS_BACKEND` (or `--backend`)
+selected, and `_call_` appended to each model pattern.
+
+None of the three takes a validation dataset. The discriminator segments have no `INFERENCE_FLOW`,
+so an inference step would want the torch template's two buffer samples as well, and a GAN has no
+held-out scalar worth selecting a checkpoint on.
+
+Sharding follows each framework's convention, as it does for the other loaders: the torch loader
+builds a `DistributedSampler` on `DATA_RANK` / `DATA_WORLD_SIZE`, the Keras one cuts both domains on
+`RANK` / `WORLD_SIZE`, and the Flax one shards nothing, because JAX is single-controller and the
+strategy splits each batch across the mesh itself.
