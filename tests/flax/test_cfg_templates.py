@@ -9,7 +9,7 @@ module-scoped, so the whole file stays a CPU-seconds affair.
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from re import search as re_search
+from re import findall as re_findall, search as re_search
 from types import ModuleType
 from typing import Any
 
@@ -545,6 +545,38 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
     assert blended == [True, False, True]  # one blend per Update, none on the micro-steps between
     assert sorted(learner.models) == ["ema_model", "model"]
     assert bool(jnp.isfinite(learner.inference_step(**batch)["ce_loss"]))
+
+
+# ---------------------------------------------------------------------------
+# The activation the three model templates share
+# ---------------------------------------------------------------------------
+
+
+GELU_MODELS: dict[str, dict[str, Any]] = {
+    "ConvNeXtV2": {"SHARED": {"num_classes": 5}, "atto": {"dims": [4, 8, 8, 16], "depths": [1, 1, 1, 1]}},
+    "SmallLanguageModel": {"tiny": {"dim": 16, "heads": 2, "depth": 1, "vocab_size": 11}},
+    "VisionTransformer": VIT_PARAMETERS,
+}
+"""Every shipped model template whose MLP activates through `flax.nnx.gelu`, shrunk to build fast."""
+
+
+@pytest.mark.parametrize("name", list(GELU_MODELS), ids=list(GELU_MODELS))
+def test_the_model_templates_activate_through_the_exact_gelu(name: str, tmp_path: Path) -> None:
+    """`flax.nnx.gelu` defaults to the tanh approximation; `torch.nn.GELU` and Keras' do not.
+
+    Left bare, these templates would compute a different MLP from their torch and Keras twins on
+    the same weights -- a divergence neither a shape nor a falling loss can see. The probe is what
+    makes the keyword worth reading back: the two forms agree to about three decimals, so a test
+    that only found `approximate=False` in the emitted module would not say it changed any number.
+    """
+    probe = jnp.linspace(-3.0, 3.0, 7)
+    assert not bool(jnp.allclose(jax.nn.gelu(probe, approximate=False), jax.nn.gelu(probe), atol=1e-5))
+
+    _model_type(tmp_path, name, GELU_MODELS[name])
+
+    calls = re_findall(r"gelu\([^)]*\)", (tmp_path / f"{name.lower()}.py").read_text())
+    assert calls, "the template stopped emitting a gelu call at all"
+    assert all("approximate=False" in call for call in calls)
 
 
 # ---------------------------------------------------------------------------

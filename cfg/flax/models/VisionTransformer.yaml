@@ -138,7 +138,11 @@ Block:
       - ["eval: inp + attended", residual]
       - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"{{dt}}}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.gelu}]]
+      # "approximate=False" is the exact erf GELU the torch and Keras twins use; the jax default is
+      # the tanh approximation, and the two agree to no more than about three decimals. The keyword
+      # is why this is a flow expression and not an object pattern: a pattern binding it would build
+      # a fresh closure per instance, which two models of this class could no longer share a trace on.
+      - ["eval: flax.nnx.gelu(_, approximate=False)", _]
       - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, projected, drop_path_mlp, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
       - ["eval: residual + projected", out]

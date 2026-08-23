@@ -7,6 +7,8 @@ PARAMETERS:
     kernel_size: 7
     drop_path_rate: 0.
     norm_eps: 1.0e-6
+    # A "flax.nnx" activation function; the block below calls it with "approximate=False", which
+    # only "gelu" takes, so any other name is a TypeError on the first forward pass.
     activation: gelu
     mlp_ratio: 4
     num_classes: 1000
@@ -138,7 +140,11 @@ Block:
           - _obj_
           - {_addr_: flax.nnx.Linear}
           - {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"}}
-      - [_, _, [_obj_, {_addr_: "flax.nnx.{{activation}}"}]]
+      # "approximate=False" is the exact erf GELU the torch and Keras twins use; the jax default is
+      # the tanh approximation, and the two agree to no more than about three decimals. The keyword
+      # is why this is a flow expression and not an object pattern: a pattern binding it would build
+      # a fresh closure per instance, which two models of this class could no longer share a trace on.
+      - ["eval: flax.nnx.{{activation}}(_, approximate=False)", _]
       - INPUTS: _
         OUTPUTS: _
         LAYER:
