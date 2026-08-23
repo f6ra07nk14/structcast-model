@@ -48,7 +48,7 @@ def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] 
     model, and a generated learner attaches none: its optimizers belong to the segments the adapter
     drives.
 
-    This is the one place a run's state is read, so the distributed strategies of P5 rewire state
+    This is the one place a run's state is read, so the distributed strategies rewire state
     collection here and nowhere else.
 
     Args:

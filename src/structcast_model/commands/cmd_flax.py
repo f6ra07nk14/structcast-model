@@ -180,10 +180,9 @@ def _compile_parser(value: str) -> dict[str, Any] | None:
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's own class declares, empty for anything else.
 
-    A generated learner carries the digests as a class attribute (see `docs/adr/0019`), which is the
-    only handle on them: the class is loaded from a file rather than imported by name, so its module
-    never lands in `sys.modules`. A hand-written learner declares none, and the resume check skips
-    what is missing.
+    A generated learner carries the digests as a class attribute, which is the only handle on them:
+    the class is loaded from a file rather than imported by name, so its module never lands in
+    `sys.modules`. A hand-written learner declares none, and the resume check skips what is missing.
     """
     return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 

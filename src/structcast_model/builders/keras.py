@@ -237,7 +237,7 @@ class KerasLearnerBehavior(LearnerBehavior):
     `optimizer.apply(gradients, variables)`, which takes nothing else, so the field is rejected
     rather than silently dropped. There is no `CLIP` field either -- clipping is a keyword of the
     Keras optimizer (`clipnorm` / `clipvalue` / `global_clipnorm`), so it belongs in `OPTIMIZER`
-    (`docs/adr/0016`) and `_reject_clip` says so, rather than leaving the inherited `extra="forbid"`
+    and `_reject_clip` says so, rather than leaving the inherited `extra="forbid"`
     to report a `CLIP` key as one more unpermitted extra input.
     """
 
@@ -287,7 +287,7 @@ class KerasUserDefinedLearner(UserDefinedLearner[KerasLearnerBehavior]):
     def _validate_mixed_precision(self) -> Self:
         """Require the two mixed precision fields to agree, since either one alone does nothing.
 
-        `MIXED_PRECISION` selects the global policy (`docs/adr/0016`) and cannot pick an element type
+        `MIXED_PRECISION` selects the global policy and cannot pick an element type
         by itself; a type without it names a policy nobody would set.
         """
         enabled = bool(self.MIXED_PRECISION) if isinstance(self.MIXED_PRECISION, bool) else True
@@ -329,16 +329,15 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     """Intermediate representation of a Keras learner.
 
     Every backend-specific mechanic -- how the loss is differentiated, how the optimizer is applied,
-    how the step is compiled -- lives in the backend adapter the generated learner selects once
-    (`docs/adr/0016`), so the emitted script imports no framework beyond `keras` and branches on no
+    how the step is compiled -- lives in the backend adapter the generated learner selects once,
+    so the emitted script imports no framework beyond `keras` and branches on no
     backend. Each optimizer segment becomes one `_flow_<optimizer>` method written in `keras.ops`,
     handed to the adapter as the `flow` of a `_segment_<optimizer>` attribute; the adapter turns
     them into the compiled training step.
 
     The emitted module holds imports and the class alone, and the class keeps no anonymous
     collection: the constants are class attributes, every segment is a named attribute, the batch
-    travels as named parameters and the views are properties assembling literal dictionaries
-    (`docs/adr/0019`).
+    travels as named parameters and the views are properties assembling literal dictionaries.
     """
 
     mixed_precision: bool | dict[str, Any]

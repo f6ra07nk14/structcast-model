@@ -218,7 +218,7 @@ class DistributedStrategy(Protocol):
 
         The global rank wherever every rank holds its own replica (DDP, FSDP2), but 0 on every rank
         of a tensor-parallel group: those ranks split one model and must run the identical batch
-        through it under the identical dropout mask (``docs/adr/0022``). A run reading the global
+        through it under the identical dropout mask. A run reading the global
         rank instead would feed a tensor-parallel group as many different batches as it has ranks,
         and every shard would draw its own mask -- both silently wrong rather than failing.
         """
@@ -427,7 +427,7 @@ class _StateDictMixin:
 
         State keyed by parameter index comes from a save that had no pairing; this path matches
         entries by parameter name and cannot resolve positions, so such a state is refused instead
-        of being silently discarded or half-applied (ADR-0008). Name-keyed state loads under
+        of being silently discarded or half-applied. Name-keyed state loads under
         ``strict_optimizer_load``, which decides whether it must cover every trainable parameter.
 
         Raises:
@@ -804,7 +804,7 @@ class TensorParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
     ``nn.Module`` neither of its branches fires on. ``BatchNorm`` is likewise left alone -- every rank
     already computes the statistics of the same batch, so there is nothing to synchronize.
 
-    Requires torch >= 2.4. ``loss_parallel`` is out of scope (``docs/adr/0022``): it constrains the
+    Requires torch >= 2.4. ``loss_parallel`` is out of scope: it constrains the
     loss to cross-entropy with a mean reduction, which the generated learners do not promise.
     """
 
@@ -955,7 +955,7 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         """Compile the sharded submodules in place, so compile units follow the shard boundaries.
 
         Compiling the root instead would bury the per-block all-gather/reduce-scatter hooks inside one
-        graph (ADR-0004). A module none of the patterns match keeps the default root compile: matching
+        graph. A module none of the patterns match keeps the default root compile: matching
         nothing in one model is normal for a multi-model learner, unlike matching nothing anywhere,
         which :func:`matched_shard_modules` rejects at wrap time.
         """

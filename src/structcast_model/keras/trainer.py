@@ -177,7 +177,7 @@ class KerasTracker:
     Unlike the torch tracker there is no all-reduce: a distributed step's criteria are reduced
     before they get here — by the distributed strategy's step wrapper on the tensorflow and torch
     backends, and by XLA's global reduction of sharded arrays on jax — so what reaches this tracker
-    is already one value (`docs/adr/0016`).
+    is already one value.
 
     Example:
         >>> import keras
@@ -269,12 +269,12 @@ def restore_training_state(
 ) -> int:
     """Load the resumed state into the models and optimizers, and return the epoch to continue at.
 
-    The saved epoch wins over *start_epoch*, as in the torch and Flax loaders (`docs/adr/0005`).
+    The saved epoch wins over *start_epoch*, as in the torch and Flax loaders.
     Three things are checked against the state, and only one of them refuses the run:
 
     - The Keras backend it was written on. Normalization statistics and RNG trajectories are not
       verified equivalent across backends, so a state from another one is refused rather than
-      silently continued (`docs/adr/0016`). It is checked before anything is assigned, so a refused
+      silently continued. It is checked before anything is assigned, so a refused
       resume leaves the freshly built run untouched.
     - The optimizer patterns, which the learner rebuilt from configuration: a schedule swapped
       between save and resume would continue the new schedule from the old step count. That warns
@@ -397,7 +397,7 @@ class KerasTrainingStateSaver:
     The twin of `structcast_model.torch.trainer.TrainingStateSaver`, minus the gradient scalers:
     Keras loss scaling lives inside the optimizer, so its state is already in the optimizer's
     variables, and the payload keeps their (always empty) slot so every framework resumes from the
-    same shape (`docs/adr/0015`).
+    same shape.
     """
 
     logger: Logger

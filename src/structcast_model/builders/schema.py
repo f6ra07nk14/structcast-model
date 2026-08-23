@@ -339,7 +339,7 @@ class UserDefinedLayer(Serializable):
 
     `true` enables the framework's own mechanism with its defaults; a mapping enables it too and carries the
     keyword arguments of that mechanism, each value resolved like any other DSL value, so patterns and
-    callables work. Which keywords are legal is checked by the framework builder (`docs/adr/0020`).
+    callables work. Which keywords are legal is checked by the framework builder.
     """
 
     @field_validator("IMPORTS", mode="before")

@@ -282,7 +282,7 @@ class FlaxTrainingStateSaver:
 
     The twin of `structcast_model.torch.trainer.TrainingStateSaver`, minus the gradient scalers Flax
     has none of; the payload keeps their (always empty) slot so both frameworks resume from the same
-    shape (`docs/adr/0015`).
+    shape.
     """
 
     logger: Logger
@@ -319,11 +319,11 @@ def restore_training_state(
 ) -> int:
     """Load the resumed state into the models and optimizers, and return the epoch to continue at.
 
-    The saved epoch wins over *start_epoch*, as in the torch loader (`docs/adr/0005`). *optimizer_hashes*
-    are the hashes of the optimizer patterns the current configuration rebuilt: optax builds `tx`
-    from configuration and the state restore cannot see it, so a schedule swapped between save and
-    resume would silently continue the new schedule from the old count. A mismatch warns rather than
-    refuses -- extending a schedule or lowering the rate of a fine-tune is legitimate.
+    The saved epoch wins over *start_epoch*, as in the torch loader. *optimizer_hashes* are the hashes
+    of the optimizer patterns the current configuration rebuilt: optax builds `tx` from configuration
+    and the state restore cannot see it, so a schedule swapped between save and resume would silently
+    continue the new schedule from the old count. A mismatch warns rather than refuses -- extending a
+    schedule or lowering the rate of a fine-tune is legitimate.
 
     Args:
         resume (str): The training state reference, in whatever form *logger* accepts.

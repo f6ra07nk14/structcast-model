@@ -235,8 +235,8 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     """Wrap the learning-rate-carrying factory of an optimizer pattern in `optax.inject_hyperparams`.
 
     Optax exposes a learning rate only through the `hyperparams` dict that `inject_hyperparams`
-    materializes, so a pattern emitted verbatim would report NaN for the rest of the run
-    (see `docs/adr/0013`). The unique factory call carrying a `learning_rate` keyword -- at any depth,
+    materializes, so a pattern emitted verbatim would report NaN for the rest of the run.
+    The unique factory call carrying a `learning_rate` keyword -- at any depth,
     including inside a `chain` -- is therefore rewritten from `adamw(learning_rate=..., b1=...)` to
     `inject_hyperparams(inner_factory=adamw, static_args=['b1'])(learning_rate=..., b1=...)`. Every
     other part of the pattern, such as the `nnx.Optimizer` binding and the surrounding chain, is
@@ -270,7 +270,7 @@ def _owned(trainable_layers: list[str]) -> str:
 
     A single owned module is passed to `flax.nnx.Optimizer` and to `update` verbatim, several as a
     plain tuple, so the optimizer state and the differentiated arguments key off the same module
-    paths without a container node the learner would have to keep (`docs/adr/0019`).
+    paths without a container node the learner would have to keep.
     """
     if len(trainable_layers) == 1:
         return trainable_layers[0]
@@ -294,7 +294,7 @@ class FlaxUserDefinedLearner(UserDefinedLearner[LearnerBehavior]):
     `true` takes the defaults; a mapping carries the keyword arguments of `flax.nnx.EMA`, each value
     resolved like any other DSL value. The average is emitted as the learner attribute `ema_<model>`
     -- the `apply_to` view, so it is callable -- updated once per Update and runnable from
-    `INFERENCE_FLOW` under that name (`docs/adr/0021`).
+    `INFERENCE_FLOW` under that name.
     """
 
 
@@ -317,7 +317,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
 
     The generated module holds the imports and the learner class alone: the flow layers, the
     differentiated flow of every segment and the two steps are all built inside `__init__`, where no
-    user-chosen name can collide with an import the model builder pulled in (`docs/adr/0019`). The
+    user-chosen name can collide with an import the model builder pulled in. The
     steps are plain functions over named parameters -- never closures over state or bound methods --
     so a trainer can wrap them in `flax.nnx.jit` and rebind each attribute `flow_functions` names,
     exactly as the PyTorch learners are compiled. Every model and optimizer is one
@@ -332,7 +332,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     the criteria, the `EXTRA` keywords and whatever a later segment reads -- and keeps the rest local.
     Gradient accumulation is the optimizer pattern's own `optax.MultiSteps`, gating on the device;
     the step compares the first optimizer's `gradient_step` across its update and hands the result
-    back, so the learner counts updates without predicting them from a window (`docs/adr/0019`).
+    back, so the learner counts updates without predicting them from a window.
 
     Learner-level flow layers (losses and metrics) are locals of `__init__` the flows close over, so
     they must be stateless: a variable-carrying layer would be captured as a constant by a compiled
@@ -381,7 +381,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
 
     Each one becomes the `flax.nnx.EMA` state `_ema_state_<model>` and the callable view `ema_<model>`
     it applies to the model, built from the expression the builder registered under that name in
-    `others` (`docs/adr/0021`)."""
+    `others`."""
 
     @cached_property
     def _inference_shadows(self) -> list[str]:
@@ -714,8 +714,8 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
     """Builder for Flax (nnx) learners.
 
     The `OPTIMIZER` pattern is a callable returning a `flax.nnx.Optimizer` when applied to the modules
-    one segment owns, so the builder appends them to the pattern (see `docs/adr/0013`): the module
-    itself when the segment owns one, a plain tuple of them when it owns several (`docs/adr/0019`).
+    one segment owns, so the builder appends them to the pattern: the module
+    itself when the segment owns one, a plain tuple of them when it owns several.
     """
 
     user_defined_learner_layer_type: ClassVar[type[FlaxLearnerIntermediate]] = FlaxLearnerIntermediate
@@ -759,7 +759,7 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
 
         The registered expression builds the average itself; the learner keeps it as
         `_ema_state_<model>` and binds `apply_to(<model>)` -- the callable view sharing its variables
-        -- to the registered name, which is what a flow runs (`docs/adr/0021`).
+        -- to the registered name, which is what a flow runs.
         """
         for model, config in module.EMA.items():
             if model not in module.TRAINABLE_LAYERS:

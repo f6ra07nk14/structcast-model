@@ -46,16 +46,16 @@ def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-
 def donate_argnames(function: Callable[..., Any]) -> tuple[str, ...]:
     """Return the arguments of a training step to donate when compiling it, its batch excluded.
 
-    The signature of a step is its donation contract (see `docs/adr/0019`): a generated training
-    step takes every model and optimizer as its own positional-or-keyword parameter and the batch as
-    keyword-only parameters, so the state it rewrites in place is exactly what it declares
-    positionally. Donating that state is what keeps a compiled run from copying every parameter
-    buffer once per step, and leaving the batch out of the donation is what keeps the caller's own
-    arrays usable afterwards. A hand-written step following the same convention is donated the same
-    way; one taking a non-state argument positionally sees it donated too, which is harmless for a
-    per-step batch. `inspect.signature` follows `__wrapped__`, so a step another layer already
-    wrapped still reports the parameters underneath. A positional-only parameter is not donated
-    either: it has no name to donate by, and a step declaring one is outside the contract.
+    The signature of a step is its donation contract: a generated training step takes every model and
+    optimizer as its own positional-or-keyword parameter and the batch as keyword-only parameters, so
+    the state it rewrites in place is exactly what it declares positionally. Donating that state is
+    what keeps a compiled run from copying every parameter buffer once per step, and leaving the
+    batch out of the donation is what keeps the caller's own arrays usable afterwards. A hand-written
+    step following the same convention is donated the same way; one taking a non-state argument
+    positionally sees it donated too, which is harmless for a per-step batch. `inspect.signature`
+    follows `__wrapped__`, so a step another layer already wrapped still reports the parameters
+    underneath. A positional-only parameter is not donated either: it has no name to donate by, and a
+    step declaring one is outside the contract.
 
     Args:
         function (Callable[..., Any]): The step about to be compiled.

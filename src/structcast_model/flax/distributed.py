@@ -3,8 +3,8 @@
 JAX expresses single-device, data-parallel and fully-sharded execution with the same mechanism -- a
 device mesh plus a `PartitionSpec` per array -- so there is one strategy class here instead of the
 three torch has, and what distinguishes the modes is a preset naming the mesh to build and the rules
-deciding each parameter's spec (see `docs/adr/0014`). The mesh is activated process-wide at
-construction, before the models are built, because eager sharding reads it there.
+deciding each parameter's spec. The mesh is activated process-wide at construction, before the
+models are built, because eager sharding reads it there.
 """
 
 from collections import OrderedDict
@@ -138,19 +138,18 @@ class FlaxDistributedStrategy:
     `explicit` types the axis, and a typed axis demands an `out_sharding` wherever a replicated array
     meets a sharded one -- including inside flax's own code, where no template can put one:
     `nnx.Embed`'s gather of a replicated table with sharded indices and a class token concatenated
-    onto a sharded activation both raise `ShardingTypeError` under it, which is why this stopped
-    being the default (the H200 amendment to `docs/adr/0022`). Opt in for a run whose every model
-    names its own shardings. Independent of :attr:`model_axis_mode`, except through
-    `nnx.with_partitioning`, whose initializer path refuses a mesh of mixed axis types ("Mesh must
-    have all axes as Explicit or all axes as Auto"), so a template built from those sets both fields
-    to `explicit`."""
+    onto a sharded activation both raise `ShardingTypeError` under it, which is why hardware
+    validation demoted it from the default. Opt in for a run whose every model names its own
+    shardings. Independent of :attr:`model_axis_mode`, except through `nnx.with_partitioning`, whose
+    initializer path refuses a mesh of mixed axis types ("Mesh must have all axes as Explicit or all
+    axes as Auto"), so a template built from those sets both fields to `explicit`."""
 
     model_axis_mode: Literal["auto", "explicit"] = "auto"
     """Axis type of the model axis, under the `tp` presets that build one. `auto` lets the compiler
     place what the rules do not, so plain layers row-parallelize with no model-template change;
     `explicit` types the axis for a template that names the sharding of its own outputs, which needs
-    every row-parallel layer to carry its own `dot_general` hook and is verified at :meth:`wrap` time
-    (`docs/adr/0022`). That hook's spec may name Explicit axes only, so it names the data axis --
+    every row-parallel layer to carry its own `dot_general` hook and is verified at :meth:`wrap` time.
+    That hook's spec may name Explicit axes only, so it names the data axis --
     `dot_general_out("data", None)` -- when :attr:`data_axis_mode` is `explicit` too, and
     `dot_general_out(None, None)` otherwise. Independent of that field: an annotated tensor-parallel
     template wants exactly the mix, its model axis typed while the data axis keeps propagating
@@ -218,9 +217,9 @@ class FlaxDistributedStrategy:
         the price: an Explicit axis demands an `out_sharding` wherever a
         replicated array meets a sharded one, and those meetings happen inside code no template can
         annotate -- `nnx.Embed`'s gather of a replicated table with sharded indices, a class token
-        concatenated onto a sharded activation -- so correct models did not trace at all
-        (`docs/adr/0022`). Under Auto the compiler propagates the shardings itself, and one it
-        chooses badly costs a reshard rather than a wrong answer.
+        concatenated onto a sharded activation -- so correct models did not trace at all. Under Auto
+        the compiler propagates the shardings itself, and one it chooses badly costs a reshard rather
+        than a wrong answer.
 
         Raises:
             ValueError: if a preset without a model axis was given one to configure, if `fsdp_tp` was

@@ -43,7 +43,7 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     Optax stores no learning rate of its own: a constant lives in the update closure and a schedule
     leaves only its step count behind, so the rate is readable only when the transformation was built
     through `optax.inject_hyperparams`, which materializes it in a `hyperparams` dict. The builder
-    wraps optimizer patterns for exactly that reason (see `docs/adr/0013`).
+    wraps optimizer patterns for exactly that reason.
 
     The walk is a pure pytree traversal of the state, so calling this inside a traced training step
     compiles to a reference to the state array rather than to a host read.
@@ -73,12 +73,11 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
 def gradient_steps(optimizer: Any) -> jax.Array | None:
     """Return the updates the optimizer's outermost `optax.MultiSteps` has applied, None without one.
 
-    Accumulation gates on the device (see `docs/adr/0017`), so the generated training step detects an
-    update by comparing this count across its own `update` call rather than predicting one from a
-    window read at construction (see `docs/adr/0019`). The read is a plain indexed read of the
-    state, so calling it inside a traced step compiles to a reference to the counter array rather
-    than to a host read; without a `MultiSteps` there is no counter, and the None reported here is
-    what tells the step that every update applies.
+    Accumulation gates on the device, so the generated training step detects an update by comparing
+    this count across its own `update` call rather than predicting one from a window read at
+    construction. The read is a plain indexed read of the state, so calling it inside a traced step
+    compiles to a reference to the counter array rather than to a host read; without a `MultiSteps`
+    there is no counter, and the None reported here is what tells the step that every update applies.
 
     Only the outermost state is examined: the nnx wrappers replace the array leaves of `opt_state`
     but leave its NamedTuple shell intact, so a `MultiSteps` wrapping the whole transformation is

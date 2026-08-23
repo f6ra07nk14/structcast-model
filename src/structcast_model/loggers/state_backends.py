@@ -2,7 +2,7 @@
 
 A logger knows *where* a training state goes; a backend knows *what it looks like* on disk. Keeping
 the two apart is what lets the same logger carry a torch checkpoint for one run and a Flax one for
-the next, instead of growing a subclass per framework (see `docs/adr/0015`).
+the next, instead of growing a subclass per framework.
 """
 
 from collections.abc import Mapping
@@ -39,7 +39,7 @@ class StateBackend(Protocol):
     `load` returns state in **host memory** -- numpy arrays or CPU tensors, never device-resident
     state. Placing a restored state is the distributed strategy's job, because only the strategy
     knows the topology the resumed run has, and a backend that placed arrays itself would tie a
-    checkpoint to the machine that wrote it (the invariant of `docs/adr/0015`).
+    checkpoint to the machine that wrote it.
     """
 
     suffix: str
@@ -141,7 +141,7 @@ class KerasStateBackend:
     no arrays -- `meta`, and the always-empty `grad_scalers` -- travel as one JSON member.
 
     The state is backend-portable but a resume is not: `meta` carries the Keras backend that wrote
-    it, and P5's resume refuses a mismatch (`docs/adr/0016`).
+    it, and the Keras trainer's `restore_training_state` refuses a state from another one.
     """
 
     suffix = ".npz"

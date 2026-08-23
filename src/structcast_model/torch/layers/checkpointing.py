@@ -20,8 +20,7 @@ class GradientCheckpointingLayer(torch.nn.Module):
     forward pass is defined to behave differently in the two modes is the anomaly, so the memory
     saving is declined rather than bought with a second pass under other semantics.
     `torch.is_grad_enabled()` adds nothing to that decision; it only keeps a `torch.no_grad()`
-    forward -- an inference step -- from paying for a checkpoint no backward pass will use
-    (`docs/adr/0020`).
+    forward -- an inference step -- from paying for a checkpoint no backward pass will use.
     """
 
     gradient_checkpointing: ClassVar[bool] = False

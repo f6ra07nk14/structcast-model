@@ -2,7 +2,7 @@
 
 One generated learner drives every Keras backend, so every mechanic the three backends disagree
 about -- gradient computation, optimizer application, variable state handling, step compilation --
-lives behind the `BackendAdapter` selected once from `keras.backend.backend()` (`docs/adr/0016`).
+lives behind the `BackendAdapter` selected once from `keras.backend.backend()`.
 
 Gradient accumulation is deliberately absent: `keras.optimizers.Optimizer` takes
 `gradient_accumulation_steps`, which accumulates and gates the update inside the optimizer on all
@@ -42,7 +42,7 @@ else:
 Flow = Callable[..., tuple[Any, dict[str, Any]]]
 """A training flow: it returns the loss to differentiate and the criteria.
 
-The batch reaches it as keyword arguments, one per input name (`docs/adr/0019`), which is also how
+The batch reaches it as keyword arguments, one per input name, which is also how
 the steps built here take it: a positional batch mapping would bind the entries by declaration
 order instead. `Callable[..., ...]` because the names are the learner's, so no signature can spell
 them.
@@ -109,10 +109,10 @@ class BackendAdapter(Protocol):
         """Compile the training step running every segment: its flow, its gradients, its update.
 
         The returned step takes the batch by name and returns the merged criteria of every segment. A
-        single-process adapter reduces nothing: `docs/adr/0016` obliges whoever runs a distributed
-        cell to reduce the criteria across replicas before they reach the tracker, since the Keras
-        tracker -- unlike its torch twin -- never all-reduces, and a strategy that skips this must
-        fail its own tests rather than log per-replica values.
+        single-process adapter reduces nothing: whoever runs a distributed cell must reduce the
+        criteria across replicas before they reach the tracker, since the Keras tracker -- unlike its
+        torch twin -- never all-reduces, and a strategy that skips this must fail its own tests rather
+        than log per-replica values.
 
         The criteria are merged last-wins, so keeping the names of two segments distinct is the
         caller's job: an adapter only sees the names at run time and cannot detect a clash here.

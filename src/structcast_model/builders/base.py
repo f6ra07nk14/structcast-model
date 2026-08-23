@@ -176,7 +176,7 @@ class LayerIntermediate(_Intermediate):
     or `None` when the layer is not checkpointed; an empty mapping is the framework's own defaults.
 
     A field of the intermediate, so two otherwise identical layers configured differently hash apart
-    and stay separate generated classes (`docs/adr/0020`)."""
+    and stay separate generated classes."""
 
     @cached_property
     def collected_imports(self) -> dict[str, set[str | None]]:
@@ -486,7 +486,7 @@ class LearnerIntermediate(_Intermediate, Generic[OptimizerSegmentT]):
     or `None` if not applicable.
 
     Populated only by the torch builder through `_intermediate_fields`: the other backends declare
-    the accumulation window through their optimizer (`docs/adr/0017`)."""
+    the accumulation window through their optimizer."""
 
     inputs: list[str]
     """The names of the input layers."""
@@ -657,7 +657,7 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
 
         Called before any flow is resolved, so each name it adds to `others` is a name the flows may
         reference and an instance the generated learner constructs. The torch and flax builders
-        register the `EMA` shadow of each model here (`docs/adr/0021`).
+        register the `EMA` shadow of each model here.
         """
 
     def _intermediate_fields(self, module: Any) -> dict[str, Any]:

@@ -14,8 +14,7 @@ class GradientCheckpointingModule(nnx.Module):
 
     `nnx.remat` resolves neither keyword-only parameters nor a `functools.partial`, so the
     rematerialized callable takes the module and the arrays positionally and reads the flags off the
-    enclosing closure -- verified against flax 0.12.8 eager, jitted and under a checkpoint policy
-    (`docs/adr/0020`).
+    enclosing closure -- verified against flax 0.12.8 eager, jitted and under a checkpoint policy.
     """
 
     gradient_checkpointing: ClassVar[bool] = False

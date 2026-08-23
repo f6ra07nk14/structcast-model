@@ -138,8 +138,7 @@ class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
     and the number of steps to accumulate for.
 
     Torch-only: PyTorch has no native accumulation window, so the generated learner gates the
-    optimizer step itself; the other backends declare the window through their optimizer
-    (`docs/adr/0017`).
+    optimizer step itself; the other backends declare the window through their optimizer.
     """
 
     MIXED_PRECISION: bool | dict[str, Any] = False
@@ -157,7 +156,7 @@ class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
     `true` takes the defaults; a mapping carries the keyword arguments of
     `torch.optim.swa_utils.AveragedModel`, each value resolved like any other DSL value. The average
     is emitted as the learner attribute `ema_<model>`, updated once per Update and runnable from
-    `INFERENCE_FLOW` under that name (`docs/adr/0021`).
+    `INFERENCE_FLOW` under that name.
     """
 
     @model_validator(mode="after")
@@ -203,7 +202,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
     """The models carrying an exponential moving average, in `EMA` declaration order.
 
     Each one is emitted as the attribute `ema_<model>`, built from the expression the builder
-    registered under that name in `others` (`docs/adr/0021`)."""
+    registered under that name in `others`."""
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},

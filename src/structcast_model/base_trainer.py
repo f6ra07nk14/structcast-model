@@ -52,7 +52,7 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
 class Learner(Protocol, Generic[ModelT]):
     """Protocol for the object that owns the models and defines how they learn.
 
-    A learner owns the training counters (docs/adr/0018), defines how a training step runs and
+    A learner owns the training counters, defines how a training step runs and
     how an inference step runs, and reports after each step whether an Update landed.
     """
 
@@ -190,7 +190,7 @@ class BaseInfo(Generic[ModelT]):
     def step(self) -> int:
         """The number of completed training Steps; a bare info counts none, a trainer reads its learner's.
 
-        Read-only: the learner owns the counters (docs/adr/0018).
+        Read-only: the learner owns the counters.
         """
         return 0
 
@@ -198,7 +198,7 @@ class BaseInfo(Generic[ModelT]):
     def update(self) -> int:
         """The number of completed Updates; a bare info counts none, a trainer reads its learner's.
 
-        Read-only: the learner owns the counters (docs/adr/0018).
+        Read-only: the learner owns the counters.
         """
         return 0
 
@@ -373,12 +373,12 @@ class BaseTrainer(BaseInfo[ModelT]):
 
     @property
     def step(self) -> int:
-        """The learner's count of completed training Steps, read on every access (docs/adr/0018)."""
+        """The learner's count of completed training Steps, read on every access."""
         return self.learner.steps
 
     @property
     def update(self) -> int:
-        """The learner's count of completed Updates, read on every access (docs/adr/0018)."""
+        """The learner's count of completed Updates, read on every access."""
         return self.learner.updates
 
     @property
@@ -454,7 +454,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         """Perform a training step and update the models.
 
         Whether the step landed an update is not returned here: the learner owns the training
-        counters, so the loop reads ``learner.has_updated`` after this call (docs/adr/0018).
+        counters, so the loop reads ``learner.has_updated`` after this call.
 
         Args:
             __inputs__ (Any): The inputs for the training step.

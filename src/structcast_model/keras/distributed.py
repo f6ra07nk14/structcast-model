@@ -4,7 +4,7 @@ Keras 3 has no distribution mechanism of its own that works everywhere: `keras.d
 implemented for JAX, is an explicitly labelled no-op prototype on TensorFlow (its
 `distribute_value` is a bare `pass`), and does not exist on torch. So the strategy here is one
 class holding one preset, and the preset is realized by whatever the active backend actually
-supports (`docs/adr/0016`):
+supports:
 
 | preset   | jax                                    | tensorflow                        | torch                    |
 | -------- | -------------------------------------- | --------------------------------- | ------------------------ |
@@ -129,9 +129,9 @@ class RuleModelParallel(keras.distribution.ModelParallel):
         variable is a candidate for `column` alone, because a column-parallel bias splits with the
         output dimension it belongs to, while a row-parallel one has to stay whole: the reduction
         that follows a row-parallel layer would count a split bias once per shard, which is the one
-        tensor-parallel mistake that reports a plausible loss instead of an error (`docs/adr/0022`).
+        tensor-parallel mistake that reports a plausible loss instead of an error.
         A dimension the mesh does not divide falls back to replication rather than failing the run --
-        the same shape the Flax twin's rules have (`docs/adr/0014`).
+        the same shape the Flax twin's rules have.
         """
         if getattr(variable, "_layout", None) is not None:
             return variable._layout  # noqa: SLF001  # The base class reads it first too; a caller may pin a layout.
@@ -272,7 +272,7 @@ class KerasDistributedStrategy:
         """Which slice of the dataset this process must consume: its rank.
 
         The same as :attr:`rank`, and a separate member because the `DistributedStrategy` protocol
-        asks for it (`docs/adr/0022`): the model axis of the `tp` preset lives inside one process, so
+        asks for it: the model axis of the `tp` preset lives inside one process, so
         no Keras run ever has ranks that must share a slice.
         """
         return self._rank
@@ -380,9 +380,9 @@ class KerasDistributedStrategy:
     def wrap_steps(self, learner: Any) -> None:
         """Rewire the learner's steps so each one runs across the replicas and reports one value.
 
-        This is where `docs/adr/0016`'s rule is honored: what reaches the tracker is already reduced
-        across replicas. The three backends need three different things, and none of them can happen
-        inside the learner, which is backend-neutral by construction:
+        What reaches the tracker must already be reduced across replicas, and this is the place that
+        does it. The three backends need three different things, and none of them can happen inside
+        the learner, which is backend-neutral by construction:
 
         - JAX places the batch across the mesh; the reductions inside the compiled step are then
           global by construction, since XLA reduces a sharded array across every device holding it.
@@ -436,7 +436,7 @@ class KerasDistributedStrategy:
                 return
             raise ValueError(
                 "A MirroredStrategy needs the learner's flow_functions to keep the host bookkeeping eager: the "
-                "public steps own the training counters (docs/adr/0018), which a replicated graph cannot run, so "
+                "public steps own the training counters, which a replicated graph cannot run, so "
                 "a hand-written learner must expose its flow callables the way a generated one does."
             )
         for name in ("training_step", "inference_step"):
@@ -541,7 +541,7 @@ class KerasDistributedStrategy:
         level further in: the learner's public steps keep their host-side counter bookkeeping
         outside the graph, so the replication wraps the flow attribute the public step calls
         through. The batch stays keyword arguments the whole way down, which is what the step
-        expects (`docs/adr/0019`).
+        expects.
         """
 
         @tf.function
@@ -568,7 +568,7 @@ class KerasDistributedStrategy:
         neither of them needs a graph around the replicated call, so the wrapper stays an eager
         Python function: JAX shards the batch and lets the compiled step reduce it globally, torch
         runs the rank's own slice and all-reduces the criteria afterwards. Wrapping the public step
-        is therefore harmless here, and the host bookkeeping it owns (`docs/adr/0018`) still runs
+        is therefore harmless here, and the host bookkeeping it owns still runs
         where it did.
         """
         if self._distribution is not None:

@@ -177,7 +177,7 @@ def optimizer_hash(optimizer: ObjectPattern) -> str:
     """Return the digest identifying one `OPTIMIZER` pattern, as it was written.
 
     Recorded in the generated learner and in the training state so a resume can report an optimizer
-    that was rebuilt from a different configuration (`docs/adr/0015`): the learner builds the
+    that was rebuilt from a different configuration: the learner builds the
     optimizer from the pattern and the restored state cannot see it, so a swapped schedule would
     otherwise continue silently from the old step count. Framework-neutral -- it hashes the
     validated pattern and nothing else -- so the Flax and Keras builders emit comparable digests;

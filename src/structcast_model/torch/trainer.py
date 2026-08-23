@@ -283,7 +283,7 @@ def restore_training_state(
 ) -> int:
     """Load the resumed state into the models, optimizers and gradient scalers, and return the epoch to continue at.
 
-    The saved epoch wins over *start_epoch* (`docs/adr/0005`). The logger owns the reference format
+    The saved epoch wins over *start_epoch*. The logger owns the reference format
     and only rank 0 holds a real one: the `NullLogger` ranks fetch nothing and take the state from
     the strategy's broadcast.
 

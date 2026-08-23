@@ -1,6 +1,6 @@
 """Typer declarations shared across the commands package.
 
-Where a declaration lives follows three rules (see docs/adr/0010):
+Where a declaration lives follows three rules:
 
 - Identical in two or more frameworks: one shared `Option`/`Argument` instance declared here. Typer copies
   the info object per registered parameter, so sharing is safe as long as the parsers stay stateless and

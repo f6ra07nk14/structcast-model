@@ -247,9 +247,9 @@ def _mixed_precision_policy(factory: Any) -> str | None:
     """Return the global policy the generated learner asks for, or None for a plain run.
 
     The factory this reads is the generated class itself, which carries the two constants as class
-    attributes (`docs/adr/0019`): the policy has to be set before the models the learner is built
-    over exist, and a class attribute is readable before anything is instantiated. A hand-written
-    learner declares none and gets no policy.
+    attributes: the policy has to be set before the models the learner is built over exist, and a
+    class attribute is readable before anything is instantiated. A hand-written learner declares none
+    and gets no policy.
     """
     raw = getattr(factory, "MIXED_PRECISION", None)
     # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
@@ -263,9 +263,8 @@ def _mixed_precision_policy(factory: Any) -> str | None:
 def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's class declares, empty for anything else.
 
-    Read off the class, as `_mixed_precision_policy` reads the mixed precision constants
-    (`docs/adr/0019`). A hand-written learner declares none, and the resume check skips what is
-    missing.
+    Read off the class, as `_mixed_precision_policy` reads the mixed precision constants. A
+    hand-written learner declares none, and the resume check skips what is missing.
     """
     return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 
@@ -285,7 +284,7 @@ def _build_logger(logger_name: str, experiment: str, is_main: bool) -> "scm_logg
 
     Only the experiment name is stored here, so the run itself starts in `__enter__`. Under a
     torchrun launch every rank reaches this, and only the main one may own the run: the others would
-    otherwise each open their own and write their own checkpoint next to it (`docs/adr/0005`).
+    otherwise each open their own and write their own checkpoint next to it.
     """
     if not is_main:
         return scm_loggers.NullLogger()
@@ -310,8 +309,7 @@ def _build_callbacks(
 
     The twin of `cmd_torch._build_callbacks`: the saver and the best-criterion monitors are built on
     every rank -- they read the state through the strategy -- and only the main rank holds a real
-    logger, so only it writes anything. The display is the main rank's alone, one per run
-    (`docs/adr/0005`).
+    logger, so only it writes anything. The display is the main rank's alone, one per run.
     """
     saver = scm_keras.KerasTrainingStateSaver(logger=logger, strategy=strategy, extra_meta=extra_meta)
     bests = scm_keras.KerasBestCriterion.from_criteria(
