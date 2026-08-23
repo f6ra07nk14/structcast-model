@@ -18,6 +18,7 @@ from structcast_model.torch.distributed import (
     SingleDeviceStrategy,
     TensorParallelStrategy,
     matched_shard_modules,
+    split_mixed_param_groups,
     sync_gate,
 )
 import torch
@@ -831,6 +832,147 @@ def test_fsdp2_tensor_parallel_refuses_an_empty_plan() -> None:
     """Without a plan the combination is plain FSDP2, and saying so beats pretending otherwise."""
     with pytest.raises(ValueError, match="parallel_modules"):
         FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=2)
+
+
+# ---------------------------------------------------------------------------
+# split_mixed_param_groups
+# ---------------------------------------------------------------------------
+
+_MIXED_PLAN = [("up", "column")]
+"""A plan naming one of the two layers; the other one's parameters are what stays plain."""
+
+_MIXED_INPUT = torch.linspace(-1.0, 1.0, 8).reshape(2, 4)
+"""A fixed batch, so two optimizers stepped separately see the very same gradients."""
+
+_MIXED_PARAMETERS = ("up.weight", "up.bias", "down.weight", "down.bias")
+
+
+def _mixed_optimizer(*, foreach: bool) -> tuple[torch.nn.Module, torch.optim.AdamW]:
+    """A partly parallelized model and one AdamW holding all of its parameters in one group.
+
+    The shape of every tensor-parallel run: the plan converts the layers it names to DTensors, and
+    the learner hands the whole model -- parallelized layers and untouched ones alike -- to one
+    optimizer.
+    """
+    model = TensorParallelStrategy(device="cpu", parallel_modules=_MIXED_PLAN).wrap(_mlp_models())["model"]
+    return model, torch.optim.AdamW(model.parameters(), lr=0.1, foreach=foreach)
+
+
+def _stepped(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    """Run the backward and the optimizer step the mixed group crashes on."""
+    model(_MIXED_INPUT).sum().backward()
+    optimizer.step()
+
+
+def _kinds(group: dict[str, Any]) -> set[str]:
+    """The tensor types one parameter group holds; a fused ``_foreach_*`` call admits exactly one."""
+    return {type(parameter).__name__ for parameter in group["params"]}
+
+
+def _local(tensor: torch.Tensor) -> torch.Tensor:
+    """The rank-local values of a tensor, so a DTensor and a plain one compare the same way."""
+    to_local = getattr(tensor, "to_local", None)
+    return cast(torch.Tensor, to_local()) if to_local else tensor
+
+
+def test_a_group_mixing_dtensor_and_plain_parameters_crashes_the_first_step(single_process_gloo: None) -> None:
+    """The shipped defect: `cfg/torch/strategies/tp.yaml` plus any learner dies on `optimizer.step()`.
+
+    torch's default multi-tensor path fuses a parameter group into one ``_foreach_*`` call and the
+    DTensor dispatcher refuses a list holding both kinds, so the run never reports a loss. Every plan
+    leaves something plain -- an untouched head is the least a transformer has -- so this is not an
+    exotic configuration but the only one tensor parallelism produces.
+    """
+    model, optimizer = _mixed_optimizer(foreach=True)
+    model(_MIXED_INPUT).sum().backward()
+
+    with pytest.raises(RuntimeError, match="mixed torch.Tensor and DTensor"):
+        optimizer.step()
+
+
+def test_splitting_makes_the_mixed_group_uniform_and_keeps_its_hyperparameters(single_process_gloo: None) -> None:
+    """The split must buy the step back without moving a parameter between hyperparameter sets.
+
+    A subgroup that lost the group's learning rate or weight decay would train the head on the
+    optimizer's defaults instead of the configured schedule -- silently, and only under tensor
+    parallelism.
+    """
+    model, optimizer = _mixed_optimizer(foreach=True)
+    settings = {k: v for k, v in optimizer.param_groups[0].items() if k != "params"}
+
+    split_mixed_param_groups(optimizer)
+
+    assert [_kinds(group) for group in optimizer.param_groups] == [{"DTensor"}, {"Parameter"}]
+    assert [{k: v for k, v in g.items() if k != "params"} for g in optimizer.param_groups] == [settings, settings]
+    assert [id(p) for group in optimizer.param_groups for p in group["params"]] == [
+        id(model.get_parameter(name)) for name in _MIXED_PARAMETERS
+    ]
+    _stepped(model, optimizer)  # the crash the split exists for
+
+
+def test_splitting_leaves_an_already_uniform_optimizer_exactly_as_it_was() -> None:
+    """Every run calls this, tensor-parallel or not, so anywhere it is not needed it must do nothing.
+
+    Rebuilding the groups unconditionally would hand every single-device and DDP run new dictionaries
+    -- and anything holding on to one, an LR scheduler above all, would then be writing into objects
+    the optimizer no longer reads.
+    """
+    model = _mlp_models()["model"]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    groups, group = optimizer.param_groups, optimizer.param_groups[0]
+
+    split_mixed_param_groups(optimizer)
+
+    assert optimizer.param_groups is groups
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0] is group
+
+
+def test_the_split_optimizer_updates_exactly_as_an_unfused_one(single_process_gloo: None) -> None:
+    """The claim that makes splitting the fix rather than a workaround: grouping is fusion, not math.
+
+    ``foreach=False`` is the other way out of the crash and is the arithmetic reference here; it is
+    not the fix, because it also unfuses the DTensor majority the strategy exists for, and the H200
+    isolation measured its numerics moving.
+    """
+    split_model, split_optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(split_optimizer)
+    reference_model, reference_optimizer = _mixed_optimizer(foreach=False)
+    initial = _local(reference_model.get_parameter("down.weight")).clone()
+
+    _stepped(split_model, split_optimizer)
+    _stepped(reference_model, reference_optimizer)
+
+    assert not torch.equal(_local(reference_model.get_parameter("down.weight")), initial)  # a step really landed
+    for name in _MIXED_PARAMETERS:
+        updated = _local(split_model.get_parameter(name))
+        assert torch.allclose(updated, _local(reference_model.get_parameter(name)), rtol=0.0, atol=1e-7)
+
+
+def test_a_state_saved_from_a_split_optimizer_resumes_into_a_freshly_split_one(single_process_gloo: None) -> None:
+    """The CLI splits before `restore_training_state`, so both ends of a resume have the same groups.
+
+    Optimizer state is keyed by parameter name rather than by group, so the split changes nothing a
+    checkpoint carries -- which is what lets the fix be unconditional instead of a checkpoint format
+    change. Splitting after the load would instead hand torch a group count the saved state lacks.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_MIXED_PLAN)
+    pairing = {"opt": ["model"]}
+    model, optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(optimizer)
+    _stepped(model, optimizer)
+    state = strategy.state_dict(OrderedDict(model=model), {"opt": optimizer}, pairing)
+    assert set(state["optimizers"]["opt"]["state"]) == {f"model.{name}" for name in _MIXED_PARAMETERS}
+
+    fresh_model, fresh_optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(fresh_optimizer)
+    strategy.load_state_dict(OrderedDict(model=fresh_model), {"opt": fresh_optimizer}, pairing, state)
+
+    assert len(fresh_optimizer.param_groups) == 2
+    for name in _MIXED_PARAMETERS:
+        restored = fresh_optimizer.state[fresh_model.get_parameter(name)]
+        assert torch.equal(_local(restored["exp_avg"]), _local(optimizer.state[model.get_parameter(name)]["exp_avg"]))
+    _stepped(fresh_model, fresh_optimizer)  # the resumed optimizer still steps
 
 
 # ---------------------------------------------------------------------------

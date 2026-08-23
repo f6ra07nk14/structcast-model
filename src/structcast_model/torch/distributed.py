@@ -147,6 +147,68 @@ def sync_gate(module: Any, armed: bool) -> None:
         module.set_requires_gradient_sync(armed)
 
 
+def _is_plain_tensor(parameter: torch.Tensor) -> bool:
+    """Whether *parameter* is an ordinary dense tensor rather than a subclass such as ``DTensor``.
+
+    By exact type rather than ``isinstance(parameter, DTensor)``: the public ``DTensor`` path only
+    exists from torch 2.5, while the tensor-parallel API that produces the mixture ships in 2.4 --
+    and a plain parameter is always exactly a ``Tensor`` or a ``Parameter``.
+    """
+    return type(parameter) in (torch.Tensor, torch.nn.Parameter)
+
+
+def split_mixed_param_groups(optimizer: Any) -> None:
+    """Rewrite *optimizer*'s parameter groups so none of them mixes ``DTensor``s with plain tensors.
+
+    Tensor parallelism converts only the parameters its ``parallel_modules`` globs name into
+    ``DTensor``s; everything else -- a vision transformer's patch embedding, class token, layer norms
+    and head -- stays a plain tensor, and a learner puts all of them into one parameter group. torch's
+    default multi-tensor path then hands that group to a single ``_foreach_*`` call, whose dispatcher
+    refuses a list holding both kinds, so a stock tensor-parallel run dies on its first
+    ``optimizer.step()`` with ``aten._foreach_lerp_.Scalar got mixed torch.Tensor and DTensor``.
+
+    A mixed group becomes one subgroup per kind, carrying the same hyperparameters and the same
+    parameters in the same order. A group that is already uniform is left as the very object it was,
+    which makes this an identity for every run with no ``DTensor`` in it -- which is why it runs for
+    every optimizer rather than under the tensor-parallel strategies alone: a hand-written strategy,
+    or a wrapper added later, produces the same mixture and needs the same protection.
+
+    Splitting is the fix that changes no arithmetic: an optimizer's update is independent per
+    parameter, and the grouping decides only which of them are fused into one kernel call. Passing
+    ``foreach=False`` would clear the crash too, but it gives up the fused path for the ``DTensor``
+    majority as well and measurably moves the numerics; making every non-parallelized parameter a
+    replicated ``DTensor`` instead breaks the forward pass, where those modules would then run
+    ``DTensor`` parameters against plain activations.
+
+    Must run before anything reads the group list back: a checkpoint written from a split optimizer
+    has to load into an identically split one, and an LR scheduler snapshots one base rate per group
+    when it is constructed.
+
+    Args:
+        optimizer (Any): The optimizer whose ``param_groups`` are rewritten in place. Duck-typed,
+            because an optimizer proxy delegates ``param_groups`` to the optimizer it wraps, and that
+            is the list that has to change.
+    """
+    groups: list[dict[str, Any]] = []
+    for group in optimizer.param_groups:
+        kinds: dict[bool, list[Any]] = {}
+        for parameter in group["params"]:
+            kinds.setdefault(_is_plain_tensor(parameter), []).append(parameter)
+        if len(kinds) < 2:
+            groups.append(group)
+        else:
+            groups.extend({**group, "params": params} for params in kinds.values())
+    if len(groups) == len(optimizer.param_groups):
+        return
+    logger.info(
+        "Splitting %d optimizer parameter group(s) into %d so that none of them mixes DTensor with "
+        "plain parameters, which the multi-tensor optimizer path cannot fuse.",
+        len(optimizer.param_groups),
+        len(groups),
+    )
+    optimizer.param_groups[:] = groups
+
+
 @runtime_checkable
 class DistributedStrategy(Protocol):
     """Protocol for the strategy owning the distributed lifecycle of a training run.
@@ -1044,6 +1106,7 @@ __all__ = [
     "TensorParallelStrategy",
     "initial_distributed_env",
     "matched_shard_modules",
+    "split_mixed_param_groups",
     "sync_gate",
 ]
 

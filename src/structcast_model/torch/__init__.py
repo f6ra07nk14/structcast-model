@@ -36,6 +36,7 @@ __all__ = [
     "restore_requires_grad",
     "restore_training_state",
     "set_lr_scale",
+    "split_mixed_param_groups",
     "sync_gate",
 ]
 
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
         TensorParallelStrategy,
         initial_distributed_env,
         matched_shard_modules,
+        split_mixed_param_groups,
         sync_gate,
     )
     from structcast_model.torch.optimizers import (
@@ -97,6 +99,7 @@ else:
             "TensorParallelStrategy",
             "initial_distributed_env",
             "matched_shard_modules",
+            "split_mixed_param_groups",
             "sync_gate",
         ],
         "layers": [],

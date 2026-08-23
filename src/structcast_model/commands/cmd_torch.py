@@ -290,6 +290,11 @@ def _assemble_learner(
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
         learner = factory(**models)
+        # Before the resume reads or writes a single optimizer state: a group mixing DTensor and
+        # plain parameters crashes the first step under tensor parallelism, and a state saved from a
+        # split optimizer must load back into an identically split one.
+        for optimizer in learner.optimizers.values():
+            scm_torch.split_mixed_param_groups(optimizer)
         learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
         tracker = scm_torch.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
