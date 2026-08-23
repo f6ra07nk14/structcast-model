@@ -246,8 +246,10 @@ import json, sys
 import jax, jax.numpy as jnp, optax
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.utils import dot_general_out
 
 preset, model_devices = sys.argv[1], int(sys.argv[2]) or None
+model_axis_mode = sys.argv[3] if len(sys.argv) > 3 else "auto"
 rules = [(r"^up\\.", "column"), (r"^down\\.", "row")] if preset in ("tp", "fsdp_tp") else None
 if preset == "fsdp_tp":
     rules = rules + [(r".*", "fsdp")]
@@ -255,13 +257,18 @@ if preset == "fsdp_tp":
 class MLP(nnx.Module):
     def __init__(self, rngs):
         self.up = nnx.Linear(8, 16, rngs=rngs)
-        self.down = nnx.Linear(16, 8, rngs=rngs)
+        # The row-parallel layer names the sharding of its own output when the model axis is typed;
+        # an out_sharding may name Explicit axes only, so the batch entry stays None while the data
+        # axis is Auto -- which is the annotation a template written for a hybrid mesh carries.
+        hook = {"dot_general": dot_general_out(None, None)} if model_axis_mode == "explicit" else {}
+        self.down = nnx.Linear(16, 8, rngs=rngs, **hook)
         # Named by no rule: under the tp presets it must keep the sharding it was built with.
         self.head = nnx.Linear(8, 8, rngs=rngs)
     def __call__(self, x):
         return self.head(self.down(nnx.relu(self.up(x))))
 
-strategy = FlaxDistributedStrategy(preset=preset, model_devices=model_devices, rules=rules, min_size=0)
+strategy = FlaxDistributedStrategy(preset=preset, model_devices=model_devices, rules=rules, min_size=0,
+                                   model_axis_mode=model_axis_mode)
 model = MLP(nnx.Rngs(params=jax.random.key(0)))
 strategy.wrap({"model": model})
 optimizer = nnx.Optimizer(model, tx=optax.sgd(0.1), wrt=nnx.Param)
@@ -295,6 +302,7 @@ compiled = strategy.compile(step, {})
 losses = [float(compiled(model, optimizer, batch["x"], batch["y"])) for _ in range(3)]
 print(json.dumps({
     "mesh": dict(strategy.mesh.shape),
+    "axis_types": [t.name for t in strategy.mesh.axis_types],
     "params": placed,
     "trained": specs(),
     "batch": {k: str(v.sharding.spec) for k, v in batch.items()},
@@ -377,6 +385,12 @@ def test_a_model_axis_option_is_refused_on_a_preset_without_one() -> None:
     with pytest.raises(ValueError, match="model_devices and model_axis_mode"):
         FlaxDistributedStrategy(preset="fsdp", model_devices=2)
 
+    # The counterpart: the data axis is the one axis every preset builds, so its own mode is
+    # configurable wherever the model-axis knobs are refused.
+    assert FlaxDistributedStrategy(preset="fsdp", data_axis_mode="explicit").mesh.axis_types == (
+        jax.sharding.AxisType.Explicit,
+    )
+
 
 def test_the_fsdp_tp_preset_requires_a_model_axis_size() -> None:
     """Without it the data axis would be one device wide, and the preset would shard nothing on it."""
@@ -405,6 +419,9 @@ def test_the_explicit_model_axis_mode_refuses_a_row_layer_without_its_own_dot_ge
         strategy.wrap(OrderedDict(model=model))
 
     assert "'fc.kernel'" in str(error.value)
+    # The line it hands out has to be one that then traces: an `out_sharding` may name Explicit axes
+    # only, so under the Auto data axis of this strategy the batch entry is None, not "data".
+    assert 'dot_general_out(None, None)"' in str(error.value)
 
 
 def test_the_explicit_model_axis_mode_refuses_a_row_parameter_owned_by_no_hooked_layer() -> None:
@@ -429,11 +446,13 @@ def test_the_tp_presets_leave_an_unmatched_parameter_on_its_construction_shardin
     `dp` and `fsdp` place every parameter, replicating whatever no rule shards, which would silently
     overwrite the annotation; under the tp presets an unmatched parameter is not placed at all. The
     annotation asserted here is one no rule in the table could have produced, so its surviving is the
-    only reason it can still be there. (A template that annotates its own parameters is written for
-    explicit mode, which is the one mode that types the mesh at all -- both axes of it, since Flax
+    only reason it can still be there. (A template that annotates its own parameters through
+    `nnx.with_partitioning` is the one case that needs both axes typed: that initializer path is what
     refuses a mesh whose axes do not all have the same type.)
     """
-    strategy = FlaxDistributedStrategy(preset="tp", model_axis_mode="explicit", rules=[(r"^up\.", "column")])
+    strategy = FlaxDistributedStrategy(
+        preset="tp", data_axis_mode="explicit", model_axis_mode="explicit", rules=[(r"^up\.", "column")]
+    )
     model = nnx.Dict(
         up=nnx.Linear(8, 16, rngs=nnx.Rngs(0)),
         head=nnx.Linear(
@@ -479,6 +498,29 @@ def test_an_embedding_looks_up_a_sharded_batch_of_indices() -> None:
     embedded = strategy.compile(lambda model, tokens: model(tokens), {})(embed, batch["tokens"])
 
     assert embedded.shape == (4, 3, 4)
+
+
+def test_the_explicit_data_axis_mode_types_the_data_axis_of_any_preset_and_fails_loud_again() -> None:
+    """The opt-in has to restore exactly what the Auto default gave up, or it is not the old mode.
+
+    An Explicit data axis is a type-system property, not a layout, so it applies to every preset --
+    `single` here, which builds no model axis at all and therefore takes no `model_axis_mode`. What
+    it buys is the refusal above: the very `nnx.Embed` lookup that traces under the Auto default
+    raises here, because a typed axis demands an `out_sharding` at a meeting point inside Flax's own
+    code. That is the point of the flag, and the reason it is not the default (`docs/adr/0022`).
+    """
+    strategy = FlaxDistributedStrategy(preset="single", device="cpu:0", data_axis_mode="explicit")
+    embed = nnx.Embed(num_embeddings=8, features=4, rngs=nnx.Rngs(params=jax.random.key(0)))
+    strategy.wrap(OrderedDict(model=embed))
+    batch = strategy.shard_batch({"tokens": jnp.zeros((4, 3), dtype=jnp.int32)})
+
+    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Explicit,)
+    # `ShardingTypeError` lives in `jax._src.core` and has no public alias, so the name is asserted
+    # rather than imported: the message is the contract a template author reads either way.
+    with pytest.raises(Exception, match=r"out_sharding") as error:
+        strategy.compile(lambda model, tokens: model(tokens), {})(embed, batch["tokens"])
+
+    assert type(error.value).__name__ == "ShardingTypeError"
 
 
 def test_a_replicated_class_token_concatenates_onto_a_sharded_activation() -> None:
@@ -703,6 +745,24 @@ def test_a_tensor_parallel_mesh_trains_to_the_losses_of_one_device(
     """
     result = _run_script(TP_SCRIPT, tmp_path, preset, model_devices, devices=4)
 
+    assert result["losses"] == pytest.approx(tp_reference["losses"], rel=1e-6)
+
+
+def test_a_hybrid_mesh_trains_an_annotated_model_to_the_losses_of_one_device(
+    tmp_path: Path, tp_reference: dict[str, Any]
+) -> None:
+    """`(Auto data, Explicit model)` is what the two flags exist for, and it has to compute correctly.
+
+    A template that names the sharding of its own outputs wants the model axis typed -- the mode that
+    makes an unnamed row-parallel result an error rather than a compiler guess -- and wants the data
+    axis left Auto all the same, because the ops that break under a typed data axis sit inside Flax
+    and no annotation reaches them. jax meshes may mix axis types, so nothing at the strategy level
+    forbids the combination; this runs it on a four-wide model axis, where a row-parallel layer really
+    does hold partial sums, and asserts the same losses as one device.
+    """
+    result = _run_script(TP_SCRIPT, tmp_path, "tp", "0", "explicit", devices=4)
+
+    assert result["axis_types"] == ["Auto", "Explicit"]
     assert result["losses"] == pytest.approx(tp_reference["losses"], rel=1e-6)
 
 

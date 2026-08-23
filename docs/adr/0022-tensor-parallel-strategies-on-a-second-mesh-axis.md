@@ -8,9 +8,10 @@
 > `jnp.concatenate` of `P(None, None, None)` onto `P("data", None, None)` (`All operands should have
 > the same sharding`, `VisionTransformer`); two of the three flax templates would not trace under any
 > preset, on one device as much as on eight, since axis typing is a type-system property and not a
-> layout. So every mesh axis is now Auto, and only `model_axis_mode: explicit` opts the whole mesh
-> into typed sharding — for the annotated templates that mode already required. The explicit mode
-> itself is unchanged; what it costs to make typing the default is what changed.
+> layout. So every mesh axis is now Auto by default, and typed sharding is opted into one axis at a
+> time — `model_axis_mode: explicit` for the model axis, `data_axis_mode: explicit` for the data one
+> — by the annotated templates that already required it. The explicit mode itself is unchanged; what
+> it costs to make typing the default is what changed.
 
 All three backends gain tensor parallelism behind their existing strategy surfaces, including the
 two-dimensional data×model combinations, with the declaration living in the strategy pattern —

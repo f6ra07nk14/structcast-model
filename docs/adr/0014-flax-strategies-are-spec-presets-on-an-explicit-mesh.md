@@ -2,9 +2,10 @@
 
 > **Superseded in part by ADR-0022.** Tensor parallelism is no longer out of scope: `tp` and
 > `fsdp_tp` presets add a model axis, and ADR-0022's H200 amendment retires the "Explicit axis types
-> everywhere" rule outright — every axis, the data one included, is Auto unless
-> `model_axis_mode: explicit` types the whole mesh. The accumulation drift experiment below did not
-> reproduce on the current stack (the zeros-inheritance hazard is fixed upstream), and the remaining
+> everywhere" rule outright — every axis, the data one included, is Auto unless its own field asks
+> otherwise: `model_axis_mode: explicit` types the model axis, `data_axis_mode: explicit` the data
+> one. The accumulation drift experiment below did not reproduce on the current stack (the
+> zeros-inheritance hazard is fixed upstream), and the remaining
 > rationale for Explicit — loud errors over silent compiler choices — turned out to reject
 > legitimate models: the errors land inside `nnx.Embed`'s gather and a class-token concatenate,
 > library code no model template can annotate.
