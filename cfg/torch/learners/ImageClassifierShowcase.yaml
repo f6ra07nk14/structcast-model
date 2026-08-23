@@ -19,6 +19,7 @@ PARAMETERS:
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
     mixed_precision_type: bfloat16 # "bfloat16" (unscaled) or "float16" (adds the GradScaler)
+    ema: true # false drops the average, which is what an FSDP2 run needs -- see 4. below
     ema_decay: 0.999
 IMPORTS: {}
 _jinja_yaml_: |-
@@ -37,12 +38,18 @@ _jinja_yaml_: |-
   #    on an apply the scaler skipped (REFERENCE.md, "EMA"; "docs/adr/0021"). It rides the "models"
   #    property, so checkpoints and resume carry it. Point an "INFERENCE_FLOW" at "ema_model" to
   #    validate over the averaged weights; the training "FLOW" may not read it.
+  #    "-p "SHARED: {ema: false}"" drops the field and points the "INFERENCE_FLOW" back at "model":
+  #    an "AveragedModel" copies the module it averages and a sharded one has no copy to take, so the
+  #    generated learner refuses an EMA under FSDP2 or tensor parallel by design. That switch is how
+  #    the other three features of this template run there.
+  {% if ema %}
   EMA:
     model:
       multi_avg_fn:
         - _obj_
         - _addr_: torch.optim.swa_utils.get_ema_multi_avg_fn
         - _call_: {decay: {{ema_decay}}}
+  {% endif %}
 OUTPUTS: [ce_loss, acc1, acc5]
 LEARNERS:
   - LOSS: ce_loss
@@ -94,9 +101,10 @@ LEARNERS:
           - _addr_: torch.no_grad
           - _call_
           - _call_: [[_obj_, {_addr_: structcast_model.torch.layers.sparse_top_k_categorical_accuracy}]]
-    # Validation runs the average, which is the point of keeping one.
+    # Validation runs the average, which is the point of keeping one -- and "model" when there is none.
     INFERENCE_FLOW:
-      - [image, cls, ema_model]
+      - _jinja_yaml_: |-
+          - [image, cls, {{"ema_model" if ema else "model"}}]
       - [{input: cls, target: label}, ce_loss, cross_entropy_loss]
       - [{y_true: label, y_pred: cls}, acc1, accuracy]
       - [{y_true: label, y_pred: cls, k: 5}, acc5, top_5_accuracy]

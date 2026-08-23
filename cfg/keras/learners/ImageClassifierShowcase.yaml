@@ -27,6 +27,7 @@ PARAMETERS:
     weight_decay: 0.05
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+    ema: true # false drops both EMA keywords below -- see 4.
     ema_momentum: 0.99
 IMPORTS: {}
 # 2. Mixed precision: "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the
@@ -59,6 +60,9 @@ LEARNERS:
     #      - it keeps no separate averaged copy, so there is nothing to validate against until
     #        "finalize_variable_values" overwrites the weights themselves. The INFERENCE_FLOW below
     #        therefore reads "model", not an average -- Keras has no "ema_model" to point it at.
+    #    "-p "SHARED: {ema: false}"" drops both keywords. Nothing on this backend needs that -- it is
+    #    the torch twin whose FSDP2 runs refuse an average by design -- but the knob is spelled the
+    #    same way on all three templates.
     OPTIMIZER:
       - _obj_
       - _addr_: create_optimizer
@@ -68,11 +72,15 @@ LEARNERS:
           no_weight_decay_names: [bias, gamma, beta, scale, embeddings]
           beta_1: 0.9
           beta_2: 0.999
-          use_ema: true
           _jinja_yaml_: |-
+            {% if ema %}
+            use_ema: true
+            {% endif %}
             learning_rate: {{lr}}
             weight_decay: {{weight_decay}}
+            {% if ema %}
             ema_momentum: {{ema_momentum}}
+            {% endif %}
             gradient_accumulation_steps: {{accumulate_gradients}}
             {% if clip_grad_norm is not none %}
             global_clipnorm: {{clip_grad_norm}}

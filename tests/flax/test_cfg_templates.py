@@ -547,6 +547,26 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
     assert bool(jnp.isfinite(learner.inference_step(**batch)["ce_loss"]))
 
 
+def test_the_showcase_average_can_be_left_out_by_parameter(vision_transformer: Any, tmp_path: Path) -> None:
+    """The `ema` parameter exists for the torch twin, whose FSDP2 runs refuse an average outright.
+
+    Nothing on this backend refuses one, but the three templates are read side by side and a knob
+    spelled differently on each is a knob nobody trusts. What it has to do here is drop the field and
+    the shadow it emits, and leave the inference flow validating over `model` -- a flow still naming
+    `ema_model` would fail on a name the learner no longer defines.
+    """
+    paths = {}
+    for name, parameters in (("averaged", {}), ("plain", {"SHARED": {"ema": False}})):
+        paths[name] = tmp_path / f"{name}.py"
+        FlaxLearnerBuilder.from_path(LEARNERS / "ImageClassifierShowcase.yaml")(parameters=parameters)(paths[name])
+    learner = _load(paths["plain"], "plain").Learner(vision_transformer(rngs=nnx.Rngs(0)))
+
+    assert "flax.nnx.EMA" in paths["averaged"].read_text()
+    assert "flax.nnx.EMA" not in paths["plain"].read_text()
+    assert sorted(learner.models) == ["model"]
+    assert bool(jnp.isfinite(learner.inference_step(**_classification_batch())["ce_loss"]))
+
+
 # ---------------------------------------------------------------------------
 # The activation the three model templates share
 # ---------------------------------------------------------------------------

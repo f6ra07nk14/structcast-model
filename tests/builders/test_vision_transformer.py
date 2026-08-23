@@ -334,3 +334,69 @@ def test_the_showcase_learner_adds_the_scaler_only_for_the_float16_precision(
     assert "GradScaler" not in scripts["bfloat16"]
     assert "torch.autocast(device_type, torch.float16)" in scripts["float16"]
     assert "torch.amp.GradScaler(device=device_type)" in scripts["float16"]
+
+
+class DTensor(torch.nn.Parameter):
+    """Stands in for a sharded FSDP2 parameter, which the generated EMA guard recognizes by type name.
+
+    The same stand-in as the one in `tests/torch/test_ema.py`, which pins the refusal this test is the
+    counterpart of, and for the same reason: a real `DTensor` needs a device mesh no single-process
+    test has a process group for, and the guard reads the type name and nothing else.
+    """
+
+
+def test_the_showcase_drops_its_average_for_a_run_that_shards(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """FSDP2 refuses an EMA by design, so the showcase has to be able to leave it out.
+
+    An `AveragedModel` copies the module it averages and a sharded module has no copy to take, which
+    the generated learner refuses in its own `__init__` -- so a template that declared `EMA`
+    unconditionally could not run its other three features under FSDP2 at all. `ema: false` is the
+    switch, and what it has to produce is a learner a sharded model can enter, validating over
+    `model` rather than over an average that no longer exists.
+    """
+    generated = tmp_path_factory.mktemp("no_ema")
+    model = _showcase_model(generated, True)
+    model.head.weight = DTensor(model.head.weight.detach())
+    image, label = torch.randn(4, 3, 16, 16), torch.tensor([0, 1, 2, 3])
+    TorchLearnerBuilder.from_path(SHOWCASE_YAML)()(generated / "averaged.py")
+    TorchLearnerBuilder.from_path(SHOWCASE_YAML)(parameters={"SHARED": {"ema": False}})(generated / "plain.py")
+
+    with pytest.raises(ValueError, match="EMA works with neither FSDP2 nor tensor parallel"):
+        _load(generated / "averaged.py").Learner(model)
+    learner = _load(generated / "plain.py").Learner(model)
+
+    assert "ema_model" in (generated / "averaged.py").read_text()
+    assert "AveragedModel" not in (script := (generated / "plain.py").read_text())
+    assert list(learner.models) == ["model"]
+    # The three features the sharded run is for are the ones that must survive the switch.
+    assert "with torch.autocast(device_type, torch.bfloat16):" in script
+    assert sorted(learner.training_step(image=image, label=label)) == ["acc1", "acc5", "ce_loss"]
+    assert learner.has_updated is False  # the accumulation window the run is for, still gating
+    assert torch.isfinite(learner.inference_step(image=image, label=label)["ce_loss"])
+
+
+def test_the_image_classifier_learner_derives_both_precision_fields_from_one_parameter(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A precision comparison varies an arm of the run, not the shipped file.
+
+    `MIXED_PRECISION_TYPE` is the autocast dtype and `MIXED_PRECISION` is the `GradScaler`, which only
+    float16 needs -- the two contradicting each other is a build-time `SpecError`, so one parameter
+    derives both rather than exposing a pair a `-p` could break. The default arm is the one this
+    template has always emitted.
+    """
+    generated = tmp_path_factory.mktemp("precision")
+    scripts = {}
+    for arm in (None, "bfloat16", "float16"):
+        path = generated / f"{arm}.py"
+        TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters={"SHARED": {"mixed_precision_type": arm}})(path)
+        scripts[arm] = path.read_text()
+    TorchLearnerBuilder.from_path(LEARNER_YAML)()(generated / "default.py")
+
+    assert (generated / "default.py").read_text() == scripts["bfloat16"]
+    assert "torch.autocast" not in scripts[None]
+    assert "GradScaler" not in scripts[None]
+    assert "torch.autocast(device_type, torch.bfloat16)" in scripts["bfloat16"]
+    assert "GradScaler" not in scripts["bfloat16"]
+    assert "torch.autocast(device_type, torch.float16)" in scripts["float16"]
+    assert "torch.amp.GradScaler(device=device_type)" in scripts["float16"]

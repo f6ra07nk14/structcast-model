@@ -11,6 +11,7 @@ PARAMETERS:
     weight_decay: 0.05
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: null # set to null or a positive integer
+    mixed_precision_type: null # null for the float32 run below, or "bfloat16" / "float16"
 IMPORTS: {}
 # "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the training CLI sets before it
 # builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
@@ -19,8 +20,17 @@ IMPORTS: {}
 # unscaled. Either field alone is refused, which is one difference in default precision from the
 # torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
 # bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
-MIXED_PRECISION: false
-MIXED_PRECISION_TYPE: null
+# That pairing rule is also why one parameter carries both fields: -p "SHARED:
+# {mixed_precision_type: bfloat16}" is the mixed arm of a precision comparison, and the default below
+# is its float32 one.
+_jinja_yaml_: |-
+  {% if mixed_precision_type is none %}
+  MIXED_PRECISION: false
+  MIXED_PRECISION_TYPE: null
+  {% else %}
+  MIXED_PRECISION: true
+  MIXED_PRECISION_TYPE: {{mixed_precision_type}}
+  {% endif %}
 INPUTS: [image, label]
 OUTPUTS: [ce_loss, acc1, acc5]
 LEARNERS:

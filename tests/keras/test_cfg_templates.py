@@ -338,6 +338,43 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
     assert all(np.isfinite(value) for value in _floats(learner.inference_step(**IMAGE_BATCH)).values())
 
 
+def test_the_showcase_average_can_be_left_out_by_parameter(tmp_path: Path) -> None:
+    """The `ema` parameter exists for the torch twin, whose FSDP2 runs refuse an average outright.
+
+    Nothing on this backend refuses one, but the three templates are read side by side and a knob
+    spelled differently on each is a knob nobody trusts. Here it has to reach both EMA keywords and
+    only those: `ema_momentum` left behind alone would be Keras' own default and invisible, while an
+    accumulation window silently dropped with it would change what the run measures.
+    """
+    model = _model(tmp_path, "VisionTransformer", SHOWCASE_PARAMETERS, None)
+    learner = _learner(tmp_path, "ImageClassifierShowcase", {"SHARED": {"ema": False}}, model=model)
+
+    optimizer = learner.optimizers["optimizer"]
+
+    assert optimizer.use_ema is False
+    assert "ema_momentum" not in (tmp_path / "ImageClassifierShowcase_learner.py").read_text()
+    assert optimizer.gradient_accumulation_steps == 4
+    assert all(np.isfinite(value) for value in _floats(learner.inference_step(**IMAGE_BATCH)).values())
+
+
+def test_the_image_classifier_learner_derives_both_precision_fields_from_one_parameter(tmp_path: Path) -> None:
+    """A precision comparison varies an arm of the run, not the shipped file.
+
+    Both fields are required together on this backend -- either one alone is refused at build time --
+    so one parameter carries the pair rather than exposing two a `-p` could set into a refusal. The
+    default arm is the float32 one this template has always emitted.
+    """
+    policies = {}
+    for name, parameters in (("default", {}), ("mixed", {"SHARED": {"mixed_precision_type": "bfloat16"}})):
+        path = tmp_path / f"{name}.py"
+        KerasLearnerBuilder.from_path(LEARNERS / "ImageClassifier.yaml")(parameters=parameters)(path)
+        learner_type = _load(path, f"precision_{name}").Learner
+        policies[name] = (learner_type.MIXED_PRECISION, learner_type.MIXED_PRECISION_TYPE)
+
+    assert policies["default"] == (False, None)
+    assert policies["mixed"] == (True, "bfloat16")
+
+
 CYCLEGAN_BATCH = {
     "real_A": RNG.random((2, 16, 16, 3), dtype="float32"),
     "real_B": RNG.random((2, 16, 16, 3), dtype="float32"),

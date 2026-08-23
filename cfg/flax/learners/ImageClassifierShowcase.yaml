@@ -32,6 +32,7 @@ PARAMETERS:
     weight_decay: 0.05
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+    ema: true # false drops the average -- see 4. below
 IMPORTS: {}
 INPUTS: [image, label]
 OUTPUTS: [ce_loss, acc1, acc5]
@@ -40,7 +41,15 @@ OUTPUTS: [ce_loss, acc1, acc5]
 #    "true" takes the filled-in defaults, "decay: 0.999" over "flax.nnx.Param" alone (an RNG key
 #    cannot be blended). It is blended once per Update, never on an accumulation micro-step, by an
 #    eager call at the end of the host "training_step" (REFERENCE.md, "EMA"; "docs/adr/0021").
-EMA: {model: true}
+#    "-p "SHARED: {ema: false}"" declares nothing and points the "INFERENCE_FLOW" back at "model".
+#    Nothing on this backend needs that -- it is the torch twin whose FSDP2 runs refuse an average by
+#    design -- but the knob is spelled the same way on all three templates.
+_jinja_yaml_: |-
+  {% if ema %}
+  EMA: {model: true}
+  {% else %}
+  EMA: {}
+  {% endif %}
 LEARNERS:
   - NAME: optimizer
     LOSS: ce_loss
@@ -98,11 +107,12 @@ LEARNERS:
       - ["eval: sample_losses.mean()", ce_loss, null]
       - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
       - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
-    # Validation runs the average, which is the point of keeping one.
+    # Validation runs the average, which is the point of keeping one -- and "model" when there is none.
     INFERENCE_FLOW:
       - INPUTS: image
         OUTPUTS: {cls: cls}
-        NAME: ema_model
+        _jinja_yaml_: |-
+          NAME: {{"ema_model" if ema else "model"}}
       - [{logits: cls, labels: label}, sample_losses, cross_entropy_loss]
       - ["eval: sample_losses.mean()", ce_loss, null]
       - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]

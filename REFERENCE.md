@@ -425,6 +425,8 @@ One learner per framework turns every field above on at once over the shipped Vi
 | [`cfg/flax/learners/ImageClassifierShowcase.yaml`](cfg/flax/learners/ImageClassifierShowcase.yaml) | `optax.MultiSteps`, `EMA` | `-p "SHARED: {gradient_checkpointing: true}"` |
 | [`cfg/keras/learners/ImageClassifierShowcase.yaml`](cfg/keras/learners/ImageClassifierShowcase.yaml) | `gradient_accumulation_steps`, `MIXED_PRECISION`/`MIXED_PRECISION_TYPE`, `use_ema` | `-p "SHARED: {gradient_checkpointing: true}" -p "base: {drop_path_rate: 0.0}"` |
 
+All three take one more parameter, `ema`, which is `true` by default and drops the average when it is not: `-p "SHARED: {ema: false}"`. It exists for the torch template, whose EMA an FSDP2 or tensor-parallel run refuses by design — an `AveragedModel` copies the module it averages, and a sharded module has no copy to take — so without it the other features here could not be run under those strategies at all. The torch and flax `INFERENCE_FLOW`s then validate over `model` instead of `ema_<model>`, and the Keras optimizer loses `use_ema`/`ema_momentum`. Nothing on the other two backends needs the switch; it is spelled the same way on all three so the templates stay readable side by side.
+
 Two of those cells are shorter than the others, and the files say why rather than papering over it. Flax has no mixed-precision field at all: precision is `dtype`/`param_dtype` on the model's layers there, which the shipped template does not parameterize, so no `-p` reaches it. Keras needs `drop_path_rate: 0.0`: a block's `DropPath` is a `keras.layers.Dropout` reached through a `TYPE` sublayer, which the build-time refusal above cannot see, and `keras.remat` re-draws its seed on the recomputation — at rate 0 it draws nothing. The Keras showcase also casts the logits to float32 before the loss and the metrics, because `keras.metrics.sparse_top_k_categorical_accuracy` raises a `TypeError` on a bfloat16 prediction.
 
 #### `LEARNERS`
@@ -540,6 +542,19 @@ the matmuls and the normalizations run in bf16. It is *mixed* precision, the Fla
 torch `MIXED_PRECISION_TYPE: bfloat16` autocast over fp32 master weights, which is what makes the two
 backends' bf16 runs comparable; pure bf16 storage would be a `param_dtype` too and is deliberately
 not offered. Left unset the template emits byte-identical code to a build that never mentions it.
+
+**Precision (torch and Keras)** — the two learners the flax one is compared against,
+[`cfg/torch/learners/ImageClassifier.yaml`](cfg/torch/learners/ImageClassifier.yaml) and
+[`cfg/keras/learners/ImageClassifier.yaml`](cfg/keras/learners/ImageClassifier.yaml), parameterize
+their precision as a single `mixed_precision_type`, because `MIXED_PRECISION` and
+`MIXED_PRECISION_TYPE` cannot be set independently without building a refusal: the torch pair rejects
+a scaler under bfloat16, and the Keras pair rejects either field alone. `null` is a float32 run,
+`"bfloat16"` is unscaled autocast (the torch default; Keras defaults to `null`), and `"float16"` adds
+the `GradScaler` there and the `LossScaleOptimizer` here.
+
+```bash
+scm torch create learner cfg/torch/learners/ImageClassifier.yaml -p 'SHARED: {mixed_precision_type: null}' -o learner.py
+```
 
 
 ## API Reference: `base_trainer.py`
