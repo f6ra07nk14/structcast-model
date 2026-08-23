@@ -33,10 +33,13 @@ PARAMETERS:
     # Activation checkpointing on every transformer block, off by default so nothing changes for a
     # run that does not ask for it. Turn it on with -p "SHARED: {gradient_checkpointing: true}",
     # which buys the block's activation memory with a second forward pass over it (REFERENCE.md,
-    # "GRADIENT_CHECKPOINTING"). Pair it with "drop_path_rate: 0.0", or the build is refused:
-    # "keras.remat" re-draws "SeedGenerator" state on the recomputation, and the "DropPath" sublayer
-    # of a block is a "keras.layers.Dropout". At rate 0 that Dropout returns its input untouched and
-    # draws nothing, so the second pass matches and the build goes through.
+    # "GRADIENT_CHECKPOINTING"). Pair it with -p "base: {drop_path_rate: 0.0}", on the selected size
+    # group and not on SHARED: the ramp below is read inside a "_jinja_group_" scope, which a
+    # "SHARED:" override alone does not reach -- it leaves the rate at 0.1, silently. Without the
+    # pairing the build is refused: "keras.remat" re-draws "SeedGenerator"
+    # state on the recomputation, and the "DropPath" sublayer of a block is a "keras.layers.Dropout".
+    # At rate 0 that Dropout returns its input untouched and draws nothing, so the second pass
+    # matches and the build goes through.
     gradient_checkpointing: false
   # model size parameters
   base:

@@ -5,6 +5,7 @@ The generated layer is exec'd from a file and trained by a generated learner on 
 alone, so the same emission has to train identically on all three.
 """
 
+from collections.abc import Iterator
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType
@@ -27,6 +28,21 @@ X = np.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0]], dtype="float32")
 """One fixed batch, so two runs can only differ through the code under test."""
 
 Y = np.asarray([[1.0, -1.0], [0.5, 0.25]], dtype="float32")
+
+
+@pytest.fixture(autouse=True)
+def flash_attention() -> Iterator[Any]:
+    """Yield the flash attention setting a test starts from, and put it back afterwards.
+
+    Autouse: the switch is process-global and every layer built below turns it off on the JAX
+    backend, which would otherwise follow the rest of the session.
+    """
+    before = keras.config.is_flash_attention_enabled()
+    yield before
+    if before is False:
+        keras.config.disable_flash_attention()
+    else:
+        keras.config.enable_flash_attention()
 
 
 def _load(path: Path, name: str) -> ModuleType:
@@ -90,6 +106,21 @@ def test_an_inference_call_never_rematerializes(tmp_path: Path, monkeypatch: pyt
     training = layer(X, training=True)
     assert calls == [1]
     assert np.array_equal(_values([inference])[0], _values([training])[0])
+
+
+def test_a_checkpointed_layer_disables_flash_attention_on_the_jax_backend(tmp_path: Path, flash_attention: Any) -> None:
+    """What is pinned is the guard, not the crash it prevents: no CPU host reproduces that one.
+
+    Inside `keras.remat` on the JAX backend the cuDNN fused attention kernel raises on a sequence
+    length it cannot serve -- ViT-B/16 at 224px asks it for 197 -- where outside rematerialization
+    Keras catches the same refusal and falls back; showing it takes a cuDNN GPU. Checkable
+    everywhere: a layer that checkpoints turns the dispatch off on that backend and on no other, and
+    a layer that does not checkpoint leaves the process-global switch exactly as it found it.
+    """
+    _layer(tmp_path, False)
+    assert keras.config.is_flash_attention_enabled() is flash_attention
+    _layer(tmp_path, True)
+    assert (keras.config.is_flash_attention_enabled() is False) == (keras.backend.backend() == "jax")
 
 
 def test_the_emission_leaves_the_layer_a_plain_keras_layer(tmp_path: Path) -> None:

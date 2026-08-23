@@ -73,7 +73,9 @@ def _load(module_path: Any) -> ModuleType:
 def model(tmp_path_factory: pytest.TempPathFactory) -> torch.nn.Module:
     """Generate the `base` preset with drop path disabled, as `vit_base_patch16_224` has it."""
     module_path = tmp_path_factory.mktemp("generated") / "vision_transformer.py"
-    TorchBuilder.from_path(MODEL_YAML)(parameters={"SHARED": {"drop_path_rate": 0.0}})(module_path)
+    # The override must name the size group: a SHARED value never reaches a group scope whose own
+    # parameters define the same name, so a bare SHARED override silently keeps the 0.1 ramp.
+    TorchBuilder.from_path(MODEL_YAML)(parameters={"SHARED": {"drop_path_rate": 0.0}, "base": {}})(module_path)
     torch.manual_seed(0)
     return _load(module_path).Model().eval()
 

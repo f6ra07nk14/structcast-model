@@ -149,7 +149,11 @@ class KerasLayerIntermediate(LayerIntermediate):
         inputs += ", " if inputs else ""
         body = "call"
         wrapper = ""
+        prologue = "super().__init__(**kwargs)"
         if self.gradient_checkpointing is not None:
+            # Before the sub-layers are built, not at training time: `keras.layers.MultiHeadAttention`
+            # caches the flash attention decision in its own `__init__`, so a later flip misses it.
+            prologue += f"{sep}disable_flash_attention_for_remat()"
             # No base class: Keras reads the `call` signature to decide whether it forwards
             # `training` and how it maps a batch passed by name, and a `*args` base would erase both.
             # Not `_call_impl`: on the torch backend a Keras layer inherits `torch.nn.Module`, which
@@ -169,7 +173,7 @@ class KerasLayerIntermediate(LayerIntermediate):
 class {class_name}(keras.layers.Layer):
 
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        {prologue}
         self.input_names = {self.inputs}
         self.input_shapes = {self.input_shapes}
         self.output_names = {self.outputs}
@@ -211,6 +215,9 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
 
         The sub-layers recomputation would run twice are rejected by
         `KerasLayerIntermediate._reject_stateful_sublayers`, which sees the whole subtree.
+
+        The one import a checkpointed layer gains is the JAX flash attention guard its `__init__`
+        calls, which no other layer imports (`REFERENCE.md`, "GRADIENT_CHECKPOINTING").
         """
         if config is False:
             return None
@@ -219,6 +226,7 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
                 f"GRADIENT_CHECKPOINTING keyword arguments {sorted(config)} have no Keras equivalent: "
                 "keras.remat takes the function alone, so set GRADIENT_CHECKPOINTING to true and drop them."
             )
+        imports["structcast_model.keras.layers"].add("disable_flash_attention_for_remat")
         return {}
 
 

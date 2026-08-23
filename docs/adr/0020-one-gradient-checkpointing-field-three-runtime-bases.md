@@ -40,6 +40,16 @@ distinguishes otherwise identical layers with different checkpoint behavior. The
 caveat lives in `REFERENCE.md`, never in generated comments (ADR-0019). Option availability across
 torch versions is documented there too; the floors do not move (ADR-0003's guard-not-floor stance).
 
+## Amendment: keras ships a runtime function beside the two bases
+
+The keras half has no base class, so its one runtime piece is a function:
+`structcast_model.keras.layers.disable_flash_attention_for_remat`, called by the generated `__init__`
+of a checkpointed layer before it builds its sub-layers. On the JAX backend the cuDNN fused attention
+kernel raises inside a rematerialized body on a sequence length it falls back on outside one, so the
+dispatch is switched off for the process, once, with a warning; `keras.layers.MultiHeadAttention`
+caches the decision in its own constructor, which is what fixes the call site to `__init__`. The
+throughput cost is in the warning and in `REFERENCE.md`, not in a generated comment (ADR-0019).
+
 ## Considered options
 
 - A `TorchUserDefinedLayer`/`TorchTemplateLayer` seam with per-framework same-named fields

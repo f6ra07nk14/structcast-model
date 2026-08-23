@@ -166,6 +166,21 @@ def test_a_checkpointed_keras_layer_wraps_its_call_body() -> None:
     assert "    def _call_body(self, x, *, training = None, **kwargs):\n" in script
 
 
+def test_a_checkpointed_keras_layer_disables_flash_attention_before_its_sublayers() -> None:
+    """The guard runs in `__init__`, before the sub-layers exist, and only where it is needed.
+
+    `keras.layers.MultiHeadAttention.__init__` caches the flash attention decision, so flipping the
+    switch once the sub-layer is built would never reach it -- and inside `keras.remat` on the JAX
+    backend that kernel raises instead of falling back (`REFERENCE.md`, "GRADIENT_CHECKPOINTING").
+    """
+    script = _script(KerasBuilder, KERAS_RAW, True)
+    assert "        super().__init__(**kwargs)\n        disable_flash_attention_for_remat()\n" in script
+    assert script.index("disable_flash_attention_for_remat()") < script.index("self.fc = Dense")
+    checkpointed = KerasBuilder(raw={**KERAS_RAW, "GRADIENT_CHECKPOINTING": True})(classname="Model")
+    assert checkpointed.collected_imports["structcast_model.keras.layers"] == {"disable_flash_attention_for_remat"}
+    assert "structcast_model.keras.layers" not in KerasBuilder(raw=KERAS_RAW)(classname="Model").collected_imports
+
+
 @pytest.mark.parametrize(
     ("builder", "raw", "module", "name"),
     [

@@ -7,7 +7,7 @@
 #   scm keras train \
 #     --model cfg/keras/models/VisionTransformer.yaml \
 #     --learner cfg/keras/learners/ImageClassifierShowcase.yaml \
-#     -p "SHARED: {gradient_checkpointing: true, drop_path_rate: 0.0}"
+#     -p "SHARED: {gradient_checkpointing: true}" -p "base: {drop_path_rate: 0.0}"
 #
 # 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
 #    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section, whose
@@ -17,7 +17,10 @@
 #    with it because the build refuses otherwise: "keras.remat" re-draws seeds on the recomputation,
 #    and a block's "DropPath" is a "keras.layers.Dropout" one TYPE sublayer down. At rate 0 it draws
 #    nothing, so the two passes agree; at any other rate the build stops instead of training on
-#    gradients that silently disagree with the forward pass.
+#    gradients that silently disagree with the forward pass. It goes on the selected size group and
+#    not on SHARED: the model reads the rate inside a "_jinja_group_" scope, which a "SHARED:"
+#    override alone does not reach, so -p "SHARED: {drop_path_rate: 0.0}" leaves the ramp at 0.1 and
+#    the build is refused anyway.
 PARAMETERS:
   DEFAULT:
     lr: 1.0e-3
