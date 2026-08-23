@@ -5,9 +5,9 @@
 # with, so a model template's own annotations survive. The batch is never split along the model
 # axis. The pattern is called with device=..., which this preset ignores: it spans the devices
 # itself. Bind model_devices to give the model axis only some of them, leaving the rest as data
-# replicas. model_axis_mode: explicit types the model axis like the data one -- every row-parallel
-# layer must then carry `dot_general: "eval: dot_general_out('data', None)"` in its template, which
-# wrap verifies before the run starts.
+# replicas. model_axis_mode: explicit types both mesh axes, the data one included -- every
+# row-parallel layer must then carry `dot_general: "eval: dot_general_out('data', None)"` in its
+# template, which wrap verifies before the run starts.
 #
 # The rules below are (parameter-path regex, tactic) pairs written for
 # cfg/flax/models/VisionTransformer.yaml and must be adapted to the model they run on: a rule

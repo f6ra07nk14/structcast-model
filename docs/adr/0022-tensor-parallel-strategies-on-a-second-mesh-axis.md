@@ -1,5 +1,17 @@
 # Tensor-parallel strategies on a second mesh axis
 
+> **Amended by H200 validation: the flax data axis is Auto, not Explicit.** The Explicit data axis
+> below rejects legitimate models. An Explicit axis demands an `out_sharding` at every point where a
+> replicated array meets a sharded one, and those points sit inside code no model template can
+> annotate — `nnx.Embed`'s `jnp.take` of a replicated table with data-sharded indices
+> (`ShardingTypeError: Use .at[...].get(out_sharding=)`, `SmallLanguageModel`) and the class-token
+> `jnp.concatenate` of `P(None, None, None)` onto `P("data", None, None)` (`All operands should have
+> the same sharding`, `VisionTransformer`); two of the three flax templates would not trace under any
+> preset, on one device as much as on eight, since axis typing is a type-system property and not a
+> layout. So every mesh axis is now Auto, and only `model_axis_mode: explicit` opts the whole mesh
+> into typed sharding — for the annotated templates that mode already required. The explicit mode
+> itself is unchanged; what it costs to make typing the default is what changed.
+
 All three backends gain tensor parallelism behind their existing strategy surfaces, including the
 two-dimensional data×model combinations, with the declaration living in the strategy pattern —
 never in a model template, which must keep running unchanged under `single`/`dp`/`tp`.

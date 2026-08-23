@@ -1,11 +1,13 @@
 # Flax distributed strategies are sharding-rule presets on an always-on Explicit mesh
 
 > **Superseded in part by ADR-0022.** Tensor parallelism is no longer out of scope: `tp` and
-> `fsdp_tp` presets add a model axis that defaults to Auto axis type (with an explicit-mode
-> option), narrowing the "Explicit axis types everywhere" rule to the data axis. The accumulation
-> drift experiment below did not reproduce on the current stack (the zeros-inheritance hazard is
-> fixed upstream); the remaining rationale for Explicit — loud errors over silent compiler
-> choices — stands for the data axis.
+> `fsdp_tp` presets add a model axis, and ADR-0022's H200 amendment retires the "Explicit axis types
+> everywhere" rule outright — every axis, the data one included, is Auto unless
+> `model_axis_mode: explicit` types the whole mesh. The accumulation drift experiment below did not
+> reproduce on the current stack (the zeros-inheritance hazard is fixed upstream), and the remaining
+> rationale for Explicit — loud errors over silent compiler choices — turned out to reject
+> legitimate models: the errors land inside `nnx.Embed`'s gather and a class-token concatenate,
+> library code no model template can annotate.
 
 JAX has no strategy zoo: one mechanism — a device mesh plus a `PartitionSpec` per tensor — expresses
 single-device, data-parallel, and FSDP execution, with XLA inserting every collective. The Flax

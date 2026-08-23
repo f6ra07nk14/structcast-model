@@ -128,12 +128,12 @@ class FlaxDistributedStrategy:
     required under `fsdp_tp`, whose data axis is what is left over."""
 
     model_axis_mode: Literal["auto", "explicit"] = "auto"
-    """Axis type of the model axis. `auto` lets the compiler place what the rules do not, so plain
-    layers row-parallelize with no model-template change; `explicit` types the model axis like the
-    data one, which needs every row-parallel layer to carry its own `dot_general` hook and is
-    verified at :meth:`wrap` time (`docs/adr/0022`). A template whose initializers are
-    `nnx.with_partitioning` needs `explicit` as well: Flax refuses a mesh whose axes do not all have
-    the same type, so those initializers raise while the model axis is Auto."""
+    """Axis type of the model axis, and with it of the whole mesh: Flax refuses a mesh whose axes do
+    not all have the same type, so the data axis takes the one this field names. `auto` lets the
+    compiler place what the rules do not, so plain layers row-parallelize with no model-template
+    change; `explicit` types both axes for a template that names the sharding of its own outputs,
+    which needs every row-parallel layer to carry its own `dot_general` hook and is verified at
+    :meth:`wrap` time (`docs/adr/0022`)."""
 
     rules: Sequence[tuple[str, str]] | None = None
     """Rules replacing the preset's table, as ordered (parameter-path regex, tactic) pairs."""
@@ -189,10 +189,15 @@ class FlaxDistributedStrategy:
     def _build_mesh(self, devices: Sequence[Any]) -> Any:
         """Build the mesh of this preset over *devices*: one data axis, plus a model axis for `tp`.
 
-        The data axis is always Explicit, which is what makes a wrong batch or parameter sharding a
-        trace-time error instead of a silent compiler choice (`docs/adr/0014`). The model axis
-        follows :attr:`model_axis_mode`, defaulting to Auto so that a plain layer -- one that names
-        no output sharding of its own -- still row-parallelizes, the compiler inserting the reduction.
+        Every axis is Auto unless :attr:`model_axis_mode` asks for `explicit`, which types the whole
+        mesh; under Auto a plain layer -- one that names no output sharding of its own -- still
+        row-parallelizes, the compiler inserting the reduction. The data axis was Explicit until
+        H200 validation showed the price: an Explicit axis demands an `out_sharding` wherever a
+        replicated array meets a sharded one, and those meetings happen inside code no template can
+        annotate -- `nnx.Embed`'s gather of a replicated table with sharded indices, a class token
+        concatenated onto a sharded activation -- so correct models did not trace at all
+        (`docs/adr/0022`). Under Auto the compiler propagates the shardings itself, and one it
+        chooses badly costs a reshard rather than a wrong answer.
 
         Raises:
             ValueError: if a preset without a model axis was given one to configure, if `fsdp_tp` was
@@ -204,7 +209,9 @@ class FlaxDistributedStrategy:
                     f"model_devices and model_axis_mode configure the model axis, which the {self.preset!r} "
                     f"preset's mesh does not have: drop them, or select one of {', '.join(TP_PRESETS)}."
                 )
-            return jax.make_mesh((len(devices),), (AXIS,), devices=devices)
+            # Named rather than left to `jax.make_mesh`, whose default axis type has changed between
+            # jax versions -- and the type is what decides whether a plain model traces at all.
+            return jax.make_mesh((len(devices),), (AXIS,), devices=devices, axis_types=(jax.sharding.AxisType.Auto,))
         if self.preset == "fsdp_tp" and self.model_devices is None:
             raise ValueError(
                 'The "fsdp_tp" preset splits its devices between the two axes, so model_devices says how '
@@ -217,12 +224,12 @@ class FlaxDistributedStrategy:
                 f"Asked for {model_devices} model-axis devices out of {len(devices)}: the count must be "
                 "between 1 and the number of devices the run spans, and must divide it."
             )
-        explicit = jax.sharding.AxisType.Explicit
+        axis_type = jax.sharding.AxisType.Explicit if self.model_axis_mode == "explicit" else jax.sharding.AxisType.Auto
         return jax.make_mesh(
             (len(devices) // model_devices, model_devices),
             (AXIS, MODEL_AXIS),
             devices=devices,
-            axis_types=(explicit, explicit if self.model_axis_mode == "explicit" else jax.sharding.AxisType.Auto),
+            axis_types=(axis_type, axis_type),
         )
 
     @property
@@ -462,8 +469,8 @@ class FlaxDistributedStrategy:
 
         Only the leading dimension of a parameter with at least two dimensions is a candidate.
         Sharding any other dimension puts the parameter's own axis on the mesh axis the batch is
-        already split along, and the elementwise ops that consume it then produce a result sharded
-        twice on `data`, which explicit-mode JAX rejects at trace time. A parameter below
+        already split along, which is not FSDP: the ops that consume it meet `data` on two different
+        dimensions, and the compiler pays a reshard every step to reconcile them. A parameter below
         :attr:`min_size`, or whose leading dimension the data axis does not divide, stays replicated
         rather than failing the run. The divisor is the data axis and not the mesh: on the
         two-dimensional `fsdp_tp` mesh the whole mesh is wider, and dividing by it would leave every

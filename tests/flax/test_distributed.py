@@ -310,12 +310,17 @@ def test_the_strategy_satisfies_the_distributed_strategy_protocol() -> None:
     assert isinstance(FlaxDistributedStrategy(), DistributedStrategy)
 
 
-def test_the_single_preset_builds_a_size_one_explicit_mesh() -> None:
-    """Single-device training is a one-device mesh, not a branch: the sharding path is always the same one."""
+def test_the_single_preset_builds_a_size_one_auto_mesh() -> None:
+    """Single-device training is a one-device mesh, not a branch: the sharding path is always the same one.
+
+    The axis type is asserted rather than left to `jax.make_mesh`, whose default has changed between
+    jax versions: an Explicit data axis refuses ops that mix a sharded array with a replicated one,
+    which is a trace failure for models that carry no sharding annotations at all.
+    """
     strategy = FlaxDistributedStrategy(preset="single", device="cpu:0")
 
     assert strategy.mesh.shape == {"data": 1}
-    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Explicit,)
+    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Auto,)
 
 
 def test_an_unknown_preset_is_refused() -> None:
@@ -424,8 +429,9 @@ def test_the_tp_presets_leave_an_unmatched_parameter_on_its_construction_shardin
     `dp` and `fsdp` place every parameter, replicating whatever no rule shards, which would silently
     overwrite the annotation; under the tp presets an unmatched parameter is not placed at all. The
     annotation asserted here is one no rule in the table could have produced, so its surviving is the
-    only reason it can still be there. (`nnx.with_partitioning` needs every mesh axis to have the same
-    type, so this is an explicit-mode template -- the mode the annotation belongs to.)
+    only reason it can still be there. (A template that annotates its own parameters is written for
+    explicit mode, which is the one mode that types the mesh at all -- both axes of it, since Flax
+    refuses a mesh whose axes do not all have the same type.)
     """
     strategy = FlaxDistributedStrategy(preset="tp", model_axis_mode="explicit", rules=[(r"^up\.", "column")])
     model = nnx.Dict(
@@ -440,6 +446,7 @@ def test_the_tp_presets_leave_an_unmatched_parameter_on_its_construction_shardin
 
     strategy.wrap(OrderedDict(model=model))
 
+    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit)
     assert _spec(model.head.kernel) == "P('model', None)"
     assert _spec(model.up.kernel) == "P(None, 'model')"
 
@@ -451,8 +458,48 @@ def test_the_auto_model_axis_mode_places_a_plain_row_layer(tmp_path: Path) -> No
 
     strategy.wrap(OrderedDict(model=model))
 
-    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Auto)
+    assert strategy.mesh.axis_types == (jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto)
     assert _spec(model.fc.bias) == "P()"
+
+
+def test_an_embedding_looks_up_a_sharded_batch_of_indices() -> None:
+    """`nnx.Embed` gathers a replicated table with the sharded indices of the batch, and must trace.
+
+    The gather is a `jnp.take` inside Flax's own module, so no model template can name the sharding
+    of its output: while the data axis was Explicit this raised `ShardingTypeError: Use
+    .at[...].get(out_sharding=)` and every template holding an embedding -- `SmallLanguageModel`
+    among them -- was unrunnable under every preset. A plain model must train with no sharding
+    annotations at all, which is what the Auto data axis buys and what this asserts.
+    """
+    strategy = FlaxDistributedStrategy(preset="single", device="cpu:0")
+    embed = nnx.Embed(num_embeddings=8, features=4, rngs=nnx.Rngs(params=jax.random.key(0)))
+    strategy.wrap(OrderedDict(model=embed))
+    batch = strategy.shard_batch({"tokens": jnp.zeros((4, 3), dtype=jnp.int32)})
+
+    embedded = strategy.compile(lambda model, tokens: model(tokens), {})(embed, batch["tokens"])
+
+    assert embedded.shape == (4, 3, 4)
+
+
+def test_a_replicated_class_token_concatenates_onto_a_sharded_activation() -> None:
+    """A learned token prepended to the batch mixes a replicated array with a sharded one, and must trace.
+
+    This is `VisionTransformer.yaml`'s class token, whose `jax.numpy.concatenate` is a plain call in
+    the generated forward: while the data axis was Explicit it raised `ShardingTypeError: All
+    operands should have the same sharding`, because the token is replicated and the activation is
+    split along the batch dimension. Neither operand is something a template can annotate, so the
+    mesh has to accept the mix -- the compiler resharding the token is the right answer here.
+    """
+    strategy = FlaxDistributedStrategy(preset="single", device="cpu:0")
+    model = nnx.Dict(class_token=nnx.Param(jnp.zeros((1, 1, 4))))
+    strategy.wrap(OrderedDict(model=model))
+    feature = strategy.shard_batch({"feature": jnp.ones((4, 3, 4))})["feature"]
+
+    def prepend(model: nnx.Dict, feature: jax.Array) -> jax.Array:
+        token = jnp.broadcast_to(model.class_token[...], (feature.shape[0], 1, feature.shape[-1]))
+        return jnp.concatenate((token, feature), axis=1)
+
+    assert strategy.compile(prepend, {})(model, feature).shape == (4, 4, 4)
 
 
 def test_wrap_returns_the_same_model_objects() -> None:
@@ -568,7 +615,7 @@ def test_the_fsdp_preset_shards_the_leading_dimension_of_the_large_parameters(tm
     assert result["params"] == {
         "divisible.kernel": "P('data', None)",
         # Sharded on dim 0 even though dim 1 is larger: dim 1 is the axis the batch is already split
-        # along, and a result sharded twice on `data` is a trace-time error.
+        # along, so every op consuming it would meet `data` on two dimensions and pay a reshard.
         "wide.kernel": "P('data', None)",
         # Every bias is one-dimensional, the 8x8 kernel is far below the cutoff, and 1023 rows do not
         # divide by four: all of them stay replicated instead of failing the run.
