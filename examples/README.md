@@ -394,7 +394,11 @@ folder per class — the same tree `cfg/torch/others/default_timm.yaml` points t
 three frameworks. One field carries both, as on the Keras side; a tfds name is any string, so the
 union is resolved left to right — an existing directory wins, anything else is a name. The
 directory form is what scales: the files are listed once and decoded a batch at a time, so a set of
-ImageNet's size costs a list of paths rather than a copy of the pixels.
+ImageNet's size costs a list of paths rather than a copy of the pixels. The training shuffle runs
+over that list, before the decode, because a tree of class folders is listed class by class and a
+buffered shuffle of the decoded stream can only ever mix a window of it — a thousand images are
+0.08% of ImageNet, which leaves every batch two or three adjacent classes and, measured, a NaN loss
+from the first epoch. `shuffle_buffer` therefore bounds a `tensorflow_datasets` set only.
 `cfg/flax/others/default_tfdata.yaml` takes `data_dir` for the tree root or `dataset` for the name,
 one of the two required, and appends the derived split to the root — so one render per split covers
 a whole tree. `tensorflow_datasets` itself loads through `try_import`, and the loader's items come
@@ -466,9 +470,11 @@ rank, before the decode. `RandomFlip`, `RandomCrop`, `Resizing` and `Rescaling` 
 TensorFlow operations when a `tf.data` pipeline traces them, so one pipeline feeds a run on any
 backend, while a layer built into the model would augment whatever loads that model afterwards.
 Building the pipeline therefore needs `tensorflow` installed even for a `jax` or `torch` run.
-`shuffle_buffer` bounds the training shuffle (a full-split buffer is what ImageNet cannot afford),
-and pad-then-crop is the small-image recipe rather than ImageNet's scale-and-aspect jitter — a run
-chasing a published number brings its own random resized crop.
+`shuffle_buffer` bounds the training shuffle of a `keras.datasets` set, whose buffer would be a
+second copy of an array already in memory; a directory is shuffled by its file list instead, after
+the shard and before the decode, so a tree listed class by class is mixed whole rather than through
+a window of it. Pad-then-crop is the small-image recipe rather than ImageNet's scale-and-aspect
+jitter — a run chasing a published number brings its own random resized crop.
 
 [`keras/optimizers.py`](keras/optimizers.py) exists for one knob: weight-decay exemptions are
 configured by `optimizer.exclude_from_weight_decay(...)` after construction and before the optimizer

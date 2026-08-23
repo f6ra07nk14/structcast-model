@@ -24,8 +24,9 @@ PARAMETERS:
     batch_size: 32
     image_size: [32, 32]
     crop_padding: 4 # pixels padded on each side before the random crop; 0 disables the crop
-    # Items the training shuffle holds at once, capped by the number of items a rank owns. A full
-    # shuffle of a set at ImageNet's size does not fit, so this bounds the window it draws from.
+    # Items the training shuffle of a "keras.datasets" set holds at once, capped by the number of
+    # items a rank owns: a full buffer there would be a second copy of an in-memory array. It does
+    # not bound a directory, whose file list is shuffled whole, before the decode.
     shuffle_buffer: 1024
     seed: 42
 _obj_:

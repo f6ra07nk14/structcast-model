@@ -55,6 +55,9 @@ with try_import() as _tfds_imports:  # not a dependency of structcast-model; the
 DTYPES = {"float32": tf.float32, "float16": tf.float16, "bfloat16": tf.bfloat16}
 """TensorFlow element types of the supported image element types."""
 
+EXTENSIONS = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png"})
+"""Suffixes read as images, lowercased: the set `keras.utils.image_dataset_from_directory` lists."""
+
 
 def hide_gpus_from_tensorflow() -> None:
     """Take every GPU out of TensorFlow's sight, so it never reserves the memory JAX needs.
@@ -69,6 +72,41 @@ def hide_gpus_from_tensorflow() -> None:
         tf.config.set_visible_devices([], "GPU")
     except RuntimeError:
         pass
+
+
+def list_labelled_images(root: Path) -> tuple[list[str], list[int]]:
+    """The images under *root* and their class indices, from a tree laid out one folder per class.
+
+    A label is its folder's position among the sorted folder names, which is what
+    `keras.utils.image_dataset_from_directory` and timm both do over the same tree -- so a class
+    keeps its index whichever framework reads the directory. Each class folder is read recursively
+    and the files are sorted, so the listing of a tree is the same list every run: it is what the
+    shuffle in `TFDataLoader.dataset` permutes, and an order that varied by itself would make a
+    seeded run unreplayable.
+
+    Args:
+        root (Path): One split's directory, e.g. `.../imagenet/train`, one folder per class.
+
+    Returns:
+        tuple[list[str], list[int]]: The file paths and their class indices, paired by position.
+
+    Raises:
+        ValueError: If the tree holds no image, which would leave an epoch with nothing in it.
+    """
+    paths: list[str] = []
+    labels: list[int] = []
+    for label, folder in enumerate(sorted(entry for entry in root.iterdir() if entry.is_dir())):
+        for path in sorted(folder.rglob("*")):
+            if path.suffix.lower() in EXTENSIONS:
+                paths.append(str(path))
+                labels.append(label)
+    if not paths:
+        raise ValueError(
+            f'No class folder under "{root}" holds an image with a suffix in {sorted(EXTENSIONS)}. '
+            "The directory form names one split's directory, e.g. .../imagenet/train, whose images "
+            "sit one folder per class -- not the dataset root and not a flat folder of files."
+        )
+    return paths, labels
 
 
 class TFDataLoader(BaseModel):
@@ -138,7 +176,13 @@ class TFDataLoader(BaseModel):
     """Whether the training augmentation flips images horizontally."""
 
     shuffle_buffer: int = 1024
-    """Items held for shuffling a training split; the whole split is shuffled when it is smaller."""
+    """Items held for shuffling a `tensorflow_datasets` training split, capped by the split's size.
+
+    It does not bound a directory: there the shuffle runs over the file list, before the decode, so
+    the whole listing is permuted every epoch and the buffer holds paths rather than images. A tfds
+    set arrives decoded, where a buffer of the whole split is what nothing of ImageNet's size can
+    afford, so that one stays bounded and its shuffle stays local to a window of the file order.
+    """
 
     seed: int = 42
     """Seed of the shuffle and of the per-item augmentation draws, so a run is reproducible."""
@@ -170,35 +214,29 @@ class TFDataLoader(BaseModel):
 
     @cached_property
     def source(self) -> tf.data.Dataset:
-        """The unbatched, unshuffled `(image, label)` pairs of this split.
+        """The unbatched, unshuffled items of this split: `(path, label)` pairs, or tfds' own pairs.
 
-        A directory is listed once with `keras.utils.image_dataset_from_directory` -- reached here
-        as `tf.keras`, which is the same function and spares this file an import it would otherwise
-        need for one call -- and its images are decoded as the pipeline pulls them, so a set of
-        ImageNet's size costs a list of paths rather than a copy of the pixels. The listing is what
-        `num_examples` counts, and the decode happens after everything downstream of this property.
-        The labels come from the folder names, sorted, so a rerun over the same tree numbers the
-        classes the same way. A tfds name is loaded through `tfds.load` instead.
+        A directory is listed once by `list_labelled_images` and handed on as paths rather than
+        pixels, so a set of ImageNet's size costs a list of strings here and `_decode` reads a file
+        only once the shuffle in `dataset` has picked it. That order is the whole point: a tree laid
+        out one folder per class is listed class by class, so the file list is the only place where
+        shuffling it globally is affordable -- a shuffle after the decode would have to hold images
+        to reorder them, and a thousand of them is 0.08% of ImageNet, which leaves every batch two
+        or three adjacent classes (the flax run of H200 tier 2 10-f: `ce_loss` was NaN from the
+        first epoch on the full tree and clean on a ten-class subset of it).
 
-        The two hand over different things -- a directory float32 images in 0..255 and int32 labels,
-        tfds uint8 and int64 -- and `_preprocess` is what makes the batch contract identical either
-        way. Images are decoded at `resize_size`, not at `image_size`: the crop that `crop_pct`
-        exists for happens in `_preprocess`, and a source that had already resized to the final size
-        would leave it nothing to crop.
+        The listing is what `num_examples` counts. A tfds name is loaded through `tfds.load`
+        instead, which hands over decoded uint8 images and int64 labels where a directory hands over
+        a path and an int32 label; `_decode` and `_preprocess` are what make the batch contract
+        identical either way. A file is decoded at `resize_size`, not at `image_size`: the crop that
+        `crop_pct` exists for happens in `_preprocess`, and an item that had already been resized to
+        the final size would leave it nothing to crop.
 
         Raises:
             ImportError: If `tensorflow_datasets` is not installed and a tfds name was asked for.
         """
         if isinstance(self.name, Path):
-            return tf.keras.utils.image_dataset_from_directory(
-                self.name,
-                labels="inferred",
-                label_mode="int",
-                image_size=(self.resize_size, self.resize_size),
-                batch_size=None,
-                shuffle=False,
-                verbose=False,
-            )
+            return tf.data.Dataset.from_tensor_slices(list_labelled_images(self.name))
         if not _tfds_imports.is_successful:
             raise ImportError(
                 f'Loading the dataset "{self.name}" needs the tensorflow_datasets package, which is not '
@@ -229,6 +267,20 @@ class TFDataLoader(BaseModel):
                 'A split written as a slice, e.g. "train[:5%]", reports one.'
             )
         return count
+
+    @tf.autograph.experimental.do_not_convert
+    def _decode(self, path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        """Read one listed file and resize it, exactly as `image_dataset_from_directory` did.
+
+        Args:
+            path (tf.Tensor): The image file to read.
+            label (tf.Tensor): Its class index, carried through untouched so the pair stays paired.
+
+        Returns:
+            tuple[tf.Tensor, tf.Tensor]: The float32 image in 0..255 at `resize_size` and its label.
+        """
+        image = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+        return tf.image.resize(image, (self.resize_size, self.resize_size)), label
 
     # AutoGraph has nothing to rewrite here -- every branch below is decided while the graph is
     # traced, and the rest is tf ops -- and it fails to introspect a method of a pydantic model.
@@ -262,10 +314,21 @@ class TFDataLoader(BaseModel):
 
     @cached_property
     def dataset(self) -> tf.data.Dataset:
-        """The batched pipeline: shuffle (training only), preprocess, batch, prefetch."""
+        """The batched pipeline: shuffle (training only), decode, preprocess, batch, prefetch.
+
+        A directory is shuffled whole and before its files are read, which is what mixes a
+        class-sorted tree; `reshuffle_each_iteration` then makes each epoch a fresh permutation of
+        the same seeded stream, so an item's augmentation -- keyed by its position in this stream --
+        varies between epochs as well. A tfds set is already decoded by the time it arrives here,
+        so it keeps the bounded `shuffle_buffer` it always had.
+        """
         dataset = self.source
+        streaming = isinstance(self.name, Path)
         if self.is_training:
-            dataset = dataset.shuffle(min(self.shuffle_buffer, self.num_examples), seed=self.seed)
+            buffer = self.num_examples if streaming else min(self.shuffle_buffer, self.num_examples)
+            dataset = dataset.shuffle(buffer, seed=self.seed, reshuffle_each_iteration=True)
+        if streaming:
+            dataset = dataset.map(self._decode, num_parallel_calls=tf.data.AUTOTUNE)
         return (
             dataset.enumerate()
             .map(self._preprocess, num_parallel_calls=tf.data.AUTOTUNE)

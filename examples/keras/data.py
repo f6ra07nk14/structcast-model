@@ -46,6 +46,44 @@ import tensorflow as tf
 
 import keras
 
+EXTENSIONS = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png"})
+"""Suffixes read as images, lowercased: the set `keras.utils.image_dataset_from_directory` lists."""
+
+
+def list_labelled_images(root: Path) -> tuple[list[str], list[int]]:
+    """The images under *root* and their class indices, from a tree laid out one folder per class.
+
+    The other seam between the pipeline and where its items come from, the streaming twin of
+    `load_arrays`. A label is its folder's position among the sorted folder names, which is what
+    `keras.utils.image_dataset_from_directory` and timm both do over the same tree -- so a class
+    keeps its index whichever framework reads the directory. Each class folder is read recursively
+    and the files are sorted, so the listing is the same list every run: the sharding below cuts
+    that order, and an order that varied by itself would hand a rank a different share each epoch.
+
+    Args:
+        root (Path): One split's directory, e.g. `.../imagenet/train`, one folder per class.
+
+    Returns:
+        tuple[list[str], list[int]]: The file paths and their class indices, paired by position.
+
+    Raises:
+        ValueError: If the tree holds no image, which would leave an epoch with nothing in it.
+    """
+    paths: list[str] = []
+    labels: list[int] = []
+    for label, folder in enumerate(sorted(entry for entry in root.iterdir() if entry.is_dir())):
+        for path in sorted(folder.rglob("*")):
+            if path.suffix.lower() in EXTENSIONS:
+                paths.append(str(path))
+                labels.append(label)
+    if not paths:
+        raise ValueError(
+            f'No class folder under "{root}" holds an image with a suffix in {sorted(EXTENSIONS)}. '
+            "The directory form names one split's directory, e.g. .../imagenet/train, whose images "
+            "sit one folder per class -- not the dataset root and not a flat folder of files."
+        )
+    return paths, labels
+
 
 def load_arrays(dataset: str, training: bool) -> tuple[np.ndarray, np.ndarray]:
     """Load one split of a `keras.datasets` set as (uint8 images, int64 labels).
@@ -122,10 +160,12 @@ class KerasImageData(BaseModel):
     """
 
     shuffle_buffer: int = 1024
-    """Items the training shuffle holds at once, capped by the number this rank owns.
+    """Items the training shuffle of a `keras.datasets` set holds at once, capped by this rank's share.
 
-    A full-split buffer is what a shuffle wants and what a set of ImageNet's size cannot afford, so
-    the buffer is bounded and the shuffle is local to a window of the file order.
+    A full-split buffer is what a shuffle wants and what an in-memory set cannot have for free: the
+    buffer would be a second copy of the array. It does not bound a directory -- there the shuffle
+    runs over the file list, before the decode, so this rank's whole share is permuted every epoch
+    and the buffer holds paths rather than images.
     """
 
     seed: int = 42
@@ -139,31 +179,23 @@ class KerasImageData(BaseModel):
 
     @cached_property
     def source(self) -> tf.data.Dataset:
-        """The whole split as unbatched, unshuffled `(image, label)` pairs.
+        """The whole split as unbatched, unshuffled items: `(path, label)` pairs, or `(image, label)`.
 
         Unbatched and unshuffled on purpose, in both forms: the sharding below has to cut the split
         by item, before anything groups or reorders it, so this stage only decides where the items
         come from.
 
-        A directory is read with `keras.utils.image_dataset_from_directory`, which lists the files
-        once and decodes them as the pipeline pulls them -- so a set of ImageNet's size costs a list
-        of paths, not a copy of the images. A `keras.datasets` name is loaded into memory instead,
-        which is the whole point of the small sets.
+        A directory is listed by `list_labelled_images` and handed on as paths rather than pixels,
+        so a set of ImageNet's size costs a list of strings and `_decode` reads a file only once the
+        shard and the shuffle below have picked it. A `keras.datasets` name is loaded into memory
+        instead, which is the whole point of the small sets.
 
-        The two differ in what they hand over -- a directory yields float32 images in 0..255 and
-        int32 labels, an array set uint8 and int64 -- and `_prepare` below is what makes the batch
-        contract identical either way.
+        The two differ in what they hand over -- a directory yields a path and an int32 label, an
+        array set a uint8 image and an int64 one -- and `_decode` plus `_prepare` below are what
+        make the batch contract identical either way.
         """
         if isinstance(self.dataset, Path):
-            return keras.utils.image_dataset_from_directory(
-                self.dataset,
-                labels="inferred",
-                label_mode="int",
-                image_size=self.image_size,
-                batch_size=None,
-                shuffle=False,
-                verbose=False,
-            )
+            return tf.data.Dataset.from_tensor_slices(list_labelled_images(self.dataset))
         return tf.data.Dataset.from_tensor_slices(load_arrays(self.dataset, self.training))
 
     @property
@@ -193,6 +225,19 @@ class KerasImageData(BaseModel):
         layers.append(keras.layers.Resizing(*self.image_size))
         layers.append(keras.layers.Rescaling(scale=1.0 / 255))
         return layers
+
+    def _decode(self, path: Any, label: Any) -> tuple[Any, Any]:
+        """Read one listed file and resize it, exactly as `image_dataset_from_directory` did.
+
+        Args:
+            path (Any): The image file to read, as a scalar string tensor.
+            label (Any): Its class index, carried through untouched so the pair stays paired.
+
+        Returns:
+            tuple[Any, Any]: The float32 image in 0..255 at `image_size` and its label.
+        """
+        image = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+        return tf.image.resize(image, self.image_size), label
 
     def _prepare(self, images: Any, labels: Any) -> dict[str, Any]:
         """Augment one batch of images and key it by the model's input names.
@@ -229,17 +274,26 @@ class KerasImageData(BaseModel):
         so a loader that sharded here as well would hand each replica a shard of a shard.
 
         The sharding comes before the shuffle and the batching, so it cuts the split by item however
-        the items are stored, and the decode of a directory happens after it -- a rank never reads a
-        file another rank owns.
+        the items are stored, and the decode of a directory happens after both -- a rank never reads
+        a file another rank owns, and never reads one twice in an epoch.
+
+        A directory's shuffle covers this rank's whole share, because there the items being
+        reordered are paths: a tree laid out one folder per class is listed class by class, and a
+        buffered shuffle of the decoded images could only ever mix a window of that order -- a
+        thousand images are 0.08% of ImageNet, which leaves every batch two or three adjacent
+        classes (the flax twin of this pipeline went NaN on exactly that, in H200 tier 2 run 10-f).
+        An array set arrives decoded and already in memory, so it keeps its bounded `shuffle_buffer`.
         """
         data = self.source
         rank, world = rank_and_world()
+        streaming = isinstance(self.dataset, Path)
         if world > 1:
             data = data.take(self.items - self.items % world).shard(world, rank)
         if self.training:
-            data = data.shuffle(
-                min(self.shard_items, self.shuffle_buffer), seed=self.seed, reshuffle_each_iteration=True
-            )
+            buffer = self.shard_items if streaming else min(self.shard_items, self.shuffle_buffer)
+            data = data.shuffle(buffer, seed=self.seed, reshuffle_each_iteration=True)
+        if streaming:
+            data = data.map(self._decode, num_parallel_calls=tf.data.AUTOTUNE)
         data = data.batch(self.batch_size, drop_remainder=True)
         return data.map(self._prepare, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
 

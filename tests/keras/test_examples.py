@@ -149,16 +149,29 @@ def test_the_validation_split_yields_the_same_epoch_every_time(arrays: None) -> 
 def _image_tree(root: Path, classes: int = 2, per_class: int = 4) -> Path:
     """Write a class-per-folder tree of tiny PNGs, the layout the timm loader reads too.
 
-    Every image is one flat colour and no two share it, so the pixel value of a decoded batch says
-    exactly which files produced it -- which is what the sharding assertions below rest on.
+    The folders are written in class order and listed back in it, which is the property the
+    shuffling assertions below turn on: a real tree of ImageNet's shape is listed the same way.
+    Every image is one flat colour, distinct while a tree holds at most twenty-six files -- which is
+    what lets the sharding assertions say exactly which files a rank got. A tree bigger than that
+    wraps, and is told apart by its labels instead.
     """
     for label in range(classes):
         folder = root / f"class{label}"
         folder.mkdir(parents=True)
         for index in range(per_class):
-            colour = 10 * (label * per_class + index) + 1
+            colour = (10 * (label * per_class + index) + 1) % 256
             keras.utils.save_img(folder / f"{index}.png", np.full((8, 8, 3), colour, "uint8"), scale=False)
     return root
+
+
+@pytest.fixture(scope="module")
+def sorted_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A class-sorted tree big enough for its listing order to matter: 20 classes of 30 images.
+
+    Module-scoped because it is written once and only ever read: six hundred files is enough that
+    a batch of twenty drawn from the raw listing is one class, and few enough to write in a second.
+    """
+    return _image_tree(tmp_path_factory.mktemp("sorted"), classes=20, per_class=30)
 
 
 def _colours(batches: Any) -> list[int]:
@@ -185,9 +198,10 @@ def test_the_streaming_source_yields_the_same_batch_contract_as_the_array_source
     assert batch["image"].max() <= 1.0
     assert batch["label"].shape == (2,)
     assert batch["label"].dtype == np.int64
-    # Per-item, not per-set: the source decodes as the pipeline pulls, which is what lets a set of
-    # ImageNet's size through at all. A source that had read the tree into one array would spec (n, ...).
-    assert tuple(data.source.element_spec[0].shape) == (8, 8, 3)
+    # A path per item, not a set of pixels: the source is the listing and the decode happens as the
+    # pipeline pulls, which is what lets a set of ImageNet's size through at all -- and what lets
+    # the shuffle reorder strings. A source that had read the tree into one array would spec (n, ...).
+    assert (data.source.element_spec[0].dtype.name, data.source.element_spec[0].shape.rank) == ("string", 0)
     assert (data.items, len(data)) == (8, 4)
 
 
@@ -233,6 +247,86 @@ def test_the_streaming_source_shuffles_the_same_way_for_the_same_seed(tmp_path: 
     assert _epoch(0) == _epoch(0)
     assert _epoch(0) != _epoch(7)
     assert sorted(_epoch(0)) == list(range(8))
+
+
+def _streaming(root: Path, **kwargs: Any) -> Any:
+    """A training pipeline over a class-per-folder tree, batching twenty of its files at a time.
+
+    `crop_padding=0` so the flat colour of an image survives the augmentation: the pad-then-crop
+    recipe would put a zero from the padding under the pixel `_colours` reads.
+    """
+    defaults = {"batch_size": 20, "image_size": (8, 8), "training": True, "crop_padding": 0}
+    return DATA.KerasImageData(dataset=root, **{**defaults, **kwargs})
+
+
+def test_the_streaming_batch_mixes_the_classes_of_a_class_sorted_tree(sorted_tree: Path) -> None:
+    """A megascale tree is listed class by class, and a batch of one class is what went NaN.
+
+    The flax twin of this pipeline is where it was measured -- H200 tier 2 run 10-f, ConvNeXtV2
+    over the 1.28M-image ImageNet train tree, `ce_loss = nan` from the first epoch while the same
+    configuration trained clean on a ten-class subset. Its label stream ran [0, 0] -> [6, 10] ->
+    [15, 20] -> [36, 40] over four hundred batches of 128: two to five adjacent classes per batch,
+    advancing monotonically, because the only shuffle was a thousand-item buffer over the decoded
+    stream -- 0.08% of that tree. This pipeline read the same tree the same way.
+
+    `shuffle_buffer=8` over six hundred files is what puts that run's proportions into a tree this
+    size: a buffer that holds a window of the listing rather than the whole of it. Raising it is not
+    the fix it looks like -- it holds decoded images, ~19 GB per hundred thousand of them -- so the
+    buffer no longer reaches a directory at all, and the file list is shuffled whole instead.
+    Twenty items drawn from twenty classes give eleven distinct ones that way; a window gives one.
+    """
+    first = next(iter(_streaming(sorted_tree, shuffle_buffer=8)))
+
+    assert len(set(first["label"].tolist())) >= 8
+
+
+def test_the_streaming_listing_is_reshuffled_every_epoch_and_replayed_by_the_seed(sorted_tree: Path) -> None:
+    """Two epochs in the same order would decorrelate nothing after the first pass over the data.
+
+    The other half of the contract is that a seed still replays a run: the shuffle is over the file
+    list rather than a Python permutation drawn at construction, so `reshuffle_each_iteration` gives
+    a fresh order per epoch while a pipeline rebuilt from the same seed repeats epoch one exactly.
+    Every epoch is also still the whole split -- twenty classes of thirty files, which the batch
+    size divides exactly -- because a reshuffle that dropped or repeated files would quietly change
+    what an epoch means.
+    """
+    data = _streaming(sorted_tree)
+
+    def _epoch() -> list[int]:
+        return [int(label) for batch in data for label in batch["label"]]
+
+    first, second = _epoch(), _epoch()
+
+    assert first != second
+    assert sorted(first) == sorted(second) == [label for label in range(20) for _ in range(30)]
+    assert [int(label) for batch in _streaming(sorted_tree) for label in batch["label"]] == first
+
+
+def test_the_streaming_shards_stay_disjoint_while_each_rank_reshuffles_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shuffle must not move a file between ranks, and must still reorder each rank's share.
+
+    Both halves are the reason the listing is shuffled after the shard and not before it. A shuffle
+    in front of the shard would hand a rank a different share each epoch -- so the ranks would
+    overlap over a run and no epoch would cover the split once -- while a shard whose order never
+    changed would train every epoch on the same sequence, which is what the shuffle exists to stop.
+    """
+    root = _image_tree(tmp_path, classes=4, per_class=4)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    epochs = {}
+    for rank in (0, 1):
+        monkeypatch.setenv("RANK", str(rank))
+        data = _streaming(root, batch_size=2)
+        epochs[rank] = [_colours(data), _colours(data)]
+
+    for first, second in epochs.values():
+        assert first != second, "a rank reshuffles its own share between epochs"
+        assert set(first) == set(second), "and owns the same files for the whole run"
+    for epoch in (0, 1):
+        assert not set(epochs[0][epoch]) & set(epochs[1][epoch])
+        assert sorted(epochs[0][epoch] + epochs[1][epoch]) == [10 * index + 1 for index in range(16)]
 
 
 def _labels_of_rank(rank: int, monkeypatch: pytest.MonkeyPatch) -> np.ndarray:

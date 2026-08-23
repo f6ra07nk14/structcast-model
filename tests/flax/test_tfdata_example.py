@@ -159,22 +159,37 @@ def test_a_missing_tensorflow_datasets_says_what_to_install() -> None:
 def _image_tree(root: Path, classes: int = 2, per_class: int = 4) -> Path:
     """Write a class-per-folder tree of tiny PNGs, the layout the timm and keras loaders read too.
 
-    Every image is one flat colour and no two share it, so the pixel value of a decoded batch says
-    exactly which files produced it -- which is what the ordering assertions below rest on.
+    The folders are written in class order and read back in it, which is the property every test
+    below turns on: a real tree of ImageNet's shape is listed the same way. Every image is one flat
+    colour; the label, not the colour, is what says here which file a batch item came from.
     """
     for label in range(classes):
         folder = root / f"class{label}"
         folder.mkdir(parents=True)
         for index in range(per_class):
-            colour = 10 * (label * per_class + index) + 1
-            image = tf.fill((8, 8, 3), tf.constant(colour, tf.uint8))
+            image = tf.fill((8, 8, 3), tf.constant((label * per_class + index) % 256, tf.uint8))
             tf.io.write_file(str(folder / f"{index}.png"), tf.io.encode_png(image))
     return root
 
 
+@pytest.fixture(scope="module")
+def sorted_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A class-sorted tree big enough for its listing order to matter: 20 classes of 30 images.
+
+    Module-scoped because it is written once and only ever read: six hundred files is enough that
+    a batch of sixteen drawn from the raw listing is one class, and few enough to write in a second.
+    """
+    return _image_tree(tmp_path_factory.mktemp("sorted"), classes=20, per_class=30)
+
+
 def _directory_loader(root: Path, **kwargs: Any) -> Any:
     """Build a loader over a class-per-folder tree, at the size the tree was written in."""
-    return TFDataLoader(name=root, batch_size=2, image_size=8, crop_pct=1.0, **kwargs)
+    return TFDataLoader(**{"name": root, "batch_size": 2, "image_size": 8, "crop_pct": 1.0, **kwargs})
+
+
+def _labels(loader: Any) -> list[int]:
+    """Every label one epoch of *loader* yields, in order."""
+    return [int(label) for batch in loader() for label in batch["label"]]
 
 
 def test_a_directory_is_told_apart_from_a_dataset_name_by_the_field_itself() -> None:
@@ -215,14 +230,15 @@ def test_a_directory_source_yields_the_same_batch_contract_as_a_dataset_name(tmp
 def test_a_directory_source_decodes_as_the_pipeline_pulls(tmp_path: Path) -> None:
     """The listing is what is read up front; the pixels are not, or ImageNet would not fit.
 
-    A per-item element spec is the proof: a source that had read the tree into one array would
-    report `(n, ...)` instead, and `num_examples` would be counting something already in memory.
-    Nothing between the listing and the decode reorders or groups the items, so a rank -- or, here,
-    the strategy's mesh -- still cuts the split by item.
+    The element spec is the proof: a scalar string per item, so the source is a list of paths and
+    everything the pipeline puts in front of the decode -- the shuffle, above all -- reorders
+    strings. A source that had read the tree into one array would report `(n, ...)` instead, and
+    `num_examples` would be counting something already in memory.
     """
     data = _directory_loader(_image_tree(tmp_path))
 
-    assert tuple(data.source.element_spec[0].shape) == (8, 8, 3)
+    assert data.source.element_spec[0] == tf.TensorSpec(shape=(), dtype=tf.string)
+    assert tuple(data.dataset.element_spec[0].shape) == (2, 8, 8, 3)
     assert data.num_examples == 8
 
 
@@ -257,3 +273,46 @@ def test_a_directory_source_shuffles_the_same_way_for_the_same_seed(tmp_path: Pa
     assert _epoch(0) == _epoch(0)
     assert _epoch(0) != _epoch(7)
     assert sorted(_epoch(0)) == list(range(8))
+
+
+def test_a_directory_batch_mixes_the_classes_of_a_class_sorted_tree(sorted_tree: Path) -> None:
+    """A megascale tree is listed class by class, and a batch of one class is what went NaN.
+
+    This is the flax half of H200 tier 2 run 10-f: ConvNeXtV2 over the 1.28M-image ImageNet train
+    tree reported `ce_loss = nan` from the first epoch, while the same learner and the same
+    thousand-class configuration trained clean on a ten-class subset of it. The measured label
+    stream ran [0, 0] -> [6, 10] -> [15, 20] -> [36, 40] over four hundred batches of 128: every
+    batch two to five adjacent classes, advancing monotonically, because the only shuffle was a
+    thousand-item buffer over the decoded stream -- 0.08% of that tree.
+
+    So the assertion is on the classes of a single batch, which is the thing the run measured.
+    `shuffle_buffer=8` over six hundred files is what puts that run's proportions into a tree this
+    size: a buffer that holds a window of the listing rather than the whole of it. Raising it is not
+    the fix it looks like -- it holds decoded images, ~19 GB per hundred thousand of them -- so the
+    buffer no longer reaches a directory at all, and the file list is shuffled whole instead.
+    Twenty items drawn from twenty classes give eleven distinct ones that way; a window gives one.
+    """
+    loader = _directory_loader(sorted_tree, batch_size=20, is_training=True, shuffle_buffer=8)
+
+    first = next(iter(loader()))
+
+    assert len(set(first["label"].tolist())) >= 8
+
+
+def test_a_directory_listing_is_reshuffled_every_epoch_and_replayed_by_the_seed(sorted_tree: Path) -> None:
+    """Two epochs in the same order would decorrelate nothing after the first pass over the data.
+
+    The other half of the contract is that a seed still replays a run: the shuffle is over the file
+    list rather than a Python permutation drawn at construction, so `reshuffle_each_iteration` gives
+    a fresh order per epoch while a loader rebuilt from the same seed repeats epoch one exactly.
+    Every epoch is also still the whole split -- twenty classes of thirty files, which the batch
+    size divides exactly -- because a reshuffle that dropped or repeated files would quietly change
+    what an epoch means.
+    """
+    loader = _directory_loader(sorted_tree, batch_size=20, is_training=True)
+
+    first, second = _labels(loader), _labels(loader)
+
+    assert first != second
+    assert sorted(first) == sorted(second) == [label for label in range(20) for _ in range(30)]
+    assert _labels(_directory_loader(sorted_tree, batch_size=20, is_training=True)) == first
