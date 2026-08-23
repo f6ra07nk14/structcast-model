@@ -835,6 +835,31 @@ def test_fsdp2_tensor_parallel_refuses_an_empty_plan() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The shared state-dict API field
+# ---------------------------------------------------------------------------
+
+
+def test_every_strategy_resolves_the_state_dict_api_at_construction() -> None:
+    """The DCP module is resolved once into a field, so every constructor must reach the mixin's hook.
+
+    `TensorParallelStrategy` and `FullyShardedDataParallelStrategy` define a `__post_init__` of
+    their own, which shadows the mixin's unless it chains: the field would then stay unset and every
+    save and load raise `AttributeError` at the first checkpoint rather than at construction.
+    """
+    dcp = pytest.importorskip("torch.distributed.checkpoint.state_dict")
+    pytest.importorskip("torch.distributed.fsdp")
+    strategies = [
+        SingleDeviceStrategy(device="cpu"),
+        DistributedDataParallelStrategy(device="cpu"),
+        TensorParallelStrategy(device="cpu", parallel_modules=_PLAN),
+        FullyShardedDataParallelStrategy(device="cpu"),
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=1, parallel_modules=_PLAN),
+    ]
+
+    assert [strategy._api for strategy in strategies] == [dcp] * len(strategies)
+
+
+# ---------------------------------------------------------------------------
 # split_mixed_param_groups
 # ---------------------------------------------------------------------------
 

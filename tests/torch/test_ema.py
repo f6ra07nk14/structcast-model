@@ -303,22 +303,20 @@ def test_a_checkpoint_carrying_an_average_the_learner_dropped_still_resumes(tmp_
     assert torch.equal(_weight(plain, "model"), _weight(averaged, "model"))
 
 
-def test_the_old_torch_fallback_saves_and_loads_the_average_symmetrically(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_old_torch_fallback_saves_and_loads_the_average_symmetrically(tmp_path: Path) -> None:
     """On a torch without the state-dict API the two halves must agree on the keys they name.
 
     The fallback used to strip every `module.` prefix on the way out, which is a wrapper's on a
     wrapped model and the average's own on an `AveragedModel`: the keys came back one level short and
     the load failed on all of them.
     """
-    # Through the real module globals: `sys.modules` holds the lazy-import proxy, which no
-    # attribute patch reaches, and the strategy looks the API helper up as a global of its own.
-    monkeypatch.setitem(SingleDeviceStrategy.state_dict.__globals__, "_state_dict_api", lambda: None)
     learner = _learner(tmp_path, _ema_raw(), "fallback")
     for _ in range(2):
         learner.training_step(**BATCH)
     strategy = SingleDeviceStrategy(device="cpu")
+    # The state-dict API is resolved into a field at construction, so an old torch is one assignment
+    # on this instance rather than a patch of the module global the strategy used to read.
+    strategy._api = None
     saved = strategy.state_dict(dict(learner.models))
     assert set(saved["models"]["ema_model"]) == {"n_averaged", "module.fc.weight", "module.fc.bias"}
 

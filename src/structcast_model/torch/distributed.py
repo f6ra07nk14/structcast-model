@@ -53,11 +53,6 @@ PARALLEL_STYLES = ("column", "row", "sequence", "column_heads")
 ``ParallelStyle`` instance itself, which is the escape hatch for the styles this vocabulary lacks."""
 
 
-def _state_dict_api() -> Any:
-    """Return the ``torch.distributed.checkpoint.state_dict`` module, or ``None`` on old torch."""
-    return _dcp_state_dict if _dcp_imports.is_successful else None
-
-
 @overload
 def initial_distributed_env(
     device: str | None = None,
@@ -147,16 +142,6 @@ def sync_gate(module: Any, armed: bool) -> None:
         module.set_requires_gradient_sync(armed)
 
 
-def _is_plain_tensor(parameter: torch.Tensor) -> bool:
-    """Whether *parameter* is an ordinary dense tensor rather than a subclass such as ``DTensor``.
-
-    By exact type rather than ``isinstance(parameter, DTensor)``: the public ``DTensor`` path only
-    exists from torch 2.5, while the tensor-parallel API that produces the mixture ships in 2.4 --
-    and a plain parameter is always exactly a ``Tensor`` or a ``Parameter``.
-    """
-    return type(parameter) in (torch.Tensor, torch.nn.Parameter)
-
-
 def split_mixed_param_groups(optimizer: Any) -> None:
     """Rewrite *optimizer*'s parameter groups so none of them mixes ``DTensor``s with plain tensors.
 
@@ -193,7 +178,11 @@ def split_mixed_param_groups(optimizer: Any) -> None:
     for group in optimizer.param_groups:
         kinds: dict[bool, list[Any]] = {}
         for parameter in group["params"]:
-            kinds.setdefault(_is_plain_tensor(parameter), []).append(parameter)
+            # Plain by exact type rather than ``isinstance(parameter, DTensor)``: the public DTensor
+            # path only exists from torch 2.5, while the tensor-parallel API that produces the
+            # mixture ships in 2.4 -- and a plain parameter is always exactly a Tensor or a Parameter.
+            plain = type(parameter) in (torch.Tensor, torch.nn.Parameter)
+            kinds.setdefault(plain, []).append(parameter)
         if len(kinds) < 2:
             groups.append(group)
         else:
@@ -287,15 +276,6 @@ def _optimizer_container(
     return torch.nn.ModuleDict({n: models[n] for n in names})
 
 
-def _missing_model_state(name: str) -> ValueError:
-    """The error a resume raises when the saved state holds nothing for one of the live models."""
-    return ValueError(
-        f'The saved training state carries no state for model "{name}": it was written before that model '
-        "was declared -- an EMA shadow added to the learner since, most likely. Resume with the learner "
-        "the checkpoint was saved from, or start a fresh run."
-    )
-
-
 def _innermost_module(module: torch.nn.Module) -> torch.nn.Module:
     """Peel DDP and torch.compile wrappers off *module*, in whatever order they were applied.
 
@@ -323,6 +303,21 @@ class _StateDictMixin:
     any coverage — even none — leaving unmatched parameters the zeroed state torch materializes.
     Missing state is never synthesized."""
 
+    _api: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Resolve the ``torch.distributed.checkpoint.state_dict`` module, or ``None`` on old torch.
+
+        ``None`` selects the wrapper-free fallback in :meth:`state_dict` and :meth:`load_state_dict`.
+        Every strategy defining its own ``__post_init__`` must chain into this one, or it inherits
+        the field without ever getting a value.
+        """
+        # `object` has no `__post_init__`, so the chain up ends here rather than at a bare super() call.
+        post = getattr(super(), "__post_init__", None)
+        if post is not None:
+            post()
+        self._api = _dcp_state_dict if _dcp_imports.is_successful else None
+
     def _options(self, api: Any) -> Any:
         return api.StateDictOptions(full_state_dict=True, cpu_offload=True)
 
@@ -336,7 +331,7 @@ class _StateDictMixin:
         optimizer_models: Mapping[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Produce wrapper-free model (and optimizer) state dicts. See :class:`DistributedStrategy`."""
-        api = _state_dict_api()
+        api = self._api
         if api is None:
             # Saved from the module the wrappers hold, which is exactly what the fallback load path
             # writes back into: stripping the prefixes off the wrapper's own keys instead would also
@@ -373,7 +368,7 @@ class _StateDictMixin:
         # others through `broadcast_from_rank0`, so only the rank holding them can say what is missing.
         holds_state = state is not None
         state = self._share_state(state)
-        api = _state_dict_api()
+        api = self._api
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
         # Checked before anything is written: torch reports a model it was handed an empty state for
@@ -382,7 +377,11 @@ class _StateDictMixin:
         if holds_state:
             for name in models:
                 if name not in model_states:
-                    raise _missing_model_state(name)
+                    raise ValueError(
+                        f'The saved training state carries no state for model "{name}": it was written '
+                        "before that model was declared -- an EMA shadow added to the learner since, most "
+                        "likely. Resume with the learner the checkpoint was saved from, or start a fresh run."
+                    )
         if api is None:
             # The old-torch fallback saved wrapper-free keys, so it must load into the innermost
             # module of whatever wrappers the CLI applied.
@@ -482,21 +481,6 @@ class _CompileMixin:
         return torch.compile(module, **compile_kw)
 
 
-def _shared_meta(state: dict[str, Any] | None) -> dict[str, Any]:
-    """Broadcast everything but the model tensors from rank 0 to every rank.
-
-    Model states stay rank-0-only and travel through ``set_model_state_dict``'s efficient
-    ``broadcast_from_rank0`` path; optimizer states are object-broadcast here because that path
-    cannot infer a device from stateless optimizers such as plain SGD.
-    """
-    payload = [None if state is None else {k: v for k, v in state.items() if k != "models"}]
-    torch.distributed.broadcast_object_list(payload, src=0)
-    shared = payload[0] or {}
-    if state is None:
-        return {"models": {}, **shared}
-    return state
-
-
 @dataclass(kw_only=True)
 class SingleDeviceStrategy(_CompileMixin, _StateDictMixin):
     """Strategy for single-device training: no wrapping, no cross-rank synchronization."""
@@ -558,7 +542,18 @@ class _MultiRankMixin:
                 torch.distributed.broadcast(tensor.data, src=0)
 
     def _share_state(self, state: dict[str, Any] | None) -> dict[str, Any]:
-        return _shared_meta(state)
+        """Broadcast everything but the model tensors from rank 0 to every rank.
+
+        Model states stay rank-0-only and travel through ``set_model_state_dict``'s efficient
+        ``broadcast_from_rank0`` path; optimizer states are object-broadcast here because that path
+        cannot infer a device from stateless optimizers such as plain SGD.
+        """
+        payload = [None if state is None else {k: v for k, v in state.items() if k != "models"}]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        shared = payload[0] or {}
+        if state is None:
+            return {"models": {}, **shared}
+        return state
 
 
 def _convert_module_sync_batchnorm(module: torch.nn.Module) -> torch.nn.Module:
@@ -833,6 +828,7 @@ class TensorParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDictMixin):
             ImportError: if ``torch.distributed.tensor.parallel`` is missing.
             ValueError: if no ``parallel_modules`` entry was given, which would parallelize nothing.
         """
+        super().__post_init__()
         if not _tp_imports.is_successful:
             raise ImportError(
                 "TensorParallelStrategy requires torch>=2.4 for the DTensor tensor-parallel API; the "
@@ -903,6 +899,7 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
 
     def __post_init__(self) -> None:
         """Fail loud when the installed torch has no stable ``fully_shard``."""
+        super().__post_init__()
         if not _fsdp_imports.is_successful:
             raise ImportError(
                 "FullyShardedDataParallelStrategy requires torch>=2.6 for the stable fully_shard "
@@ -970,15 +967,6 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         for _, submodule in matched:
             submodule.compile(**compile_kw)
         return module
-
-    def sync_initial_weights(self, models: Mapping[str, torch.nn.Module]) -> None:
-        """Broadcast rank 0's parameters and buffers; ``fully_shard`` performs no such synchronization."""
-        for module in models.values():
-            for tensor in chain(module.parameters(), module.buffers()):
-                torch.distributed.broadcast(tensor.data, src=0)
-
-    def _share_state(self, state: dict[str, Any] | None) -> dict[str, Any]:
-        return _shared_meta(state)
 
     def _require_pairing_or_warn(self, action: str) -> None:
         raise ValueError(
