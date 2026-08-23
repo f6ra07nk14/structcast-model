@@ -495,6 +495,63 @@ def test_the_tensorflow_dp_preset_trains_under_mirrored_strategy(
     assert np.allclose(result["kernel"], tensorflow_reference["kernel"], rtol=1e-5)
 
 
+@pytest.fixture(scope="module")
+def loss_class(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the same fixtures with the loss written as a `keras.losses.Loss` instead of a function.
+
+    That one word is the whole difference from `generated`, and it is the difference that matters
+    under a `tf.distribute` strategy: only the class form goes through Keras' loss reduction, which
+    is where the per-replica value is normalized by the global batch.
+    """
+    directory = tmp_path_factory.mktemp("loss_class")
+    template = (CFG_DIR / "LinearLearner.yaml").read_text()
+    learner = template.replace(
+        "LAYER: [_obj_, {_addr_: keras.losses.mean_squared_error}]",
+        "LAYER: [_obj_, {_addr_: keras.losses.MeanSquaredError}, _call_]",
+    )
+    assert learner != template, "the fixture's loss layer moved: this test no longer builds a loss class"
+    (directory / "LinearLearner.yaml").write_text(learner)
+    KerasBuilder.from_path(CFG_DIR / "Linear.yaml")()(directory / "model.py")
+    KerasLearnerBuilder.from_path(directory / "LinearLearner.yaml")()(directory / "learner.py")
+    return directory
+
+
+@pytest.fixture(scope="module")
+def loss_class_reference(tmp_path_factory: pytest.TempPathFactory, loss_class: Path) -> dict[str, Any]:
+    """Run the loss-class learner's three steps on one TensorFlow device, as the yardstick for `dp`."""
+    directory = tmp_path_factory.mktemp("loss_class_reference")
+    return _run(TENSORFLOW_SCRIPT, directory, str(loss_class), "single", backend="tensorflow")
+
+
+def test_a_keras_loss_class_reports_and_trains_the_same_under_dp(
+    tmp_path: Path, loss_class: Path, loss_class_reference: dict[str, Any]
+) -> None:
+    """A `keras.losses.Loss` must mean the same number on one device and on two.
+
+    The H200 tier-1 `dp` run of `cfg/keras/learners/ImageClassifierShowcase.yaml` reported every loss
+    divided by the replica count -- 2.65 on one device, 1.31 on two, 0.66 on four, training and
+    validation alike, while the accuracies beside them stayed put. A `keras.losses.Loss` reduced over
+    the batch divides by the *global* batch under a `tf.distribute` strategy, so the replica's value
+    is already a fraction of the whole batch's loss and averaging the replicas keeps it that way,
+    while an accuracy -- a `keras.ops` expression like every other criterion -- is not scaled at all.
+    A run reporting loss/N poisons every comparison against another strategy and every loss-based
+    checkpoint criterion (`--lower-criterion`), which reads the very same reduced value.
+
+    The same scaling reaches the gradients: the flow's loss is what the tape differentiates, and the
+    strategy divides it by the replica count once more for the optimizer's SUM all-reduce, so a
+    scaled loss also trains at a fraction of the learning rate. The kernel is therefore asserted
+    beside the losses, against the same steps taken whole on one device.
+    """
+    result = _run(TENSORFLOW_SCRIPT, tmp_path, str(loss_class), "dp", backend="tensorflow")
+
+    assert result["replicas"] == 2
+    assert result["losses"][0] == pytest.approx(result["expected"], rel=1e-5)
+    assert result["losses"] == pytest.approx(loss_class_reference["losses"], rel=1e-5)
+    # The validation half of the same defect: one inference flow, one reduction, one loss layer.
+    assert result["inference"] == pytest.approx(loss_class_reference["inference"], rel=1e-5)
+    assert np.allclose(result["kernel"], loss_class_reference["kernel"], rtol=1e-5)
+
+
 TENSORFLOW_CLI_SCRIPT = """
 import json, os, sys
 

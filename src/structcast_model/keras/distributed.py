@@ -546,7 +546,11 @@ class KerasDistributedStrategy:
 
         @tf.function
         def replicated(**batch: Any) -> dict[str, Any]:
-            criteria = self._mirrored.run(flow, kwargs=batch)
+            # Traced under :func:`_local_batch_losses`: a Keras loss class would otherwise hand back
+            # the replica's share of the global batch's loss, which `ReduceOp.MEAN` below cannot
+            # tell from the per-replica means every other criterion is.
+            with _local_batch_losses():
+                criteria = self._mirrored.run(flow, kwargs=batch)
             return {
                 name: self._mirrored.reduce(tf.distribute.ReduceOp.MEAN, value, axis=None)
                 for name, value in criteria.items()
@@ -692,6 +696,40 @@ def _mean_flow(flow: Any, replicas: int) -> Any:
         return loss / replicas, criteria
 
     return mean
+
+
+@contextmanager
+def _local_batch_losses() -> Iterator[None]:
+    """Keep a `keras.losses.Loss` normalizing by the replica's own batch while a flow is traced.
+
+    A Keras loss reduced over the batch divides by the *global* batch under a `tf.distribute`
+    strategy: `keras.losses.Loss.__call__` ends in `scale_loss_for_distribution`, which multiplies
+    the replica's mean by `1 / num_replicas_in_sync` so that the SUM all-reduce the TensorFlow
+    optimizer applies to the gradients lands on the global mean. Keras' own `fit` undoes that
+    scaling before it reports the value (`unscale_loss_for_distribution` in its TensorFlow trainer),
+    and nothing else a flow computes is scaled at all -- not an accuracy, not a `keras.ops`
+    expression, not a loss written as the plain function.
+
+    A flow's loss is both what the tape differentiates and what the tracker logs, beside criteria
+    that were never scaled, so the multiply is neutralized here rather than compensated for
+    downstream: every value a flow returns is then the replica's own mean, which `ReduceOp.MEAN`
+    turns into the global one, and the loss is divided by the replica count exactly once --
+    in :func:`_mean_flow`, for the gradients. Without this a `dp` run reported every
+    `keras.losses.Loss` criterion divided by the replica count, training and validation alike, and
+    trained on gradients that small too.
+
+    The patch spans the trace rather than the step: the multiply is a graph op, written once, when
+    the replicated function is traced. `keras.src.losses.loss` is the private module `keras.losses`
+    is built from, so `import keras` has already bound it and the name below is the one
+    `reduce_values` itself looks up -- a Keras release moving the function raises here, loudly.
+    """
+    module = keras.src.losses.loss
+    original = module.scale_loss_for_distribution
+    module.scale_loss_for_distribution = lambda value: value
+    try:
+        yield
+    finally:
+        module.scale_loss_for_distribution = original
 
 
 def _wrap_ddp(model: Any) -> Any:
