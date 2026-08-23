@@ -1,12 +1,10 @@
 # The Keras twin of "cfg/torch/models/SmallLanguageModel.yaml": a GPT-style decoder reading "tokens"
 # and emitting "logits" over the vocabulary, with a "backbone" of pre-LN blocks named "block0" ...
-# "blockN-1".
-# Attention is "keras.layers.MultiHeadAttention" with "use_causal_mask=true", which builds its own
-# query/key/value projections and masks the future inside the layer -- there is no
-# "CausalSelfAttention" section to write. That has one consequence: the torch twin rotates the query
-# and the key with a rotary embedding, which needs the projections spelled out, so positions here
-# come from a learned table instead. The table has "max_seq_len" rows, which is therefore the longest
-# sequence this model runs, while the rotary twin runs any length.
+# "blockN-1", whose causal attention, rotary position embedding included, is a section of this
+# configuration rather than a package layer.
+# "keras.layers.MultiHeadAttention" is deliberately not used: it builds its own query/key/value
+# projections and leaves nowhere to rotate the query and the key, and the point of the rotation is
+# that the model carries no position table and therefore no longest sequence it can run.
 # The root emits a structured output, as "cfg/keras/models/ConvNeXtV2.yaml" does and as
 # "scm keras create model" forces by default, so the learner reads "logits" off the returned mapping.
 PARAMETERS:
@@ -18,10 +16,14 @@ PARAMETERS:
     # with the shared ones, never the default ones. Overriding them on the command line therefore
     # means overriding them on the selected size group, e.g. -p "tiny: {vocab_size: 100}".
     vocab_size: 65 # the character vocabulary of Tiny Shakespeare
+    # Only the length of the "INPUT_SHAPES" dummy forward: the rotary position embedding below
+    # derives its angles from the sequence length of the actual input, so the model has no position
+    # table and no length it cannot run.
     max_seq_len: 256
     dropout: 0.0
     norm_eps: 1.0e-5
     mlp_ratio: 4
+    rope_base: 10000.0 # the standard RoPE frequency base
   # model size parameters
   tiny:
     dim: 256
@@ -48,11 +50,6 @@ FLOW:
       {% raw %}
         _jinja_yaml_: |-
           - [tokens, feature, token_embedding, [_obj_, {_addr_: keras.layers.Embedding}, {_call_: {input_dim: {{vocab_size}}, output_dim: {{dim}}}}]]
-          # The position indices of the traced sequence, looked up in a learned table and added to
-          # every batch element by broadcasting.
-          - ["eval: keras.ops.arange(feature.shape[1])", index, null]
-          - [index, position, position_embedding, [_obj_, {_addr_: keras.layers.Embedding}, {_call_: {input_dim: {{max_seq_len}}, output_dim: {{dim}}}}]]
-          - ["eval: feature + position", feature, null]
           - [feature, feature, [_obj_, {_addr_: keras.layers.Dropout}, {_call_: {rate: {{dropout}}}}]]
           - [feature, feature, backbone, {TYPE: Backbone}]
           - [feature, feature, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
@@ -74,19 +71,7 @@ Block:
   _jinja_yaml_: |-
     FLOW:
       - [inp, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
-      # Self-attention: the same tensor is the query and the value, and "use_causal_mask" masks the
-      # future inside the layer, so no (seq x seq) mask is materialized.
-      # There is deliberately no attention-weight dropout, as in the torch twin: small language
-      # models train it at 0 anyway, and the dropouts that matter sit on the MLP and residual paths
-      # below. Wiring "dropout" into this layer would silently regularize somewhere the torch twin
-      # does not the moment anyone raises it.
-      - INPUTS: {query: _, value: _, use_causal_mask: true}
-        OUTPUTS: attended
-        NAME: attention
-        LAYER:
-          - _obj_
-          - _addr_: keras.layers.MultiHeadAttention
-          - _call_: {num_heads: {{heads}}, key_dim: {{dim // heads}}}
+      - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
       - ["eval: inp + attended", residual, null]
       - [residual, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
       - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: "eval: {{dim}} * {{mlp_ratio}}"}}]]
@@ -94,3 +79,47 @@ Block:
       - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{dim}}}}]]
       - [_, projected, [_obj_, {_addr_: keras.layers.Dropout}, {_call_: {rate: {{dropout}}}}]]
       - ["eval: residual + projected", out, null]
+CausalSelfAttention:
+  # Causal self-attention with rotary position embedding, defined entirely here: two
+  # "keras.layers.Dense" projections plus flow lines for the head split, the rotation and the fused
+  # attention kernel.
+  # There is no attention-weight dropout: "keras.ops.dot_product_attention" takes no dropout at all,
+  # and small language models train attention dropout at 0 anyway; the dropouts that matter sit in
+  # the MLP and residual paths of "Block", where "keras.layers.Dropout" reads the "training" flag
+  # the generated call hands it.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    {% set head_dim = dim // heads %}
+    {% set half_dim = head_dim // 2 %}
+    FLOW:
+      # (batch, seq, dim) -> (batch, seq, 3 * dim) -> (batch, seq, 3, heads, {{head_dim}}).
+      # The fused projection is laid out as q, k, v each of "dim" contiguous features, heads-major
+      # within each, so one reshape performs both the qkv split and the head split; the fused
+      # kernel below reads (batch, seq, heads, head_dim) directly, so nothing is transposed.
+      # "keras.layers.Reshape" is given the shape without the batch dimension, which the symbolic
+      # trace leaves unknown, and infers the sequence length the run actually carries.
+      # Both projections carry an explicit "name": a Keras variable path spells the layer's own name,
+      # not the attribute it hangs on, and Keras numbers unnamed "Dense" layers from a process-global
+      # counter -- so without it no regex, tensor-parallel rules above all, could tell the fused
+      # projection of one block from the output projection of another.
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{3 * dim}}, name: qkv_proj}}]]
+      - [qkv, fused, split_qkv, [_obj_, {_addr_: keras.layers.Reshape}, {_call_: {target_shape: [-1, 3, {{heads}}, {{head_dim}}]}}]]
+      - ["eval: fused[:, :, 0]", query, null]
+      - ["eval: fused[:, :, 1]", key, null]
+      - ["eval: fused[:, :, 2]", value, null]
+      # Rotary position embedding: angles for the actual sequence length, shared by every head as
+      # (1, seq, 1, {{head_dim}}), so nothing here is bound to a maximum length.
+      - ["eval: keras.ops.arange(inp.shape[1], dtype='float32')", positions, null]
+      - ["eval: {{rope_base}} ** (-keras.ops.arange(0, {{head_dim}}, 2, dtype='float32') / {{head_dim}})", inv_freq, null]
+      - ["eval: positions[:, None] * inv_freq", freqs, null]
+      - ["eval: keras.ops.concatenate((freqs, freqs), axis=-1)", angles, null]
+      - ["eval: keras.ops.cast(keras.ops.cos(angles)[None, :, None], query.dtype)", cos, null]
+      - ["eval: keras.ops.cast(keras.ops.sin(angles)[None, :, None], query.dtype)", sin, null]
+      # Rotate the query and the key by their position: "x * cos + rotate_half(x) * sin".
+      - ["eval: query * cos + keras.ops.concatenate((-query[..., {{half_dim}}:], query[..., :{{half_dim}}]), axis=-1) * sin", query, null]
+      - ["eval: key * cos + keras.ops.concatenate((-key[..., {{half_dim}}:], key[..., :{{half_dim}}]), axis=-1) * sin", key, null]
+      # "is_causal=True" masks the future inside the kernel, so no (seq x seq) mask is materialized.
+      - ["eval: keras.ops.dot_product_attention(query, key, value, is_causal=True)", attended, null]
+      # (batch, seq, heads, {{head_dim}}) -> (batch, seq, dim).
+      - [attended, attended, merge_heads, [_obj_, {_addr_: keras.layers.Reshape}, {_call_: {target_shape: [-1, {{dim}}]}}]]
+      - [attended, out, out_proj, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{dim}}, name: out_proj}}]]

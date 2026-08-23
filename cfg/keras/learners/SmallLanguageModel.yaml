@@ -30,8 +30,8 @@ LEARNERS:
     TRAINABLE_LAYERS: [model]
     # "create_optimizer" is only there for "no_weight_decay_names": Keras exempts variables from
     # weight decay through a method call, not a constructor keyword. Everything else is a plain
-    # "keras.optimizers.AdamW" keyword. "embeddings" covers both lookup tables of this model, the
-    # token embedding and the position table.
+    # "keras.optimizers.AdamW" keyword. "embeddings" covers the one lookup table of this model, the
+    # token embedding: positions are rotated inside the attention section, not looked up.
     OPTIMIZER:
       - _obj_
       - _addr_: create_optimizer

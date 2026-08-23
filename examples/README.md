@@ -216,6 +216,8 @@ How the CLI maps onto the objects of the tutorial:
 The logger is a context manager owning the run: it starts the run, logs the parameters and the
 artifacts given with `--log-artifacts/-A`, records the epoch metrics through its own `on_epoch_end`,
 and ends the run. `--logger wandb` needs the `wandb` extra, `--logger mlflow` the `mlflow` extra.
+Current MLflow refuses a plain file-store tracking URI (the default when no server is configured)
+unless `MLFLOW_ALLOW_FILE_STORE=true` is set in the environment.
 
 ## File-addressed optimizer compositions
 
@@ -601,6 +603,8 @@ How the CLI maps onto the objects of the tutorial:
 The logger is a context manager owning the run: it starts the run, logs the parameters and the
 artifacts given with `--log-artifacts/-A`, records the epoch metrics through its own `on_epoch_end`,
 and ends the run. `--logger wandb` needs the `wandb` extra, `--logger mlflow` the `mlflow` extra.
+Current MLflow refuses a plain file-store tracking URI (the default when no server is configured)
+unless `MLFLOW_ALLOW_FILE_STORE=true` is set in the environment.
 
 ## File-addressed optimizer compositions
 
@@ -1049,6 +1053,8 @@ How the CLI maps onto the objects of the tutorial:
 The logger is a context manager owning the run: it starts the run, logs the parameters and the
 artifacts given with `--log-artifacts/-A`, records the epoch metrics through its own `on_epoch_end`,
 and ends the run. `--logger wandb` needs the `wandb` extra, `--logger mlflow` the `mlflow` extra.
+Current MLflow refuses a plain file-store tracking URI (the default when no server is configured)
+unless `MLFLOW_ALLOW_FILE_STORE=true` is set in the environment.
 
 ## File-addressed optimizer compositions
 
@@ -1290,10 +1296,11 @@ is built, which an object pattern cannot express. Keras names its parameters `ke
 scales and lookup tables" rule.
 
 [`keras/corpus.py`](keras/corpus.py) supplies `{"tokens", "targets"}` NumPy blocks for
-[`cfg/keras/models/SmallLanguageModel.yaml`](../cfg/keras/models/SmallLanguageModel.yaml), whose
-`keras.layers.MultiHeadAttention(use_causal_mask=true)` owns its projections — so unlike the torch
-twin there is no attention section, and positions come from a learned table whose `max_seq_len`
-rows bound the longest sequence the model runs.
+[`cfg/keras/models/SmallLanguageModel.yaml`](../cfg/keras/models/SmallLanguageModel.yaml), which —
+like the torch twin — writes its own attention section: a fused `qkv_proj` `Dense`, the rotary
+rotation of the query and the key, and `keras.ops.dot_product_attention(is_causal=True)` into an
+`out_proj` `Dense`. The angles come from the length of the actual input, so `max_seq_len` only sizes
+the `INPUT_SHAPES` dummy forward and bounds nothing the model runs on.
 
 Both Keras loaders shard per rank when `RANK` and `WORLD_SIZE` are set, and serve the whole stream
 when they are not — read from the environment rather than from a framework, because the file must

@@ -140,6 +140,53 @@ def test_a_shipped_model_and_learner_pair_trains_on_the_cpu(case: str, tmp_path:
     assert _moved(before, _values(model.trainable_variables)) > 0.0
 
 
+def test_the_language_model_rotates_its_attention_rather_than_looking_a_position_up(tmp_path: Path) -> None:
+    """The rotary position embedding is what makes this template the twin of the torch and flax ones.
+
+    A learned position table -- what this template carried before -- reads as plausibly as a rotation
+    on the batch it was traced with, so two properties are pinned instead: the attention section
+    against the reference RoPE formula in numpy, which no other position scheme reproduces, and a
+    forward pass three times longer than the traced `max_seq_len`, which a table of `max_seq_len`
+    rows cannot serve at all. The raw layer is called rather than a traced `keras.Model`, whose input
+    spec would pin the length of the trace.
+    """
+    model_name, model_parameters, *_ = PAIRS["SmallLanguageModel"]
+    dim, heads = model_parameters["tiny"]["dim"], model_parameters["tiny"]["heads"]
+    head_dim, half, batch, seq = dim // heads, dim // heads // 2, 2, 6
+    rng = np.random.default_rng(1)
+    KerasBuilder.from_path(MODELS / f"{model_name}.yaml")(parameters=model_parameters)(tmp_path / "rope.py")
+    module = _load(tmp_path / "rope.py", "model_rope")
+    keras.utils.set_random_seed(0)
+    attention = module.CausalSelfAttention()
+    hidden = rng.standard_normal((batch, seq, dim)).astype("float32")
+
+    attended = keras.ops.convert_to_numpy(attention(hidden))
+
+    def rotate_half(tensor: np.ndarray) -> np.ndarray:
+        """The second half of every head's features, negated, brought in front of the first."""
+        return np.concatenate((-tensor[..., half:], tensor[..., :half]), axis=-1)
+
+    qkv_kernel, qkv_bias, out_kernel, out_bias = _values(attention.weights)
+    fused = (hidden @ qkv_kernel + qkv_bias).reshape(batch, seq, 3, heads, head_dim)
+    query, key, value = fused[:, :, 0], fused[:, :, 1], fused[:, :, 2]
+    freqs = np.arange(seq, dtype="float32")[:, None] * 10000.0 ** (-np.arange(0, head_dim, 2, "float32") / head_dim)
+    angles = np.concatenate((freqs, freqs), axis=-1)
+    cos, sin = np.cos(angles)[None, :, None], np.sin(angles)[None, :, None]
+    query, key = query * cos + rotate_half(query) * sin, key * cos + rotate_half(key) * sin
+    scores = np.einsum("bqhd,bkhd->bhqk", query, key) / head_dim**0.5
+    scores = np.where(np.tril(np.ones((seq, seq), bool)), scores, -np.inf)
+    weights = np.exp(scores - scores.max(-1, keepdims=True))
+    heads_merged = np.einsum("bhqk,bkhd->bqhd", weights / weights.sum(-1, keepdims=True), value)
+    assert np.allclose(attended, heads_merged.reshape(batch, seq, dim) @ out_kernel + out_bias, atol=1e-5)
+
+    traced = model_parameters["tiny"]["max_seq_len"]
+    tokens = rng.integers(0, 12, (batch, 3 * traced)).astype("int64")
+    logits = keras.ops.convert_to_numpy(module.Model()(tokens)["logits"])
+
+    assert logits.shape == (batch, 3 * traced, model_parameters["tiny"]["vocab_size"])
+    assert np.isfinite(logits).all()
+
+
 @pytest.mark.parametrize("case", list(PAIRS), ids=list(PAIRS))
 def test_a_shipped_pair_evaluates_without_training(case: str, tmp_path: Path) -> None:
     """Validation must report the same criteria and move nothing, or every run's curve is a lie."""
@@ -161,25 +208,36 @@ def test_the_shipped_tensor_parallel_rules_name_this_models_variables(case: str,
 
     A rule matching no variable is refused at wrap time -- loud, but only once the run started -- and
     a table that matched only half of a column/row pair would train a wrong answer, so both halves
-    are pinned against the `MultiHeadAttention` sublayer names Keras builds. The MLP is deliberately
-    outside the plan: Keras numbers its `Dense` layers from a global counter, so no stable regex
-    tells the first of a block from the second.
+    are pinned: against the `MultiHeadAttention` sublayer names Keras builds for the transformer, and
+    against the two projections the language model's own attention section names. The MLP is
+    deliberately outside the plan: Keras numbers its `Dense` layers from a global counter, so no
+    stable regex tells the first of a block from the second.
     """
     model_name, model_parameters, shapes, *_ = PAIRS[case]
     model = _model(tmp_path, model_name, model_parameters, shapes)
-    rules = [(pattern, tactic) for pattern, tactic in load_any(str(STRATEGIES / "tp.yaml"))[2]["_bind_"]["rules"]]
+    strategy = STRATEGIES / "tp.yaml"
+    if case == "SmallLanguageModel":
+        # The two tables cannot ship active together, so this model's pair is commented under the
+        # transformer's. Uncommenting it back into a file that loads is what keeps it honest: an
+        # alternate nothing parses is exactly what went stale when this attention was rewritten.
+        lines = [line for line in strategy.read_text().splitlines() if '- ["multi_head' not in line]
+        strategy = tmp_path / "tp.yaml"
+        strategy.write_text("\n".join(line.replace("# - [", "- [") for line in lines))
+    rules = [(pattern, tactic) for pattern, tactic in load_any(str(strategy))[2]["_bind_"]["rules"]]
     paths = [variable.path for variable in model.variables]
 
     matched = {tactic: [path for path in paths if re_search(pattern, path)] for pattern, tactic in rules}
 
     depth = next(iter(model_parameters.values()))["depth"]
+    columns = ("query", "key", "value") if case == "VisionTransformer" else ("qkv_proj",)
+    output = "attention_output" if case == "VisionTransformer" else "out_proj"
     assert [tactic for _, tactic in rules] == ["column", "row"]
-    # A kernel and a bias for each of the three input projections, and for the output one, per block:
-    # the counts are what make this a pinned pair rather than "something matched".
-    assert len(matched["column"]) == 6 * depth
+    # A kernel and a bias for each projection the column rule names, and for the output one, per
+    # block: the counts are what make this a pinned pair rather than "something matched".
+    assert len(matched["column"]) == 2 * len(columns) * depth
     assert len(matched["row"]) == 2 * depth
-    assert all(path.rsplit("/", 2)[-2] in ("query", "key", "value") for path in matched["column"])
-    assert all(path.rsplit("/", 2)[-2] == "attention_output" for path in matched["row"])
+    assert all(path.rsplit("/", 2)[-2] in columns for path in matched["column"])
+    assert all(path.rsplit("/", 2)[-2] == output for path in matched["row"])
 
 
 def test_a_shipped_learner_accumulates_over_the_window_its_optimizer_was_given(tmp_path: Path) -> None:
