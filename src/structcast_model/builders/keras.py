@@ -568,8 +568,10 @@ class {self.classname}:
         res = self._training_step({named})
         # A genuine post-step read: the adapter has assigned the optimizer variables back by now, so
         # under a float16 loss-scale skip the frozen counter truthfully reports no update. The
-        # public `iterations` already counts completed windows, accumulated or not. The tracker
-        # syncs the host every step anyway, so this costs nothing.
+        # public `iterations` already counts completed windows, accumulated or not. It is a host
+        # read on every step and cannot be deferred -- `has_updated` answers for the step that just
+        # ran -- but it is not an extra wait: the tracker reads this step's criteria back right
+        # after, on the same computation. Under an accumulation window it costs one device division.
         current = {clock}
         self._has_updated = current > self._last_updates
         self._last_updates = current
