@@ -32,7 +32,15 @@ PARAMETERS:
     # draw. Nothing checks that for a layer that writes its own variables -- keep such state out.
     gradient_checkpointing: false
     # Compute precision of every parameterized layer below, off by default so nothing changes for a
-    # run that does not ask for it. Turn it on with -p "SHARED: {dtype: bfloat16}".
+    # run that does not ask for it. Turn it on by overriding it on the *selected size group*, which
+    # is the whole incantation:
+    #   -p "base: {dtype: bfloat16}"
+    # One override reaches every layer because the flows below select a size group with
+    # "_jinja_group_" and hand that group's value down to each section as a parameter of its own, as
+    # "ConvNeXtV2.yaml" does. Overriding "SHARED" is what does not work: a command-line "SHARED" is
+    # merged onto the default group, and it reaches a size group only when the same invocation names
+    # that group too -- so the shared form still works alongside the group one, and on its own it is
+    # a no-op rather than a model with narrowed blocks and a float32 head.
     # This is *mixed* precision, not pure bf16: it sets the "dtype" of each layer and leaves
     # "param_dtype" at its float32 default, so the weights, the gradients and the optimizer moments
     # stay fp32 while the matmuls and the normalizations run in bf16 -- the Flax spelling of what
@@ -120,7 +128,7 @@ Backbone:
       {% raw %}
         _jinja_yaml_: |-
           {% for i in range(depth) %}
-          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1) if depth > 1 else 0.0}}}}}]
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1) if depth > 1 else 0.0}}, dtype: {{dtype | tojson}}}}}]
           {% endfor %}
       {% endraw %}
 Block:
@@ -133,7 +141,7 @@ Block:
     GRADIENT_CHECKPOINTING: {{gradient_checkpointing}}
     FLOW:
       - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
-      - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - [_, attended, {TYPE: SelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dtype: {{dtype | tojson}}}}}]
       - [attended, attended, drop_path_attention, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
       - ["eval: inp + attended", residual]
       - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]

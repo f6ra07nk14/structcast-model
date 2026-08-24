@@ -39,6 +39,12 @@ CYCLE_GAN_CRITERIA = ["loss_D_A", "loss_D_B", "loss_G", "loss_GAN", "loss_cycle"
 VIT_PARAMETERS = {"base": {"dim": 16, "heads": 2, "depth": 2, "image_size": 16, "patch_size": 8, "num_classes": 5}}
 """A four-patch, two-block Vision Transformer: the smallest one that still has a patch order."""
 
+CONVNEXT_PARAMETERS: dict[str, Any] = {
+    "SHARED": {"num_classes": 5},
+    "atto": {"dims": [4, 8, 8, 16], "depths": [1, 1, 1, 1]},
+}
+"""A four-stage ConvNeXt V2 one block deep: every layer type the template builds, built fast."""
+
 
 def _load(path: Path, name: str) -> ModuleType:
     """Load a generated module by file path, the way a configuration does: not by import name."""
@@ -573,7 +579,7 @@ def test_the_showcase_average_can_be_left_out_by_parameter(vision_transformer: A
 
 
 GELU_MODELS: dict[str, dict[str, Any]] = {
-    "ConvNeXtV2": {"SHARED": {"num_classes": 5}, "atto": {"dims": [4, 8, 8, 16], "depths": [1, 1, 1, 1]}},
+    "ConvNeXtV2": CONVNEXT_PARAMETERS,
     "SmallLanguageModel": {"tiny": {"dim": 16, "heads": 2, "depth": 1, "vocab_size": 11}},
     "VisionTransformer": VIT_PARAMETERS,
 }
@@ -715,7 +721,7 @@ def test_vision_transformer_emits_the_same_module_until_a_dtype_is_asked_for(tmp
 
 
 def test_vision_transformer_computes_in_bfloat16_over_float32_weights(tmp_path: Path) -> None:
-    """`-p "SHARED: {dtype: bfloat16}"` is the flax-native counterpart of torch bf16 autocast.
+    """`-p "base: {dtype: bfloat16}"` is the flax-native counterpart of torch bf16 autocast.
 
     Mixed, not pure: only `dtype` is threaded, so `param_dtype` stays float32 and the weights -- and
     with them the gradients and the optax moments -- keep an fp32 master copy while the matmuls and
@@ -724,7 +730,7 @@ def test_vision_transformer_computes_in_bfloat16_over_float32_weights(tmp_path: 
     nowhere. Both halves are therefore asserted, and on every parameterized layer type the template
     builds, since a keyword threaded onto four of five is the failure that looks like it worked.
     """
-    parameters = {**VIT_PARAMETERS, "SHARED": {"dtype": "bfloat16"}}
+    parameters = {"base": {**VIT_PARAMETERS["base"], "dtype": "bfloat16"}}
     script = _vit_script(parameters, tmp_path / "bf16")
     model = _model_type(tmp_path, "VisionTransformer", parameters)(rngs=nnx.Rngs(0))
 
@@ -733,3 +739,76 @@ def test_vision_transformer_computes_in_bfloat16_over_float32_weights(tmp_path: 
         assert all("dtype='bfloat16'" in line for line in script.splitlines() if f"= {layer}(" in line)
     assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
     assert model(jnp.zeros((2, 16, 16, 3)))["cls"].dtype == jnp.bfloat16
+    # Why the template names the size group rather than "SHARED": the root flow renders in that
+    # group's scope, and a command-line "SHARED" is merged onto the default group alone. Threaded
+    # down to each section as a parameter, that near miss is a no-op; read from the shared scope it
+    # used to leave the patch embedding, the two tables, the final norm and the head at float32
+    # while the blocks narrowed -- a half-precision model that trains, reports nothing wrong and is
+    # not the one that was asked for. The shared form still has to work alongside the group one,
+    # because that is the incantation the template used to document. Both are rendered at the
+    # shipped size on purpose: naming a size group for anything at all is what pulls the shared half
+    # into it, so a shrunk render would hide the trap.
+    assert _vit_script({"SHARED": {"dtype": "bfloat16"}}, tmp_path / "shared-only") == _vit_script(
+        {}, tmp_path / "no-knob"
+    )
+    assert _vit_script({"base": {"dtype": "bfloat16"}}, tmp_path / "group") == _vit_script(
+        {"SHARED": {"dtype": "bfloat16"}, "base": {"dtype": "bfloat16"}}, tmp_path / "group-and-shared"
+    )
+
+
+def _conv_next_script(parameters: dict[str, Any], directory: Path) -> str:
+    """Emit the ConvNeXt V2 template for *parameters* and return the generated module text."""
+    path = directory / "convnext.py"
+    FlaxBuilder.from_path(MODELS / "ConvNeXtV2.yaml")(parameters=parameters)(path)
+    return path.read_text()
+
+
+def _typed_layers(script: str) -> list[tuple[str, bool]]:
+    """Every parameterized layer the module constructs, paired with whether it was given a `dtype`."""
+    return [
+        (match.group(1), "dtype=" in line)
+        for line in script.splitlines()
+        if (match := re_search(r"= (Conv|LayerNorm|Linear|GlobalResponseNorm)\(", line))
+    ]
+
+
+def test_conv_next_v2_narrows_every_layer_from_the_one_size_group_override(tmp_path: Path) -> None:
+    """`-p "atto: {dtype: bfloat16}"` is the whole incantation, and it has to reach every layer.
+
+    Mixed, not pure: only `dtype` is threaded, so `param_dtype` stays float32 and the weights -- and
+    with them the gradients and the optax moments -- keep an fp32 master copy while the convolutions,
+    the matmuls and the normalizations run in bf16, which is what makes this comparable to the torch
+    twin's `MIXED_PRECISION_TYPE: bfloat16` autocast. The count is what makes it worth asserting:
+    the template reaches its layers through four sections, and a knob threaded into three of them
+    would narrow most of the model, train, converge and be a different model from the one asked for.
+    So every constructed layer is read back, not a sample of them, and the two renders are compared
+    site for site so that a `dtype` bought by dropping a layer would not pass either.
+    """
+    typed = {**CONVNEXT_PARAMETERS, "atto": {**CONVNEXT_PARAMETERS["atto"], "dtype": "bfloat16"}}
+    narrowed = _typed_layers(_conv_next_script(typed, tmp_path / "bf16"))
+    absent = _typed_layers(_conv_next_script(CONVNEXT_PARAMETERS, tmp_path / "fp32"))
+
+    assert [name for name, _ in narrowed] == [name for name, _ in absent]
+    assert {"Conv", "LayerNorm", "Linear", "GlobalResponseNorm"} == {name for name, _ in narrowed}
+    assert [name for name, typed_here in narrowed if not typed_here] == []
+    assert [name for name, typed_here in absent if typed_here] == []
+
+    model = _model_type(tmp_path, "ConvNeXtV2", typed)(rngs=nnx.Rngs(0))
+
+    assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
+    assert model(jnp.zeros((2, 32, 32, 3)))["cls"].dtype == jnp.bfloat16
+
+
+def test_conv_next_v2_leaves_the_module_untouched_for_a_shared_only_override(tmp_path: Path) -> None:
+    """The knob is all-or-nothing on purpose: a size group owns it, so "SHARED" must not half apply.
+
+    A command-line "SHARED" is merged onto the default group alone, so on its own it never reaches
+    the size group the flows select. The template therefore hands the group's value down to each
+    section as a parameter rather than reading a shared one, which turns that near miss into a
+    no-op: byte equality with the knob absent is what says the module a run trains is never left
+    partly narrowed. Rendered at the shipped size, because naming a size group for anything at all
+    is what pulls the shared half into it.
+    """
+    assert _conv_next_script({"SHARED": {"dtype": "bfloat16"}}, tmp_path / "shared") == _conv_next_script(
+        {}, tmp_path / "absent"
+    )

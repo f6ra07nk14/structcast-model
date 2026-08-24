@@ -12,6 +12,27 @@ PARAMETERS:
     activation: gelu
     mlp_ratio: 4
     num_classes: 1000
+    # Compute precision of every parameterized layer below, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on by overriding it on the *selected size group*, which
+    # is the whole incantation:
+    #   -p "atto: {dtype: bfloat16}"
+    # One override reaches every layer because the flows below select a size group with
+    # "_jinja_group_" and hand that group's value down to each section as a parameter of its own.
+    # Overriding "SHARED" is what does not work: a command-line "SHARED" is merged onto the default
+    # group, and it reaches a size group only when the same invocation happens to name that group
+    # too. Here -- and in "VisionTransformer.yaml", which threads the value the same way -- the
+    # miss is a no-op rather than a half-narrowed model.
+    # This is *mixed* precision, not pure bf16: it sets the "dtype" of each layer and leaves
+    # "param_dtype" at its float32 default, so the weights, the gradients and the optimizer moments
+    # stay fp32 while the convolutions, the matmuls and the normalizations run in bf16 -- the Flax
+    # spelling of what torch does with "MIXED_PRECISION_TYPE: bfloat16" autocast over fp32 master
+    # weights, which is what makes the two backends' bf16 runs comparable. Pure bf16 storage would
+    # be a "param_dtype" too, and is deliberately not offered: an fp32 master copy is what keeps a
+    # long run's small updates from rounding away.
+    # "flax.nnx" promotes an input against the layer's "dtype", so feeding bf16 batches
+    # (-p "DEFAULT: {image_dtype: bfloat16}" on the dataset template) is neither necessary nor
+    # sufficient on its own -- without this knob those batches are promoted back up to float32.
+    dtype: null
   # backbone model parameters
   atto:
     dims: [40, 80, 160, 320]
@@ -52,8 +73,9 @@ FLOW:
       - _jinja_group_: {{backbone}}
       {% raw %}
         _jinja_yaml_: |-
-          - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dims[-1]}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-          - [_, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dims[-1]}}, out_features: {{num_classes}}, rngs: "eval: rngs"}}]]
+          {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+          - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dims[-1]}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
+          - [_, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dims[-1]}}, out_features: {{num_classes}}, rngs: "eval: rngs"{{dt}}}}]]
       {% endraw %}
 Backbone:
   INPUTS: [image]
@@ -65,27 +87,28 @@ Backbone:
         {% raw %}
           _jinja_yaml_: |-
             {% set cum_depths = [0] + depths | cumsum %}
-            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fin: {{image_channels}}, fout: {{dims[0]}}}}}]
+            - [image, feat1, {TYPE: Stem, PARAM: {DEFAULT: {fin: {{image_channels}}, fout: {{dims[0]}}, dtype: {{dtype | tojson}}}}}]
             {% for i in range(cum_depths[0], cum_depths[1]) %}
-            - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}}}}]
+            - [feat1, feat1, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[0]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}, dtype: {{dtype | tojson}}}}}]
             {% endfor %}
-            - [feat1, feat2, "downsample1", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}}}}]
+            - [feat1, feat2, "downsample1", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[0]}}, fout: {{dims[1]}}, dtype: {{dtype | tojson}}}}}]
             {% for i in range(cum_depths[1], cum_depths[2]) %}
-            - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}}}}]
+            - [feat2, feat2, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[1]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}, dtype: {{dtype | tojson}}}}}]
             {% endfor %}
-            - [feat2, feat3, "downsample2", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}}}}]
+            - [feat2, feat3, "downsample2", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[1]}}, fout: {{dims[2]}}, dtype: {{dtype | tojson}}}}}]
             {% for i in range(cum_depths[2], cum_depths[3]) %}
-            - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}}}}]
+            - [feat3, feat3, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[2]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}, dtype: {{dtype | tojson}}}}}]
             {% endfor %}
-            - [feat3, feat4, "downsample3", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}}}}]
+            - [feat3, feat4, "downsample3", {TYPE: DownSample, PARAM: {DEFAULT: {fin: {{dims[2]}}, fout: {{dims[3]}}, dtype: {{dtype | tojson}}}}}]
             {% for i in range(cum_depths[3], cum_depths[4]) %}
-            - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}}}}]
+            - [feat4, feat4, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {fout: {{dims[3]}}, drop_path: {{drop_path_rate * i / (cum_depths[-1] - 1) if cum_depths[-1] > 1 else 0.0}}, dtype: {{dtype | tojson}}}}}]
             {% endfor %}
         {% endraw %}
 Stem:
   OUTPUTS: [out]
   FLOW:
     - _jinja_yaml_: |-
+        {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
         - INPUTS: inp
           OUTPUTS: _
           LAYER:
@@ -98,12 +121,18 @@ Stem:
                 strides: [{{stem_kernel_size}}, {{stem_kernel_size}}]
                 padding: SAME
                 rngs: "eval: rngs"
-        - [_, out, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+                # A line of its own, unlike the "{{dt}}" suffix the flow-style layers take: this
+                # "_call_" is a block mapping, where a trailing ", dtype: ..." is not a key.
+                {% if dtype is not none %}
+                dtype: {{dtype}}
+                {% endif %}
+        - [_, out, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
 DownSample:
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     FLOW:
-      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fin}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fin}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - INPUTS: _
         OUTPUTS: out
         LAYER:
@@ -116,9 +145,13 @@ DownSample:
               strides: [2, 2]
               padding: SAME
               rngs: "eval: rngs"
+              {% if dtype is not none %}
+              dtype: {{dtype}}
+              {% endif %}
 Block:
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     FLOW: 
       - INPUTS: inp
         OUTPUTS: _
@@ -133,13 +166,16 @@ Block:
               padding: SAME
               feature_group_count: {{fout}}
               rngs: "eval: rngs"
-      - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
+              {% if dtype is not none %}
+              dtype: {{dtype}}
+              {% endif %}
+      - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - INPUTS: _
         OUTPUTS: _
         LAYER:
           - _obj_
           - {_addr_: flax.nnx.Linear}
-          - {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"}}
+          - {_call_: {in_features: {{fout}}, out_features: "eval: {{fout}} * {{mlp_ratio}}", rngs: "eval: rngs"{{dt}}}}
       # "approximate=False" is the exact erf GELU the torch and Keras twins use; the jax default is
       # the tanh approximation, and the two agree to no more than about three decimals. Every value
       # bound here is a literal, which is what lets the builder hoist the bound callable to a
@@ -150,13 +186,13 @@ Block:
         LAYER:
           - _obj_
           - {_addr_: structcast_model.flax.layers.GlobalResponseNorm}
-          - {_call_: {num_features: "eval: {{fout}} * {{mlp_ratio}}", epsilon: {{norm_eps}}, rngs: "eval: rngs"}}
+          - {_call_: {num_features: "eval: {{fout}} * {{mlp_ratio}}", epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}
       - INPUTS: _
         OUTPUTS: _
         LAYER:
           - _obj_
           - {_addr_: flax.nnx.Linear}
-          - {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"}}
+          - {_call_: {in_features: "eval: {{fout}} * {{mlp_ratio}}", out_features: {{fout}}, rngs: "eval: rngs"{{dt}}}}
       - INPUTS: _
         OUTPUTS: feat
         LAYER:
