@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import tensorflow as tf
 
 import keras
 from structcast_model.base_trainer import Learner
@@ -144,6 +145,159 @@ def test_the_validation_split_yields_the_same_epoch_every_time(arrays: None) -> 
 
     assert np.array_equal(next(iter(validation))["image"], next(iter(validation))["image"])
     assert np.array_equal(next(iter(validation))["label"], next(iter(validation))["label"])
+
+
+IMAGENET = {"crop_pct": 0.875, "mean": (0.0, 0.25, 0.5), "std": (1.0, 0.5, 0.25)}
+"""The ImageNet recipe with readable channel statistics, so a normalized pixel can be predicted."""
+
+
+def _one_picture(monkeypatch: pytest.MonkeyPatch, picture: np.ndarray) -> None:
+    """Feed the pipeline sixteen copies of *picture*, so its shuffle cannot change what it reads."""
+    images = np.repeat(picture[None], 16, axis=0)
+    monkeypatch.setattr(DATA, "load_arrays", lambda dataset, training: (images, LABELS))
+
+
+def test_the_imagenet_recipe_normalizes_with_the_channel_statistics_it_was_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch has to leave here on the scale `examples/torch/data.py` trains the same model on.
+
+    Scaling to 0..1 and stopping there is what this catches, and it is what this pipeline did for
+    every source: it survives every shape and dtype assertion, it still trains, and it is a different
+    input distribution from the torch example's -- so a cross-framework comparison would be measuring
+    the pixels rather than the framework, which is what a Keras leg training visibly differently from
+    the other two turned out to be. A flat grey image makes the arithmetic readable: every channel
+    has to come out at (128/255 - mean)/std. The
+    defaults are pinned with it, because they are the other half of that agreement: they are timm's
+    `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`.
+    """
+    _one_picture(monkeypatch, np.full((12, 12, 3), 128, "uint8"))
+
+    image = next(iter(_pipeline(training=False, **IMAGENET)))["image"]
+
+    assert np.allclose(image, [(128 / 255), (128 / 255 - 0.25) * 2, (128 / 255 - 0.5) * 4], atol=1e-5)
+    assert _pipeline().mean == (0.485, 0.456, 0.406)
+    assert _pipeline().std == (0.229, 0.224, 0.225)
+
+
+def test_the_imagenet_training_crop_is_a_random_window_of_the_source_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The torch example trains on `RandomResizedCrop`; a pad-then-crop of a squashed image is not it.
+
+    Two draws say which one this is. A whole-area, square-aspect crop has to give back exactly the
+    bicubic resize of the source, because that is what "the window is the whole image" means -- the
+    small-image path could not, it pads the image with zeros and cuts a fixed-size window out. And a
+    small-area draw has to give two items two different windows, where a pad-then-crop of an
+    already-resized image differs by an offset of a few pixels at most. The scale range is the whole
+    strength of this augmentation, so it has to reach the crop.
+    """
+    picture = np.arange(12 * 12 * 3, dtype="uint8").reshape(12, 12, 3)
+    _one_picture(monkeypatch, picture)
+    bare: Any = {"training": True, "crop_pct": 0.875, "hflip": False, "color_jitter": 0.0}
+    bare |= {"mean": (0.0,) * 3, "std": (1.0,) * 3}
+    plain = tf.image.resize(tf.cast(picture, tf.float32), (8, 8), method="bicubic", antialias=True).numpy() / 255.0
+
+    whole = next(iter(_pipeline(**bare, scale=(1.0, 1.0), ratio=(1.0, 1.0))))["image"]
+    windows = next(iter(_pipeline(**bare, scale=(0.08, 0.15))))["image"]
+
+    assert np.allclose(whole[0], plain, atol=1e-5)
+    assert np.allclose(whole[0], whole[3], atol=1e-6)
+    assert not np.allclose(windows[0], windows[1], atol=1e-3)
+
+
+def test_the_evaluation_crop_is_the_window_torchvision_would_have_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The evaluation window has to be the exact one, not one a pixel off it.
+
+    `Resize` then `CenterCrop` looks like two roundings nobody can get wrong, and both of them can
+    be: the long edge has to be truncated and the crop offset has to be rounded half to even, which
+    is what `CenterCrop` gets from Python's own `round`. Flooring the offset instead shifts the
+    window by one pixel whenever the margin is an odd number of them -- about a quarter of the
+    aspect ratios in a real set -- and one pixel of shift on a gradient is a residual of tens of
+    levels per channel against the torch example, which is more than the whole of bf16's error.
+
+    A 9x11 source with `image_size=(8, 8)` and `crop_pct=0.875` is the smallest case that separates
+    the two: the shortest edge is already 9, so the margins are 1 and 3 and the correct offsets are
+    (0, 2) where flooring gives (0, 1). The source is a gradient because a shift has to be visible.
+    """
+    picture = (np.arange(9 * 11 * 3) % 256).astype("uint8").reshape(9, 11, 3)
+    _one_picture(monkeypatch, picture)
+    resized = tf.image.resize(tf.cast(picture, tf.float32), (9, 11), method="bicubic", antialias=True)
+    expected = tf.clip_by_value(resized, 0.0, 255.0).numpy()[0:8, 2:10] / 255.0
+
+    window = next(iter(_pipeline(crop_pct=0.875, mean=(0.0,) * 3, std=(1.0,) * 3)))["image"]
+
+    assert np.allclose(window[0], expected, atol=1e-5)
+    # And the whole geometry belongs to the ImageNet path: without `crop_pct` the small-image recipe
+    # resizes to `image_size` outright, aspect ratio and all, so the gate cannot be silently
+    # bypassing the recipe a run asked for.
+    assert not np.allclose(next(iter(_pipeline()))["image"][0], expected, atol=1e-2)
+
+
+def test_an_evaluation_epoch_keeps_the_tail_a_training_epoch_drops(arrays: None) -> None:
+    """The validation split is a measurement, so it has to be over all of it.
+
+    The dropped tail is silent and small enough to look like noise: 50 000 ImageNet validation
+    images in batches of 512 are 97 whole batches and 336 images nobody scored, against the 98 steps
+    the torch example runs, so the two frameworks report a metric over different data. Training keeps
+    dropping its tail, because the distributed strategies split a batch across their replicas and a
+    short one would not divide, and `__len__` has to agree with the epoch either way -- it is what
+    sizes the progress bar and the schedule.
+    """
+    validation, training = _pipeline(batch_size=5), _pipeline(batch_size=5, training=True)
+
+    assert [len(batch["label"]) for batch in validation] == [5, 5, 5, 1]
+    assert [len(batch["label"]) for batch in training] == [5, 5, 5]
+    assert (len(validation), len(training)) == (4, 3)
+
+
+def _graph_parallelism(dataset: Any) -> tuple[list[int], list[int]]:
+    """The `num_parallel_calls` of every map and the buffer of every prefetch, source side first.
+
+    Read off the private attributes of the built graph because `tf.data` publishes no reader for
+    either, and a field the pipeline accepted and then ignored is indistinguishable from one it
+    honoured until the ops themselves are asked.
+    """
+    calls: list[int] = []
+    buffers: list[int] = []
+
+    def _walk(node: Any) -> None:
+        for source in node._inputs():
+            _walk(source)
+        if (parallel := getattr(node, "_num_parallel_calls", None)) is not None:
+            calls.append(int(parallel))
+        if (buffer := getattr(node, "_buffer_size", None)) is not None:
+            buffers.append(int(buffer))
+
+    _walk(dataset)
+    return calls, buffers
+
+
+def test_the_parallelism_knobs_reach_the_ops_that_take_them(tmp_path: Path) -> None:
+    """AUTOTUNE is a floor, not a budget, and the timm example is handed `num_workers: 32`.
+
+    On a host whose cores are shared with a busy training process AUTOTUNE settles well under what
+    the machine has, and a starved input pipeline shows up as a slower run rather than as an error --
+    so a launch configuration has to be able to hand this one an explicit count, the way it hands the
+    torch example its worker count. Every map takes it, the decode included: the file read is the
+    first op inside the decode, so that map is the read parallelism too. An evaluation split is what
+    is walked, because a training shuffle carries a buffer of its own and this asserts on every
+    buffer the graph holds.
+    """
+    root = _image_tree(tmp_path)
+    budgeted = DATA.KerasImageData(dataset=root, image_size=(8, 8), num_parallel_calls=6, prefetch=2, crop_pct=0.875)
+    autotuned = DATA.KerasImageData(dataset=root, image_size=(8, 8), crop_pct=0.875)
+
+    calls, buffers = _graph_parallelism(budgeted.pipeline)
+    assert calls, "no map carries a parallelism at all"
+    assert set(calls) == {6}, "a map was left on AUTOTUNE"
+    assert buffers == [2]
+    calls, buffers = _graph_parallelism(autotuned.pipeline)
+    assert calls
+    assert set(calls) == {tf.data.AUTOTUNE}
+    assert buffers == [tf.data.AUTOTUNE]
 
 
 def _image_tree(root: Path, classes: int = 2, per_class: int = 4) -> Path:

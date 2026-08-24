@@ -9,11 +9,19 @@
 #   - "dataset": the name of a "keras.datasets" set ("mnist", "cifar10" or "cifar100"), downloaded
 #     once into the Keras cache directory and held in memory. Small sets only.
 # "training" also selects everything that follows from the split -- the training split is shuffled
-# and augmented (a horizontal flip and a pad-then-crop, as core Keras preprocessing layers inside the
-# tf.data pipeline), the validation split is neither.
+# and augmented, the validation split is neither, and only the training split drops a short final
+# batch, so a validation epoch is measured over the whole split.
+# "crop_pct" picks the augmentation recipe. Left null it is the small-image one (a horizontal flip
+# and a pad-then-crop, as core Keras preprocessing layers inside the tf.data pipeline, pixels scaled
+# to 0..1), which is what a CIFAR-sized set trains under. Set, it is the recipe timm gives
+# "cfg/torch/others/default_timm.yaml" -- a random resized crop, a horizontal flip and colour jitter
+# while training, a shortest-edge resize and a central crop while evaluating, ImageNet channel
+# statistics either way -- so a Keras run and a torch run over the same tree are drawn from the same
+# distributions rather than from two recipes. That is the recipe an ImageNet run wants, and 0.875 is
+# the ratio timm defaults to.
 # Render it twice, once per split, e.g.
 #   scm format cfg/keras/others/default_keras.yaml -o dataset_train.yaml \
-#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true, image_size: [224, 224]}'
+#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true, image_size: [224, 224], crop_pct: 0.875}'
 #   scm format cfg/keras/others/default_keras.yaml -o dataset_valid.yaml \
 #       -p 'DEFAULT: {dataset: cifar100, training: false}'
 PARAMETERS:
@@ -23,12 +31,24 @@ PARAMETERS:
     validation_split: validation # directory under "data_dir" holding the validation split
     batch_size: 32
     image_size: [32, 32]
-    crop_padding: 4 # pixels padded on each side before the random crop; 0 disables the crop
+    crop_padding: 4 # small-image recipe: pixels padded on each side before the random crop
+    # null keeps the small-image recipe above; a ratio switches to the ImageNet one, where the
+    # shortest edge is resized to image_size / crop_pct before the evaluation crop.
+    crop_pct: null
+    hflip: true # random horizontal flip, training split only, on either recipe
     # Items the training shuffle of a "keras.datasets" set holds at once, capped by the number of
     # items a rank owns: a full buffer there would be a second copy of an in-memory array. It does
     # not bound a directory, whose file list is shuffled whole, before the decode.
     shuffle_buffer: 1024
     seed: 42
+    # Items decoded and augmented at once, and batches held ready ahead of the device; null is
+    # "tf.data.AUTOTUNE" for both. They are this pipeline's "num_workers: 32", the number
+    # "cfg/torch/others/default_timm.yaml" hands timm: AUTOTUNE sizes itself from what it is already
+    # achieving, which on a host shared with a busy training process settles below what the CPU has,
+    # and a starved input pipeline costs step time rather than raising anything. The file read is the
+    # first op of the decode, so one number is both the reading and the augmentation budget.
+    num_parallel_calls: null
+    prefetch: null
 _obj_:
   - _addr_: KerasImageData
     _file_: examples/keras/data.py
@@ -52,5 +72,9 @@ _obj_:
         batch_size: {{batch_size}}
         image_size: {{image_size}}
         crop_padding: {{crop_padding}}
+        crop_pct: {{crop_pct | tojson}}
+        hflip: {{hflip}}
         shuffle_buffer: {{shuffle_buffer}}
         seed: {{seed}}
+        num_parallel_calls: {{num_parallel_calls | tojson}}
+        prefetch: {{prefetch | tojson}}
