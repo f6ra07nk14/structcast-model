@@ -71,6 +71,8 @@ def test_resolve_object_with_bind_pattern() -> None:
     ((name, expressions),) = _bound_callables(imports).items()
     assert name == resolved
     (expression,) = expressions
+    # `None` in an import bucket marks a whole-module import; a hoisted binding is always an expression.
+    assert expression is not None
     assert "lambda" in expression
     assert "'value': 1.0" in expression
     assert "'mode': 'norm'" in expression
@@ -384,6 +386,7 @@ def test_resolve_object_with_list_bind_pattern() -> None:
     resolved, class_name = resolve_object(imports, ObjectPattern.model_validate(raw))
     assert class_name == "Identity"
     (expression,) = _bound_callables(imports)[resolved]
+    assert expression is not None
     assert "lambda" in expression
     # list bind places positional args before *args
     assert "1, 2, 3" in expression

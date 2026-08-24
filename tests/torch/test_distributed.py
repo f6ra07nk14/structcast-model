@@ -848,7 +848,8 @@ def test_every_strategy_resolves_the_state_dict_api_at_construction() -> None:
     """
     dcp = pytest.importorskip("torch.distributed.checkpoint.state_dict")
     pytest.importorskip("torch.distributed.fsdp")
-    strategies = [
+    # Annotated at the mixin owning `_api`: the join of the five classes is `_CompileMixin`, which does not.
+    strategies: list[distributed._StateDictMixin] = [
         SingleDeviceStrategy(device="cpu"),
         DistributedDataParallelStrategy(device="cpu"),
         TensorParallelStrategy(device="cpu", parallel_modules=_PLAN),
