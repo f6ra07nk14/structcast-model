@@ -126,6 +126,7 @@ import jax, jax.numpy as jnp
 from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.flax.optimizers import unwrap_variables
+from structcast_model.flax.utils import donate_argnames
 
 def load(path, name):
     spec = spec_from_file_location(name, path)
@@ -138,8 +139,10 @@ strategy = FlaxDistributedStrategy(preset=preset, min_size=0)
 model = load(directory + "/model.py", "generated_model").Model(rngs=nnx.Rngs(params=jax.random.key(0)))
 strategy.wrap({"model": model})
 learner = load(directory + "/learner.py", "generated_learner").Learner(model)
+# The names the command derives from the step's own signature. A step declaring **kwargs makes
+# jax accept any donate_argnames, so a stale pair here would donate nothing and say nothing.
 learner._training_step = strategy.compile(
-    learner._training_step, {"donate_argnames": ("models", "optimizers")}
+    learner._training_step, {"donate_argnames": donate_argnames(learner._training_step)}
 )
 x = jnp.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.5], [-1.0, 1.0, 0.0, 1.0]] * 2)
 y = jnp.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]] * 2)

@@ -22,6 +22,7 @@ from flax import nnx
 from structcast_model.base_trainer import Learner, SimpleDataProvider
 from structcast_model.builders.flax import FlaxBuilder, FlaxLearnerBuilder
 from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer
+from structcast_model.flax.utils import donate_argnames
 from structcast_model.utils.base import load_any
 from tests import FIXTURES_DIR
 
@@ -59,8 +60,12 @@ def _learner_type(tmp_path: Path, path: Path = LEARNER_YAML, **kwargs: Any) -> A
 
 
 def _parameters(model: Any) -> list[jax.Array]:
-    """Read the parameter arrays of a model, in a stable order."""
-    return jax.tree.leaves(nnx.state(model, nnx.Param))
+    """Read the parameter arrays of a model, in a stable order.
+
+    Copied, because a compiled step is handed these buffers donated and deletes them: a snapshot
+    taken to be compared after the step has to outlive the step that consumed it.
+    """
+    return [jnp.copy(leaf) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))]
 
 
 def _optimizer_state(learner: Any, name: str = "optimizer") -> list[jax.Array]:
@@ -110,21 +115,32 @@ def test_training_step_lowers_the_loss_it_reports(tmp_path: Path) -> None:
     assert losses[-1] < losses[0]
 
 
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 @pytest.mark.parametrize(
     ("window", "gates"),
     [(3, [False, False, True]), (2, [False, True, False, True])],
     ids=["window-of-three", "window-of-two"],
 )
-def test_accumulated_gradients_apply_only_on_the_gated_step(tmp_path: Path, window: int, gates: list[bool]) -> None:
+def test_accumulated_gradients_apply_only_on_the_gated_step(
+    tmp_path: Path, window: int, gates: list[bool], compiled: bool
+) -> None:
     """With a `MultiSteps` window the parameters may move on every k-th step and on no other.
 
     The accumulation lives inside the optimizer state on the device, and the step compares the count
     it advanced across its own `update` call, so `has_updated` must agree, step by step, with which
     step the parameters actually moved on -- and `updates` must count exactly those steps.
+
+    Compiled as well as eager, under the donation the command derives from the step's signature:
+    that is the only shape a real run takes, and a window whose counter did not survive tracing --
+    or whose state the donated buffers dropped -- would leave every step accumulating into a window
+    that never closes, which reads as a model that trains without ever moving.
     """
     learner = _learner_type(tmp_path, parameters={"DEFAULT": {"accumulate_gradients": window}})(
         _model_type(tmp_path)(rngs=nnx.Rngs(0))
     )
+    if compiled:
+        step = learner._training_step
+        learner._training_step = nnx.jit(step, donate_argnames=donate_argnames(step))
     previous = _parameters(learner.models["model"])
 
     reported, moved = [], []
