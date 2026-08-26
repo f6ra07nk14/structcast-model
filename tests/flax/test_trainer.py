@@ -50,6 +50,19 @@ class _Recorder:
         self.log.append(event)
 
 
+class _BatchPlacement:
+    """Record the batches a sharded dataset places."""
+
+    def __init__(self) -> None:
+        """Start with no placed batches."""
+        self.placed: list[int] = []
+
+    def shard_batch(self, batch: dict[str, int]) -> dict[str, int]:
+        """Record and return one batch without changing it."""
+        self.placed.append(batch["x"])
+        return batch
+
+
 def _trainer(tracker: Any, **kwargs: Any) -> FlaxTrainer:
     """Build a trainer over one training and one validation batch."""
     return FlaxTrainer(
@@ -134,6 +147,19 @@ def test_flax_trainer_dispatches_the_documented_event_order() -> None:
         "on_validation_end",
         "on_epoch_end",
     ]
+
+
+def test_sharded_dataset_prefetches_two_batches_before_the_first_step() -> None:
+    """Device placement must be queued ahead of the step to overlap input transfer with compute."""
+    placement = _BatchPlacement()
+    dataset = ShardedDataset([{"x": index} for index in range(3)], placement)
+    iterator = iter(dataset)
+
+    assert next(iterator) == {"x": 0}
+    assert placement.placed == [0, 1]
+
+    assert next(iterator) == {"x": 1}
+    assert placement.placed == [0, 1, 2]
 
 
 def test_create_jax_inputs_from_int_tuple_returns_array() -> None:

@@ -1,5 +1,6 @@
 """Trainer helpers for Flax models."""
 
+from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from logging import getLogger
@@ -108,7 +109,9 @@ class ShardedDataset:
     """A dataset whose batches are placed across the strategy's mesh as they are read.
 
     Built once per run and handed to the data provider, whose properties must return the same object
-    on every read. Counting an epoch goes to the wrapped dataset, so it places nothing.
+    on every read. Counting an epoch goes to the wrapped dataset, so it places nothing. The queue
+    keeps two batches in flight by default, matching Flax's GPU prefetch recommendation: JAX's
+    asynchronous placement can then overlap the next transfer with the current step.
     """
 
     dataset: DatasetLike | Callable[[], DatasetLike]
@@ -117,9 +120,24 @@ class ShardedDataset:
     strategy: Any
     """The strategy whose mesh the batches are placed on."""
 
+    prefetch_size: int = 2
+    """Number of batches kept in the device placement buffer."""
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        """Yield every batch of one epoch, placed on the mesh."""
-        return (self.strategy.shard_batch(batch) for batch in get_dataset(self.dataset))
+        """Yield every batch of one epoch, placed on the mesh and prefetched ahead."""
+        batches = iter(get_dataset(self.dataset))
+        pending: deque[dict[str, Any]] = deque()
+        for _ in range(self.prefetch_size):
+            try:
+                pending.append(self.strategy.shard_batch(next(batches)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft()
+            try:
+                pending.append(self.strategy.shard_batch(next(batches)))
+            except StopIteration:
+                pass
 
     def __len__(self) -> int:
         """Return the number of batches in one epoch."""
@@ -132,6 +150,8 @@ class ShardedDataset:
         participants of an event with `isinstance` against a protocol, and a protocol check looks its
         attributes up statically, which never reaches a `__getattr__`.
         """
+        if self.prefetch_size < 1:
+            raise ValueError(f"prefetch_size must be at least 1, got {self.prefetch_size}")
         for event in EVENTS:
             method = getattr(self.dataset, event, None)
             if method is not None:
