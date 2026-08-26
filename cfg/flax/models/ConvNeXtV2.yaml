@@ -198,5 +198,5 @@ Block:
         LAYER:
           - _obj_
           - {_addr_: flax.nnx.Dropout}
-          - {_call_: {rate: {{drop_path}}, broadcast_dims: [2, 3, 4], rngs: "eval: rngs"}}
+          - {_call_: {rate: {{drop_path}}, broadcast_dims: [1, 2, 3], rngs: "eval: rngs"}}
       - ["eval: inp + feat", out, null]

@@ -812,3 +812,27 @@ def test_conv_next_v2_leaves_the_module_untouched_for_a_shared_only_override(tmp
     assert _conv_next_script({"SHARED": {"dtype": "bfloat16"}}, tmp_path / "shared") == _conv_next_script(
         {}, tmp_path / "absent"
     )
+
+
+def test_conv_next_v2_drops_whole_samples_when_stochastic_depth_is_on(tmp_path: Path) -> None:
+    """Stochastic depth drops a sample's residual branch whole, so its mask spans every axis but the batch.
+
+    The activations here are NHWC, so that is dims 1, 2 and 3; naming an axis they do not have
+    makes `flax.nnx.Dropout` raise on the first block whose rate is above zero, which is every
+    block of the recipe this template ships for. The rate is therefore what is under test rather
+    than the emitted keyword: nothing below runs at all under a mask that indexes past the last
+    axis.
+
+    Repeated rows are what say the drop is per sample. Three of the four blocks draw a mask, so one
+    image repeated across the batch can only come back as the eight outcomes those masks spell out,
+    where an element-wise mask would give all sixty-four rows a value of their own.
+    """
+    parameters = {**CONVNEXT_PARAMETERS, "atto": {**CONVNEXT_PARAMETERS["atto"], "drop_path_rate": 0.9}}
+    model = _model_type(tmp_path, "ConvNeXtV2", parameters)(rngs=nnx.Rngs(0))
+    image = jnp.broadcast_to(jax.random.normal(jax.random.key(0), (1, 16, 16, 3)), (64, 16, 16, 3))
+
+    dropped = model(image)["cls"]
+
+    assert not jnp.allclose(dropped, model(image)["cls"])
+    assert jnp.array_equal(_evaluating(model)(image)["cls"], _evaluating(model)(image)["cls"])
+    assert len({tuple(row.tolist()) for row in dropped}) <= 8
