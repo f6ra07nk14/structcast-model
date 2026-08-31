@@ -283,7 +283,9 @@ def _averaging(model: Any, *, applies: int = 1, learning_rate: float = 0.1) -> A
     variables = list(model.trainable_variables)
     optimizer.build(variables)
     for _ in range(applies):
-        optimizer.apply([keras.ops.ones_like(variable) for variable in variables], variables)
+        # Built from the shape rather than with `ones_like`, which hands the JAX backend a Keras
+        # variable it refuses to read a dtype off.
+        optimizer.apply([keras.ops.ones(v.shape, v.dtype) for v in variables], variables)
     return optimizer
 
 
