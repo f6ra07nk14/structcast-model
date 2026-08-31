@@ -49,17 +49,18 @@ LEARNERS:
     #    "LossScaleOptimizer" skipped truthfully reports no update. Every optimizer of a learner
     #    must share the window (REFERENCE.md, "ACCUMULATE_GRADIENTS"; "docs/adr/0018").
     #
-    # 4. EMA is "use_ema"/"ema_momentum" on the optimizer, with three limitations this template does
+    # 4. EMA is "use_ema"/"ema_momentum" on the optimizer, with two limitations this template does
     #    not work around and does not hide (REFERENCE.md, "EMA"):
     #      - the average is updated on every "apply" call, including the accumulation no-ops of the
     #        window above, so its effective horizon is "accumulate_gradients" times shorter than the
     #        momentum suggests -- unlike the torch and flax "EMA" fields, which blend once per Update;
     #      - it belongs on the inner optimizer, which is what this pattern builds: under a float16
     #        policy the adapter wraps this optimizer in a "LossScaleOptimizer", and "use_ema" set on
-    #        that wrapper instead would do nothing;
-    #      - it keeps no separate averaged copy, so there is nothing to validate against until
-    #        "finalize_variable_values" overwrites the weights themselves. The INFERENCE_FLOW below
-    #        therefore reads "model", not an average -- Keras has no "ema_model" to point it at.
+    #        that wrapper instead would do nothing.
+    #    Keras keeps no separate averaged copy, so the INFERENCE_FLOW below reads "model" and not an
+    #    average -- there is no "ema_model" to point it at. It still validates over the averaged
+    #    weights: the generated "inference_step" swaps them into the model around the flow and puts
+    #    the trained ones back afterwards.
     #    "-p "SHARED: {ema: false}"" drops both keywords. Nothing on this backend needs that -- it is
     #    the torch twin whose FSDP2 runs refuse an average by design -- but the knob is spelled the
     #    same way on all three templates.
