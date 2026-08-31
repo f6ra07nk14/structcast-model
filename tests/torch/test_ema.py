@@ -5,6 +5,7 @@ average is worth depends on when it is blended, by how much, and whether it surv
 and none of that is decided until the emitted code runs.
 """
 
+from collections import OrderedDict
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType
@@ -12,9 +13,10 @@ from typing import Any
 
 import pytest
 from structcast.core.exceptions import SpecError
+from torch.distributed.fsdp import fully_shard
 
 from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
-from structcast_model.torch.distributed import SingleDeviceStrategy
+from structcast_model.torch.distributed import SingleDeviceStrategy, TensorParallelStrategy
 from structcast_model.torch.trainer import initial_model
 from structcast_model.utils.base import load_any
 from tests import FIXTURES_DIR
@@ -207,28 +209,60 @@ def test_a_name_the_average_needs_and_the_learner_already_uses_is_rejected() -> 
         TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
 
 
-class DTensor(torch.nn.Parameter):
-    """Stands in for a sharded FSDP2 parameter, which the generated guard recognizes by type name.
-
-    Naming is all the guard reads, deliberately: the generated learner cannot import
-    `torch.distributed.tensor` to run an `isinstance` check that would only ever matter in a run that
-    has already sharded, and a real `DTensor` needs a device mesh this test has no process group for.
-    """
-
-
-def test_a_model_reaching_the_learner_sharded_is_refused_rather_than_averaged(tmp_path: Path) -> None:
-    """An `AveragedModel` copies the module it averages, and a DTensor-parameter module has no copy.
+def test_a_model_reaching_the_learner_sharded_is_refused_rather_than_averaged(
+    tmp_path: Path, single_process_gloo: None
+) -> None:
+    """FSDP2 shards every parameter, and the class `fully_shard` gives the module forbids the copy.
 
     The models arrive already wrapped, so the learner is the first place this is knowable; refusing
-    it here is what keeps a half-copied shard out of a checkpoint nobody can tell apart from a good
-    one.
+    it here is what turns torch's bare "FSDP does not support deepcopy" assertion into a message
+    naming the model and the way out.
     """
     TorchLearnerBuilder(raw=_ema_raw(), current_path=str(LEARNER_YAML))()(tmp_path / "sharded.py")
-    model = _model(tmp_path)
-    model.fc.weight = DTensor(model.fc.weight.detach())
+    model = fully_shard(_model(tmp_path))
 
-    with pytest.raises(ValueError, match="EMA works with neither FSDP2 nor tensor parallel"):
+    with pytest.raises(ValueError, match="which an AveragedModel cannot average"):
         _load(tmp_path / "sharded.py", "sharded_learner").Learner(model)
+
+
+class _PartlyParallelizable(torch.nn.Module):
+    """Two parameter-bearing layers, of which a realistic tensor-parallel plan matches only one.
+
+    What every real plan produces: `parallelize_module` replaces the parameters of the modules it
+    matched and leaves the rest -- patch embeddings, heads, norms -- plain.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = torch.nn.Linear(4, 8)
+        self.head = torch.nn.Linear(8, 2)
+
+
+def test_a_tensor_parallel_model_is_refused_before_it_can_fail_mid_run(
+    tmp_path: Path, single_process_gloo: None
+) -> None:
+    """The copy a tensor-parallel model allows is worthless: the blend after it raises.
+
+    `get_ema_multi_avg_fn` calls `torch._foreach_lerp_` over the whole parameter list at once, and a
+    partially parallelized model hands it DTensors beside plain tensors. The first blend is the
+    *second* Update -- the first only seeds -- so without the refusal a run dies deep into training,
+    or later still under accumulation. The second half of this test is the reason for the first: it
+    is what has to stay broken for the refusal to be worth keeping, and the signal to revisit it
+    (issue #33) if torch ever makes the kernel mixed-safe.
+    """
+    TorchLearnerBuilder(raw=_ema_raw(), current_path=str(LEARNER_YAML))()(tmp_path / "parallel.py")
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=[("up", "column")])
+    model: Any = strategy.wrap(OrderedDict(model=_PartlyParallelizable()))["model"]
+    assert {type(p).__name__ for p in model.parameters()} == {"DTensor", "Parameter"}
+
+    with pytest.raises(ValueError, match="which an AveragedModel cannot average"):
+        _load(tmp_path / "parallel.py", "parallel_learner").Learner(model)
+
+    averaging = torch.optim.swa_utils.get_ema_multi_avg_fn(0.999)  # the default the builder fills in
+    average = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=averaging)
+    average.update_parameters(model)  # the seeding Update copies rather than blending, and survives
+    with pytest.raises(RuntimeError, match="mixed torch.Tensor and DTensor"):
+        average.update_parameters(model)
 
 
 def test_a_mapping_keeps_the_averaging_defaults_it_does_not_mention(tmp_path: Path) -> None:

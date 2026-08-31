@@ -393,16 +393,23 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
 
     @cached_property
     def _ema_lines(self) -> list[str]:
-        """Emit the `__init__` lines building each averaged model, refusing an already sharded one."""
+        """Emit the `__init__` lines building each averaged model, refusing a DTensor-parameter one."""
         lines: list[str] = []
         for model in self.ema:
             message = (
-                f'The exponential moving average of "{model}" cannot be built: an AveragedModel copies the '
-                "module it averages, and a module whose parameters are sharded (DTensor) has no copy to take. "
-                "EMA works with neither FSDP2 nor tensor parallel; drop the EMA entry, or train this model "
-                "under a strategy that keeps whole parameters."
+                f'The exponential moving average of "{model}" cannot be built: the module carries DTensor '
+                "parameters, which an AveragedModel cannot average. Under FSDP2 the deepcopy an AveragedModel "
+                "takes is forbidden by the class fully_shard gives the module; under tensor parallelism the "
+                "copy succeeds, but the averaging kernel torch._foreach_lerp_ then refuses the mixed DTensor "
+                "and plain parameter list any partial plan produces. Drop the EMA entry, or train this model "
+                "under a strategy that keeps whole parameters: a single device or DDP."
             )
             lines += [
+                # One parameter walk covers both refusals: FSDP2 shards every parameter and forbids the copy
+                # outright, tensor parallelism shards only the modules its plan matched and then breaks on the
+                # first blend of the mixed list that leaves behind. The type name is all the check reads --
+                # the generated learner cannot import `torch.distributed.tensor` for an `isinstance` -- and
+                # walking the parameters is what sees through a DDP or compile wrapper without naming either.
                 f'if any(type(p).__name__ == "DTensor" for p in {model}.parameters()):',
                 f"{' ' * 4}raise ValueError({message!r})",
                 "# Averaged over the module a DDP wrapper holds: the wrapper is not copyable, and the",

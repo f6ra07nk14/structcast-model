@@ -402,13 +402,15 @@ def test_learner_emits_the_average_over_the_module_a_wrapper_holds() -> None:
     Copying the DDP wrapper is not possible at all, and averaging is meant to happen over the weights
     either way, so the average is built over what the wrapper holds. `multi_avg_fn` is what makes it
     exponential: without it torch averages every Update equally, which is a different feature under
-    the same key. The build stays sharding-aware where it cannot work -- a DTensor parameter has no
-    copy -- and the average is never trained, so it is put in eval mode once (`docs/adr/0021`).
+    the same key. The build stays sharding-aware where it cannot work -- a DTensor parameter list is
+    one FSDP2 refuses to copy and one the averaging kernel refuses to blend -- and the average is
+    never trained, so it is put in eval mode once (`docs/adr/0021`).
     """
     script = _ema_script()
 
     assert 'if any(type(p).__name__ == "DTensor" for p in model.parameters()):' in script
-    assert "EMA works with neither FSDP2 nor tensor parallel" in script
+    assert "which an AveragedModel cannot average" in script
+    assert "torch._foreach_lerp_" in script
     assert (
         f"ema_model = torch.optim.swa_utils.AveragedModel({UNWRAPPED}, "
         "multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999))"

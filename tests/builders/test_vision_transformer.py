@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import pytest
 import timm
+from torch.distributed.fsdp import fully_shard
 
 from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
 from structcast_model.commands.utils import path_or_any_parser
@@ -336,32 +337,24 @@ def test_the_showcase_learner_adds_the_scaler_only_for_the_float16_precision(
     assert "torch.amp.GradScaler(device=device_type)" in scripts["float16"]
 
 
-class DTensor(torch.nn.Parameter):
-    """Stands in for a sharded FSDP2 parameter, which the generated EMA guard recognizes by type name.
+def test_the_showcase_drops_its_average_for_a_run_that_shards(
+    tmp_path_factory: pytest.TempPathFactory, single_process_gloo: None
+) -> None:
+    """A sharding run refuses an EMA by design, so the showcase has to be able to leave it out.
 
-    The same stand-in as the one in `tests/torch/test_ema.py`, which pins the refusal this test is the
-    counterpart of, and for the same reason: a real `DTensor` needs a device mesh no single-process
-    test has a process group for, and the guard reads the type name and nothing else.
-    """
-
-
-def test_the_showcase_drops_its_average_for_a_run_that_shards(tmp_path_factory: pytest.TempPathFactory) -> None:
-    """FSDP2 refuses an EMA by design, so the showcase has to be able to leave it out.
-
-    An `AveragedModel` copies the module it averages and a sharded module has no copy to take, which
-    the generated learner refuses in its own `__init__` -- so a template that declared `EMA`
-    unconditionally could not run its other three features under FSDP2 at all. `ema: false` is the
-    switch, and what it has to produce is a learner a sharded model can enter, validating over
-    `model` rather than over an average that no longer exists.
+    A DTensor parameter list is one FSDP2 refuses to copy and one the averaging kernel refuses to
+    blend, which the generated learner turns into its own `__init__` failure -- so a template that
+    declared `EMA` unconditionally could not run its other three features under FSDP2 or tensor
+    parallelism at all. `ema: false` is the switch, and what it has to produce is a learner a sharded
+    model can enter, validating over `model` rather than over an average that no longer exists.
     """
     generated = tmp_path_factory.mktemp("no_ema")
-    model = _showcase_model(generated, True)
-    model.head.weight = DTensor(model.head.weight.detach())
+    model = fully_shard(_showcase_model(generated, True))
     image, label = torch.randn(4, 3, 16, 16), torch.tensor([0, 1, 2, 3])
     TorchLearnerBuilder.from_path(SHOWCASE_YAML)()(generated / "averaged.py")
     TorchLearnerBuilder.from_path(SHOWCASE_YAML)(parameters={"SHARED": {"ema": False}})(generated / "plain.py")
 
-    with pytest.raises(ValueError, match="EMA works with neither FSDP2 nor tensor parallel"):
+    with pytest.raises(ValueError, match="which an AveragedModel cannot average"):
         _load(generated / "averaged.py").Learner(model)
     learner = _load(generated / "plain.py").Learner(model)
 
