@@ -39,9 +39,9 @@ _jinja_yaml_: |-
   #    property, so checkpoints and resume carry it. Point an "INFERENCE_FLOW" at "ema_model" to
   #    validate over the averaged weights; the training "FLOW" may not read it.
   #    "-p "SHARED: {ema: false}"" drops the field and points the "INFERENCE_FLOW" back at "model":
-  #    an "AveragedModel" copies the module it averages and a sharded one has no copy to take, so the
-  #    generated learner refuses an EMA under FSDP2 or tensor parallel by design. That switch is how
-  #    the other three features of this template run there.
+  #    a DTensor parameter list is one FSDP2 will not let an "AveragedModel" copy and one the
+  #    averaging kernel will not blend, so the generated learner refuses an EMA under FSDP2 or tensor
+  #    parallel by design. That switch is how the other three features of this template run there.
   {% if ema %}
   EMA:
     model:

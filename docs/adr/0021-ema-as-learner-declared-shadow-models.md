@@ -1,5 +1,21 @@
 # EMA instances are learner-declared shadow models
 
+> **Amended by torch 2.13 verification: the DTensor refusal is right, its recorded reason is only
+> half of it.** "An `AveragedModel` cannot copy a DTensor-parameter module" is not what happens: a
+> `DTensor` deep-copies fine, and the two strategies fail for two different reasons. Under FSDP2 the
+> copy is what fails — `fully_shard` swaps the module's class for a synthesized `FSDP<Cls>` carrying
+> a `__deepcopy__` that raises ("FSDP does not support deepcopy",
+> `torch/distributed/fsdp/_fully_shard/_fully_shard.py:299-302`, bound onto the class at
+> `_fsdp_init.py:425`). Under tensor parallelism the copy succeeds and the *blend* fails:
+> `parallelize_module` replaces only the parameters of the modules its plan matched, and
+> `get_ema_multi_avg_fn`'s `torch._foreach_lerp_` raises `RuntimeError: got mixed torch.Tensor and
+> DTensor` on the mixed list every realistic plan leaves — at the second Update, not the first, which
+> only seeds. The parameter-type check below therefore stays exactly as it is; only the explanation
+> changes. Enabling either (a DTensor-safe `multi_avg_fn` for the tensor-parallel case, a
+> clone-before-`wrap` assembly order for FSDP2) is tracked in
+> [issue #33](https://github.com/f6ra07nk14/structcast-model/issues/33); everything else below is
+> unchanged.
+
 Exponential moving averages are declared at the top level of a torch or flax learner template —
 `EMA: dict[str, bool | dict[str, Any]]`, keyed by model name — and emitted as named learner
 attributes `ema_<model>`: `torch.optim.swa_utils.AveragedModel` over the (DDP-unwrapped) model on
