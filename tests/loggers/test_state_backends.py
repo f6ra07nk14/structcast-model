@@ -85,7 +85,9 @@ def test_flax_backend_round_trips_a_state_the_strategy_can_load(tmp_path: Path) 
     strategy = FlaxDistributedStrategy(preset="single")
     model, optimizer = _trained()
     states: dict[str, Any] = strategy.state_dict({"model": model}, {"optimizer": optimizer})
-    states["grad_scalers"] = {}
+    # What a float16 learner puts in the slot: the carry of each segment's `DynamicScale`, which is
+    # plain numbers, so the item stays on the backend's JSON path rather than on its array one.
+    states["grad_scalers"] = {"optimizer_dynamic_scale": {"scale": 32768.0, "fin_steps": 3}}
     states["meta"] = {"epoch": 2, "step": 7, "update": 3, "optimizer_hashes": {"optimizer": "abc"}}
 
     path = FlaxStateBackend().save(states, tmp_path, "training_state")
@@ -93,7 +95,7 @@ def test_flax_backend_round_trips_a_state_the_strategy_can_load(tmp_path: Path) 
 
     assert path == tmp_path / "training_state.tar.gz"
     assert restored["meta"] == states["meta"]
-    assert restored["grad_scalers"] == {}
+    assert restored["grad_scalers"] == states["grad_scalers"]
     arrays = {key: states[key] for key in ("models", "optimizers")}
     back = {key: restored[key] for key in ("models", "optimizers")}
     assert _leaf_paths(back) == _leaf_paths(arrays)

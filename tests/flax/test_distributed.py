@@ -674,6 +674,80 @@ def test_the_fsdp_preset_shards_the_leading_dimension_of_the_large_parameters(tm
     assert result["optimizer"] == result["params"]
 
 
+SKIP_SCRIPT = """
+import json, sys
+from importlib.util import module_from_spec, spec_from_file_location
+import jax, jax.numpy as jnp
+from flax import nnx
+from structcast_model.flax.distributed import FlaxDistributedStrategy
+from structcast_model.flax.utils import donate_argnames
+
+def load(path, name):
+    spec = spec_from_file_location(name, path)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+directory, preset = sys.argv[1], sys.argv[2]
+# A tensor-parallel preset needs a second axis and a rule that actually splits something.
+extra = {"model_devices": 2, "rules": [(".*", "column")]} if "tp" in preset else {}
+strategy = FlaxDistributedStrategy(preset=preset, min_size=0, **extra)
+model = load(directory + "/model.py", "generated_model").Model(rngs=nnx.Rngs(params=jax.random.key(0)))
+strategy.wrap({"model": model})
+learner = load(directory + "/learner.py", "generated_learner").Learner(model)
+learner._training_step = strategy.compile(
+    learner._training_step, {"donate_argnames": donate_argnames(learner._training_step)}
+)
+x = jnp.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.5], [-1.0, 1.0, 0.0, 1.0]] * 2)
+y = jnp.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]] * 2)
+# The NaN sits in the last row, which on four devices is carried by the last shard alone --
+# of the batch, not of the gradient, which a batch-summed loss makes non-finite everywhere.
+poisoned = strategy.shard_batch({"x": x.at[-1, 0].set(jnp.nan), "y": y})
+clean = strategy.shard_batch({"x": x, "y": y})
+
+def kernel():
+    return [round(float(v), 6) for v in jnp.ravel(jax.device_get(model.fc.kernel[...]))]
+
+initial, scales, kernels = kernel(), [], []
+for batch in (poisoned, clean, clean, clean):
+    learner.training_step(**batch)
+    scales.append(float(learner.grad_scalers["optimizer_dynamic_scale"].scale))
+    kernels.append(kernel())
+print(json.dumps({"initial": initial, "scales": scales, "kernels": kernels}))
+"""
+
+
+@pytest.mark.parametrize("preset", ["dp", "fsdp", "tp"])
+def test_a_non_finite_shard_skips_the_update_of_a_scaled_learner_on_every_device(preset: str, tmp_path: Path) -> None:
+    """A NaN carried by one device's slice of the batch must stop the update on the whole run.
+
+    What this locks is end-to-end agreement: the sharded run decides exactly what the one-device run
+    decides, step for step and weight for weight, on the step it rejects as much as on the ones it
+    applies. That covers the loss and gradient reductions spanning the mesh, the rollback reaching
+    every shard of the parameters and the optimizer state, and the scale coming back replicated.
+
+    What it does not lock is the finiteness reduction being replicated rather than per-device: the
+    gradient of a batch-summed loss carries the NaN into every parameter element on every device
+    long before `is_finite` runs, so a per-device answer would look the same here. That property
+    comes from GSPMD's single logical program -- the reduction lowers to a partial reduce plus the
+    all-reduce the partitioner inserts -- which is why the step names no `axis_name` and calls no
+    `lax.pmean`, as it would have to under `pmap` or `shard_map`. Poisoning one gradient shard alone
+    would take reaching inside the step, which is what this end-to-end test exists not to do.
+    """
+    FlaxBuilder.from_path(CFG_DIR / "Linear.yaml")()(tmp_path / "model.py")
+    FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(
+        parameters={"DEFAULT": {"mixed_precision": {"growth_interval": 2}}}
+    )(tmp_path / "learner.py")
+
+    one = _run_script(SKIP_SCRIPT, tmp_path, str(tmp_path), "single", devices=1)
+    four = _run_script(SKIP_SCRIPT, tmp_path, str(tmp_path), preset, devices=4)
+
+    assert four["kernels"][0] == four["initial"]
+    assert four["kernels"][1] != four["initial"]
+    assert four["scales"] == one["scales"] == [32768.0, 32768.0, 32768.0, 65536.0]
+    assert four["kernels"] == one["kernels"]
+
+
 @pytest.mark.parametrize("preset", ["dp", "fsdp"])
 def test_a_generated_learner_trains_to_the_same_losses_on_four_devices(preset: str, tmp_path: Path) -> None:
     """A run must not depend on how many devices it was given, or a sharded run cannot be trusted.

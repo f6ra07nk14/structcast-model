@@ -288,6 +288,16 @@ the parameters, exactly as the optimizers are built `wrt=Param`."""
 class FlaxUserDefinedLearner(UserDefinedLearner[LearnerBehavior]):
     """User defined learner configuration for Flax."""
 
+    MIXED_PRECISION: bool | dict[str, Any] = False
+    """Whether to scale the loss of every segment with a `flax.training.dynamic_scale.DynamicScale`.
+
+    A dictionary enables it too and carries the keyword arguments of that class -- `growth_interval`,
+    `backoff_factor`, the initial `scale`. There is no element-type field beside it: Flax carries
+    precision on the model, as the `dtype` (compute) and `param_dtype` (storage) of each layer, so
+    the learner cannot pick one and this field only says whether the loss the learner differentiates
+    is scaled. It is what a `dtype: float16` model needs and a `bfloat16` one does not.
+    """
+
     EMA: dict[str, bool | dict[str, Any]] = Field(default_factory=dict)
     """The models an exponential moving average shadows, keyed by the model name.
 
@@ -310,6 +320,9 @@ class FlaxOptimizerSegment(OptimizerSegment):
 
     optimizer_hash: str
     """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES` in the learner."""
+
+    scale: str | None = None
+    """The variable name of the segment's `DynamicScale`, or `None` if its loss is not scaled."""
 
 
 class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
@@ -351,6 +364,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     _learner_members: ClassVar[frozenset[str]] = frozenset(
         {
             "flow_functions",
+            "grad_scalers",
             "has_updated",
             "inference_step",
             "inputs",
@@ -373,7 +387,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     )
     """Every attribute and property the generated class defines, besides the per-model view attributes."""
 
-    _step_locals: ClassVar[frozenset[str]] = frozenset({"_", "_before", "_grads", "_has_updated", "lrs"})
+    _step_locals: ClassVar[frozenset[str]] = frozenset({"_", "_before", "_grads", "_has_updated", "_loss_scale", "lrs"})
     """The names the generated training step binds for itself, between the flow calls it makes."""
 
     ema: tuple[str, ...] = ()
@@ -382,6 +396,11 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
     Each one becomes the `flax.nnx.EMA` state `_ema_state_<model>` and the callable view `ema_<model>`
     it applies to the model, built from the expression the builder registered under that name in
     `others`."""
+
+    @cached_property
+    def mixed_precision_scales(self) -> list[str]:
+        """The `DynamicScale` of each segment whose loss is scaled, in flow order."""
+        return unique([u.scale for u in self.flow if isinstance(u, FlaxOptimizerSegment) and u.scale])
 
     @cached_property
     def _inference_shadows(self) -> list[str]:
@@ -485,32 +504,50 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                     f'LOSS "{segment.loss}". A Flax segment only differentiates what its own flow computes.'
                 )
             returns = f"({', '.join(aux)},)"
-            definitions.append(f"def _flow_{segment.optimizer}({', '.join([*models, *passed])}):")
-            definitions += [f"    {line}" for line in [*body, f"return {segment.loss}, {returns}"]]
+            # A scaled segment differentiates its loss multiplied by the scale it is handed, and
+            # reports the plain one as its criterion: what the scale keeps out of the float16
+            # underflow range is the backward pass, not the number the run is judged by.
+            scaled = f"{segment.loss} * _loss_scale" if segment.scale else segment.loss
+            parameters = [*models, *passed, *(["_loss_scale"] if segment.scale else [])]
+            definitions.append(f"def _flow_{segment.optimizer}({', '.join(parameters)}):")
+            definitions += [f"    {line}" for line in [*body, f"return {scaled}, {returns}"]]
             # The owned models are the leading parameters, so their positions are the `argnums`; the
             # default of 0 already names the single owned model of a one-module segment.
             argnums = f", argnums={tuple(range(len(owned)))}" if len(owned) > 1 else ""
-            arguments = ", ".join([*models, *(f"{name}={name}" for name in passed)])
+            values = [f"{name}={name}" for name in passed]
+            if segment.scale:
+                values.append(f"_loss_scale={segment.scale}.scale")
+            arguments = ", ".join([*models, *values])
             grad = f"flax.nnx.value_and_grad(_flow_{segment.optimizer}{argnums}, has_aux=True)({arguments})"
             step.append(f"(_, {returns}), _grads = {grad}")
-            if index == 0:
-                step += [
-                    "# The first optimizer is the learner's clock: with an optax.MultiSteps window the",
-                    "# device decides which step an update lands on, so the count it advanced is read",
-                    "# across this update. Without a window there is no counter and every step applies.",
-                    f"_before = gradient_steps({segment.optimizer})",
-                ]
-            step.append(f"{segment.optimizer}.update({_owned(owned)}, _grads{extra})")
-            if index == 0:
-                step.append(
-                    f"_has_updated = True if _before is None else gradient_steps({segment.optimizer}) > _before"
-                )
+            clock = [
+                "# The first optimizer is the learner's clock: with an optax.MultiSteps window the",
+                "# device decides which step an update lands on, so the count it advanced is read",
+                "# across this update. Without a window there is no counter and every step applies.",
+            ]
+            if segment.scale:
+                # The helper divides the scale back out, keeps the state it just wrote wherever a
+                # gradient came back non-finite, and reports the apply it attempted either way.
+                if index == 0:
+                    step += clock
+                target = "_has_updated" if index == 0 else "_"
+                update = f"update_with_loss_scale({_owned(owned)}, {segment.optimizer}, _grads, {segment.scale}{extra})"
+                step.append(f"{target}, {segment.scale} = {update}")
+            else:
+                if index == 0:
+                    step += [*clock, f"_before = gradient_steps({segment.optimizer})"]
+                step.append(f"{segment.optimizer}.update({_owned(owned)}, _grads{extra})")
+                if index == 0:
+                    step.append(
+                        f"_has_updated = True if _before is None else gradient_steps({segment.optimizer}) > _before"
+                    )
         rates = ", ".join(f"{name!r}: get_learning_rate({name})" for name in self.optimizers)
+        carried = "".join(f", {name}" for name in self.mixed_precision_scales)
         step += [
             "# Read at trace time: the walk compiles to a reference to the injected rate rather than to",
             "# a host read, which after the step would touch the state buffers the caller donated.",
             f"lrs = {{{rates}}}",
-            f"return {self._forward_outputs}, lrs, _has_updated",
+            f"return {self._forward_outputs}, lrs, _has_updated{carried}",
         ]
         return definitions, step
 
@@ -546,7 +583,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                     "average is a copy the optimizers never touch, and differentiating it trains nothing. "
                     "Read it from INFERENCE_FLOW instead."
                 )
-        state = [*self.models, *self.optimizers]
+        state = [*self.models, *self.optimizers, *self.mixed_precision_scales]
         reserved = {
             "self",
             "kwargs",
@@ -589,7 +626,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         view = (
             "flax.nnx.view({0}, raise_if_not_found=False, training=False, deterministic=True, use_running_average=True)"
         )
-        state = ", ".join(f"self.{name}" for name in [*self.models, *self.optimizers])
+        scales = self.mixed_precision_scales
+        carried = "".join(f", self.{name}" for name in scales)
+        state = ", ".join(f"self.{name}" for name in [*self.models, *self.optimizers, *scales])
         shadows = [f"ema_{name}" for name in self._inference_shadows]
         views = ", ".join(f"self._view_{name}" for name in [*self.models, *shadows])
         models_repr = ", ".join(f"{name!r}: self.{name}" for name in [*self.models, *[f"ema_{n}" for n in self.ema]])
@@ -600,6 +639,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         body = [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]
         body += [f"self.{name} = {name}" for name in self.models]
         body += [f"self.{name} = {self.others[name]}" for name in self.optimizers]
+        body += [f"self.{name} = {self.others[name]}" for name in scales]
         body += [
             "self._steps = 0",
             "self._updates = 0",
@@ -613,7 +653,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             body.append(f"self.ema_{name} = self._ema_state_{name}.apply_to({name})")
         body += [f"self._view_{name} = {view.format(f'self.{name}')}" for name in shadows]
         body += self._forward_training_flow
-        body.append(f"def _training_step({', '.join([*self.models, *self.optimizers])}, {named}**kwargs):")
+        body.append(f"def _training_step({', '.join([*self.models, *self.optimizers, *scales])}, {named}**kwargs):")
         body += [f"{indent}{line}" for line in self._training_flow_parts[1]]
         body.append(f"def _inference_step({', '.join([*self.models, *shadows])}, {named}**kwargs):")
         body += [f"{indent}{line}" for line in self._forward_inference_flow]
@@ -634,6 +674,25 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             else []
         )
         updates = "".join(f"\n{indent * 2}{line}" for line in averages)
+        scalers = (
+            "\n    @property\n    def grad_scalers(self):\n"
+            f"        return {{{', '.join(f'{name!r}: self.{name}' for name in scales)}}}\n"
+            if scales
+            else ""
+        )
+        scaling = (
+            """
+
+    Each optimizer segment carries a `flax.training.dynamic_scale.DynamicScale`: its flow
+    differentiates the loss multiplied by the current scale, the update divides it back out, and a
+    gradient that came back non-finite leaves the parameters and the optimizer state -- the
+    accumulation window included -- as they were, while the scale backs off. The counters keep
+    intent through that: `has_updated` reports that an apply was attempted, not that the scale let
+    it land. Each scale is a parameter and a result of the training step, so a compiled step carries
+    it with the rest of the state."""
+            if scales
+            else ""
+        )
         return f"""\
 class {self.classname}:
     \"\"\"Learner generated from a Flax (nnx) learner template.
@@ -652,7 +711,7 @@ class {self.classname}:
     by comparing the first optimizer's applied count across its update -- without a window every
     step applies -- and `updates` accumulates it. `restore_counters` seeds both from a checkpoint.
     `outputs` names the criteria the steps return, and `inference_step` runs against inference views
-    of the models, which share their arrays with the trained ones.
+    of the models, which share their arrays with the trained ones.{scaling}
     \"\"\"
 
     OPTIMIZER_HASHES: dict[str, str] = {{{hashes}}}
@@ -662,7 +721,7 @@ class {self.classname}:
 
     def training_step(self, {inputs}**kwargs):
         self._steps += 1
-        criteria, learning_rates, has_updated = self._training_step({state}, {passed}**kwargs)
+        criteria, learning_rates, has_updated{carried} = self._training_step({state}, {passed}**kwargs)
         self._learning_rates = learning_rates
         self._has_updated = bool(has_updated)
         self._updates += int(self._has_updated){updates}
@@ -698,7 +757,7 @@ class {self.classname}:
     @property
     def optimizer_models(self):
         return {{{optimizer_models}}}
-
+{scalers}
     @property
     def flow_functions(self):
         return {{"_training_step": self._training_step, "_inference_step": self._inference_step}}
@@ -746,7 +805,33 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             optimizer=base.optimizer,
             trainable_layers=base.trainable_layers,
             optimizer_hash=optimizer_hash(learner.OPTIMIZER),
+            scale=self._register_loss_scale(imports, module.MIXED_PRECISION, opt_name, naming, layers, others),
         )
+
+    def _register_loss_scale(
+        self,
+        imports: defaultdict[str, set[str | None]],
+        mixed_precision: bool | dict[str, Any],
+        opt_name: str,
+        naming: AutoName,
+        layers: dict[str, LayerIntermediate | str],
+        others: dict[str, str],
+    ) -> str | None:
+        """Register the segment's `DynamicScale`, named after its optimizer as the torch scaler is.
+
+        Nothing is registered when the loss is not scaled, which is what keeps a learner without the
+        field emitting the code it emitted before there was one.
+        """
+        if isinstance(mixed_precision, bool) and not mixed_precision:
+            return None
+        if (name := naming(f"{opt_name}_dynamic_scale")) in layers or name in others:
+            raise SpecError(f'Duplicate variable name "{name}" for the loss scale found in the learner flow.')
+        imports["structcast_model.flax.optimizers"].add("loss_scale")
+        imports["structcast_model.flax.optimizers"].add("update_with_loss_scale")
+        options = {} if isinstance(mixed_precision, bool) else mixed_precision
+        keywords = ", ".join(f"{key}={resolve_getter(imports, value)}" for key, value in options.items())
+        others[name] = f"loss_scale({keywords})"
+        return name
 
     def _register_shadow_models(
         self,

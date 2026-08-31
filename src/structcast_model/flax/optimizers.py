@@ -1,9 +1,10 @@
-"""Read and mask optimizer state for Flax (nnx) learners."""
+"""Read and mask optimizer state for Flax (nnx) learners, and scale one segment's update."""
 
 from collections.abc import Callable
 from re import compile as re_compile
 from typing import TYPE_CHECKING, Any
 
+from flax.training.dynamic_scale import DynamicScale
 import jax
 import jax.numpy as jnp
 import optax
@@ -97,6 +98,84 @@ def gradient_steps(optimizer: Any) -> jax.Array | None:
     return None
 
 
+def loss_scale(**options: Any) -> DynamicScale:
+    """Build the `flax.training.dynamic_scale.DynamicScale` a float16 learner carries.
+
+    The carry is pinned to its device element types instead of the Python `int` and `float` the
+    dataclass defaults to: the step returns a new scale built from `jax.numpy.where`, so a carry
+    handed in as a Python scalar has a different element type on the second call than on the first,
+    which recompiles the whole step and leaves its first-call donation with nothing to donate.
+
+    Args:
+        **options: Keyword arguments of `DynamicScale`, e.g. `growth_interval` or `scale`.
+
+    Returns:
+        DynamicScale: The scale to hand to the first training step.
+
+    Example:
+        >>> from structcast_model.flax.optimizers import loss_scale
+        >>> scale = loss_scale(growth_interval=100)
+        >>> scale.scale.dtype, scale.fin_steps.dtype
+        (dtype('float32'), dtype('int32'))
+    """
+    scale = DynamicScale(**options)
+    return scale.replace(fin_steps=jnp.asarray(scale.fin_steps, jnp.int32), scale=jnp.asarray(scale.scale, jnp.float32))
+
+
+def update_with_loss_scale(
+    models: Any, optimizer: Any, grads: Any, dynamic_scale: DynamicScale, /, **extra: Any
+) -> tuple[Any, DynamicScale]:
+    """Apply one optimizer update against gradients a `DynamicScale` scaled, and advance the scale.
+
+    The gradients arrive multiplied by `dynamic_scale.scale`, because the differentiated flow scaled
+    its loss by it: they are divided back out in float32 here, exactly as `DynamicScale.value_and_grad`
+    would have. That method is not what produced them -- it wraps `jax.value_and_grad`, which
+    differentiates a plain pytree rather than the module graph `flax.nnx.value_and_grad` follows, so
+    it would leave a model's batch statistics and its RNG counters behind -- so the scale is advanced
+    here by handing its own dynamics a scalar carrying nothing but whether the gradients were finite.
+
+    A non-finite gradient rolls the whole update back through `jax.numpy.where` over the state the
+    update wrote: the parameters and the optimizer state, which under an `optax.MultiSteps` window
+    includes the accumulator and the window counter, so the poisoned micro-step is dropped rather
+    than the window it landed in. The RNG state is left out of the rollback, and the batch statistics
+    the forward wrote sit in both snapshots unchanged: the forward pass ran, only the update is undone.
+
+    The reported update is intent, not detection: the window counter is read before the rollback, so
+    a step whose apply was skipped still reports the update it attempted, as the torch gradient
+    scaler's does.
+
+    Args:
+        models (Any): The modules the optimizer owns, one module or a tuple of them.
+        optimizer (Any): The `flax.nnx.Optimizer` to apply.
+        grads (Any): The scaled gradients of the segment's flow.
+        dynamic_scale (DynamicScale): The scale the loss was multiplied by.
+        **extra: Further keyword arguments for `flax.nnx.Optimizer.update`.
+
+    Returns:
+        tuple[Any, DynamicScale]: Whether an update was attempted, and the advanced scale.
+    """
+    grads = jax.tree.map(lambda gradient: jnp.asarray(gradient, jnp.float32) / dynamic_scale.scale, grads)
+    finite = jax.tree.reduce(lambda seen, g: seen & jnp.all(jnp.isfinite(g)), grads, jnp.asarray(True))
+    # Differentiating `x * carrier` reproduces `carrier` as the gradient DynamicScale inspects, which
+    # is finite exactly when the real gradients are: the growth interval, the backoff and the floor
+    # then stay flax's own rather than a second copy of them here.
+    carrier = jnp.where(finite, 0.0, jnp.nan)
+    dynamic_scale, finite, _, _ = dynamic_scale.value_and_grad(lambda x: x * carrier)(jnp.float32(1.0))
+    node = (models, optimizer)
+    prior = nnx.to_pure_dict(nnx.state(node, nnx.Not(nnx.RngState)))
+    before = gradient_steps(optimizer)
+    optimizer.update(models, grads, **extra)
+    # Read before the rollback below, which would revert the count with the rest of the state:
+    # either read is None exactly when the transformation carries no window at all.
+    after = gradient_steps(optimizer)
+    has_updated = True if before is None or after is None else after > before
+    applied = nnx.state(node, nnx.Not(nnx.RngState))
+    kept = jax.tree.map(lambda new, old: jnp.where(finite, new, old), nnx.to_pure_dict(applied), prior)
+    nnx.replace_by_pure_dict(applied, kept)
+    nnx.update(node, applied)
+    return has_updated, dynamic_scale
+
+
 def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     r"""Build an optax mask excluding the parameters whose path matches any of the regexes.
 
@@ -128,7 +207,14 @@ def no_weight_decay_mask(*regexes: str) -> Callable[[Any], Any]:
     return mask
 
 
-__all__ = ["get_learning_rate", "gradient_steps", "no_weight_decay_mask", "unwrap_variables"]
+__all__ = [
+    "get_learning_rate",
+    "gradient_steps",
+    "loss_scale",
+    "no_weight_decay_mask",
+    "unwrap_variables",
+    "update_with_loss_scale",
+]
 
 
 if not TYPE_CHECKING:

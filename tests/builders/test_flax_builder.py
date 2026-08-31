@@ -486,6 +486,71 @@ def test_flax_learner_detects_its_updates_inside_the_step() -> None:
     assert "need_update" not in script
 
 
+def test_flax_learner_scales_the_loss_it_differentiates_and_carries_the_scale_through_the_step() -> None:
+    """`MIXED_PRECISION` puts one `DynamicScale` per segment on the learner and threads it through.
+
+    The scale multiplies the loss inside the differentiated flow -- that is what keeps a float16
+    backward out of the underflow range -- while the criterion the step reports stays the plain one.
+    It reaches the flow as a parameter and leaves the step as a result, so a compiled step donates
+    and returns it with the models and the optimizers rather than closing over the value the learner
+    was built with, and the learner exposes it under the `grad_scalers` name a checkpoint saves.
+    """
+    script = _learner_script(LEARNER_YAML, {"DEFAULT": {"mixed_precision": {"growth_interval": 100}}})
+
+    assert "self.optimizer_dynamic_scale = loss_scale(growth_interval=100)" in script
+    assert "def _flow_optimizer(model, x, y, _loss_scale):" in script
+    assert "return loss * _loss_scale, (loss,)" in script
+    assert "def _training_step(model, optimizer, optimizer_dynamic_scale, *, x, y, **kwargs):" in script
+    assert "_loss_scale=optimizer_dynamic_scale.scale)" in script
+    assert (
+        "_has_updated, optimizer_dynamic_scale = update_with_loss_scale("
+        "model, optimizer, _grads, optimizer_dynamic_scale)"
+    ) in script
+    assert "return {'loss': loss}, lrs, _has_updated, optimizer_dynamic_scale\n" in script
+    assert (
+        "criteria, learning_rates, has_updated, self.optimizer_dynamic_scale = self._training_step("
+        "self.model, self.optimizer, self.optimizer_dynamic_scale, x=x, y=y"
+    ) in script
+    assert "return {'optimizer_dynamic_scale': self.optimizer_dynamic_scale}" in script
+    # The plain update path is gone with the scaled one in: only one of them may write the state.
+    assert "optimizer.update(model, _grads)" not in script
+
+
+def test_flax_learner_without_mixed_precision_emits_no_scale_at_all() -> None:
+    """The field defaults to off, and off has to mean the code a learner emitted before it existed.
+
+    Every learner in the repository is unscaled, so anything the scaled path emits unconditionally
+    -- an import, a step parameter, a helper call -- would change every generated file at once.
+    """
+    script = _learner_script(LEARNER_YAML)
+    imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
+
+    assert "loss_scale" not in script
+    assert "_loss_scale" not in script
+    assert "dynamic_scale" not in script
+    assert "grad_scalers" not in script
+    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
+
+
+def test_flax_learner_scales_every_segment_on_its_own_scale() -> None:
+    """One scale per optimizer, as the torch learner builds one gradient scaler per optimizer.
+
+    A segment whose gradients overflow may not stop the segments beside it from applying, and the
+    two converge on different factors because they differentiate different losses.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["MIXED_PRECISION"] = True
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "self.optimizer_ab_dynamic_scale = loss_scale()" in script
+    assert "self.optimizer_c_dynamic_scale = loss_scale()" in script
+    # The clock is still the first segment alone: the later ones report no update of their own.
+    assert "_has_updated, optimizer_ab_dynamic_scale = update_with_loss_scale((a, b), optimizer_ab," in script
+    assert "_, optimizer_c_dynamic_scale = update_with_loss_scale(c, optimizer_c," in script
+    assert "lrs, _has_updated, optimizer_ab_dynamic_scale, optimizer_c_dynamic_scale\n" in script
+
+
 def test_flax_learner_detects_on_the_first_optimizer_alone() -> None:
     """One learner, one update count, and the first segment is the clock it runs on.
 
@@ -751,9 +816,19 @@ def _build(raw: dict[str, Any]) -> None:
         (lambda raw: _rename_model(raw, "inputs"), 'Name "inputs" is reserved'),
         (lambda raw: _rename_model(raw, "training_step"), 'Name "training_step" is reserved'),
         (lambda raw: _rename_input(raw, "kwargs"), 'Name "kwargs" is reserved'),
+        # Reserved whether or not this learner scales anything: the property exists on the class as
+        # soon as one segment does, and a batch entry of that name would shadow it for every learner.
+        (lambda raw: _rename_input(raw, "grad_scalers"), 'Name "grad_scalers" is reserved'),
         (lambda raw: raw["LEARNERS"][0].update(NAME="self"), 'Name "self" is reserved'),
     ],
-    ids=["optimizer-named-like-an-input", "model-named-inputs", "model-named-training-step", "input-kwargs", "self"],
+    ids=[
+        "optimizer-named-like-an-input",
+        "model-named-inputs",
+        "model-named-training-step",
+        "input-kwargs",
+        "input-grad-scalers",
+        "self",
+    ],
 )
 def test_flax_learner_rejects_a_name_the_generated_class_cannot_carry(
     mutate: Callable[[dict[str, Any]], Any], message: str
@@ -794,8 +869,12 @@ def test_flax_learner_rejects_a_model_named_like_the_view_of_another() -> None:
         lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "lrs", None]),
         lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_grads", None]),
         lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "model", None]),
+        # `_loss_scale` is the scaled flow's own parameter, refused on every learner: the guard is
+        # uniform, so an output that would shadow it cannot slip through on the unscaled path and
+        # then break when the template turns `MIXED_PRECISION` on.
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_loss_scale", None]),
     ],
-    ids=["learning-rates", "gradients", "model"],
+    ids=["learning-rates", "gradients", "model", "loss-scale"],
 )
 def test_flax_learner_rejects_a_flow_output_the_step_already_binds(mutate: Callable[[dict[str, Any]], Any]) -> None:
     """The step binds the flow results next to the names it computes itself, so the two may not meet.

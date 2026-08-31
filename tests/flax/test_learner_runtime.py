@@ -36,6 +36,14 @@ X = jnp.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0]])
 
 Y = jnp.asarray([[1.0, -1.0], [0.5, 0.25]])
 
+POISONED = X.at[0, 0].set(jnp.nan)
+"""The fixed batch with one NaN in it, which is what makes a step's gradients come back non-finite.
+
+Injected through the batch rather than into the gradients: the whole path a loss scale sits on --
+the scaled flow, the unscaling, the finiteness check and the skip -- then runs the way a real step
+runs it, and nothing inside the generated learner has to be reached into.
+"""
+
 
 def _load(path: Path, name: str) -> ModuleType:
     """Load a generated module by file path, the way a configuration does: not by import name."""
@@ -156,6 +164,65 @@ def test_accumulated_gradients_apply_only_on_the_gated_step(
     assert (learner.steps, learner.updates) == (len(gates), sum(gates))
 
 
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_a_scaled_learner_backs_off_and_grows_over_the_steps_it_skipped(tmp_path: Path, compiled: bool) -> None:
+    """The scale is the mechanism, so the assertion is its trajectory, not a flag.
+
+    One non-finite step halves it, the finite ones after it hold it, and it doubles once the run of
+    finite steps reaches the growth interval. The parameters say the same from the other side: they
+    may not move on the step the scale rejected and must move on every other one. The counters keep
+    reporting the apply that was attempted, as the torch gradient scaler's do -- a skipped apply is
+    still an update the schedules it drives are indexed by.
+
+    Compiled as well as eager, under the donation the command derives from the step's signature: the
+    scale is one more donated argument and one more result there, and a carry that did not survive
+    that round trip would leave every step scaling by the value the learner was built with.
+    """
+    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"mixed_precision": {"growth_interval": 2}}})(
+        _model_type(tmp_path)(rngs=nnx.Rngs(0))
+    )
+    assert donate_argnames(learner._training_step) == ("model", "optimizer", "optimizer_dynamic_scale")
+    if compiled:
+        step = learner._training_step
+        learner._training_step = nnx.jit(step, donate_argnames=donate_argnames(step))
+    previous = _parameters(learner.models["model"])
+
+    scales, moved = [], []
+    for batch in (POISONED, X, X, X):
+        learner.training_step(x=batch, y=Y)
+        scales.append(float(learner.grad_scalers["optimizer_dynamic_scale"].scale))
+        current = _parameters(learner.models["model"])
+        moved.append(not all(jnp.array_equal(a, b) for a, b in zip(previous, current, strict=True)))
+        previous = current
+
+    assert scales == [32768.0, 32768.0, 32768.0, 65536.0]
+    assert moved == [False, True, True, True]
+    assert (learner.steps, learner.updates, learner.has_updated) == (4, 4, True)
+
+
+def test_an_overflowed_micro_step_pauses_the_window_it_landed_in(tmp_path: Path) -> None:
+    """A window whose micro-step overflowed drops that micro-step, not the window.
+
+    The skip rolls the optimizer state back, and an `optax.MultiSteps` keeps its accumulator and its
+    window counter there, so the non-finite gradients never enter the accumulation and the window
+    closes one step later than it would have. The torch twin drops the whole window instead: its
+    accumulator is each parameter's own gradient buffer, which a scaler can only discard entire.
+    """
+    parameters = {"DEFAULT": {"accumulate_gradients": 2, "mixed_precision": True}}
+    learner = _learner_type(tmp_path, parameters=parameters)(_model_type(tmp_path)(rngs=nnx.Rngs(0)))
+    previous = _parameters(learner.models["model"])
+
+    moved = []
+    for batch in (POISONED, X, X):
+        learner.training_step(x=batch, y=Y)
+        current = _parameters(learner.models["model"])
+        moved.append(not all(jnp.array_equal(a, b) for a, b in zip(previous, current, strict=True)))
+        previous = current
+
+    assert moved == [False, False, True]
+    assert (learner.steps, learner.updates) == (3, 1)
+
+
 def test_each_optimizer_moves_only_the_models_it_owns(tmp_path: Path) -> None:
     """Two segments: each optimizer applies its own rate to the parameters it owns, and to no other.
 
@@ -272,15 +339,16 @@ def test_a_value_no_later_code_reads_never_leaves_the_differentiated_closure(tmp
 
 
 @pytest.mark.parametrize(
-    ("path", "models", "accumulate", "rates"),
+    ("path", "models", "accumulate", "rates", "scaled"),
     [
-        (LEARNER_YAML, 1, 3, {"optimizer": pytest.approx(0.1)}),
-        (SEGMENTS_YAML, 3, 2, {"optimizer_ab": pytest.approx(0.1), "optimizer_c": pytest.approx(0.01)}),
+        (LEARNER_YAML, 1, 3, {"optimizer": pytest.approx(0.1)}, False),
+        (SEGMENTS_YAML, 3, 2, {"optimizer_ab": pytest.approx(0.1), "optimizer_c": pytest.approx(0.01)}, False),
+        (LEARNER_YAML, 1, 3, {"optimizer": pytest.approx(0.1)}, True),
     ],
-    ids=["one-segment", "two-segments"],
+    ids=["one-segment", "two-segments", "one-segment-scaled"],
 )
 def test_compiled_training_step_never_retraces_across_the_window(
-    tmp_path: Path, path: Path, models: int, accumulate: int, rates: dict[str, Any]
+    tmp_path: Path, path: Path, models: int, accumulate: int, rates: dict[str, Any], scaled: bool
 ) -> None:
     """The step is compilable at the seam the learner exposes, and one trace covers the whole run.
 
@@ -290,10 +358,12 @@ def test_compiled_training_step_never_retraces_across_the_window(
     `flow_functions` is an attribute holding the current implementation, so compiling is
     `setattr(learner, name, compile(getattr(learner, name)))`. Donating every state parameter the
     step declares has to be safe there, on every segment count -- a buffer the caller still holds
-    would make XLA warn and silently copy instead.
+    would make XLA warn and silently copy instead. A loss scale is one more such parameter and one
+    more result, and a carry whose element types changed between two calls would trace twice.
     """
     model_type = _model_type(tmp_path)
-    learner = _learner_type(tmp_path, path, parameters={"DEFAULT": {"accumulate_gradients": accumulate}})(
+    parameters = {"DEFAULT": {"accumulate_gradients": accumulate, "mixed_precision": scaled}}
+    learner = _learner_type(tmp_path, path, parameters=parameters)(
         *[model_type(rngs=nnx.Rngs(seed)) for seed in range(models)]
     )
     step = learner._training_step

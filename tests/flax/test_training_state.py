@@ -77,12 +77,23 @@ def make_learner(tmp_path_factory: pytest.TempPathFactory) -> Callable[..., Any]
     FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(parameters={"DEFAULT": {"accumulate_gradients": 2}})(
         directory / "windowed.py"
     )
+    # A growth interval of one so two clean steps actually move the scale: a scale that never left
+    # its initial value would survive a resume that restored nothing at all.
+    FlaxLearnerBuilder.from_path(CFG_DIR / "LinearLearner.yaml")(
+        parameters={"DEFAULT": {"mixed_precision": {"scale": 1024.0, "growth_interval": 1}}}
+    )(directory / "scaled.py")
     model_type = _load(directory / "model.py", "generated_model").Model
     learner_type = _load(directory / "learner.py", "generated_learner").Learner
     windowed_type = _load(directory / "windowed.py", "generated_windowed").Learner
+    scaled_type = _load(directory / "scaled.py", "generated_scaled").Learner
 
-    def _build(seed: int = 0, window: bool = False) -> Any:
-        """Build a learner over a model initialized from *seed*; with *window*, a `MultiSteps` of two."""
+    def _build(seed: int = 0, window: bool = False, scaled: bool = False) -> Any:
+        """Build a learner over a model initialized from *seed*.
+
+        With *window*, a `MultiSteps` of two; with *scaled*, a `DynamicScale` on its loss.
+        """
+        if scaled:
+            return scaled_type(model_type(rngs=nnx.Rngs(seed)))
         return (windowed_type if window else learner_type)(model_type(rngs=nnx.Rngs(seed)))
 
     return _build
@@ -162,6 +173,40 @@ def test_the_saver_writes_one_resumable_state_per_epoch(
     assert states["meta"] == {"epoch": 2, "step": 2, "update": 2, "seed": 42}
     assert list(states["models"]) == ["model"]
     assert list(states["optimizers"]) == ["optimizer"]
+
+
+def test_a_loss_scale_that_moved_comes_back_from_the_saved_state(
+    make_learner: Callable[..., Any], strategy: FlaxDistributedStrategy
+) -> None:
+    """A float16 run carries its loss scale beside its weights, and a resume has to continue it.
+
+    The scale converges on the largest factor the gradients tolerate, so a resume that restarted it
+    at the configured value would spend those steps again -- and overflow through every one of them.
+    It travels in the same `grad_scalers` slot the torch scaler states travel in, as the two numbers
+    a `DynamicScale` carries, which is what keeps the slot JSON on the way out as it was when it was
+    always empty.
+    """
+    recorder = _RecordingLogger()
+    trained = make_learner(scaled=True)
+    _trainer(trained, [FlaxTrainingStateSaver(logger=recorder, strategy=strategy)]).fit(epochs=2)
+    saved, _ = recorder.states[-1]
+
+    assert saved["grad_scalers"] == {"optimizer_dynamic_scale": {"scale": 2048.0, "fin_steps": 0}}
+
+    resumed = make_learner(seed=7, scaled=True)
+    restore_training_state(
+        resume="whatever",
+        strategy=strategy,
+        models=resumed.models,
+        learner=resumed,
+        start_epoch=1,
+        logger=_StateLogger(saved),
+    )
+
+    restored = resumed.grad_scalers["optimizer_dynamic_scale"]
+    assert (float(restored.scale), int(restored.fin_steps)) == (2048.0, 0)
+    # The dynamics themselves stay the ones the learner was rebuilt with, as optax's own do.
+    assert restored.growth_interval == 1
 
 
 def test_the_best_criterion_saves_the_models_alone(

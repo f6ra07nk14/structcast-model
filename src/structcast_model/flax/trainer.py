@@ -298,11 +298,13 @@ class _BestLogger:
 
 @dataclass(kw_only=True, slots=True)
 class FlaxTrainingStateSaver:
-    """Callback saving models, optimizers and loop counters through a logger.
+    """Callback saving models, optimizers, loss scales and loop counters through a logger.
 
-    The twin of `structcast_model.torch.trainer.TrainingStateSaver`, minus the gradient scalers Flax
-    has none of; the payload keeps their (always empty) slot so both frameworks resume from the same
-    shape.
+    The twin of `structcast_model.torch.trainer.TrainingStateSaver`. The `grad_scalers` slot both
+    frameworks resume from carries the `flax.training.dynamic_scale.DynamicScale` of each scaled
+    segment as its two carried numbers -- the current scale and the run of finite steps behind it --
+    which is what keeps the slot JSON on the way out, as it was when it was always empty. A learner
+    without a scaled segment leaves it empty, exactly as before.
     """
 
     logger: Logger
@@ -320,7 +322,10 @@ class FlaxTrainingStateSaver:
         learner = cast("FlaxTrainer", info).learner
         states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states.setdefault("optimizers", {})
-        states["grad_scalers"] = {}
+        states["grad_scalers"] = {
+            name: {"scale": float(scale.scale), "fin_steps": int(scale.fin_steps)}
+            for name, scale in getattr(learner, "grad_scalers", {}).items()
+        }
         states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update, **dict(self.extra_meta)}
         self.logger.log_state_dict(states, "training_state")
 
@@ -337,7 +342,7 @@ def restore_training_state(
     config_hash: str | None = None,
     is_main: bool = True,
 ) -> int:
-    """Load the resumed state into the models and optimizers, and return the epoch to continue at.
+    """Load the resumed state into the models, optimizers and loss scales, and return the epoch to continue at.
 
     The saved epoch wins over *start_epoch*, as in the torch loader. *optimizer_hashes* are the hashes
     of the optimizer patterns the current configuration rebuilt: optax builds `tx` from configuration
@@ -349,7 +354,7 @@ def restore_training_state(
         resume (str): The training state reference, in whatever form *logger* accepts.
         strategy (FlaxDistributedStrategy): The strategy placing the restored arrays.
         models (Mapping[str, nnx.Module]): The live models to restore into.
-        learner (Any): The learner owning the optimizers to restore into.
+        learner (Any): The learner owning the optimizers and loss scales to restore into.
         start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
@@ -362,6 +367,18 @@ def restore_training_state(
     state = strategy.load_state_dict(
         models, learner.optimizers, learner.optimizer_models, logger.fetch_training_state(resume)
     )
+    for name, scale in getattr(learner, "grad_scalers", {}).items():
+        if saved := state.get("grad_scalers", {}).get(name):
+            # A DynamicScale is immutable, so the restored one is bound back under the name the
+            # learner reported it under -- which is the attribute it keeps it in.
+            setattr(
+                learner,
+                name,
+                scale.replace(
+                    fin_steps=jnp.asarray(saved["fin_steps"], jnp.int32),
+                    scale=jnp.asarray(saved["scale"], jnp.float32),
+                ),
+            )
     meta = state["meta"]
     saved_hashes = meta.get("optimizer_hashes", {})
     for segment, digest in (optimizer_hashes or {}).items():
