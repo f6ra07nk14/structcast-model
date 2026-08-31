@@ -413,6 +413,29 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             criteria[segment.optimizer] = names
         return criteria
 
+    @cached_property
+    def _averaging(self) -> list[KerasOptimizerSegment]:
+        """The segments whose optimizer keeps an average, refusing two that would average one model.
+
+        The swap `inference_step` runs can only put one average into a model, and it resolves the
+        clash by letting the first optimizer win -- so the second one's average would be computed on
+        every step and read by nobody. That is the silent drop `_criteria` refuses for a criterion
+        name, refused here for the same reason.
+        """
+        segments = [segment for _, segment in self._segments if segment.uses_ema]
+        owners: dict[str, str] = {}
+        for segment in segments:
+            for layer in segment.trainable_layers:
+                if layer in owners:
+                    raise SpecError(
+                        f'Model "{layer}" is trained by optimizer "{owners[layer]}" and by optimizer '
+                        f'"{segment.optimizer}", and both keep an exponential moving average of it. The '
+                        "inference step can put only one of the two averages into the model, so the other would "
+                        "be blended on every step and evaluated by nobody: leave use_ema on one of them."
+                    )
+                owners[layer] = segment.optimizer
+        return segments
+
     @property
     def _flow_parameters(self) -> str:
         """The batch parameters of a flow method: one keyword-only parameter per input name.
@@ -512,7 +535,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             f'if len(windows) > 1:{sep3}raise ValueError(f"One learner, one update window: the optimizers '
             'disagree on gradient_accumulation_steps {windows}.")'
         )
-        uses_ema = any(segment.uses_ema for _, segment in self._segments)
+        uses_ema = bool(self._averaging)
         if uses_ema:
             # Off `inners`, which already reached through a float16 wrapper: `use_ema` belongs to the
             # inner optimizer, the only one that keeps an average at all.
@@ -549,10 +572,12 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             ]
             ema_doc = """
     An optimizer of this learner averages its weights (`use_ema`), so `inference_step` swaps that
-    average into the models around the inference flow and swaps the trained weights back after it.
-    The averaged weights are the optimizer's, which blends them on every `apply` -- accumulation
-    no-ops included -- and the swap is a copy in both directions, so training resumes bit-exactly
-    where it paused.
+    average into the variables the optimizer owns around the inference flow and swaps the trained
+    weights back after it. The averaged weights are the optimizer's, which blends them on every
+    `apply` -- accumulation no-ops included -- and the swap is a copy in both directions, so
+    training resumes bit-exactly where it paused. Before the first update there is no average to
+    read -- Keras starts it at zero and seeds it from the weights -- so an evaluation there reports
+    the weights the learner was given.
 """
         models = ", ".join(f"{name!r}: self.{name}" for name in self.models)
         optimizers = ", ".join(f"{s.optimizer!r}: self._segment_{s.optimizer}.optimizer" for _, s in self._segments)

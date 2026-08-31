@@ -356,6 +356,55 @@ class TorchAdapter(_Adapter):
         return inference
 
 
+def _exchange(variable: Any, average: Any) -> None:
+    """Trade one variable's value for its average, through a copy so the trade is exact.
+
+    Not the add-and-subtract dance of `keras.callbacks.SwapEMAWeights._tf_swap_variables`: that one
+    spares the temporary at the cost of rounding both values, and a run has to resume training from
+    the weights it paused on. It needs no `tf.distribute` branch either -- the swap runs on the host
+    under a `MirroredStrategy` (`keras/distributed.py`, `wrap_steps`, replicates the inner flow
+    alone), and assigning a `MirroredVariable` from there updates every replica.
+    """
+    held = keras.ops.copy(variable)
+    variable.assign(average)
+    average.assign(held)
+
+
+def _ema_pairs(optimizers: Sequence[Any]) -> list[tuple[Any, Any]]:
+    """List the (variable, average) pairs one swap should trade, in the order it trades them.
+
+    Three things are skipped, each for a reason a swap cannot recover from:
+
+    - An optimizer that has never applied. `_model_variables_moving_average` is zero-initialized and
+      first written by an `apply`, so evaluating before a run has trained -- `Trainer.evaluate()` on
+      a fresh model -- would measure an all-zero model. Keras seeds the average from the weights on
+      every apply while `iterations` is still 0, so a zero count also means "the average is the
+      weights", and skipping is the same answer either way.
+    - A variable whose gradient overwrites it. `add_optimizer_variables` puts `None` in place of the
+      average of an `overwrite_with_gradient` variable, so there is nothing to trade.
+    - A variable a previous optimizer already claimed. Two optimizers averaging one model would
+      otherwise trade it twice, which puts the *second* average in the model on the way in and
+      leaves the *first* one in it on the way out -- a corruption, not a wrong reading. The first
+      optimizer in the sequence wins; the learner builder refuses the configuration that gets here.
+    """
+    pairs: list[tuple[Any, Any]] = []
+    claimed: set[int] = set()
+    for optimizer in optimizers:
+        # The same host read `training_step` makes of this counter, on the same variable.
+        if not int(keras.ops.convert_to_numpy(optimizer.iterations)):
+            continue
+        # Paired positionally against the optimizer's own list, as `keras.callbacks.SwapEMAWeights`
+        # does: both are built from the variables `build` was given.
+        for variable, average in zip(
+            optimizer._trainable_variables, optimizer._model_variables_moving_average, strict=True
+        ):
+            if average is None or id(variable) in claimed:
+                continue
+            claimed.add(id(variable))
+            pairs.append((variable, average))
+    return pairs
+
+
 def swap_ema_weights(optimizers: Sequence[Any]) -> None:
     """Exchange the trainable variables of each optimizer with the moving averages it keeps.
 
@@ -365,12 +414,9 @@ def swap_ema_weights(optimizers: Sequence[Any]) -> None:
     it -- which is what a generated learner's `inference_step` does, under a `try`/`finally` -- this
     runs the flow on the average and leaves the weights exactly as it found them.
 
-    The exchange copies through `keras.ops.copy` rather than the add-and-subtract dance of
-    `keras.callbacks.SwapEMAWeights._tf_swap_variables`: that one spares the temporary at the cost
-    of rounding both values, so a run would resume training from weights that are not the ones it
-    paused on. It needs no `tf.distribute` branch either -- `inference_step` stays on the host under
-    a `MirroredStrategy` (`keras/distributed.py`, `wrap_steps`), and assigning a `MirroredVariable`
-    from there updates every replica.
+    It is all-or-nothing: a swap that fails partway -- an allocation failure inside the copy, above
+    all -- puts back what it had already traded before re-raising, because the caller's `finally`
+    only knows how to undo a swap that finished. What is not traded is listed by `_ema_pairs`.
 
     Args:
         optimizers: The built optimizers whose average to swap in, each already unwrapped from any
@@ -378,18 +424,16 @@ def swap_ema_weights(optimizers: Sequence[Any]) -> None:
             average, so only the inner optimizer has one. An optimizer without an EMA has no
             averages to pair against and raises rather than passing silently.
     """
-    for optimizer in optimizers:
-        # Paired positionally against the optimizer's own list, as `keras.callbacks.SwapEMAWeights`
-        # does: both are built from the variables `build` was given, and a variable its gradient
-        # overwrites -- `overwrite_with_gradient` -- holds `None` in place of an average.
-        for variable, average in zip(
-            optimizer._trainable_variables, optimizer._model_variables_moving_average, strict=True
-        ):
-            if average is None:
-                continue
-            held = keras.ops.copy(variable)
-            variable.assign(average)
-            average.assign(held)
+    pairs = _ema_pairs(optimizers)
+    traded = 0
+    try:
+        for variable, average in pairs:
+            _exchange(variable, average)
+            traded += 1
+    except BaseException:
+        for variable, average in pairs[:traded]:
+            _exchange(variable, average)
+        raise
 
 
 def _state_variables(segments: Sequence[AdapterSegment], owned: set[int]) -> list[Any]:

@@ -571,6 +571,24 @@ def test_keras_learner_swaps_an_average_into_inference_only_when_one_is_declared
     }
 
 
+def test_keras_learner_rejects_two_optimizers_averaging_the_same_model() -> None:
+    """One model, one average: the second one would be blended every step and evaluated by nobody.
+
+    The inference step can put only one average into a model's variables, and it resolves the clash
+    by letting the first optimizer win -- the same silent drop `_criteria` refuses for a criterion
+    two segments both compute, refused here for the same reason and named the same way.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    ema = [{"_addr_": "keras.optimizers.SGD"}, {"_call_": {"learning_rate": 0.1, "use_ema": True}}]
+    # The second segment keeps the model its own flow runs and takes the first segment's "a" too.
+    raw["LEARNERS"][1]["TRAINABLE_LAYERS"] = ["c", "a"]
+    for learner in raw["LEARNERS"]:
+        learner["OPTIMIZER"] = ["_obj_", *ema]
+
+    with pytest.raises(SpecError, match='Model "a" is trained by optimizer "optimizer_ab"'):
+        _built(raw, SEGMENTS_YAML)
+
+
 def test_keras_learner_scripts_are_byte_identical_across_builds() -> None:
     """The same template must render the same script every time, in every process.
 

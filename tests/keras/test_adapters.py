@@ -24,6 +24,7 @@ from structcast_model.keras.adapters import (
     Flow,
     InferenceFlow,
     select_backend_adapter,
+    swap_ema_weights,
 )
 
 
@@ -274,6 +275,82 @@ def test_inference_step_reads_the_current_weights(adapter: BackendAdapter) -> No
     before = _run(inference, _batch(), 1)[0]
     _run(adapter.build_train_step([segment]), _batch(), 5)
     assert _run(inference, _batch(), 1)[0] < before
+
+
+def _averaging(model: Any, *, applies: int = 1, learning_rate: float = 0.1) -> Any:
+    """An SGD keeping an average of every trainable variable of `model`, stepped `applies` times."""
+    optimizer = keras.optimizers.SGD(learning_rate=learning_rate, use_ema=True, ema_momentum=0.5)
+    variables = list(model.trainable_variables)
+    optimizer.build(variables)
+    for _ in range(applies):
+        optimizer.apply([keras.ops.ones_like(variable) for variable in variables], variables)
+    return optimizer
+
+
+def test_swap_ema_weights_leaves_an_unstarted_average_alone() -> None:
+    """`Trainer.evaluate()` before the first update must measure the model, not a field of zeros.
+
+    Keras zero-initializes `_model_variables_moving_average` and only writes it from an `apply`, so
+    a swap that trusted the array to hold an average would evaluate an all-zero model and report a
+    validation number belonging to nothing -- finite, plausible and wrong.
+    """
+    model = _model()
+    optimizer = _averaging(model, applies=0)
+    before = [_value(variable) for variable in model.trainable_variables]
+
+    swap_ema_weights([optimizer])
+
+    assert all(np.array_equal(_value(v), b) for v, b in zip(model.trainable_variables, before, strict=True))
+    assert all(not np.any(_value(a)) for a in optimizer._model_variables_moving_average)
+
+
+def test_swap_ema_weights_trades_a_shared_variable_once() -> None:
+    """Two optimizers averaging one model must not trade the same variable twice.
+
+    A second trade puts the second average into the model on the way in and leaves the *first* one
+    there on the way out, so the weights come back as an average and training continues from them --
+    corruption, not a wrong reading. The learner builder refuses the configuration that reaches this,
+    so the rule here is what keeps a hand-wired one from being silently destroyed.
+    """
+    model = _model()
+    first, second = _averaging(model), _averaging(model, learning_rate=0.2)
+    weights = [_value(variable) for variable in model.trainable_variables]
+    averages = [_value(average) for average in first._model_variables_moving_average]
+    assert not np.array_equal(averages[0], _value(second._model_variables_moving_average[0]))
+
+    swap_ema_weights([first, second])
+    swapped = [_value(variable) for variable in model.trainable_variables]
+    swap_ema_weights([first, second])
+
+    # The first optimizer in the sequence wins, and the second one's average is left where it was.
+    assert all(np.array_equal(value, average) for value, average in zip(swapped, averages, strict=True))
+    assert all(np.array_equal(_value(v), w) for v, w in zip(model.trainable_variables, weights, strict=True))
+    assert all(
+        np.array_equal(_value(average), value)
+        for average, value in zip(first._model_variables_moving_average, averages, strict=True)
+    )
+
+
+def test_swap_ema_weights_puts_back_what_it_traded_when_a_trade_fails() -> None:
+    """A swap that dies partway must unwind: its caller's `finally` can only undo a whole one.
+
+    An allocation failure inside the copy is the real shape of this, and a shape the assignment
+    refuses is the deterministic stand-in. Without the unwind the variables traded before the
+    failure keep the average, and the run trains on from there.
+    """
+    model = _model()
+    # Three applies, so the average has actually moved away from the weights: after a single one it
+    # is seeded to them, and a swap that never unwound would still look like it had.
+    optimizer = _averaging(model, applies=3)
+    weights = [_value(variable) for variable in model.trainable_variables]
+    assert not np.array_equal(weights[0], _value(optimizer._model_variables_moving_average[0]))
+    # The second pair alone is broken, so the first has already been traded when the swap fails.
+    optimizer._model_variables_moving_average[1] = keras.Variable(np.zeros((3, 3), "float32"))
+
+    with pytest.raises(ValueError, match="shape"):
+        swap_ema_weights([optimizer])
+
+    assert all(np.array_equal(_value(v), w) for v, w in zip(model.trainable_variables, weights, strict=True))
 
 
 def test_select_backend_adapter_caches_the_adapter_of_the_active_backend() -> None:

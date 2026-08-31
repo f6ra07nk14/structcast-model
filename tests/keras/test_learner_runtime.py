@@ -502,6 +502,24 @@ def test_a_loss_scaled_learner_evaluates_the_inner_optimizers_average(tmp_path: 
     assert _moved(weights, averages) > 0.0
     assert loss == pytest.approx(_squared_error(averages), rel=1e-5)
     assert _moved(weights, _values(model.trainable_variables)) == 0.0
+    assert _moved(averages, _averages(learner)) == 0.0
+
+
+def test_inference_before_the_first_update_reads_the_weights_it_was_given(tmp_path: Path) -> None:
+    """A validation pass before any training must measure the model, not an average that has none.
+
+    `Trainer.evaluate()` on a fresh learner is an ordinary thing to run -- a baseline, a smoke test,
+    a resume that evaluates first -- and Keras zero-initializes the average, so a swap that did not
+    check would hand the flow an all-zero model and report a number belonging to nothing.
+    """
+    model = _models(tmp_path)[0]
+    learner = _averaged(tmp_path, "unstarted")(model)
+    weights = _values(model.trainable_variables)
+
+    loss = float(keras.ops.convert_to_numpy(learner.inference_step(**BATCH)["loss"]))
+
+    assert loss == pytest.approx(_squared_error(weights), rel=1e-5)
+    assert _moved(weights, _values(model.trainable_variables)) == 0.0
 
 
 def test_inference_step_sees_what_the_last_training_step_wrote(tmp_path: Path) -> None:

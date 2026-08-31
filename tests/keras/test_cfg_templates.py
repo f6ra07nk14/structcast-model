@@ -332,10 +332,39 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
 
     assert flags == [False, True, False, True]
     assert (learner.steps, learner.updates) == (4, 2)
-    # Keras keeps the average in the optimizer and offers no copy to validate against, so what a
-    # combined run can assert is that the averages exist and shadow every trained variable.
+    # Keras keeps the average in the optimizer rather than in a second model, so what a combined run
+    # can assert is that the averages exist and shadow every trained variable; the evaluation the
+    # swap runs on them is asserted on its own below.
     assert len(optimizer._model_variables_moving_average) == len(models[True].trainable_variables)
     assert all(np.isfinite(value) for value in _floats(learner.inference_step(**IMAGE_BATCH)).values())
+
+
+def test_the_showcase_validates_on_the_average_it_trains(tmp_path: Path) -> None:
+    """The shipped template is what a validation run trains, so its EMA is asserted on the real thing.
+
+    Everything the swap has to reach is only true of a generated learner: the average lives in the
+    optimizer the `OPTIMIZER` pattern built, the window is the template's, and the models are the
+    ones the CLI hands over. Two updates are enough to pull the average away from the weights, which
+    is what makes the two evaluations below distinguishable at all.
+    """
+    model = _model(tmp_path, "VisionTransformer", SHOWCASE_PARAMETERS, None)
+    learner = _learner(tmp_path, "ImageClassifierShowcase", {"DEFAULT": {"accumulate_gradients": 2}}, model=model)
+    optimizer = learner.optimizers["optimizer"]
+    for _ in range(4):
+        learner.training_step(**IMAGE_BATCH)
+    weights = _values(model.trainable_variables)
+    averages = _values(optimizer._model_variables_moving_average)
+
+    averaged = _floats(learner.inference_step(**IMAGE_BATCH))
+
+    assert _moved(weights, averages) > 0.0
+    assert _moved(weights, _values(model.trainable_variables)) == 0.0
+    assert _moved(averages, _values(optimizer._model_variables_moving_average)) == 0.0
+    # The raw-weight reading of the same batch, taken by dropping the average the swap reaches for.
+    learner._ema_optimizers = []
+    raw = _floats(learner.inference_step(**IMAGE_BATCH))
+
+    assert averaged["ce_loss"] != pytest.approx(raw["ce_loss"], rel=1e-6)
 
 
 def test_the_showcase_average_can_be_left_out_by_parameter(tmp_path: Path) -> None:
