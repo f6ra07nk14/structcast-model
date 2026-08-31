@@ -356,6 +356,42 @@ class TorchAdapter(_Adapter):
         return inference
 
 
+def swap_ema_weights(optimizers: Sequence[Any]) -> None:
+    """Exchange the trainable variables of each optimizer with the moving averages it keeps.
+
+    A Keras optimizer blends its EMA into `_model_variables_moving_average` on every `apply` and
+    only writes it back into the weights at `finalize_variable_values`, so a flow reading the
+    variables as they stand reports the raw weights. Called before an inference flow and again after
+    it -- which is what a generated learner's `inference_step` does, under a `try`/`finally` -- this
+    runs the flow on the average and leaves the weights exactly as it found them.
+
+    The exchange copies through `keras.ops.copy` rather than the add-and-subtract dance of
+    `keras.callbacks.SwapEMAWeights._tf_swap_variables`: that one spares the temporary at the cost
+    of rounding both values, so a run would resume training from weights that are not the ones it
+    paused on. It needs no `tf.distribute` branch either -- `inference_step` stays on the host under
+    a `MirroredStrategy` (`keras/distributed.py`, `wrap_steps`), and assigning a `MirroredVariable`
+    from there updates every replica.
+
+    Args:
+        optimizers: The built optimizers whose average to swap in, each already unwrapped from any
+            `keras.optimizers.LossScaleOptimizer` -- that wrapper refuses `use_ema` and keeps no
+            average, so only the inner optimizer has one. An optimizer without an EMA has no
+            averages to pair against and raises rather than passing silently.
+    """
+    for optimizer in optimizers:
+        # Paired positionally against the optimizer's own list, as `keras.callbacks.SwapEMAWeights`
+        # does: both are built from the variables `build` was given, and a variable its gradient
+        # overwrites -- `overwrite_with_gradient` -- holds `None` in place of an average.
+        for variable, average in zip(
+            optimizer._trainable_variables, optimizer._model_variables_moving_average, strict=True
+        ):
+            if average is None:
+                continue
+            held = keras.ops.copy(variable)
+            variable.assign(average)
+            average.assign(held)
+
+
 def _state_variables(segments: Sequence[AdapterSegment], owned: set[int]) -> list[Any]:
     """List every variable of every model that no optimizer owns, deduplicated, in model order.
 
@@ -415,6 +451,7 @@ __all__ = [
     "TensorFlowAdapter",
     "TorchAdapter",
     "select_backend_adapter",
+    "swap_ema_weights",
 ]
 
 

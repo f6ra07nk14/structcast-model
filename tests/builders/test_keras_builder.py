@@ -543,6 +543,34 @@ def test_keras_learner_imports_only_keras_and_the_adapter_helpers() -> None:
     assert imports["structcast_model.keras.adapters"] == {"AdapterSegment", "select_backend_adapter"}
 
 
+def test_keras_learner_swaps_an_average_into_inference_only_when_one_is_declared() -> None:
+    """The swap wrapper is emitted off the OPTIMIZER pattern, so a learner without an EMA is untouched.
+
+    Emitting it unconditionally would put an import, a `try`/`finally` and two swap calls into every
+    generated learner, iterating a list that is always empty. The generated file is what a reader
+    checks a run against, and a step announcing that it evaluates an average where none exists costs
+    more than the branch it saves.
+    """
+    raw = load_any(LEARNER_YAML)
+    plain = _built(raw)
+    raw["LEARNERS"][0]["OPTIMIZER"] = [
+        "_obj_",
+        {"_addr_": "keras.optimizers.SGD"},
+        {"_call_": {"learning_rate": 0.1, "use_ema": True}},
+    ]
+    built = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()
+
+    assert "swap_ema_weights" not in plain
+    assert "_ema_optimizers" not in plain
+    # Both directions of the loan, and the import that carries them, only here.
+    assert built.scripts[-1].count("swap_ema_weights(self._ema_optimizers)") == 2
+    assert built.collected_imports["structcast_model.keras.adapters"] == {
+        "AdapterSegment",
+        "select_backend_adapter",
+        "swap_ema_weights",
+    }
+
+
 def test_keras_learner_scripts_are_byte_identical_across_builds() -> None:
     """The same template must render the same script every time, in every process.
 

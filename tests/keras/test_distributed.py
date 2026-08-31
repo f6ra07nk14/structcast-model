@@ -552,6 +552,102 @@ def test_a_keras_loss_class_reports_and_trains_the_same_under_dp(
     assert np.allclose(result["kernel"], loss_class_reference["kernel"], rtol=1e-5)
 
 
+TENSORFLOW_EMA_SCRIPT = """
+import json, sys
+from importlib.util import module_from_spec, spec_from_file_location
+import numpy as np
+import tensorflow as tf
+
+# Before anything initializes the TensorFlow runtime, which fixes the logical device list.
+cpus = tf.config.list_physical_devices("CPU")
+tf.config.set_logical_device_configuration(cpus[0], [tf.config.LogicalDeviceConfiguration()] * 2)
+
+import keras
+from structcast_model.keras.distributed import KerasDistributedStrategy
+from structcast_model.keras.trainer import initial_model
+
+def load(path, name):
+    spec = spec_from_file_location(name, path)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+def values(variables):
+    return [np.asarray(keras.ops.convert_to_numpy(v.value)) for v in variables]
+
+def error(weights):
+    return float(np.mean((x @ weights[0] + weights[1] - y) ** 2))
+
+directory = sys.argv[1]
+strategy = KerasDistributedStrategy(preset="dp")
+with strategy.activate():
+    keras.utils.set_random_seed(0)
+    model = initial_model(load(directory + "/model.py", "generated_model").Model(), {"x": (4,)})
+    learner = load(directory + "/learner.py", "generated_learner").Learner(model=model)
+strategy.wrap_steps(learner)
+
+x = np.asarray([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0], [2.0, 0.0, 1.0, 0.5], [-1.0, 1.0, 0.0, 1.0]], "f4")
+y = np.asarray([[1.0, -1.0], [0.5, 0.25], [0.0, 1.0], [-0.5, 0.5]], "float32")
+for _ in range(3):
+    learner.training_step(x=x, y=y)
+optimizer = learner.optimizers["optimizer"]
+weights, averages = values(model.trainable_variables), values(optimizer._model_variables_moving_average)
+loss = float(keras.ops.convert_to_numpy(learner.inference_step(x=x, y=y)["loss"]))
+print(json.dumps({
+    "mirrored": type(model.trainable_variables[0].value).__name__,
+    "loss": loss,
+    # Both computed here, without TensorFlow, off the two sets of weights the swap moves between.
+    "averaged": error(averages),
+    "trained": error(weights),
+    "weights_moved": max(float(np.abs(a - b).max()) for a, b in zip(weights, values(model.trainable_variables))),
+    "averages_moved": max(
+        float(np.abs(a - b).max())
+        for a, b in zip(averages, values(optimizer._model_variables_moving_average))
+    ),
+}))
+"""
+
+
+@pytest.fixture(scope="module")
+def averaged(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the same fixtures with an optimizer that keeps an exponential moving average.
+
+    Those two keywords are the whole difference from `generated`, and they are what puts a second
+    mirrored copy of every weight beside the first -- the copy `inference_step` swaps in.
+    """
+    directory = tmp_path_factory.mktemp("averaged")
+    template = (CFG_DIR / "LinearLearner.yaml").read_text()
+    learner = template.replace(
+        "          learning_rate: 0.1\n",
+        "          learning_rate: 0.1\n          use_ema: true\n          ema_momentum: 0.5\n",
+    )
+    assert learner != template, "the fixture's optimizer moved: this test no longer declares an EMA"
+    (directory / "LinearLearner.yaml").write_text(learner)
+    KerasBuilder.from_path(CFG_DIR / "Linear.yaml")()(directory / "model.py")
+    KerasLearnerBuilder.from_path(directory / "LinearLearner.yaml")()(directory / "learner.py")
+    return directory
+
+
+def test_the_averaged_inference_step_swaps_every_mirrored_replica(tmp_path: Path, averaged: Path) -> None:
+    """Assigning a mirrored variable from the host reaches every replica, so the swap needs no branch.
+
+    `keras.callbacks.SwapEMAWeights` routes its TensorFlow swap through
+    `strategy.extended.update` and adds the average in and out again to spare the temporary. Neither
+    is copied here: `inference_step` stays eager under a `MirroredStrategy` (only the inner flow is
+    replicated), where a plain `assign` already updates both replicas, and the addition trick is not
+    exact enough to hand training back the weights it paused on. The loss below is what proves the
+    replicas agree -- it is reduced over both, and the second replica owns the batch rows the
+    hand-computed value covers.
+    """
+    result = _run(TENSORFLOW_EMA_SCRIPT, tmp_path, str(averaged), backend="tensorflow")
+
+    assert result["mirrored"] == "MirroredVariable"
+    assert result["loss"] == pytest.approx(result["averaged"], rel=1e-5)
+    assert result["loss"] != pytest.approx(result["trained"], rel=1e-5)
+    assert result["weights_moved"] == 0.0
+    assert result["averages_moved"] == 0.0
+
+
 TENSORFLOW_CLI_SCRIPT = """
 import json, os, sys
 

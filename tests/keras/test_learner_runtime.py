@@ -96,6 +96,39 @@ class _MovementRecorder:
         self.previous = current
 
 
+EMA_OPTIMIZER = [
+    "_obj_",
+    {"_addr_": "keras.optimizers.SGD"},
+    {"_call_": {"learning_rate": 0.1, "use_ema": True, "ema_momentum": 0.5}},
+]
+"""An averaging optimizer, which is the only way a Keras learner declares an EMA at all."""
+
+
+def _averaged(tmp_path: Path, name: str, **fields: Any) -> Any:
+    """Generate the linear learner over `EMA_OPTIMIZER`, with any extra learner fields merged in."""
+    raw = {**load_any(LEARNER_YAML), **fields}
+    raw["LEARNERS"][0]["OPTIMIZER"] = EMA_OPTIMIZER
+    KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))()(tmp_path / f"{name}.py")
+    return _load(tmp_path / f"{name}.py", f"{name}_learner").Learner
+
+
+def _averages(learner: Any) -> list[np.ndarray]:
+    """Read the moving averages the segment's inner optimizer keeps, in trainable-variable order."""
+    optimizer = learner.optimizers["optimizer"]
+    inner = getattr(optimizer, "inner_optimizer", optimizer)
+    return _values(inner._model_variables_moving_average)
+
+
+def _squared_error(variables: list[np.ndarray]) -> float:
+    """The loss the fixture flow reports for one `[kernel, bias]` pair, computed on the host.
+
+    The fixture model is a single `keras.layers.Dense`, so the expected value goes through neither
+    the generated code nor the swap it runs: it is what those weights mean.
+    """
+    kernel, bias = variables
+    return float(np.mean((X @ kernel + bias - Y) ** 2))
+
+
 def _sgd_step(model: Any, learning_rate: float) -> tuple[np.ndarray, np.ndarray]:
     """Return the kernel and bias one plain SGD step on the fixed batch should produce.
 
@@ -388,6 +421,87 @@ def test_inference_step_reports_the_criteria_and_mutates_nothing(tmp_path: Path)
     # ... and a training step does move both, so the comparisons above can fail.
     assert _moved(before, _values(model.trainable_variables)) > 0.0
     assert _moved(optimizer_before, _values(optimizer.variables)) > 0.0
+
+
+def test_inference_step_evaluates_the_average_the_optimizer_keeps(tmp_path: Path) -> None:
+    """With `use_ema` on, evaluation has to read the average, and the compiled step has to see it.
+
+    Keras blends the average into the optimizer and only writes it into the weights when training
+    ends, so an inference step left alone measures the trained model where the run asked for the
+    averaged one it means to ship -- a gap that never surfaces as an error, only as validation
+    numbers belonging to the wrong weights. The step is warmed before the weights and the average
+    diverge, so a compiled step holding its variables from the trace would answer with what it was
+    traced on rather than with what the swap put underneath it.
+    """
+    model = _models(tmp_path)[0]
+    learner = _averaged(tmp_path, "averaged")(model)
+    learner.inference_step(**BATCH)
+    for _ in range(3):
+        learner.training_step(**BATCH)
+    weights, averages = _values(model.trainable_variables), _averages(learner)
+
+    loss = float(keras.ops.convert_to_numpy(learner.inference_step(**BATCH)["loss"]))
+
+    assert _moved(weights, averages) > 0.0
+    assert loss == pytest.approx(_squared_error(averages), rel=1e-5)
+    assert loss != pytest.approx(_squared_error(weights), rel=1e-5)
+    # The swap is a loan: training continues from the weights it paused on, to the bit, or every
+    # evaluation quietly perturbs the run it is only supposed to measure.
+    assert _moved(weights, _values(model.trainable_variables)) == 0.0
+    assert _moved(averages, _averages(learner)) == 0.0
+
+
+def test_a_failing_inference_flow_still_puts_the_trained_weights_back(tmp_path: Path) -> None:
+    """The average is swapped in under a `try`/`finally`, so a raising flow cannot strand it.
+
+    An out-of-memory evaluation is a recoverable event for a trainer -- it can log it and go on --
+    but a model left holding its own average would train from there, and the failure would be
+    remembered as a loss curve that jumped for no reason.
+    """
+    model = _models(tmp_path)[0]
+    learner = _averaged(tmp_path, "raising")(model)
+    for _ in range(3):
+        learner.training_step(**BATCH)
+    weights, averages = _values(model.trainable_variables), _averages(learner)
+
+    seen: list[list[np.ndarray]] = []
+
+    def explode(**batch: Any) -> dict[str, Any]:
+        """Fail the way an evaluation batch that does not fit does, once the average is in place."""
+        seen.append(_values(model.trainable_variables))
+        raise RuntimeError("out of memory")
+
+    learner._inference_step = explode
+    with pytest.raises(RuntimeError, match="out of memory"):
+        learner.inference_step(**BATCH)
+
+    assert _moved(seen[0], averages) == 0.0
+    assert _moved(weights, _values(model.trainable_variables)) == 0.0
+    assert _moved(averages, _averages(learner)) == 0.0
+
+
+def test_a_loss_scaled_learner_evaluates_the_inner_optimizers_average(tmp_path: Path) -> None:
+    """`use_ema` lives on the inner optimizer, so the swap has to reach through the wrapper.
+
+    `keras.optimizers.LossScaleOptimizer` refuses `use_ema` outright and keeps no average of its
+    own, so a swap reading the optimizer the learner reports would find nothing to swap and
+    evaluate the raw weights -- the very failure this exists to remove, reappearing only under a
+    float16 policy, where it would be least likely to be noticed.
+    """
+    model = _models(tmp_path)[0]
+    learner = _averaged(
+        tmp_path, "scaled_average", MIXED_PRECISION={"initial_scale": 128.0}, MIXED_PRECISION_TYPE="float16"
+    )(model)
+    for _ in range(3):
+        learner.training_step(**BATCH)
+    weights, averages = _values(model.trainable_variables), _averages(learner)
+
+    loss = float(keras.ops.convert_to_numpy(learner.inference_step(**BATCH)["loss"]))
+
+    assert isinstance(learner.optimizers["optimizer"], keras.optimizers.LossScaleOptimizer)
+    assert _moved(weights, averages) > 0.0
+    assert loss == pytest.approx(_squared_error(averages), rel=1e-5)
+    assert _moved(weights, _values(model.trainable_variables)) == 0.0
 
 
 def test_inference_step_sees_what_the_last_training_step_wrote(tmp_path: Path) -> None:

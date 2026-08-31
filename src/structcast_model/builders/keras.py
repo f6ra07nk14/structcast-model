@@ -317,12 +317,29 @@ class KerasTemplateLearner(Template[KerasUserDefinedLearner]):
     target_type: ClassVar[type[KerasUserDefinedLearner]] = KerasUserDefinedLearner
 
 
+def _declares_ema(pattern: Any) -> bool:
+    """Whether one dumped `OPTIMIZER` pattern turns the Keras optimizer's own EMA on.
+
+    Read off the pattern as it was written, so an optimizer factory setting `use_ema` behind the
+    template's back is invisible here and its average is never swapped in for inference -- the same
+    reach `_STATEFUL_KERAS_LAYERS` has, and documented in `REFERENCE.md` the same way.
+    """
+    if isinstance(pattern, Mapping):
+        return bool(pattern.get("use_ema")) or any(_declares_ema(value) for value in pattern.values())
+    if isinstance(pattern, list):
+        return any(_declares_ema(value) for value in pattern)
+    return False
+
+
 @dataclass(kw_only=True, slots=True)
 class KerasOptimizerSegment(OptimizerSegment):
     """One optimizer step of a Keras learner flow, carrying the digest of the pattern that built it."""
 
     optimizer_hash: str
     """The digest of the segment's `OPTIMIZER` pattern, emitted as `OPTIMIZER_HASHES`."""
+
+    uses_ema: bool = False
+    """Whether the segment's `OPTIMIZER` pattern asks for the optimizer's own exponential moving average."""
 
 
 class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
@@ -495,6 +512,11 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             f'if len(windows) > 1:{sep3}raise ValueError(f"One learner, one update window: the optimizers '
             'disagree on gradient_accumulation_steps {windows}.")'
         )
+        uses_ema = any(segment.uses_ema for _, segment in self._segments)
+        if uses_ema:
+            # Off `inners`, which already reached through a float16 wrapper: `use_ema` belongs to the
+            # inner optimizer, the only one that keeps an average at all.
+            body.append('self._ema_optimizers = [inner for inner in inners if getattr(inner, "use_ema", False)]')
         body.append("self._steps = 0")
         body.append("self._last_updates = 0")
         body.append("self._has_updated = False")
@@ -511,6 +533,27 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             f"int(keras.ops.convert_to_numpy({sep3}getattr({attributes[0]}.optimizer, "
             f'"inner_optimizer", {attributes[0]}.optimizer).iterations{sep2}))'
         )
+        inference = [f"return self._inference_step({named})"]
+        ema_doc = ""
+        if uses_ema:
+            inference = [
+                "# On the averaged weights, not the trained ones: a Keras optimizer keeps its EMA",
+                "# beside the variables and only writes it back when training ends, so the flow",
+                "# would otherwise read the raw weights. The `finally` is what keeps a flow that",
+                "# raises from leaving the average in the model.",
+                "swap_ema_weights(self._ema_optimizers)",
+                "try:",
+                f"{indent}return self._inference_step({named})",
+                "finally:",
+                f"{indent}swap_ema_weights(self._ema_optimizers)",
+            ]
+            ema_doc = """
+    An optimizer of this learner averages its weights (`use_ema`), so `inference_step` swaps that
+    average into the models around the inference flow and swaps the trained weights back after it.
+    The averaged weights are the optimizer's, which blends them on every `apply` -- accumulation
+    no-ops included -- and the swap is a copy in both directions, so training resumes bit-exactly
+    where it paused.
+"""
         models = ", ".join(f"{name!r}: self.{name}" for name in self.models)
         optimizers = ", ".join(f"{s.optimizer!r}: self._segment_{s.optimizer}.optimizer" for _, s in self._segments)
         optimizer_models = ", ".join(f"{s.optimizer!r}: {s.trainable_layers!r}" for _, s in self._segments)
@@ -545,7 +588,7 @@ class {self.classname}:
     optimizer counter -- detection, not prediction, so a float16 loss-scale skip, which freezes the
     counter, truthfully reports no update. `restore_counters` re-seeds `steps` after a checkpoint
     restore and re-baselines the counter read.
-    \"\"\"
+{ema_doc}    \"\"\"
 
     # Read by the training CLI off the class, after this module is imported and before the class is
     # instantiated: the `keras.mixed_precision` global policy has to be in place before the models
@@ -578,7 +621,7 @@ class {self.classname}:
         return res
 
     def inference_step(self, {inputs}**kwargs):
-        return self._inference_step({named})
+        {sep2.join(inference)}
 
     def restore_counters(self, steps: int, updates: int) -> None:
         # `updates` is ignored on purpose: the restored optimizer variables already carry the
@@ -652,11 +695,16 @@ class KerasLearnerBuilder(BaseLearnerBuilder[KerasLearnerIntermediate]):
         # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
         # discarded one, so `super()` raises here, exactly as in the Flax builder.
         base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
+        # The one import an averaging learner gains is the swap its `inference_step` runs, which no
+        # other learner imports (`REFERENCE.md`, "EMA").
+        if uses_ema := _declares_ema(learner.OPTIMIZER.model_dump(by_alias=True)):
+            imports["structcast_model.keras.adapters"].add("swap_ema_weights")
         return KerasOptimizerSegment(
             loss=base.loss,
             optimizer=base.optimizer,
             trainable_layers=base.trainable_layers,
             optimizer_hash=optimizer_hash(learner.OPTIMIZER),
+            uses_ema=uses_ema,
         )
 
 

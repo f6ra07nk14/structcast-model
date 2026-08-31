@@ -32,6 +32,7 @@ __all__ = [
     "resolve_input_shapes",
     "restore_training_state",
     "select_backend_adapter",
+    "swap_ema_weights",
 ]
 
 if TYPE_CHECKING:
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
         TensorFlowAdapter,
         TorchAdapter,
         select_backend_adapter,
+        swap_ema_weights,
     )
     from structcast_model.keras.distributed import (
         AXIS,
@@ -87,6 +89,7 @@ else:
             "TensorFlowAdapter",
             "TorchAdapter",
             "select_backend_adapter",
+            "swap_ema_weights",
         ],
         "distributed": [
             "AXIS",
