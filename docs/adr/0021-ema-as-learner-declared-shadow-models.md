@@ -21,7 +21,8 @@
 > swaps the optimizer's average into the variables it owns for the duration of the inference flow
 > and puts the trained weights back after it, so a Keras run validates over averaged weights like
 > its torch and flax twins. What stays true is that there is no separate averaged *model* — no
-> `ema_<model>` an `INFERENCE_FLOW` could name, and no averaged weights in a saved checkpoint. The
+> `ema_<model>` an `INFERENCE_FLOW` could name, and no averaged weights in the best-model artifact
+> (the average does ride a resume checkpoint's optimizer state). The
 > other two limitations (blending on every apply, configuration on the inner optimizer) stand.
 
 Exponential moving averages are declared at the top level of a torch or flax learner template —
