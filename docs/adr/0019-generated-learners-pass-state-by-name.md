@@ -1,5 +1,10 @@
 # Generated learners pass state by name and keep module scope empty
 
+> **Amended by ADR-0023: a scaled flax step also takes its loss scales.** The signature is
+> `_training_step(<models...>, <optimizers...>, <scales...>, *, <inputs...>, **kwargs)` when
+> `MIXED_PRECISION` is on, and the step returns one more value per scale; the donation contract
+> below is unchanged, and an unscaled learner emits exactly the signature described here.
+
 A generated learner module used to carry user-named flow layers, `OPTIMIZER_HASHES` and the two
 step functions at module scope, and the flax steps took the models and the optimizers as
 dictionaries. Everything a learner template names comes from the user's configuration — and the

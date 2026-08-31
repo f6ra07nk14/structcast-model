@@ -1,5 +1,12 @@
 # Training state flows through logger state backends as single-file archives
 
+> **Amended by ADR-0023: the Flax `grad_scalers` slot is no longer always empty.** A learner
+> whose `MIXED_PRECISION` scales its losses fills it with the two numbers each
+> `flax.training.dynamic_scale.DynamicScale` carries, `{"scale", "fin_steps"}` per segment,
+> which are plain enough to stay on this backend's JSON path rather than its array one. The
+> payload contract below is otherwise unchanged, and a learner without the field still leaves
+> the slot empty.
+
 `log_state_dict` / `fetch_training_state` were the only `Logger` members with a framework baked in: three
 `torch.load` sites, one `torch.save`, one `mlflow.pytorch.log_state_dict`, plus the `.pt`/`*.pth` filename
 conventions (ADR-0011 counted them). Flax state is a different serialization problem — orbax, whose checkpoint
