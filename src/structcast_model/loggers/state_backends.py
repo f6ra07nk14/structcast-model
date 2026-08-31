@@ -85,7 +85,8 @@ class FlaxStateBackend:
         """Write *states* as an orbax checkpoint and pack it into `directory/name.tar.gz`.
 
         Each top-level entry becomes one orbax item: an array tree is saved by the standard handler,
-        anything JSON-serializable -- `meta`, and the always-empty `grad_scalers` -- as plain JSON.
+        anything JSON-serializable -- `meta`, and the `grad_scalers` a loss-scaled learner fills with
+        plain numbers -- as plain JSON.
         """
         path = directory / f"{name}{self.suffix}"
         # A failed save leaves orbax's own temporary directory behind, and cleaning that up raises
