@@ -16,6 +16,14 @@
 > [issue #33](https://github.com/f6ra07nk14/structcast-model/issues/33); everything else below is
 > unchanged.
 
+> **Amended: the third Keras limitation below no longer holds.** "Offers no separate averaged copy
+> to validate against" recorded a gap, not a decision: the generated Keras `inference_step` now
+> swaps the optimizer's average into the variables it owns for the duration of the inference flow
+> and puts the trained weights back after it, so a Keras run validates over averaged weights like
+> its torch and flax twins. What stays true is that there is no separate averaged *model* — no
+> `ema_<model>` an `INFERENCE_FLOW` could name, and no averaged weights in a saved checkpoint. The
+> other two limitations (blending on every apply, configuration on the inner optimizer) stand.
+
 Exponential moving averages are declared at the top level of a torch or flax learner template —
 `EMA: dict[str, bool | dict[str, Any]]`, keyed by model name — and emitted as named learner
 attributes `ema_<model>`: `torch.optim.swa_utils.AveragedModel` over the (DDP-unwrapped) model on

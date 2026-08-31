@@ -57,7 +57,7 @@ LEARNERS:
     #      - it belongs on the inner optimizer, which is what this pattern builds: under a float16
     #        policy the adapter wraps this optimizer in a "LossScaleOptimizer", and "use_ema" set on
     #        that wrapper instead would do nothing.
-    #    Keras keeps no separate averaged copy, so the INFERENCE_FLOW below reads "model" and not an
+    #    Keras keeps no separate averaged model, so the INFERENCE_FLOW below reads "model" and not an
     #    average -- there is no "ema_model" to point it at. It still validates over the averaged
     #    weights: the generated "inference_step" swaps them into the model around the flow and puts
     #    the trained ones back afterwards.
