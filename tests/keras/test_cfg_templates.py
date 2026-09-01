@@ -386,6 +386,27 @@ def test_the_showcase_average_can_be_left_out_by_parameter(tmp_path: Path) -> No
     assert all(np.isfinite(value) for value in _floats(learner.inference_step(**IMAGE_BATCH)).values())
 
 
+def test_the_showcase_window_can_be_taken_off_by_parameter(tmp_path: Path) -> None:
+    """Every knob on this template is one a run turns off, and accumulation had no off switch.
+
+    `gradient_accumulation_steps` rendered unguarded puts Python's `None` into the YAML as the
+    *string* `None`, which Keras compares against 2 and rejects -- so the showcase could not express
+    "train without a window" at all. Off, the keyword has to be absent rather than passed as
+    anything: Keras reads a missing one as no accumulation, and the learner's own window read
+    (`... or 1`) would take any non-empty string for a real window.
+    """
+    model = _model(tmp_path, "VisionTransformer", SHOWCASE_PARAMETERS, None)
+    learner = _learner(tmp_path, "ImageClassifierShowcase", {"DEFAULT": {"accumulate_gradients": None}}, model=model)
+    source = (tmp_path / "ImageClassifierShowcase_learner.py").read_text()
+
+    flags = [(learner.training_step(**IMAGE_BATCH), learner.has_updated)[1] for _ in range(2)]
+
+    assert "gradient_accumulation_steps=" not in source  # the keyword is absent, not passed as anything
+    assert learner.optimizers["optimizer"].gradient_accumulation_steps is None
+    assert flags == [True, True]  # without a window every step applies
+    assert learner.updates == 2
+
+
 def test_the_image_classifier_learner_derives_both_precision_fields_from_one_parameter(tmp_path: Path) -> None:
     """A precision comparison varies an arm of the run, not the shipped file.
 

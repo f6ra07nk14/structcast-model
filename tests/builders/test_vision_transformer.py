@@ -314,6 +314,34 @@ def test_the_showcase_pair_runs_all_four_features_in_one_training_step(
     assert torch.isfinite(learner.inference_step(image=image, label=label)["ce_loss"])
 
 
+def test_the_showcase_window_can_be_taken_off_by_parameter(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Every knob on this template is one a run turns off, and accumulation had no off switch.
+
+    `ACCUMULATE_GRADIENTS` rendered unguarded puts Python's `None` into the YAML as the *string*
+    `None`, which the learner schema rejects outright -- so the showcase could not express "train
+    without a window" at all, and the three backends disagreed about a parameter they are read side
+    by side for. Off has to reach both halves of the mechanism, since they are emitted separately:
+    the loss keeps its full scale and every step applies, which is what the divisor and the gate
+    below say. Set, the divisor is the window, which is the half a guard is easiest to drop.
+    """
+    generated = tmp_path_factory.mktemp("window")
+    sources = {}
+    for name, window in (("off", None), ("on", 4)):
+        TorchLearnerBuilder.from_path(SHOWCASE_YAML)(parameters={"DEFAULT": {"accumulate_gradients": window}})(
+            generated / f"{name}.py"
+        )
+        sources[name] = (generated / f"{name}.py").read_text()
+    learner = _load(generated / "off.py").Learner(_showcase_model(generated, False))
+    image, label = torch.randn(4, 3, 16, 16), torch.tensor([0, 1, 2, 3])
+
+    gates = [(learner.training_step(image=image, label=label), learner.has_updated)[1] for _ in range(2)]
+
+    assert "ce_loss.backward()" in sources["off"]  # no window, so no divisor and no gate to miss
+    assert "(ce_loss / 4).backward()" in sources["on"]  # the integer the window was set to
+    assert gates == [True, True]  # without a window every step applies
+    assert learner.updates == 2
+
+
 def test_the_showcase_learner_adds_the_scaler_only_for_the_float16_precision(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:

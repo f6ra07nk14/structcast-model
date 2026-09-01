@@ -573,6 +573,41 @@ def test_the_showcase_average_can_be_left_out_by_parameter(vision_transformer: A
     assert bool(jnp.isfinite(learner.inference_step(**_classification_batch())["ce_loss"]))
 
 
+def test_the_showcase_window_can_be_taken_off_by_parameter(vision_transformer: Any, tmp_path: Path) -> None:
+    """Every knob on this template is one a run turns off, and accumulation had no off switch.
+
+    Off means no `optax.MultiSteps` at all, the way the base learner spells it -- a window is a
+    mechanism, and ADR-0017 keeps the mechanism out of the chain when it is not asked for. Rendering
+    the parameter unguarded instead spells `None` into the YAML as a *string*, which `optax` takes
+    for a schedule callable and only rejects at the first update, long after the file was written
+    and imported. So the window set is asserted as an integer, not merely as present: a run whose
+    gate is any string at all is the bug, and `every_k_schedule='4'` would gate no better than
+    `'None'` does.
+    """
+    sources = {}
+    for label, window in (("off", None), ("on", 4)):
+        path = tmp_path / f"{label}.py"
+        FlaxLearnerBuilder.from_path(LEARNERS / "ImageClassifierShowcase.yaml")(
+            parameters={"DEFAULT": {"accumulate_gradients": window}}
+        )(path)
+        sources[label] = path.read_text()
+    learner = _load(tmp_path / "off.py", "off").Learner(vision_transformer(rngs=nnx.Rngs(0)))
+    batch = _classification_batch()
+
+    gates = [(learner.training_step(**batch), learner.has_updated)[1] for _ in range(2)]
+
+    assert "every_k_schedule" not in sources["off"]  # no window keyword means no wrapper was built
+    assert "every_k_schedule=4" in sources["on"]  # the integer, not the string '4' and not 'None'
+    # Off, the chain is the base learner's: the showcase is meant to read as a diff of knobs.
+    showcase, base = (
+        _render(LEARNERS / f"{name}.yaml", {"DEFAULT": {"accumulate_gradients": None}})["LEARNERS"][0]["OPTIMIZER"]
+        for name in ("ImageClassifierShowcase", "ImageClassifier")
+    )
+    assert showcase == base
+    assert gates == [True, True]  # without a window every step applies
+    assert learner.updates == 2
+
+
 # ---------------------------------------------------------------------------
 # The activation the three model templates share
 # ---------------------------------------------------------------------------

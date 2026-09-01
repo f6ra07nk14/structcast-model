@@ -17,7 +17,7 @@ PARAMETERS:
     lr: 1.0e-3
     weight_decay: 0.05
     clip_grad_norm: null # set to null or a positive float
-    accumulate_gradients: 4 # a positive integer: this learner is the accumulating one
+    accumulate_gradients: 4 # null or a positive integer: this learner is the accumulating one
     mixed_precision_type: bfloat16 # "bfloat16" (unscaled) or "float16" (adds the GradScaler)
     ema: true # false drops the average, which is what an FSDP2 run needs -- see 4. below
     ema_decay: 0.999
@@ -27,7 +27,11 @@ _jinja_yaml_: |-
   #    "accumulate_gradients" batches, and "has_updated" reads true only on those steps -- which is
   #    what makes the trainer fire "on_update" per update instead of per batch (REFERENCE.md,
   #    "ACCUMULATE_GRADIENTS"; "docs/adr/0017", "docs/adr/0018").
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
   ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
   # 3. Mixed precision: "MIXED_PRECISION_TYPE" is the dtype the flow runs under "torch.autocast",
   #    and "MIXED_PRECISION" is the "torch.amp.GradScaler" -- which only float16 needs, so it
   #    follows the type rather than being set on its own (REFERENCE.md, "MIXED_PRECISION").
