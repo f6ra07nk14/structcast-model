@@ -466,6 +466,27 @@ def test_both_image_classifiers_evaluate_their_top_k_under_a_bfloat16_policy(
     assert all(np.isfinite(value) for value in (*trained.values(), *evaluated.values()))
 
 
+@pytest.mark.parametrize("case", ["ImageClassifier", "ImageClassifierShowcase", "ConvNeXtV2"])
+def test_no_top_k_learner_hands_its_criteria_the_uncast_head_output(case: str, tmp_path: Path) -> None:
+    """Every template calling `sparse_top_k_categorical_accuracy` must route it through the cast.
+
+    The behavioral form of this is the bfloat16 run above, and it is the better check -- but it can
+    only be written for the two learners that can reach a policy at all. `ConvNeXtV2` declares
+    `MIXED_PRECISION: false` as a literal, and the CLI reads the policy off that class attribute
+    alone, so no parameter and no flag turns it on: the only way to reach the crash is to edit the
+    two fields, and a test cannot run what the shipped file cannot express. What is left is the
+    structural half, asserted on the rendered source, and it is the half that stops the next copy of
+    this recipe from shipping a flow whose accuracies read the head directly. Both flows are counted
+    because each spells the cast on its own.
+    """
+    path = tmp_path / f"{case}.py"
+    KerasLearnerBuilder.from_path(LEARNERS / f"{case}.yaml")(parameters={})(path)
+    source = path.read_text()
+
+    assert source.count("logits = keras.ops.cast(cls, 'float32')") == 2  # the training and inference flows
+    assert "y_pred=cls" not in source
+
+
 CYCLEGAN_BATCH = {
     "real_A": RNG.random((2, 16, 16, 3), dtype="float32"),
     "real_B": RNG.random((2, 16, 16, 3), dtype="float32"),

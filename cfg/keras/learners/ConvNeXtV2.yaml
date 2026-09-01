@@ -80,12 +80,19 @@ LEARNERS:
     # "keras.losses.SparseCategoricalCrossentropy" has no label smoothing, so the integer labels are
     # one-hot encoded against the width of the logits and the categorical loss carries the smoothing.
     # At "label_smoothing: 0.0" the two are the same loss.
+    # The cast is the one the two image classifier learners spell: it is an identity under the float32
+    # policy above, and the reason it is here anyway is that the accuracies want float32 --
+    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16
+    # prediction outright on the tensorflow backend (jax and torch compute it, and the
+    # "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). So turning
+    # MIXED_PRECISION on here is a two-line edit rather than a broken run.
     FLOW:
       - INPUTS: image
         OUTPUTS: {cls: cls}
         NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
       - ["eval: keras.ops.one_hot(label, cls.shape[-1])", one_hot_label, null]
-      - INPUTS: {y_true: one_hot_label, y_pred: cls}
+      - INPUTS: {y_true: one_hot_label, y_pred: logits}
         OUTPUTS: ce_loss
         NAME: cross_entropy_loss
         _jinja_yaml_: |-
@@ -94,12 +101,12 @@ LEARNERS:
             - _addr_: keras.losses.CategoricalCrossentropy
             - _call_: {from_logits: true, label_smoothing: {{label_smoothing}}}
       # The accuracy functions report one 0/1 value per sample, so each is averaged over the batch.
-      - INPUTS: {y_true: label, y_pred: cls}
+      - INPUTS: {y_true: label, y_pred: logits}
         OUTPUTS: correct1
         NAME: accuracy
         LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
       - ["eval: keras.ops.mean(correct1)", acc1, null]
-      - INPUTS: {y_true: label, y_pred: cls, k: 5}
+      - INPUTS: {y_true: label, y_pred: logits, k: 5}
         OUTPUTS: correct5
         NAME: top_5_accuracy
         LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
@@ -108,11 +115,12 @@ LEARNERS:
       - INPUTS: image
         OUTPUTS: {cls: cls}
         NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
       - ["eval: keras.ops.one_hot(label, cls.shape[-1])", one_hot_label, null]
-      - [{y_true: one_hot_label, y_pred: cls}, ce_loss, cross_entropy_loss]
-      - [{y_true: label, y_pred: cls}, correct1, accuracy]
+      - [{y_true: one_hot_label, y_pred: logits}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: logits}, correct1, accuracy]
       - ["eval: keras.ops.mean(correct1)", acc1, null]
-      - [{y_true: label, y_pred: cls, k: 5}, correct5, top_5_accuracy]
+      - [{y_true: label, y_pred: logits, k: 5}, correct5, top_5_accuracy]
       - ["eval: keras.ops.mean(correct5)", acc5, null]
 # "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
 # to specify the losses and models to be used during training.
