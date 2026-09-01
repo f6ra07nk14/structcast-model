@@ -103,13 +103,9 @@ fi
 # Wire Claude Code plugins via the official plugin marketplace. $CLAUDE_HOME is
 # bind-mounted from the host's ~/.claude, so plugin state is intentionally
 # shared with the host and survives rebuilds.
-if ! command -v claude >/dev/null 2>&1; then
-  echo "Claude CLI not found. Skipping Claude plugin setup."
-else
-  claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail
-  claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman
-  claude plugin marketplace add openai/codex-plugin-cc && claude plugin install codex@openai-codex
-fi
+claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail
+claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman
+claude plugin marketplace add openai/codex-plugin-cc && claude plugin install codex@openai-codex
 
 echo "Devcontainer post-create setup complete."
 echo "Codex path: $(command -v codex || echo 'not found')"
