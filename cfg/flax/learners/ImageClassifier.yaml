@@ -5,11 +5,9 @@
 # The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
 # learning rate, and "flax.nnx.Optimizer" only binds that chain to the module (see "docs/adr/0013").
 # There is no "CLIP" key either -- it is torch-only, and the chain below is where clipping lives.
-# "clip_grad_norm" therefore means something else than in the torch twin: here it is the "max_norm"
-# of "optax.clip_by_global_norm", i.e. the bound the global gradient norm is scaled down to, while
-# the torch template passes it to timm's clipper as "norm_type" -- the p of the norm -- and fixes
-# the bound at 1.0. A value that reads as a clipping threshold is what the committed
-# "cfg/flax/learners/ConvNeXtV2.yaml" already uses, so the Flax side stays consistent with itself.
+# "clip_grad_norm" is the "max_norm" of "optax.clip_by_global_norm", i.e. the bound the global
+# gradient norm is scaled down to -- the same L2 threshold the torch and Keras twins hand to timm's
+# clipper and to "global_clipnorm".
 # The builder wraps the factory carrying "learning_rate" in "optax.inject_hyperparams" so the rate
 # stays readable at run time; writing that wrapper here by hand is equally valid.
 PARAMETERS:

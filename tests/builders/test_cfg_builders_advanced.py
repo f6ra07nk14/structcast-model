@@ -5,10 +5,12 @@ from re import findall
 from typing import Any
 
 import pytest
+from timm.utils.clip_grad import dispatch_clip_grad
 
 from structcast_model.builders.torch import TorchLearnerBuilder
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR
+import torch
 
 LEARNER_YAML = CFG_DIR / "torch" / "learners" / "ConvNeXtV2.yaml"
 
@@ -261,6 +263,49 @@ def test_learner_no_clip_when_null() -> None:
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)(parameters=params).scripts[0]
     assert "dispatch_clip_grad" not in script
     assert "unscale_" not in script
+
+
+@pytest.mark.parametrize("template", ["ConvNeXtV2", "ImageClassifier", "ImageClassifierShowcase", "SmallLanguageModel"])
+def test_learner_clip_grad_norm_is_the_threshold_not_the_p_norm(template: str, tmp_path: Path) -> None:
+    """Every torch learner template must hand `clip_grad_norm` to timm as `value`, never `norm_type`.
+
+    `value` is the norm the gradients are scaled down to and `norm_type` is the p of that norm, so
+    binding the knob to `norm_type` leaves the threshold at the literal beside it and turns a
+    request to clip at 2.0 into an L2-vs-p choice clipped at 1.0. It is a silent inversion -- the
+    build succeeds and training runs -- and it would put the torch templates at odds with the Flax
+    (`optax.clip_by_global_norm`) and Keras (`global_clipnorm`) twins, where the same parameter has
+    always been the L2 bound.
+    """
+    yaml = CFG_DIR / "torch" / "learners" / f"{template}.yaml"
+    built = TorchLearnerBuilder.from_path(yaml)(parameters={"DEFAULT": {"clip_grad_norm": 2.0}})
+    assert "dispatch_clip_grad(*_arg0, value=2.0, mode='norm', norm_type=2.0, **_kw0)" in rendered_module(
+        built, tmp_path
+    )
+
+
+def test_dispatch_clip_grad_value_is_the_l2_bound() -> None:
+    """What the templates assume of timm: `value` bounds the global norm, and only when exceeded.
+
+    Pinned against the real `dispatch_clip_grad` because the binding above is only correct for as
+    long as this holds; a timm release that renamed or reordered these would otherwise land as a
+    silent change in what every torch template clips at.
+    """
+
+    def gradients() -> list[torch.nn.Parameter]:
+        """A single parameter whose gradient has a global L2 norm of exactly 5.0."""
+        parameter = torch.nn.Parameter(torch.zeros(2))
+        parameter.grad = torch.tensor([3.0, 4.0])
+        return [parameter]
+
+    (loose,) = gradients()
+    dispatch_clip_grad(loose, value=100.0, mode="norm", norm_type=2.0)
+    assert loose.grad is not None
+    assert loose.grad.norm().item() == pytest.approx(5.0)
+
+    (tight,) = gradients()
+    dispatch_clip_grad(tight, value=1.0, mode="norm", norm_type=2.0)
+    assert tight.grad is not None
+    assert tight.grad.norm().item() == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
