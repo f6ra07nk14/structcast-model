@@ -3,13 +3,15 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cache, cached_property
+from inspect import signature
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import Field, ValidationError
 from structcast.core.exceptions import SpecError
-from structcast.core.instantiator import ObjectPattern
+from structcast.core.instantiator import AddressPattern, ObjectPattern
+from structcast.utils.base import import_from_address
 
 from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.base import (
@@ -41,6 +43,13 @@ class FlaxLayerIntermediate(LayerIntermediate):
     (passed down to sub-module constructors via ``eval: rngs`` in the YAML template) and
     whose ``__call__`` accepts a ``training: bool`` keyword argument for toggling training vs. inference behaviour.
 
+    ``__init__`` also carries the precision pair every ``flax.nnx`` layer is parameterized by --
+    ``dtype`` (compute, defaulting to ``None``, which is each layer's own default) and ``param_dtype``
+    (storage, defaulting to ``jax.numpy.float32``, which is the ``flax.nnx`` default) -- and the
+    builder forwards them to every sub-layer whose constructor names them, per keyword, and to every
+    nested generated class. A ``dtype`` or ``param_dtype`` the template wrote on a layer itself wins:
+    the builder only adds what the pattern does not already set.
+
     Example:
         >>> from structcast_model.builders.flax import FlaxLayerIntermediate
         >>> script = FlaxLayerIntermediate(
@@ -57,8 +66,12 @@ class FlaxLayerIntermediate(LayerIntermediate):
         True
     """
 
-    default_imports: ClassVar[dict[str, set[str | None]]] = {"flax.nnx": {None}}
-    """Default imports for Flax nnx modules."""
+    default_imports: ClassVar[dict[str, set[str | None]]] = {
+        "flax.nnx": {None},
+        "flax.typing": {None},
+        "jax.numpy": {None},
+    }
+    """Default imports for Flax nnx modules; the last two spell the `__init__` precision pair."""
 
     def _get_layer(self, layername: str) -> str:
         """Get the sub-module with the given name."""
@@ -66,7 +79,7 @@ class FlaxLayerIntermediate(LayerIntermediate):
 
     @classmethod
     def _get_class_instance(cls, classname: str) -> str:
-        return f"{classname}(rngs=rngs, training=training)"
+        return f"{classname}(rngs=rngs, training=training, dtype=dtype, param_dtype=param_dtype)"
 
     def _get_layer_script(self, class_name: str, initialized_layers: list[str]) -> str:
         """Return the Python class script for a Flax nnx module."""
@@ -95,7 +108,8 @@ class FlaxLayerIntermediate(LayerIntermediate):
         return f"""\
 class {class_name}({base}):
 
-{attributes}    def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):
+{attributes}    def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True, \
+dtype: flax.typing.Dtype | None = None, param_dtype: flax.typing.Dtype = jax.numpy.float32):
         self.inputs = {self.inputs}
         self.input_shapes = {self.input_shapes}
         self.outputs = {self.outputs}
@@ -116,6 +130,64 @@ class {class_name}({base}):
 _REMAT_OPTIONS = frozenset({"graph", "graph_updates", "policy", "prevent_cse", "static_argnums"})
 """The keyword arguments `flax.nnx.remat` accepts, which `GRADIENT_CHECKPOINTING` carries."""
 
+_DTYPE_ARGUMENTS = ("dtype", "param_dtype")
+"""The precision keywords the generated `__init__` carries and forwards to the layers that name them."""
+
+
+@cache
+def _accepted_dtypes(address: str, file: str | None) -> tuple[str, ...]:
+    """Return which of the precision keywords the addressed layer's constructor names.
+
+    Read off the signature, and per keyword rather than as a pair, because the layers do not agree
+    on both: `flax.nnx.Conv` names `dtype` and `param_dtype`, `flax.nnx.Dropout` neither, and a
+    user's own layer may name one. A `**kwargs` does not count -- it says nothing about what the
+    layer would do with the value -- so only a real parameter is forwarded to.
+
+    An address that cannot be imported or read here forwards nothing, which is what this builder
+    emitted before there was anything to forward: the generated script imports the same address, so
+    a layer that is missing at build time is a failure the run reports itself.
+    """
+    try:
+        target = import_from_address(address, module_file=file)
+        # A class keeps its arguments on `__init__`: every `flax.nnx` layer answers `(*args, **kwargs)`
+        # for the class itself, which would report the whole catalogue as naming neither keyword.
+        constructor: Any = target
+        if isinstance(target, type):
+            constructor = constructor.__init__
+        parameters = signature(constructor).parameters
+    except Exception:  # Any import or introspection failure means the layer is forwarded nothing.
+        return ()
+    return tuple(name for name in _DTYPE_ARGUMENTS if name in parameters)
+
+
+def _with_dtypes(pattern: ObjectPattern) -> ObjectPattern:
+    """Add to one layer's pattern the precision keywords it accepts and does not already set.
+
+    The keywords are added as `eval:` values, so they resolve to the `dtype` and `param_dtype`
+    parameters of the generated `__init__` exactly as `rngs` resolves to its `rngs` parameter. What
+    the pattern already carries -- a template that threads its own `dtype` onto a layer, say -- is
+    left alone, so a per-layer value always wins over the constructor argument.
+
+    Only a pattern that ends in the call building the layer is rewritten: a bare address
+    (`flax.nnx.relu`) names a function the flow calls with its input, and a `_bind_` names a callable
+    whose arguments the configuration has already chosen.
+    """
+    head = pattern.patterns[0]
+    if not isinstance(head, AddressPattern):
+        return pattern
+    # Serialized rather than validated: `ObjectPattern` takes the list form its validator accepts
+    # back, which is also where a call's keywords are plain data.
+    dumped = cast(list[Any], pattern.model_dump(by_alias=True))
+    # An argument-less call dumps to the bare key, which is still the call that builds the layer.
+    last = {"_call_": {}} if dumped[-1] == "_call_" else dumped[-1]
+    if not isinstance(keywords := (last.get("_call_") if isinstance(last, dict) else None), dict):
+        return pattern
+    missing = {name: f"eval: {name}" for name in _accepted_dtypes(head.address, head.file) if name not in keywords}
+    if not missing:
+        return pattern
+    dumped[-1] = {"_call_": {**keywords, **missing}}
+    return ObjectPattern.model_validate(dumped)
+
 
 @dataclass(kw_only=True, slots=True)
 class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
@@ -127,6 +199,10 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     Sub-modules that require a random-number generator should receive ``rngs: "eval: rngs"`` in
     their ``_call_`` arguments so that the builder emits ``rngs=rngs`` in the generated ``__init__`` body.
 
+    The ``dtype``/``param_dtype`` pair is not threaded that way: the builder reads each layer's
+    constructor and adds whichever of the two it names, so every generated model is a precision knob
+    without its template saying so. A value written on the layer in the configuration wins.
+
     Example:
         >>> from structcast_model.builders.flax import FlaxBuilder
         >>> layer_spec = {"_obj_": [["_addr_", "flax.nnx.Linear"], {"_call_": {"in_features": 8, "out_features": 4}}]}
@@ -137,6 +213,10 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     """
 
     user_defined_layer_type: ClassVar[type[FlaxLayerIntermediate]] = FlaxLayerIntermediate
+
+    def _resolve_layer(self, imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
+        """Resolve one layer, handing it the precision keywords of the generated `__init__`."""
+        return resolve_object(imports, _with_dtypes(pattern))
 
     def _resolve_gradient_checkpointing(
         self,

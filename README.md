@@ -853,7 +853,8 @@ _obj_:
 **[`cfg/flax/models/ConvNeXtV2.yaml`](cfg/flax/models/ConvNeXtV2.yaml)** — Generates a [Flax `nnx.Module`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/module.html) equivalent of the PyTorch ConvNeXtV2 model. The template mirrors the same parameter groups (`atto` through `huge`) and uses [`GlobalResponseNorm`](src/structcast_model/flax/layers/grn.py) as a custom Flax layer. Key differences from the PyTorch variant:
 
 - uses channel-last tensor layout (*H × W × C*)
-- constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization
+- constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization, and a
+  `dtype`/`param_dtype` pair forwarded to every layer that takes one (see REFERENCE.md, *Precision (Flax)*)
 - `__call__` propagates a `training` flag to sub-modules
 - layer APIs differ (e.g., `flax.nnx.Conv` instead of `torch.nn.LazyConv2d`)
 

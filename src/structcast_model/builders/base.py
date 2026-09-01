@@ -336,6 +336,17 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             "module: build the layer with the torch, flax or keras builder."
         )
 
+    def _resolve_layer(self, imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
+        """Resolve one flow layer's pattern to the expression the generated `__init__` builds it with.
+
+        The hook a framework builder overrides to hand every layer of its models what the generated
+        `__init__` carries for all of them -- the Flax builder's `dtype` and `param_dtype` -- rather
+        than making each template thread it. Only the layers of a model go through here: a nested
+        object inside one layer's arguments is resolved by `resolve_object` itself, and the flow
+        layers of a learner are resolved by the learner builder.
+        """
+        return resolve_object(imports, pattern)
+
     def _get_layer(self, parameters: Parameters, unit: UserLayer) -> tuple[str, LayerIntermediateT]:
         if unit.CFG is not None:
             current_path = str(unit.CFG)
@@ -413,7 +424,7 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
                     name = unit.NAME
                 else:
                     if isinstance(unit.LAYER, ObjectPattern):
-                        subinst, subclassname = resolve_object(imports, unit.LAYER)
+                        subinst, subclassname = self._resolve_layer(imports, unit.LAYER)
                     else:
                         subclassname, subinst = self._get_layer(parameters, unit.LAYER)
                     if (name := unit.NAME or naming(to_snake(subclassname))) in layers:

@@ -550,9 +550,25 @@ LEARNERS:
 ---
 
 **Precision (Flax)** — Flax carries precision on the model, not on the learner: each `flax.nnx`
-layer takes a `dtype` (compute) and a `param_dtype` (storage).
+layer takes a `dtype` (compute) and a `param_dtype` (storage). Every generated model takes that pair
+on its `__init__`, beside `rngs`, and forwards it to every layer whose constructor names it and to
+every nested generated class — read off each signature, so per keyword: a layer naming only one gets
+only that one, and a layer naming neither (`flax.nnx.Dropout`, a bare function like `flax.nnx.relu`)
+gets nothing. Precision is therefore a knob on every Flax model, whatever its template says:
+
+```python
+model = Model(rngs=nnx.Rngs(0), dtype=jnp.bfloat16)  # every layer of it, CycleGAN included
+```
+
+`dtype` defaults to `None`, which leaves each layer on its own compute type, and `param_dtype` to
+`jax.numpy.float32`, which is the `flax.nnx` default — a model that names neither is the model this
+builder emitted before the pair existed. A `dtype` or `param_dtype` the configuration wrote on a
+layer wins over the constructor argument, per keyword, which is what keeps a template's own
+threading authoritative.
+
+That threading is the other half, and it is build time rather than construction time:
 [`cfg/flax/models/VisionTransformer.yaml`](cfg/flax/models/VisionTransformer.yaml) parameterizes the
-first as a `SHARED` template parameter, defaulting to `null`:
+first of the pair as a `SHARED` template parameter, defaulting to `null`:
 
 ```bash
 scm flax create model cfg/flax/models/VisionTransformer.yaml -p 'SHARED: {dtype: bfloat16}' -o model.py

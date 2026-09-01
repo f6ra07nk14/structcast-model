@@ -638,3 +638,47 @@ def test_restore_counters_seeds_both_counts_from_the_checkpoint(tmp_path: Path) 
     learner.training_step(x=X, y=Y)
 
     assert (learner.steps, learner.updates) == (8, 4)
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_a_half_precision_model_trains_under_the_scale_the_learner_owns(tmp_path: Path, compiled: bool) -> None:
+    """The two halves of a Flax float16 run are configured apart and have to meet here.
+
+    Precision is the model's -- the `dtype` its generated `__init__` now takes, whatever its template
+    threads -- and the loss scale is the learner's `MIXED_PRECISION`, so nothing pairs them at build
+    time. What this asserts is that they compose: the activations are float16 over the fp32 master
+    weights, the scaled step still brings the loss down, and the counters still report the applies.
+
+    The constructor arguments are not step arguments, which is the other half. They are read once,
+    in `__init__`, and what they leave behind is a static attribute of each layer, so the donation
+    contract the command derives from the step's signature must be the float32 one, a compiled step
+    must accept them without a new argument, and the inference views the learner runs validation
+    through must see the same narrowed layers.
+
+    The scale is started low on purpose: at the `DynamicScale` default of 65536 a gradient of order
+    one overflows float16 on the first step, which is the mechanism working rather than the pairing
+    failing, and it would leave three skipped steps to assert nothing about.
+    """
+    model = _model_type(tmp_path)(rngs=nnx.Rngs(0), dtype=jnp.float16)
+    learner = _learner_type(tmp_path, parameters={"DEFAULT": {"mixed_precision": {"scale": 128.0}}})(model)
+
+    assert model.fc.dtype is jnp.float16
+    assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
+    assert donate_argnames(learner._training_step) == ("model", "optimizer", "optimizer_dynamic_scale")
+    if compiled:
+        step = learner._training_step
+        learner._training_step = nnx.jit(step, donate_argnames=donate_argnames(step))
+    before = _parameters(learner.models["model"])
+
+    losses = [float(learner.training_step(x=X, y=Y)["loss"]) for _ in range(3)]
+    after = _parameters(learner.models["model"])
+
+    assert bool(jnp.all(jnp.isfinite(jnp.asarray(losses))))
+    assert losses[-1] < losses[0]
+    assert any(not jnp.array_equal(a, b) for a, b in zip(before, after, strict=True))
+    assert (learner.steps, learner.updates) == (3, 3)
+    # The inference path runs `nnx.view` copies of the models, which carry the layers themselves:
+    # a view that had rebuilt them would evaluate a float32 model the run never trained.
+    assert learner._view_model.fc.dtype is jnp.float16
+    assert jnp.isfinite(learner.inference_step(x=X, y=Y)["loss"])
+    assert all(jnp.array_equal(a, b) for a, b in zip(after, _parameters(learner.models["model"]), strict=True))

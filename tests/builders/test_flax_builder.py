@@ -62,7 +62,12 @@ def test_flax_layer_intermediate_generates_training_inference_branches() -> None
 
 
 def test_flax_layer_intermediate_init_accepts_rngs() -> None:
-    """Generated __init__ signature must include rngs: flax.nnx.Rngs."""
+    """Generated __init__ signature must include rngs: flax.nnx.Rngs and the precision pair.
+
+    The defaults are the contract: `dtype=None` leaves every layer on its own compute type and
+    `param_dtype=jax.numpy.float32` is the `flax.nnx` storage default, so a model built without
+    naming either is the model this builder emitted before it carried them.
+    """
     script = FlaxLayerIntermediate(
         classname="Unit",
         imports={},
@@ -73,7 +78,10 @@ def test_flax_layer_intermediate_init_accepts_rngs() -> None:
         inference_flow=[],
         structured_output=False,
     )._get_layer_script("Unit", [])
-    assert "def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):" in script
+    assert (
+        "def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True, "
+        "dtype: flax.typing.Dtype | None = None, param_dtype: flax.typing.Dtype = jax.numpy.float32):"
+    ) in script
 
 
 def test_flax_layer_intermediate_uses_inputs_outputs_attributes() -> None:
@@ -1071,3 +1079,86 @@ def test_flax_learner_without_ema_is_emitted_as_it_was_before_the_field_existed(
 
     assert built.ema == ()
     assert "ema_" not in built.scripts[-1]
+
+
+class ComputeOnlyLayer:
+    """A layer naming `dtype` and not `param_dtype`, which no shipped `flax.nnx` layer does.
+
+    Addressed by the test below so the forwarding is proven per keyword rather than as a pair: every
+    parameterized `flax.nnx` layer names both, so a builder that treated them as one would pass on
+    the whole shipped catalogue and hand a user's own layer an argument it cannot take.
+    """
+
+    def __init__(self, *, dtype: Any = None) -> None:
+        """Take the compute type and nothing else; the builder only ever reads this signature."""
+        self.dtype = dtype
+
+
+def _flow_layer(address: str, **keywords: Any) -> dict[str, Any]:
+    """One `LAYER` pattern calling *address* with *keywords*."""
+    return {"_obj_": [["_addr_", address], {"_call_": keywords}]}
+
+
+def test_flax_forwards_each_precision_keyword_only_to_the_layers_that_name_it() -> None:
+    """The constructor pair reaches a layer through its own signature, not through the template.
+
+    Which is what makes every generated Flax model a precision knob, the templates that thread
+    `dtype` themselves included. Read per keyword and per layer, because the alternatives all
+    generate code that imports: a pair forwarded together breaks the layer naming one, a pair
+    forwarded to everything breaks `flax.nnx.Dropout`, and a bare address is a function the flow
+    calls, not a constructor with arguments to add.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            ["x", "x", "fc", _flow_layer("flax.nnx.Linear", in_features=4, out_features=4, rngs="eval: rngs")],
+            ["x", "x", "drop", _flow_layer("flax.nnx.Dropout", rate=0.5, rngs="eval: rngs")],
+            ["x", "x", "act", {"_obj_": [["_addr_", "flax.nnx.relu"]]}],
+            ["x", "y", "half", _flow_layer("tests.builders.test_flax_builder.ComputeOnlyLayer")],
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert (
+        "self.fc = Linear(in_features=4, out_features=4, rngs=rngs, dtype=dtype, param_dtype=param_dtype)\n"
+    ) in script
+    assert "self.drop = Dropout(rate=0.5, rngs=rngs)\n" in script
+    assert "self.act = relu\n" in script
+    assert "self.half = ComputeOnlyLayer(dtype=dtype)\n" in script
+
+
+def test_a_precision_keyword_written_on_a_layer_wins_over_the_constructor_argument() -> None:
+    """A value the configuration chose for one layer is the one that layer keeps.
+
+    The templates that already thread `dtype` through their own parameters are the reason: their
+    per-layer value has to survive a model built with the constructor argument, or a size group's
+    `bfloat16` would become whatever the caller passed. The other keyword is still forwarded, so the
+    precedence is per keyword too.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            [
+                "x",
+                "y",
+                "fc",
+                _flow_layer(
+                    "flax.nnx.Linear",
+                    in_features=4,
+                    out_features=2,
+                    rngs="eval: rngs",
+                    dtype="eval: jax.numpy.bfloat16",
+                ),
+            ]
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert (
+        "self.fc = Linear(in_features=4, out_features=2, rngs=rngs, "
+        "dtype=jax.numpy.bfloat16, param_dtype=param_dtype)\n"
+    ) in script

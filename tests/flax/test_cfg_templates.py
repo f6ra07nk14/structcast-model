@@ -749,9 +749,16 @@ def test_vision_transformer_emits_the_same_module_until_a_dtype_is_asked_for(tmp
 
     assert absent == explicit_none
     assert checkpointed == checkpointed_none
-    # Layer constructions only: the class-token index is a "jax.numpy.zeros(..., dtype=...)"
-    # expression that has always been there, so a bare "dtype=" would not mean what it looks like.
-    assert not [line for line in absent.splitlines() if line.lstrip().startswith("self.") and "dtype=" in line]
+    # Layer constructions only, and only a dtype the template chose: the class-token index is a
+    # "jax.numpy.zeros(..., dtype=...)" expression that has always been there, and every layer now
+    # carries the builder's own "dtype=dtype" forwarding, so a bare "dtype=" would not mean what it
+    # looks like. What must stay absent is a value the knob picked, which is what the template
+    # threads and what would move the module a run trains.
+    assert not [
+        line
+        for line in absent.splitlines()
+        if line.lstrip().startswith("self.") and re_search(r"\bdtype=(?!dtype\b)", line)
+    ]
     assert "gradient_checkpointing = True" in checkpointed
 
 
@@ -799,9 +806,14 @@ def _conv_next_script(parameters: dict[str, Any], directory: Path) -> str:
 
 
 def _typed_layers(script: str) -> list[tuple[str, bool]]:
-    """Every parameterized layer the module constructs, paired with whether it was given a `dtype`."""
+    """Every parameterized layer the module constructs, paired with whether the template typed it.
+
+    A `dtype=dtype` is the builder forwarding its `__init__` argument to every layer that takes one
+    and is not what this knob is asked to prove: what the template threads is a value, and a layer
+    the template missed keeps the forwarded name.
+    """
     return [
-        (match.group(1), "dtype=" in line)
+        (match.group(1), bool(re_search(r"\bdtype=(?!dtype\b)", line)))
         for line in script.splitlines()
         if (match := re_search(r"= (Conv|LayerNorm|Linear|GlobalResponseNorm)\(", line))
     ]
@@ -871,3 +883,59 @@ def test_conv_next_v2_drops_whole_samples_when_stochastic_depth_is_on(tmp_path: 
     assert not jnp.allclose(dropped, model(image)["cls"])
     assert jnp.array_equal(_evaluating(model)(image)["cls"], _evaluating(model)(image)["cls"])
     assert len({tuple(row.tolist()) for row in dropped}) <= 8
+
+
+CYCLE_GAN_GENERATOR = {"DEFAULT": {"n_residual_blocks": 1, "init_features": 4}}
+"""The smallest generator the template builds that still has one of each block."""
+
+
+def test_the_cycle_gan_generator_narrows_from_its_constructor_alone(tmp_path: Path) -> None:
+    """A template that threads no `dtype` of its own still builds a half-precision model.
+
+    Which is the point of carrying the pair on the generated `__init__`: the CycleGAN templates
+    mention precision nowhere, and before this every layer of them was float32 whatever the caller
+    asked for. Every convolution and normalization is read back rather than a sample, because the
+    generator reaches its layers through four nested classes and a pair forwarded into three of them
+    would half narrow a model that still trains. `param_dtype` stays at its default, so the weights
+    keep the fp32 master copy a float16 run needs; only the activations are float16.
+    """
+    model = _model_type(tmp_path, "CycleGAN_generator", CYCLE_GAN_GENERATOR)(rngs=nnx.Rngs(0), dtype=jnp.float16)
+    layers = [node for _, node in nnx.iter_graph(model) if isinstance(node, (nnx.Conv, nnx.InstanceNorm))]
+
+    assert len(layers) >= 10
+    assert {layer.dtype for layer in layers} == {jnp.float16}
+    assert {layer.param_dtype for layer in layers} == {jnp.float32}
+    assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
+    assert model(jnp.zeros((1, 32, 32, 3)))["out"].dtype == jnp.float16
+
+
+def test_the_precision_pair_left_at_its_defaults_is_the_model_that_was_emitted_without_it(tmp_path: Path) -> None:
+    """The pair is inert unless it is asked for, proven against the module as it read before it existed.
+
+    That module is this one with the three things the feature adds deleted -- the two parameters of
+    `__init__` and the forwarding of each to a layer and to a nested class -- so the comparison is
+    against real generated code rather than against a rewrite of it. What has to match is behaviour,
+    not text: the same `rngs` seed must produce the same parameters, leaf for leaf, and the same
+    forward output, because a `param_dtype` that was not the `flax.nnx` default or a `dtype=None`
+    that did not mean "the layer's own" would move a model every existing checkpoint is keyed to.
+    """
+    path = tmp_path / "vit.py"
+    FlaxBuilder.from_path(MODELS / "VisionTransformer.yaml")(parameters=VIT_PARAMETERS)(path)
+    without = (
+        path.read_text()
+        .replace(", dtype: flax.typing.Dtype | None = None, param_dtype: flax.typing.Dtype = jax.numpy.float32", "")
+        .replace(", dtype=dtype, param_dtype=param_dtype", "")
+    )
+    (stripped := tmp_path / "vit_without.py").write_text(without)
+
+    assert "dtype=dtype" not in without
+    assert without != path.read_text()
+    with_pair = _load(path, "vit").Model(rngs=nnx.Rngs(0))
+    without_pair = _load(stripped, "vit_without").Model(rngs=nnx.Rngs(0))
+    batch = jnp.zeros((2, 16, 16, 3))
+
+    left, right = _named_parameters(with_pair), _named_parameters(without_pair)
+
+    assert [name for name, _ in left] == [name for name, _ in right]
+    assert all(jnp.array_equal(a, b) for (_, a), (_, b) in zip(left, right, strict=True))
+    assert jnp.array_equal(with_pair(batch)["cls"], without_pair(batch)["cls"])
