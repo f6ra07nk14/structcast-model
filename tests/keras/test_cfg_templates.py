@@ -30,6 +30,8 @@ MODELS = CFG_DIR / "keras" / "models"
 LEARNERS = CFG_DIR / "keras" / "learners"
 STRATEGIES = CFG_DIR / "keras" / "strategies"
 
+BACKEND = keras.backend.backend()
+
 RNG = np.random.default_rng(0)
 """One generator for every fixed batch below, so the arrays are the same in every process."""
 
@@ -423,6 +425,45 @@ def test_the_image_classifier_learner_derives_both_precision_fields_from_one_par
 
     assert policies["default"] == (False, None)
     assert policies["mixed"] == (True, "bfloat16")
+
+
+IMAGE_CLASSIFIERS: dict[str, dict[str, Any]] = {
+    "ImageClassifier": {"SHARED": {"mixed_precision_type": "bfloat16"}},
+    "ImageClassifierShowcase": {},
+}
+"""The two templates of one image-classification recipe, each in the parametrization of its mixed arm.
+
+The showcase declares the policy in the file; the base learner reaches the same one through the
+parameter that carries both precision fields.
+"""
+
+
+@pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow backend's in_top_k refuses bfloat16.")
+@pytest.mark.parametrize("case", list(IMAGE_CLASSIFIERS), ids=list(IMAGE_CLASSIFIERS))
+def test_both_image_classifiers_evaluate_their_top_k_under_a_bfloat16_policy(
+    case: str, tmp_path: Path, restore_policy: None
+) -> None:
+    """One recipe in two templates: the mixed arm has to run on both, or the pair has drifted apart.
+
+    Under the policy the head emits bfloat16, and `tf.math.in_top_k` -- what
+    `keras.metrics.sparse_top_k_categorical_accuracy` reaches on this backend -- refuses a bfloat16
+    prediction outright, so a flow handing it the head's output dies on the run's first accuracy.
+    The showcase carried the float32 cast that avoids this and the base learner did not, because
+    nothing read the two side by side; this does, over the same model and the same batch. Both flows
+    are exercised: each spells the cast separately, and a training run reaches the training one first.
+    """
+    keras.mixed_precision.set_global_policy("mixed_bfloat16")
+    model = _model(tmp_path, "VisionTransformer", SHOWCASE_PARAMETERS, None)
+    learner = _learner(tmp_path, case, IMAGE_CLASSIFIERS[case], model=model)
+
+    assert (learner.MIXED_PRECISION, learner.MIXED_PRECISION_TYPE) == (True, "bfloat16")
+    assert keras.backend.standardize_dtype(model(IMAGE_BATCH["image"])["cls"].dtype) == "bfloat16"
+
+    trained = _floats(learner.training_step(**IMAGE_BATCH))
+    evaluated = _floats(learner.inference_step(**IMAGE_BATCH))
+
+    assert sorted(trained) == sorted(evaluated) == sorted(learner.outputs)
+    assert all(np.isfinite(value) for value in (*trained.values(), *evaluated.values()))
 
 
 CYCLEGAN_BATCH = {
