@@ -2,7 +2,9 @@
 # backend turned on at once. The optimizer call, the flow and the criteria are the base learner's,
 # unchanged, so a diff against it shows the knobs and nothing else. Three of the four are keyword
 # arguments of the optimizer: Keras owns accumulation and EMA itself, and this backend declares no
-# ACCUMULATE_GRADIENTS and no EMA field of its own (REFERENCE.md, "EMA"; "docs/adr/0017").
+# ACCUMULATE_GRADIENTS and no EMA field of its own -- a learner field exists only where the
+# framework has no mechanism of its own, so either key here is rejected as an unknown field
+# (REFERENCE.md, "EMA").
 #
 #   scm keras train \
 #     --model cfg/keras/models/VisionTransformer.yaml \
@@ -13,7 +15,7 @@
 #    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section, whose
 #    generated "call" then wraps "_call_body" in "keras.remat" on the training path. Keras takes the
 #    bare "true" only -- "keras.remat" has no options, and a non-empty mapping is rejected at build
-#    time (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020"). "drop_path_rate: 0.0" travels
+#    time (REFERENCE.md, "GRADIENT_CHECKPOINTING"). "drop_path_rate: 0.0" travels
 #    with it because the build refuses otherwise: "keras.remat" re-draws seeds on the recomputation,
 #    and a block's "DropPath" is a "keras.layers.Dropout" one TYPE sublayer down. At rate 0 it draws
 #    nothing, so the two passes agree; at any other rate the build stops instead of training on
@@ -47,7 +49,9 @@ LEARNERS:
     #    and the generated learner reads the optimizer's own counter back after each step, so
     #    "has_updated" reports a real apply rather than a predicted one -- a step a float16
     #    "LossScaleOptimizer" skipped truthfully reports no update. Every optimizer of a learner
-    #    must share the window (REFERENCE.md, "ACCUMULATE_GRADIENTS"; "docs/adr/0018").
+    #    must share the window: the first optimizer's counter is the learner's clock, so the
+    #    generated "__init__" refuses a second window rather than mis-gate the rest of them
+    #    silently (REFERENCE.md, "ACCUMULATE_GRADIENTS").
     #
     # 4. EMA is "use_ema"/"ema_momentum" on the optimizer, with two limitations this template does
     #    not work around and does not hide (REFERENCE.md, "EMA"):

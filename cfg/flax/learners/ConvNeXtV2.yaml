@@ -1,7 +1,7 @@
 # Supervised image classification for the Flax model "cfg/flax/models/ConvNeXtV2.yaml", which reads
 # "image" and emits a structured output whose only key is "cls".
 # The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
-# learning rate, and "flax.nnx.Optimizer" only binds that chain to the module (see "docs/adr/0013").
+# learning rate, and "flax.nnx.Optimizer" only binds that chain to the module.
 # The builder wraps the factory carrying "learning_rate" in "optax.inject_hyperparams" so the rate
 # stays readable at run time; writing that wrapper here by hand is equally valid.
 PARAMETERS:
@@ -22,8 +22,7 @@ LEARNERS:
     # convolutions and the two projections of each block are all that is left to decay.
     # "accumulate_gradients", when set, wraps the whole chain in "optax.MultiSteps": accumulation
     # gates on the device, and the generated step reads the applied count back off the outermost
-    # optimizer state across its own update, so the wrapper has to stay outermost to be seen
-    # (see "docs/adr/0019").
+    # optimizer state across its own update, so the wrapper has to stay outermost to be seen.
     OPTIMIZER:
       - _obj_
       - _addr_: flax.nnx.Optimizer

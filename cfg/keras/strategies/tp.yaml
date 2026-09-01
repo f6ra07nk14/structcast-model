@@ -1,12 +1,15 @@
 # Distributed strategy pattern: tensor parallelism, on the jax Keras backend alone -- the tensorflow
-# and torch cells are refused at construction with the reason (docs/adr/0016, docs/adr/0022). The
-# mesh is two-dimensional, ("batch", "model"), with a batch axis of one: every device holds a slice
-# of the layers the rules name and runs the whole batch through it. "column" splits a variable by its
-# last dimension (a bias with it), "row" splits by the first one and leaves the bias whole, because
-# the reduction that follows a row-parallel layer would otherwise count a split bias once per shard.
-# A dimension the devices do not divide falls back to replication rather than failing the run. Rules
-# are required: which layers pair up into a column/row split is the model's own shape. The pattern is
-# called with device=...; bind devices to use only the first N of them.
+# and torch cells are refused at construction with the reason: splitting a layer across devices goes
+# through "keras.distribution", which is a no-op prototype on tensorflow and has no torch
+# implementation at all, so an unrefused run there would replicate every variable, compute the whole
+# layer on every device, and report success. The mesh is two-dimensional, ("batch", "model"), with a
+# batch axis of one: every device holds a slice of the layers the rules name and runs the whole batch
+# through it. "column" splits a variable by its last dimension (a bias with it), "row" splits by the
+# first one and leaves the bias whole, because the reduction that follows a row-parallel layer would
+# otherwise count a split bias once per shard. A dimension the devices do not divide falls back to
+# replication rather than failing the run. Rules are required: which layers pair up into a column/row
+# split is the model's own shape. The pattern is called with device=...; bind devices to use only the
+# first N of them.
 #
 # The rules below are (variable-path regex, tactic) pairs written for
 # cfg/keras/models/VisionTransformer.yaml and must be adapted to the model they run on: a rule

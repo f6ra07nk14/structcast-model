@@ -9,7 +9,7 @@
 #
 # 1. Gradient checkpointing is a model-side field, not a learner one, so the "-p" above is what turns
 #    it on: it sets "GRADIENT_CHECKPOINTING" on the Vision Transformer's "Block" section
-#    (REFERENCE.md, "GRADIENT_CHECKPOINTING"; "docs/adr/0020"). "timm.layers.DropPath" inside the
+#    (REFERENCE.md, "GRADIENT_CHECKPOINTING"). "timm.layers.DropPath" inside the
 #    block is safe under it -- torch replays the same random draw when it recomputes.
 # 2..4 are the three fields below.
 PARAMETERS:
@@ -26,7 +26,8 @@ _jinja_yaml_: |-
   # 2. Accumulation: each loss is divided by the window, "optimizer.step()" runs once every
   #    "accumulate_gradients" batches, and "has_updated" reads true only on those steps -- which is
   #    what makes the trainer fire "on_update" per update instead of per batch (REFERENCE.md,
-  #    "ACCUMULATE_GRADIENTS"; "docs/adr/0017", "docs/adr/0018").
+  #    "ACCUMULATE_GRADIENTS"). The learner counts the batches itself and gates on
+  #    "(steps + 1) % accumulate_gradients", so the first window of a run is one batch short.
   {% if accumulate_gradients is none %}
   ACCUMULATE_GRADIENTS: null
   {% else %}
@@ -39,7 +40,7 @@ _jinja_yaml_: |-
   MIXED_PRECISION: {{mixed_precision_type == "float16"}}
   # 4. EMA: an exponential moving average of "model", emitted as the learner attribute "ema_model"
   #    and blended once per Update -- never on an accumulation micro-step, and, under float16, even
-  #    on an apply the scaler skipped (REFERENCE.md, "EMA"; "docs/adr/0021"). It rides the "models"
+  #    on an apply the scaler skipped (REFERENCE.md, "EMA"). It rides the "models"
   #    property, so checkpoints and resume carry it. Point an "INFERENCE_FLOW" at "ema_model" to
   #    validate over the averaged weights; the training "FLOW" may not read it.
   #    "-p "SHARED: {ema: false}"" drops the field and points the "INFERENCE_FLOW" back at "model":
