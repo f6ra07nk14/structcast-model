@@ -342,8 +342,11 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
         The hook a framework builder overrides to hand every layer of its models what the generated
         `__init__` carries for all of them -- the Flax builder's `dtype` and `param_dtype` -- rather
         than making each template thread it. Only the layers of a model go through here: a nested
-        object inside one layer's arguments is resolved by `resolve_object` itself, and the flow
-        layers of a learner are resolved by the learner builder.
+        object inside one layer's arguments is resolved by `resolve_object` itself, and a learner's
+        own flow layers are resolved by the learner builder, which does not call this. A learner
+        layer declared with `TYPE`/`CFG` is the exception -- it is built by this builder and emitted
+        into the learner's `__init__`, where the arguments a model's `__init__` carries are not
+        bound; that scope has never bound `rngs` there either.
         """
         return resolve_object(imports, pattern)
 

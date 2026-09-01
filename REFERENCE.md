@@ -551,10 +551,10 @@ LEARNERS:
 
 **Precision (Flax)** — Flax carries precision on the model, not on the learner: each `flax.nnx`
 layer takes a `dtype` (compute) and a `param_dtype` (storage). Every generated model takes that pair
-on its `__init__`, beside `rngs`, and forwards it to every layer whose constructor names it and to
-every nested generated class — read off each signature, so per keyword: a layer naming only one gets
-only that one, and a layer naming neither (`flax.nnx.Dropout`, a bare function like `flax.nnx.relu`)
-gets nothing. Precision is therefore a knob on every Flax model, whatever its template says:
+on its `__init__`, beside `rngs`, and forwards it to every nested generated class and to every layer
+that declares the same default — read off each signature, so per keyword: a layer naming only one
+gets only that one, and a layer naming neither (`flax.nnx.Dropout`, a bare function like
+`flax.nnx.relu`) gets nothing:
 
 ```python
 model = Model(rngs=nnx.Rngs(0), dtype=jnp.bfloat16)  # every layer of it, CycleGAN included
@@ -564,7 +564,43 @@ model = Model(rngs=nnx.Rngs(0), dtype=jnp.bfloat16)  # every layer of it, CycleG
 `jax.numpy.float32`, which is the `flax.nnx` default — a model that names neither is the model this
 builder emitted before the pair existed. A `dtype` or `param_dtype` the configuration wrote on a
 layer wins over the constructor argument, per keyword, which is what keeps a template's own
-threading authoritative.
+threading authoritative — **and what makes the constructor argument a no-op on exactly those
+layers**: a template that bakes a `dtype` literal into a layer has already decided that layer's
+compute type, and `Model(dtype=...)` will not move it. The two shipped image templates below only
+bake one when their `dtype` parameter is set, so a model built at their default takes the
+constructor's value everywhere.
+
+"The same default" is the rule, not "names the keyword": a keyword is forwarded only where the
+layer's own declared default is the one the generated `__init__` carries — `None` for `dtype`,
+float32 for `param_dtype`. That is what makes the defaults inert everywhere rather than almost
+everywhere. `flax.nnx.SimpleCell` is the layer it exists for: alone in the zoo it defaults `dtype`
+to float32, so it computes in float32 rather than in its input's type, and forwarding `dtype=None`
+would quietly change it — it gets `param_dtype` and not `dtype`. The mask builders
+(`make_causal_mask`, `make_attention_mask`, `combine_masks`) fall out of the same rule for a
+different reason: their `dtype` is the element type of the mask they *return*, defaulted to float32,
+and a compute type must never reach it.
+
+Five more things the pair is *not* forwarded to, so a layer that needs one has to say so itself:
+
+- a layer whose `_call_` is positional rather than a mapping — there is no keyword to add;
+- a parameter the layer declares with no default at all, which the configuration has to supply;
+- a pattern that walks an `_attr_` after the address (`SomeLayer.from_config`), or one whose address
+  is a wrapper such as `functools.partial` — the signature read belongs to the address, and the call
+  belongs to something else, so forwarding would be a `TypeError` at construction or a keyword handed
+  to the wrong callable;
+- an address the builder cannot import or introspect: it logs a `WARNING` naming the address and
+  emits the layer unforwarded, rather than failing a build that may legitimately be running where
+  that framework is not installed;
+- a `_bind_`, whose arguments the configuration has already chosen.
+
+Reading those signatures means `scm flax create model` **imports the addressed layer targets at build
+time**, once per distinct address — including `_file_` addresses, which executes the user module the
+generated script would import anyway. The read is cached per process, so a layer module edited
+between two builds inside one process is introspected from the first read.
+
+The cost of the rule is the mirror of what it buys: a layer that opts out of the `flax.nnx` defaults
+opts out of the constructor knob too, and has to be given its value in the configuration. Nothing in
+`cfg/flax/models/` does — every layer the shipped templates build declares the inert pair.
 
 That threading is the other half, and it is build time rather than construction time:
 [`cfg/flax/models/VisionTransformer.yaml`](cfg/flax/models/VisionTransformer.yaml) parameterizes the

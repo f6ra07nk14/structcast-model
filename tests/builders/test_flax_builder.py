@@ -1162,3 +1162,67 @@ def test_a_precision_keyword_written_on_a_layer_wins_over_the_constructor_argume
         "self.fc = Linear(in_features=4, out_features=2, rngs=rngs, "
         "dtype=jax.numpy.bfloat16, param_dtype=param_dtype)\n"
     ) in script
+
+
+def test_a_layer_the_builder_cannot_read_is_left_unforwarded_and_said_so(caplog: pytest.LogCaptureFixture) -> None:
+    """Forwarding nothing is the safe fallback, and a silent one is the dangerous kind.
+
+    The commands import no framework, so a script can be rendered where the layers it addresses are
+    not installed. Failing the build there would break that; forwarding nothing quietly is worse --
+    the same configuration would emit a narrowed model in one environment and a float32 one in
+    another, and the generated script carries no trace of which. So the fallback logs the address it
+    could not read.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [["x", "y", "fc", _flow_layer("no_such_module.NoSuchLayer", units=2)]],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="structcast_model.builders.flax"):
+        script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.fc = NoSuchLayer(units=2)\n" in script
+    assert [r.message for r in caplog.records if "no_such_module.NoSuchLayer" in r.message]
+
+
+def test_no_precision_keyword_is_added_to_a_call_an_attribute_walked_to() -> None:
+    """The signature read is the address's; an `_attr_` moves the call somewhere else.
+
+    `flax.nnx.Linear.from_config(...)` would be given the `dtype` that `Linear.__init__` names and
+    that the classmethod does not, which is a `TypeError` the moment the model is built. The address
+    and the callable have to be the same object for the read to mean anything, so a pattern that
+    walks away from it is left exactly as the configuration wrote it.
+    """
+    pattern = {"_obj_": [["_addr_", "flax.nnx.Linear"], {"_attr_": "from_config"}, {"_call_": {"config": 2}}]}
+    raw = {"INPUTS": ["x"], "OUTPUTS": ["y"], "FLOW": [["x", "y", "fc", pattern]]}
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.fc = Linear.from_config(config=2)\n" in script
+
+
+def test_a_layer_that_declares_its_own_default_is_not_handed_the_builders() -> None:
+    """A keyword is forwarded only where forwarding this builder's default changes nothing.
+
+    `flax.nnx.SimpleCell` is the counterexample the rule exists for: alone in the zoo it computes in
+    float32 rather than in the input's type, so handing it `dtype=None` would silently make it
+    input-inferred -- the one layer where the pair would not be inert at its defaults. Its
+    `param_dtype` does default to float32, so that half is still forwarded, which is what keeps the
+    rule per keyword rather than per layer. The mask builders fall out of the same rule for a
+    different reason: their `dtype` is the element type of the mask they return, and it defaults to
+    float32 too, so a compute type must never reach it.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            ["x", "x", "cell", _flow_layer("flax.nnx.SimpleCell", in_features=4, hidden_features=4, rngs="eval: rngs")],
+            ["x", "y", "mask", _flow_layer("flax.nnx.make_causal_mask", x="eval: x")],
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.cell = SimpleCell(in_features=4, hidden_features=4, rngs=rngs, param_dtype=param_dtype)\n" in script
+    assert "self.mask = make_causal_mask(x=x)\n" in script
