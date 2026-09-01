@@ -89,12 +89,13 @@ LEARNERS:
             global_clipnorm: {{clip_grad_norm}}
             {% endif %}
     EXTRA: {}
-    # The cast is what a mixed policy costs this flow, and it is the difference from the base
-    # learner's: the head emits MIXED_PRECISION_TYPE, and the loss and the accuracies want float32 --
-    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", raises a TypeError
-    # on a bfloat16 prediction outright. This is the "float32 output layer" rule of the Keras mixed
-    # precision guide, written in the flow rather than as a "dtype" on the head, so that the model
-    # template stays the one the base learner trains too.
+    # The cast is what a mixed policy costs this flow, and the base learner spells it the same way:
+    # the head emits MIXED_PRECISION_TYPE, and the accuracies want float32 -- "tf.math.in_top_k",
+    # behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16 prediction outright
+    # on the tensorflow backend (jax and torch compute it, and the "SparseTopKCategoricalAccuracy"
+    # class is no way around it: it calls the same kernel). This is the "float32 output layer" rule of
+    # the Keras mixed precision guide, written in the flow rather than as a "dtype" on the head, so
+    # that the model template stays the one the base learner trains too.
     FLOW:
       - INPUTS: image
         OUTPUTS: {cls: cls}

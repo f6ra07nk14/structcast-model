@@ -62,21 +62,29 @@ LEARNERS:
             gradient_accumulation_steps: {{accumulate_gradients}}
             {% endif %}
     EXTRA: {}
+    # The cast is what the mixed arm of "mixed_precision_type" costs this flow, and an identity on the
+    # float32 default: the head emits MIXED_PRECISION_TYPE, and the accuracies want float32 --
+    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16
+    # prediction outright on the tensorflow backend (jax and torch compute it, and the
+    # "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). This is the
+    # "float32 output layer" rule of the Keras mixed precision guide, written in the flow rather than
+    # as a "dtype" on the head, so that one model template serves both arms unchanged.
     FLOW:
       - INPUTS: image
         OUTPUTS: {cls: cls}
         NAME: model
-      - INPUTS: {y_true: label, y_pred: cls}
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - INPUTS: {y_true: label, y_pred: logits}
         OUTPUTS: ce_loss
         NAME: cross_entropy_loss
         LAYER: [_obj_, {_addr_: keras.losses.SparseCategoricalCrossentropy}, {_call_: {from_logits: true}}]
       # The accuracy functions report one 0/1 value per sample, so each is averaged over the batch.
-      - INPUTS: {y_true: label, y_pred: cls}
+      - INPUTS: {y_true: label, y_pred: logits}
         OUTPUTS: correct1
         NAME: accuracy
         LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
       - ["eval: keras.ops.mean(correct1)", acc1, null]
-      - INPUTS: {y_true: label, y_pred: cls, k: 5}
+      - INPUTS: {y_true: label, y_pred: logits, k: 5}
         OUTPUTS: correct5
         NAME: top_5_accuracy
         LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
@@ -85,10 +93,11 @@ LEARNERS:
       - INPUTS: image
         OUTPUTS: {cls: cls}
         NAME: model
-      - [{y_true: label, y_pred: cls}, ce_loss, cross_entropy_loss]
-      - [{y_true: label, y_pred: cls}, correct1, accuracy]
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - [{y_true: label, y_pred: logits}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: logits}, correct1, accuracy]
       - ["eval: keras.ops.mean(correct1)", acc1, null]
-      - [{y_true: label, y_pred: cls, k: 5}, correct5, top_5_accuracy]
+      - [{y_true: label, y_pred: logits, k: 5}, correct5, top_5_accuracy]
       - ["eval: keras.ops.mean(correct5)", acc5, null]
 # "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
 # to specify the losses and models to be used during training.
