@@ -72,20 +72,21 @@ def bool_or_path_or_dict_parser(value: str) -> dict[str, Any] | None:
 
     If the string is a valid path to a file, the content of the file will be loaded and returned.
     If the string is "true" or "false" (case-insensitive), it will be parsed as a boolean.
+    A YAML null, spelled "null" or "~", is off, the same as "false".
     Otherwise, the string will be parsed as a YAML string and returned as a dictionary.
 
     Args:
         value (str): The string to parse.
 
     Returns:
-        dict[str, Any] | None: The parsed dictionary, or None if the input is empty or "false".
+        dict[str, Any] | None: The parsed dictionary, or None if the input is empty, null or "false".
     """
     if not value:
         return None
-    data: bool | str | dict[str, Any] = pydantic.TypeAdapter(bool | str | dict[str, Any]).validate_python(
+    data: bool | str | dict[str, Any] | None = pydantic.TypeAdapter(bool | str | dict[str, Any] | None).validate_python(
         load_yaml_from_string(value)
     )
-    if isinstance(data, bool):
+    if data is None or isinstance(data, bool):
         return {} if data else None
     if isinstance(data, str):
         return base.load_any(data) if data else None
