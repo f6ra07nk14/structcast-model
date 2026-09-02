@@ -689,7 +689,7 @@ def test_the_simple_training_example_trains_end_to_end(capsys: pytest.CaptureFix
 def test_the_hand_written_learner_satisfies_the_trainer_protocol() -> None:
     """The trainer and the CLI drive learners through the protocol only, generated or hand-written.
 
-    `flow_functions` names the compiled steps here, as a generated Keras learner's does, because a
+    `flow_functions` names the two steps here, as a generated Keras learner's does, because a
     distributed strategy rebinds a run's steps by walking exactly that mapping: a learner returning
     an empty one would run unreplicated while looking wired up.
     """

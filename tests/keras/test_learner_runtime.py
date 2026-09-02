@@ -424,14 +424,15 @@ def test_inference_step_reports_the_criteria_and_mutates_nothing(tmp_path: Path)
 
 
 def test_inference_step_evaluates_the_average_the_optimizer_keeps(tmp_path: Path) -> None:
-    """With `use_ema` on, evaluation has to read the average, and the compiled step has to see it.
+    """With `use_ema` on, evaluation has to read the average, and the step has to see the swap.
 
     Keras blends the average into the optimizer and only writes it into the weights when training
     ends, so an inference step left alone measures the trained model where the run asked for the
     averaged one it means to ship -- a gap that never surfaces as an error, only as validation
     numbers belonging to the wrong weights. The step is warmed before the weights and the average
-    diverge, so a compiled step holding its variables from the trace would answer with what it was
-    traced on rather than with what the swap put underneath it.
+    diverge, so a step holding its variables from its first run -- which is what compiling one does
+    unless they are threaded through it -- would answer with what it started from rather than with
+    what the swap put underneath it.
     """
     model = _models(tmp_path)[0]
     learner = _averaged(tmp_path, "averaged")(model)
@@ -525,8 +526,9 @@ def test_inference_before_the_first_update_reads_the_weights_it_was_given(tmp_pa
 def test_inference_step_sees_what_the_last_training_step_wrote(tmp_path: Path) -> None:
     """The steps share the models, so validation reads the weights the last update produced.
 
-    A compiled inference step that captured its variables as constants would keep reporting the
-    criteria of the weights it was first traced on -- a validation curve that never moves.
+    An inference step that captured its variables once -- which is what compiling one does unless
+    they are threaded through it -- would keep reporting the criteria of the weights it first ran
+    on, a validation curve that never moves.
     """
     model = _models(tmp_path)[0]
     learner = _learner_type(tmp_path)(model)

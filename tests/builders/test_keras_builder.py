@@ -225,10 +225,10 @@ def test_keras_learner_prepares_the_segments_before_it_builds_the_steps() -> Non
     """The order is the adapter's contract, and only JAX fails loudly when it is wrong.
 
     `prepare` builds every optimizer against its variables; TensorFlow and torch would happily build
-    one inside the compiled step instead, so a learner that compiled first would only break on JAX.
-    The `optimizers` property reads through the segment for a related reason: `prepare` replaces the
-    optimizer of a segment it wraps for loss scaling, and a dictionary built before that would
-    report the optimizer that never applied anything.
+    one inside the step, inside its graph when compiled, so a learner that built its steps first
+    would only break on JAX. The `optimizers` property reads through the segment for a related
+    reason: `prepare` replaces the optimizer of a segment it wraps for loss scaling, and a dictionary
+    built before that would report the optimizer that never applied anything.
     """
     script = _learner_script(LEARNER_YAML)
 

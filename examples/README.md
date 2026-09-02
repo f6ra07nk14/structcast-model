@@ -441,11 +441,13 @@ command states it rather than inheriting `~/.keras/keras.json`.
 
 - **The backend adapter owns the mechanics.** `select_backend_adapter()` returns the adapter of the
   active backend, `prepare` builds the optimizer against the segment's variables, and
-  `build_train_step` / `build_inference_step` return the compiled steps. `prepare` has to run first:
-  JAX refuses an unbuilt optimizer inside a jitted step (`docs/adr/0016`).
-- **There is no compile stage.** `flow_functions` names the two compiled steps rather than a flow
-  the CLI would wrap, because the adapter already compiled them with `tf.function` or `jax.jit`;
-  it is the mapping a distributed strategy rebinds when it replicates a step.
+  `build_train_step` / `build_inference_step` return the steps. `prepare` has to run first:
+  JAX refuses an unbuilt optimizer inside the step it threads, and above all inside a jitted one (`docs/adr/0016`).
+- **There is no compile stage.** `flow_functions` names the two steps rather than a flow the CLI
+  would wrap: whether they are compiled is the adapter's doing, from the `compile_kw` that
+  `scm keras train --compile` leaves on it before the learner is built — `tf.function` or `jax.jit`,
+  and eager when nothing asked. It is the mapping a distributed strategy rebinds when it replicates
+  a step.
 - **The counters are read, not incremented.** `training_step` counts itself and then reads the
   optimizer's `iterations` back, so an accumulation window or a float16 loss-scale skip reports
   `has_updated is False` truthfully, without a line of the learner changing (`docs/adr/0019`).

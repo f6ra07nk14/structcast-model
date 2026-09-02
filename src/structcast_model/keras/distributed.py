@@ -32,7 +32,7 @@ from re import Pattern, compile as re_compile
 from typing import TYPE_CHECKING, Any, Literal
 
 import keras
-from structcast_model.keras.adapters import AdapterSegment
+from structcast_model.keras.adapters import AdapterSegment, TensorFlowAdapter, select_backend_adapter
 from structcast_model.keras.utils import apply_state_dict, collect_state_dict, get_keras_device
 
 if TYPE_CHECKING:
@@ -384,8 +384,9 @@ class KerasDistributedStrategy:
         does it. The three backends need three different things, and none of them can happen inside
         the learner, which is backend-neutral by construction:
 
-        - JAX places the batch across the mesh; the reductions inside the compiled step are then
-          global by construction, since XLA reduces a sharded array across every device holding it.
+        - JAX places the batch across the mesh; the reductions inside the step are then global by
+          construction, compiled or not, since XLA reduces a sharded array across every device
+          holding it.
         - TensorFlow splits the batch per replica, runs the step through `MirroredStrategy.run` and
           reduces the per-replica criteria with `ReduceOp.MEAN`.
         - torch runs the step as it is -- the loader owns the rank's slice of the data -- and
@@ -404,16 +405,6 @@ class KerasDistributedStrategy:
         if self.preset == "single":
             return
         if self._mirrored is not None:
-            # The adapter traced each step into a `tf.function`, and a graph applying an optimizer is
-            # a synchronization point TensorFlow refuses to nest inside `strategy.run`. The traced
-            # steps are therefore unwrapped back to the Python functions they were built from, and
-            # re-traced below inside the one graph that wraps the replicated call. `flow_functions`
-            # is what a learner exposes for exactly this rebinding (as in `cmd_flax`), and what the
-            # check below requires here.
-            for name in learner.flow_functions:
-                traced = getattr(learner, name)
-                if hasattr(traced, "python_function"):
-                    setattr(learner, name, traced.python_function)
             # The loss, not the gradients: it is the one value the strategy can reach from out here,
             # the segment's flow being what the adapter differentiates, and dividing it by the
             # replica count turns the optimizer's SUM all-reduce into the mean of the per-replica
@@ -430,7 +421,8 @@ class KerasDistributedStrategy:
                 # The generated learner's public steps stay eager: `training_step` owns the host
                 # counters and reads the optimizer counter back after the step (`docs/adr/0018`),
                 # neither of which can run inside the replicated graph, so the strategy wraps the
-                # inner flow steps it just unwrapped instead.
+                # inner flow steps instead. `flow_functions` is what a learner exposes for exactly
+                # this rebinding, as in `cmd_flax`.
                 for name in flows:
                     setattr(learner, name, self._replicated_flow(getattr(learner, name)))
                 return
@@ -542,9 +534,17 @@ class KerasDistributedStrategy:
         outside the graph, so the replication wraps the flow attribute the public step calls
         through. The batch stays keyword arguments the whole way down, which is what the step
         expects.
+
+        *flow* goes into `strategy.run` exactly as the adapter built it, traced or not: a step the
+        adapter compiled under `--compile` keeps its `tf.function`, which
+        `mirrored_run.call_for_each_replica` lifts off its `python_function` itself before the
+        replica call, so nothing here has to undo the decoration.
+
+        That graph is this strategy's own and not `--compile`'s: it exists either way, because the
+        reduction below has to be part of what `strategy.run` is traced into. Only its options
+        follow the run, so whatever `--compile` asked the adapter for is asked of this call too.
         """
 
-        @tf.function
         def replicated(**batch: Any) -> dict[str, Any]:
             # Traced under :func:`_local_batch_losses`: a Keras loss class would otherwise hand back
             # the replica's share of the global batch's loss, which `ReduceOp.MEAN` below cannot
@@ -556,8 +556,10 @@ class KerasDistributedStrategy:
                 for name, value in criteria.items()
             }
 
+        traced = tf.function(replicated, **TensorFlowAdapter._tf_function_kw(select_backend_adapter().compile_kw))
+
         def flow_step(**batch: Any) -> dict[str, Any]:
-            return dict(replicated(**self.shard_batch(batch)))
+            return dict(traced(**self.shard_batch(batch)))
 
         return flow_step
 
@@ -566,10 +568,9 @@ class KerasDistributedStrategy:
 
         What :meth:`_replicated_flow` is for TensorFlow, this is for the other two backends -- and
         neither of them needs a graph around the replicated call, so the wrapper stays an eager
-        Python function: JAX shards the batch and lets the compiled step reduce it globally, torch
-        runs the rank's own slice and all-reduces the criteria afterwards. Wrapping the public step
-        is therefore harmless here, and the host bookkeeping it owns still runs
-        where it did.
+        Python function: JAX shards the batch and lets the step reduce it globally, compiled or not,
+        torch runs the rank's own slice and all-reduces the criteria afterwards. Wrapping the public
+        step is therefore harmless here, and the host bookkeeping it owns still runs where it did.
         """
         if self._distribution is not None:
 

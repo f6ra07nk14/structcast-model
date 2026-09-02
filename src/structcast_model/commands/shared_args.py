@@ -110,7 +110,8 @@ def shapes_option(help_text: str) -> Any:
 def compile_option(api: str) -> Any:
     """Build the `--compile` option for the frameworks that compile the model graph.
 
-    Keras is not one of them: its `--compile` is run configuration, so it keeps its own declaration.
+    Not the keras commands yet: `docs/adr/0024` puts all six declarations on this factory, and the
+    two in `cmd_keras` still declare their own until the commit that unifies them.
 
     Args:
         api (str): The compilation entry point, e.g. "torch.compile" or "nnx.jit".
@@ -123,7 +124,7 @@ def compile_option(api: str) -> Any:
         "--compile",
         "-c",
         parser=bool_or_path_or_dict_parser,
-        help=f'Whether to compile the model using "{api}". Omitted or false leaves the model uncompiled; '
+        help=f'Whether to compile the model using "{api}". Omitted, null or false leaves the model uncompiled; '
         "true compiles with default options. Can also be a path to an existing YAML/JSON file, or a dictionary of "
         f'keyword arguments for "{api}".',
     )

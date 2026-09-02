@@ -104,7 +104,7 @@ class SimpleLearner:
     def __init__(
         self, model: keras.Model, learning_rate: float = 0.1, gradient_accumulation_steps: int | None = None
     ) -> None:
-        """Create the learner over *model*, with its own optimizer, flows, and compiled steps.
+        """Create the learner over *model*, with its own optimizer, flows, and steps.
 
         Args:
             model: The model to train. `scm keras train` passes it under the name of its model
@@ -129,7 +129,8 @@ class SimpleLearner:
         )
         adapter = select_backend_adapter()
         # `prepare` builds the optimizer against those variables, and it has to run before the step
-        # is compiled: JAX refuses an unbuilt optimizer inside a jitted step.
+        # is built: JAX refuses an unbuilt optimizer inside the step it threads, and above all
+        # inside a jitted one.
         adapter.prepare([self._segment])
         self._training_step = adapter.build_train_step([self._segment])
         self._inference_step = adapter.build_inference_step(self._flow_inference, models=[model])
@@ -182,11 +183,12 @@ class SimpleLearner:
 
     @property
     def flow_functions(self) -> dict[str, Any]:
-        """The compiled steps of this learner, by attribute name.
+        """The steps of this learner, by attribute name.
 
-        A Keras run compiles nothing on top of these -- the backend adapter already built them with
-        `tf.function` or `jax.jit` -- so this is what a generated Keras learner reports too, and it
-        is the mapping a distributed strategy rebinds when it replicates a step across devices.
+        A Keras run compiles nothing on top of these -- the backend adapter built them the way
+        `scm keras train --compile` asked it to, with `tf.function`, `jax.jit` or nothing at all --
+        so this is what a generated Keras learner reports too, and it is the mapping a distributed
+        strategy rebinds when it replicates a step across devices.
         """
         return {"_training_step": self._training_step, "_inference_step": self._inference_step}
 
@@ -233,7 +235,7 @@ class SimpleLearner:
         return int(keras.ops.convert_to_numpy(optimizer.iterations))
 
     def training_step(self, x: Any, y: Any, **kwargs: Any) -> dict[str, Any]:
-        """Run one training batch through the compiled step and update the counters.
+        """Run one training batch through the training step and update the counters.
 
         The step the adapter built owns the gradients and the optimizer application; what is left
         here is the host-side bookkeeping, which a compiled region could not hold anyway.
@@ -257,7 +259,7 @@ class SimpleLearner:
         return criteria
 
     def inference_step(self, x: Any, y: Any, **kwargs: Any) -> dict[str, Any]:
-        """Run one validation batch through the compiled inference step, returning the same criteria.
+        """Run one validation batch through the inference step, returning the same criteria.
 
         Args:
             x: The input features of the batch.

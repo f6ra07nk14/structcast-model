@@ -23,9 +23,21 @@ from structcast_model.keras.adapters import (
     BackendAdapter,
     Flow,
     InferenceFlow,
+    JaxAdapter,
+    TensorFlowAdapter,
+    TorchAdapter,
     select_backend_adapter,
     swap_ema_weights,
 )
+
+COMPILE_OPTIONS: list[dict[str, Any] | None] = [None] if keras.backend.backend() == "torch" else [None, {}]
+"""The two compilation choices the two tests below are checked under.
+
+Only those two: they are the mechanics whose failure mode needs a compiler to exist -- a jitted
+closure folding its variables into constants, and a loss-scaled `apply` raising under a trace -- so
+everywhere else the second case would double the run time without a way to fail. The torch backend
+builds no compiled step, so it has the one case.
+"""
 
 
 @pytest.fixture
@@ -135,7 +147,7 @@ def test_batch_normalization_statistics_move_in_training_and_freeze_in_inference
     trained = _value(moving_mean)
     assert np.abs(trained - before).max() > 0
 
-    _run(adapter.build_inference_step(_inference_flow(model)), _batch(), 2)
+    _run(adapter.build_inference_step(_inference_flow(model), models=[model]), _batch(), 2)
     assert np.array_equal(_value(moving_mean), trained)
 
 
@@ -158,7 +170,7 @@ def test_dropout_advances_its_seed_in_training_and_stays_deterministic_in_infere
     assert losses[0] != losses[1]
     assert not np.array_equal(_value(seed), before)
 
-    inference = _run(adapter.build_inference_step(_inference_flow(model)), _batch(), 2)
+    inference = _run(adapter.build_inference_step(_inference_flow(model), models=[model]), _batch(), 2)
     assert inference[0] == inference[1]
 
 
@@ -184,15 +196,24 @@ def test_each_segment_updates_only_its_own_variables(adapter: BackendAdapter) ->
     assert np.array_equal(_value(second.trainable_variables[0]), untouched)
 
 
+@pytest.mark.parametrize("compile_kw", COMPILE_OPTIONS, ids=lambda kw: "eager" if kw is None else "compiled")
 def test_float16_wraps_the_optimizer_and_keeps_the_gradients_scaled(
-    adapter: BackendAdapter, restore_policy: None
+    compile_kw: dict[str, Any] | None, restore_policy: None
 ) -> None:
     """A float16 policy must wrap the optimizer and the scaling must actually reach the loss.
 
     `LossScaleOptimizer` always unscales the gradients by its dynamic scale, so an adapter that
     never calls `scale_loss` divides every update by 2**15 instead: the loss still decreases, just
     imperceptibly. Asserting the size of the update is what separates the two.
+
+    Both choices, unlike everything else here but the freeze-at-first-trace test: the wrapper's
+    stateful `apply` raises an `UnexpectedTracerError` under a JAX trace, which is the whole reason
+    the adapter threads the loss scale through `stateless_apply`, and an eager run never reaches
+    that failure. A fresh adapter rather than the cached one, whose choice belongs to whoever ran
+    the command.
     """
+    adapter = type(select_backend_adapter())()
+    adapter.compile_kw = compile_kw
     keras.mixed_precision.set_global_policy("mixed_float16")
     model = _model()
     segment = _segment(model)
@@ -261,13 +282,18 @@ def test_inference_step_changes_no_variable(adapter: BackendAdapter) -> None:
     )
 
 
-def test_inference_step_reads_the_current_weights(adapter: BackendAdapter) -> None:
+@pytest.mark.parametrize("compile_kw", COMPILE_OPTIONS, ids=lambda kw: "eager" if kw is None else "compiled")
+def test_inference_step_reads_the_current_weights(compile_kw: dict[str, Any] | None) -> None:
     """A step built before training must answer with the weights training left, not the traced ones.
 
-    On JAX the compiled step only does that if the variables are threaded through the jit as
-    arguments; a jitted closure reading them directly constant-folds the initial weights and keeps
-    reporting the same validation loss for the whole run.
+    Both choices, unlike everything else here: on JAX the compiled step only does that if the
+    variables are threaded through the jit as arguments, and a jitted closure reading them directly
+    constant-folds the initial weights and keeps reporting the same validation loss for the whole
+    run. The eager case is what says that threading costs an uncompiled step nothing. A fresh
+    adapter rather than the cached one, whose choice belongs to whoever ran the command.
     """
+    adapter = type(select_backend_adapter())()
+    adapter.compile_kw = compile_kw
     model = _model()
     segment = _segment(model)
     adapter.prepare([segment])
@@ -353,6 +379,173 @@ def test_swap_ema_weights_puts_back_what_it_traded_when_a_trade_fails() -> None:
         swap_ema_weights([optimizer])
 
     assert all(np.array_equal(_value(v), w) for v, w in zip(model.trainable_variables, weights, strict=True))
+
+
+def _repeated_python_calls(adapter: BackendAdapter) -> int:
+    """Run one training step until it is warm, then count the flow's Python runs over two more calls.
+
+    The one difference a compiled step shows from outside: it runs the flow while it is traced and
+    never again, where an eager step runs it on every call. The warm-up is two calls because a
+    backend may trace more than once before it settles, and only what happens after that is counted.
+    """
+    calls: list[str] = []
+    model = _model()
+    segment = _segment(model)
+    flow = segment.flow
+
+    def counted(**batch: Any) -> tuple[Any, dict[str, Any]]:
+        calls.append("run")
+        return flow(**batch)
+
+    segment.flow = counted
+    adapter.prepare([segment])
+    step = adapter.build_train_step([segment])
+    batch = _batch()
+    step(**batch)
+    step(**batch)
+    warm = len(calls)
+    step(**batch)
+    step(**batch)
+    return len(calls) - warm
+
+
+def test_the_steps_stay_eager_until_compilation_is_asked_for() -> None:
+    """An adapter nobody asked to compile must not: `--compile` owns that choice on every backend.
+
+    The TensorFlow and JAX adapters used to compile whatever their framework could, which made the
+    same learner run one way here and another way on torch. Nothing else in a run tells the two
+    apart -- the criteria are identical -- so the Python the flow stops running is what pins it.
+    """
+    adapter = type(select_backend_adapter())()
+
+    assert adapter.compile_kw is None
+    assert _repeated_python_calls(adapter) == 2
+
+
+@pytest.mark.skipif(keras.backend.backend() == "torch", reason="The torch backend builds no compiled step.")
+def test_asking_for_compilation_traces_the_step_instead_of_rerunning_it() -> None:
+    """`--compile true` must reach `tf.function`/`jax.jit`, and a warm step going quiet is the proof."""
+    adapter = type(select_backend_adapter())()
+    adapter.compile_kw = {}
+
+    assert _repeated_python_calls(adapter) == 0
+
+
+def test_the_torch_backend_refuses_the_compilation_it_cannot_do() -> None:
+    """Dropping the arguments would report a compiled run to a user who asked for one and got none.
+
+    Both builders, because a learner builds both: an inference step that quietly stayed eager while
+    the training step refused would make the same flag mean two things in one run. Checked on every
+    backend, not only under torch: the refusal belongs to the adapter that has no compiler, and it is
+    the reason `--compile` is not silently backend-dependent.
+    """
+    adapter = TorchAdapter()
+    adapter.compile_kw = {"mode": "max-autotune"}
+
+    with pytest.raises(ValueError, match="builds no compiled step"):
+        adapter.build_train_step([])
+    with pytest.raises(ValueError, match="builds no compiled step"):
+        adapter.build_inference_step(lambda **batch: dict(batch))
+
+
+def test_the_jax_adapter_refuses_to_jit_an_inference_step_it_cannot_thread() -> None:
+    """Without a model to thread, jitting would freeze the weights, so the request is refused.
+
+    The one place a Keras compile request could still be dropped silently: that early return exists
+    because a jitted closure reading its variables directly answers with the weights of its first
+    trace forever, and returning the eager flow while `--compile` asked for a compiled one would be
+    the same lie the torch backend refuses to tell. No model reaches it from a generated learner,
+    which is why nothing else would notice.
+    """
+    adapter = JaxAdapter()
+
+    def flow(**batch: Any) -> dict[str, Any]:
+        return dict(batch)
+
+    # Eager, the case the early return exists for: the flow is handed back as it is.
+    assert adapter.build_inference_step(flow) is flow
+
+    adapter.compile_kw = {}
+    with pytest.raises(ValueError, match="no model to thread"):
+        adapter.build_inference_step(flow)
+
+
+def _recorded_compiler_kw(monkeypatch: pytest.MonkeyPatch, framework: str, compiler: str) -> list[dict[str, Any]]:
+    """Collect what the adapters hand `<framework>.<compiler>`, with the real compiler still running.
+
+    The adapter module binds each framework to a `LazyModuleImporter` in its own globals, and that
+    importer copies the framework's `__dict__` onto itself the first time it is read, so patching
+    the real `jax` or `tensorflow` module would leave the copy an adapter reads untouched. The
+    binding it does read is reached here through the globals of one of its own methods:
+    `sys.modules` holds a `LazySelectedImporter` that exposes nothing but `__all__`.
+    """
+    importer = JaxAdapter._compile_step.__globals__[framework]
+    compile_step = getattr(importer, compiler)
+    recorded: list[dict[str, Any]] = []
+
+    def recording(step: Any, **kwargs: Any) -> Any:
+        recorded.append(kwargs)
+        return compile_step(step, **kwargs)
+
+    monkeypatch.setattr(importer, compiler, recording)
+    return recorded
+
+
+@pytest.mark.skipif(keras.backend.backend() != "jax", reason="Only the JAX adapter jits with these arguments.")
+def test_the_jax_adapter_drops_the_contract_arguments_of_the_step_it_jits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What is static and what is donated belongs to the step, not to whoever passes `--compile`.
+
+    One mapping is splatted into a training step and an inference step whose positional signatures
+    differ, so the same `donate_argnums` names the optimizer state in one and the batch in the
+    other: both spellings of both keys are dropped, from both steps, and everything else --
+    `inline` here -- is passed through as it came. What reaches `jax.jit` is what is asserted
+    because donation is a no-op on CPU: a forwarded `donate_argnums` changes nothing a run could
+    observe here, so only the call itself can say the key went.
+    """
+    recorded = _recorded_compiler_kw(monkeypatch, "jax", "jit")
+    adapter = JaxAdapter()
+    adapter.compile_kw = {
+        "static_argnums": [0],
+        "static_argnames": "batch",
+        "donate_argnums": [1],
+        "donate_argnames": "batch",
+        "inline": True,
+    }
+    model = _model()
+    segment = _segment(model)
+    adapter.prepare([segment])
+
+    train_step = adapter.build_train_step([segment])
+    adapter.build_inference_step(_inference_flow(model), models=[model])
+
+    assert recorded == [{"inline": True}, {"inline": True}]
+    # What survives still has to trace and compute; the recorded call alone cannot say that it did.
+    assert np.isfinite(_run(train_step, _batch(), 1)[0])
+
+
+@pytest.mark.skipif(
+    keras.backend.backend() != "tensorflow", reason="Only the TensorFlow adapter takes an input signature."
+)
+def test_the_tensorflow_adapter_drops_an_input_signature_it_cannot_trace_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The steps built here take their batch by name, which is exactly what a signature forbids.
+
+    `tf.function` replaces the traced function's parameters with the signature it is given, so a
+    step declared as `**batch` is left unable to bind the batch it is called with. That one key
+    goes and no other: `reduce_retracing` below is the caller's to set and reaches the trace. The
+    value is not even a `tf.TensorSpec`, so a forwarded one fails at construction -- the run says
+    the drop happened, the recorded call says nothing else was dropped with it.
+    """
+    recorded = _recorded_compiler_kw(monkeypatch, "tf", "function")
+    adapter = TensorFlowAdapter()
+    adapter.compile_kw = {"input_signature": ["not a tf.TensorSpec"], "reduce_retracing": True}
+    model = _model()
+
+    step = adapter.build_inference_step(_inference_flow(model), models=[model])
+
+    assert recorded == [{"reduce_retracing": True}]
+    assert np.isfinite(_run(step, _batch(), 1)[0])
 
 
 def test_select_backend_adapter_caches_the_adapter_of_the_active_backend() -> None:

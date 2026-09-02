@@ -83,6 +83,18 @@ class BackendAdapter(Protocol):
     def name(self) -> str:
         """The `keras.backend.backend()` value this adapter implements."""
 
+    compile_kw: Mapping[str, Any] | None
+    """How the steps this adapter builds are compiled: the compiler's keyword arguments, or None.
+
+    None leaves them eager, an empty mapping compiles with the backend compiler's own defaults, and
+    a non-empty one is passed to it. Read while a step is built, so it must be set before the
+    learner is built; `select_backend_adapter` documents how `scm keras train --compile` sets it.
+
+    The protocol's one data member, which the CLI needs -- it writes the choice through this typed
+    return -- and which costs `issubclass`: a runtime-checkable protocol with a non-method member
+    still answers `isinstance`, and refuses `issubclass` by design.
+    """
+
     def prepare(
         self,
         segments: Sequence[AdapterSegment],
@@ -106,7 +118,9 @@ class BackendAdapter(Protocol):
         """
 
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
-        """Compile the training step running every segment: its flow, its gradients, its update.
+        """Build the training step running every segment: its flow, its gradients, its update.
+
+        Compiled only when `compile_kw` asks for it; eager otherwise, on every backend.
 
         The returned step takes the batch by name and returns the merged criteria of every segment. A
         single-process adapter reduces nothing: whoever runs a distributed cell must reduce the
@@ -117,17 +131,17 @@ class BackendAdapter(Protocol):
         The criteria are merged last-wins, so keeping the names of two segments distinct is the
         caller's job: an adapter only sees the names at run time and cannot detect a clash here.
         `prepare` must have run first -- only the JAX backend refuses an unbuilt optimizer, while
-        TensorFlow and torch would build it inside the compiled step.
+        TensorFlow and torch would build it inside the step, inside its graph when compiled.
 
         Args:
             segments: The optimizer segments, applied in order, each against its own variables.
 
         Returns:
-            The compiled training step.
+            The training step.
         """
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
-        """Compile the inference step, which updates no variable.
+        """Build the inference step, which updates no variable; compiled only when `compile_kw` asks.
 
         Args:
             flow: The inference flow.
@@ -136,14 +150,49 @@ class BackendAdapter(Protocol):
                 this argument.
 
         Returns:
-            The compiled inference step.
+            The inference step.
         """
 
 
 class _Adapter:
-    """The optimizer preparation the three adapters share."""
+    """The optimizer preparation the three adapters share, and the step compilation torch has none of."""
 
     name: str
+
+    compile_kw: Mapping[str, Any] | None = None
+    """How this adapter compiles its steps, None -- eager -- until something asks for more.
+
+    An attribute rather than a constructor argument because nobody constructs an adapter:
+    `select_backend_adapter` is `@cache`d and takes none, and a generated learner calls it that way
+    inside its own constructor, which is where its steps are built. Whoever chooses -- `scm keras
+    train --compile` -- therefore writes on that one cached instance before building the learner,
+    and clears it again once the steps exist.
+    """
+
+    def _compile_step(self, step: Callable[..., Any]) -> Callable[..., Any]:
+        """Return *step* as it is, which is every step the torch backend runs.
+
+        Keras' torch backend compiles nothing here, deliberately and not by omission: these steps
+        assign to Keras variables and run a Keras optimizer, which `torch.compile` would graph-break
+        on rather than accelerate, so there is no compiler to hand keyword arguments to. Asking for
+        one is refused instead of dropped -- a run that silently ignored `--compile` would report a
+        compiled run it never had.
+
+        Args:
+            step: The step to compile.
+
+        Returns:
+            The step, unchanged.
+
+        Raises:
+            ValueError: If any compilation was asked for.
+        """
+        if self.compile_kw is None:
+            return step
+        raise ValueError(
+            f"The {self.name!r} Keras backend builds no compiled step, so it cannot be compiled with "
+            f"{dict(self.compile_kw)}. Drop --compile, or run the same learner on the tensorflow or jax backend."
+        )
 
     def prepare(
         self,
@@ -164,7 +213,7 @@ class _Adapter:
             if enabled and mixed_precision_type == "float16":
                 kwargs = mixed_precision if isinstance(mixed_precision, Mapping) else {}
                 segment.optimizer = keras.optimizers.LossScaleOptimizer(segment.optimizer, **kwargs)
-            # Building here rather than on the first update keeps every slot variable out of the
+            # Building here rather than on the first update keeps every slot variable out of a
             # compiled step, where TensorFlow forbids creating variables and JAX would trace them.
             segment.optimizer.build(segment.variables)
 
@@ -173,14 +222,38 @@ class TensorFlowAdapter(_Adapter):
     """Adapter differentiating with `tf.GradientTape` and applying the optimizer statefully.
 
     `optimizer.stateless_apply` refuses to run on TensorFlow by design, so the stateful `apply` is
-    the only path; `tf.function` wraps the whole step once, so the tape, the gradients and the
-    update land in one graph.
+    the only path; a compiled step is one `tf.function` around the whole of it, so the tape, the
+    gradients and the update land in one graph.
     """
 
     name = "tensorflow"
 
+    @staticmethod
+    def _tf_function_kw(compile_kw: Mapping[str, Any] | None) -> dict[str, Any]:
+        """The `tf.function` arguments of a `--compile` mapping, minus the one no step here can take.
+
+        `input_signature` replaces the traced function's parameters with the signature it is given,
+        and every step built here takes its batch by name, so a forwarded one would trace a step
+        unable to bind its own batch: it is the step's contract, and is dropped rather than honored.
+        `keras/distributed.py` reads it through this class for the same reason -- the call its `dp`
+        preset traces takes the batch by name too.
+
+        Args:
+            compile_kw: The run's `--compile` mapping, or None for an eager run.
+
+        Returns:
+            The keyword arguments to trace with, empty when nothing was asked for.
+        """
+        return {name: value for name, value in (compile_kw or {}).items() if name != "input_signature"}
+
+    def _compile_step(self, step: Callable[..., Any]) -> Callable[..., Any]:
+        """Trace *step* into a `tf.function`, or leave it eager when nothing asked for a graph."""
+        if self.compile_kw is None:
+            return step
+        return tf.function(step, **self._tf_function_kw(self.compile_kw))
+
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
-        """Trace one `tf.function` running every segment's tape, gradients and update."""
+        """Build the step running every segment's tape, gradients and update, traced when asked."""
 
         def step(**batch: Any) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
@@ -195,29 +268,44 @@ class TensorFlowAdapter(_Adapter):
                 criteria.update(values)
             return criteria
 
-        return tf.function(step)
+        return self._compile_step(step)
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
-        """Trace the inference flow into one `tf.function`, reading its variables from the closure."""
-        return tf.function(flow)
+        """Run the inference flow, traced when asked, reading its variables from the closure."""
+        return self._compile_step(flow)
 
 
 class JaxAdapter(_Adapter):
     """Adapter differentiating with `jax.value_and_grad` and applying the optimizer statelessly.
 
     The stateful path is unavailable: `LossScaleOptimizer.apply` raises an `UnexpectedTracerError`
-    under a trace. Every variable the step reads is therefore threaded through the jitted function
-    as an argument and bound with a `keras.StatelessScope`, the idiom of Keras' own JAX trainer --
-    a variable read from the closure instead would be traced as a constant and freeze at its first
-    value. That includes the state the flow updates without owning: the moving statistics of a
-    normalization layer and the state of every `SeedGenerator`, which `Layer.variables` lists, and
-    which a dropped thread would silently freeze into one repeated mask.
+    under a trace. Every variable the step reads is therefore threaded through the step as an
+    argument and bound with a `keras.StatelessScope`, the idiom of Keras' own JAX trainer, which is
+    what lets a jitted step stay correct: a variable read from the closure instead would be traced
+    as a constant and freeze at its first value. That includes the state the flow updates without
+    owning: the moving statistics of a normalization layer and the state of every `SeedGenerator`,
+    which `Layer.variables` lists, and which a dropped thread would silently freeze into one
+    repeated mask. The threading is unconditional, so the eager step runs the identical arithmetic.
     """
 
     name = "jax"
 
+    def _compile_step(self, step: Callable[..., Any]) -> Callable[..., Any]:
+        """Jit *step*, or leave it eager when nothing asked for a compiled one.
+
+        Only the pure inner function is ever handed here: the variable reads and writes around it
+        stay Python either way, which is what lets the same threading run compiled and eager.
+        """
+        if self.compile_kw is None:
+            return step
+        # Both spellings of both contract arguments go, as `cmd_flax` drops them for `nnx.jit`: one
+        # mapping is splatted into a training step and an inference step whose positional signatures
+        # differ, so a `donate_argnums` meant for the first would donate the second's live weights.
+        fixed = {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"}
+        return jax.jit(step, **{name: value for name, value in self.compile_kw.items() if name not in fixed})
+
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
-        """Compile one `jax.jit` step threading trainable, state and optimizer values through."""
+        """Build one step threading trainable, state and optimizer values through, jitted when asked."""
         segments = list(segments)
         owned = {id(variable) for segment in segments for variable in segment.variables}
         state_variables = _state_variables(segments, owned)
@@ -270,7 +358,7 @@ class JaxAdapter(_Adapter):
                 criteria.update(values)
             return criteria, trainables, states, optimizers
 
-        jitted = jax.jit(step)
+        jitted = self._compile_step(step)
 
         # The batch is gathered back into one mapping for the jitted call: the state lists are the
         # positional arguments the trace is built around, and a batch spread over keywords there
@@ -293,24 +381,34 @@ class JaxAdapter(_Adapter):
         return train_step
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
-        """Compile one `jax.jit` step threading the models' variables through, as the training step does.
+        """Build one step threading the models' variables through, as the training step does.
 
-        A jitted closure reading its variables directly would trace them as constants and answer
-        with the weights of the step it was first traced on, so every variable is threaded as an
-        argument and bound with a `keras.StatelessScope`. The scope's writes are dropped instead of
-        assigned back, which is exactly inference: whatever the flow touches -- moving statistics,
-        seeds -- stays as the training step left it. Without the models there is nothing to thread,
-        so the flow runs eagerly rather than freezing at its first weights.
+        Jitted when `compile_kw` asks for it. A jitted closure reading its variables directly would
+        trace them as constants and answer with the weights of the step it was first traced on, so
+        every variable is threaded as an argument and bound with a `keras.StatelessScope`. The
+        scope's writes are dropped instead of assigned back, which is exactly inference: whatever
+        the flow touches -- moving statistics, seeds -- stays as the training step left it. Without
+        the models there is nothing to thread, so the flow runs eagerly rather than freezing at its
+        first weights, and a compilation asked for there is refused rather than dropped.
+
+        Raises:
+            ValueError: If compilation was asked for and there is no model to thread.
         """
         variables = [variable for model in models for variable in model.variables]
         if not variables:
+            if self.compile_kw is not None:
+                raise ValueError(
+                    "A JAX inference step with no model to thread its variables through cannot be jitted: the "
+                    "jitted closure would answer with the weights of its first trace forever. Got: "
+                    f"{dict(self.compile_kw)}. Pass the models the flow runs, or drop --compile."
+                )
             return flow
 
         def inference(values: list[Any], batch: Mapping[str, Any]) -> dict[str, Any]:
             with keras.StatelessScope(state_mapping=list(zip(variables, values, strict=True))):
                 return flow(**batch)
 
-        jitted = jax.jit(inference)
+        jitted = self._compile_step(inference)
 
         def inference_step(**batch: Any) -> dict[str, Any]:
             return jitted([variable.value for variable in variables], batch)
@@ -325,12 +423,15 @@ class TorchAdapter(_Adapter):
     off `variable.value.grad` per variable. Zipping `module.parameters()` against the segment's
     variables instead would pair the wrong tensors: `parameters()` walks a path-alphabetical
     `ParameterDict` while the variables keep creation order.
+
+    Its steps are the eager ones: it inherits `_Adapter._compile_step`, which compiles nothing and
+    refuses to be asked to -- see there for why this backend has no compiler to pass arguments to.
     """
 
     name = "torch"
 
     def build_train_step(self, segments: Sequence[AdapterSegment]) -> InferenceFlow:
-        """Build the step reading each segment's gradients off its own variables."""
+        """Build the eager step reading each segment's gradients off its own variables."""
 
         def step(**batch: Any) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
@@ -348,12 +449,19 @@ class TorchAdapter(_Adapter):
                 criteria.update(values)
             return criteria
 
-        return step
+        return self._compile_step(step)
 
     def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
-        """Run the inference flow with autograd disabled, reading its variables from the closure."""
-        inference: InferenceFlow = torch.no_grad()(flow)
-        return inference
+        """Run the inference flow with autograd disabled, reading its variables from the closure.
+
+        The refusal comes first, so a request this backend cannot honor is raised about the flow it
+        was made for rather than about the `no_grad` wrapper put around it.
+
+        Raises:
+            ValueError: If compilation was asked for -- `_Adapter._compile_step` says why.
+        """
+        inference: InferenceFlow = self._compile_step(flow)
+        return torch.no_grad()(inference)
 
 
 def _exchange(variable: Any, average: Any) -> None:
@@ -472,6 +580,12 @@ _ADAPTERS: dict[str, Callable[[], BackendAdapter]] = {
 @cache
 def select_backend_adapter() -> BackendAdapter:
     """Return the adapter of the active Keras backend, resolved once and reused.
+
+    Cached, so it is one adapter per process, and that is what `compile_kw` travels on: a generated
+    learner builds its steps in its own constructor, calling this with no arguments, so a caller
+    choosing how those steps are compiled -- `scm keras train --compile` -- sets `compile_kw` on the
+    adapter this returns *before* it builds the learner. Setting it afterwards changes nothing: the
+    steps are already built, and `cache_clear()` drops the choice with the adapter that carried it.
 
     Returns:
         The adapter, the same instance on every call.

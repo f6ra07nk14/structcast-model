@@ -350,7 +350,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     so the emitted script imports no framework beyond `keras` and branches on no
     backend. Each optimizer segment becomes one `_flow_<optimizer>` method written in `keras.ops`,
     handed to the adapter as the `flow` of a `_segment_<optimizer>` attribute; the adapter turns
-    them into the compiled training step.
+    them into the training step, compiled when `scm keras train --compile` asked for it.
 
     The emitted module holds imports and the class alone, and the class keeps no anonymous
     collection: the constants are class attributes, every segment is a named attribute, the batch
@@ -591,7 +591,7 @@ class {self.classname}:
     the backend adapter selected in `__init__` owns the gradients, the optimizer application and the
     step compilation. The steps are built once here, so `prepare` -- which builds every optimizer
     against its variables and wraps it in a `keras.optimizers.LossScaleOptimizer` under a float16
-    policy -- has run before the training step is compiled, as it must.
+    policy -- has run before any training step is built, compiled or not.
 
     The batch travels by name: the flows and the steps below take one keyword argument per input, so
     whoever rebinds a step -- the distributed strategy replicating it across devices, above all --

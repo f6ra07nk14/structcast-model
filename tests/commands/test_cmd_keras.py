@@ -25,6 +25,7 @@ from typer.testing import CliRunner
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.commands.cmd_keras import app
+from structcast_model.keras.adapters import select_backend_adapter
 from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.keras.trainer import KerasTrainer
 from structcast_model.loggers.state_backends import KerasStateBackend
@@ -349,6 +350,133 @@ def test_train_end_to_end(tmp_path: Path, cli_runner: CliRunner, patterns: tuple
     artifacts = {artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)}
     assert {"training_state.npz", "best_val_loss.npz", "arguments.yaml"} <= artifacts
     assert run.data.params["keras_backend"] == BACKEND
+
+
+@pytest.fixture
+def built_steps(monkeypatch: pytest.MonkeyPatch) -> list[tuple[dict[str, Any] | None, bool]]:
+    """Watch how each run's learner builds its training step: the choice it read, and what it got.
+
+    Reading `compile_kw` off the adapter after a run proves nothing about the seam, because the
+    attribute reads the same whether it was set before the learner was built -- the only moment that
+    decides anything -- or uselessly after it. The build call is that moment, so it is what is
+    recorded, together with whether the step handed back is a traced one: a `tf.function` carries the
+    `python_function` it was built from, an eager step does not.
+    """
+    adapter: Any = select_backend_adapter()
+    built: list[tuple[dict[str, Any] | None, bool]] = []
+    build = adapter.build_train_step
+
+    def recording(segments: Any) -> Any:
+        step = build(segments)
+        choice = None if adapter.compile_kw is None else dict(adapter.compile_kw)
+        built.append((choice, hasattr(step, "python_function")))
+        return step
+
+    monkeypatch.setattr(adapter, "build_train_step", recording)
+    return built
+
+
+@pytest.mark.skipif(BACKEND == "torch", reason="The torch backend builds no compiled step; it refuses the flag below.")
+def test_train_compiles_the_learners_steps_only_while_compile_asks_for_it(
+    tmp_path: Path,
+    cli_runner: CliRunner,
+    patterns: tuple[str, str],
+    built_steps: list[tuple[dict[str, Any] | None, bool]],
+) -> None:
+    """--compile must reach the adapter before the learner builds its steps, and only for its own run.
+
+    Three runs in one process, because no one of them shows the seam on its own: the criteria are
+    identical compiled or eager, an assignment made after the learner was built reads back exactly
+    like one made in time, and the two eager runs are what prove the compiled run's choice does not
+    stay behind on an adapter cached for the whole process. `--compile null` and an omitted flag are
+    the two spellings of off; on tensorflow the step itself is checked too, which is what a backend
+    compiling unconditionally again -- the behaviour this replaced -- would fail on.
+    """
+    _train(cli_runner, patterns, tmp_path, experiment="keras-compiled", epochs=1, extra=["--compile", "true"])
+    assert select_backend_adapter().compile_kw is None
+    _train(cli_runner, patterns, tmp_path, experiment="keras-null", epochs=1, extra=["--compile", "null"])
+    _train(cli_runner, patterns, tmp_path, experiment="keras-eager", epochs=1)
+
+    assert [choice for choice, _ in built_steps] == [{}, None, None]
+    if BACKEND == "tensorflow":
+        assert [traced for _, traced in built_steps] == [True, False, False]
+    (run,) = mlflow.search_runs(experiment_names=["keras-eager"], output_format="list")
+    assert isfinite(run.data.metrics["loss"])
+
+
+def test_train_refuses_none_as_a_spelling_of_an_eager_run(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
+) -> None:
+    """The bare word "none" was a local hack here, and YAML reads it as a string: a path that is not.
+
+    Off is spelled the way YAML spells it -- omitted, `null`, `~` or `false`, all asserted eager
+    above -- and the run this would otherwise have made is a full, successful, silently eager one:
+    the arguments below are exactly the ones a passing run is given. Invoked directly rather than
+    through the helper, which asserts success.
+    """
+    keras.backend.clear_session()
+    mlflow.set_tracking_uri(str(tmp_path / "mlruns"))
+    model_pattern, learner_pattern = patterns
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "train",
+            model_pattern,
+            "--backend",
+            BACKEND,
+            "--shape",
+            "x: [4]",
+            "--learner",
+            learner_pattern,
+            "--training-dataset",
+            DATASET,
+            "--epochs",
+            "1",
+            "--lower-criterion",
+            "loss",
+            "--experiment",
+            "keras-compile-none",
+            "--ci",
+            "--compile",
+            "none",
+        ],
+    )
+
+    assert result.exit_code != 0
+    # The word itself, not only a non-zero exit: a typer that no longer knew `--compile` at all
+    # would also exit non-zero, and this run has to fail on the value it was handed.
+    assert "Path does not exist: none" in str(result.exception)
+    assert not mlflow.search_runs(experiment_names=["keras-compile-none"], output_format="list")
+
+
+@pytest.mark.skipif(BACKEND != "torch", reason="Only the torch backend has no compiler to refuse for.")
+def test_train_refuses_compilation_on_the_backend_that_has_none(cli_runner: CliRunner) -> None:
+    """A --compile the backend cannot honor must abort the run, not train eagerly and report success.
+
+    Before the models and the learner are built, not down in the adapter: everything downstream
+    would look like a healthy run, and only the missing speed would say otherwise. The model and the
+    learner below name files that do not exist, so a refusal arriving with the first built step --
+    where a hand-written learner still meets it -- would be drowned out by an import error instead.
+    """
+    result = cli_runner.invoke(
+        app,
+        [
+            "train",
+            "model: [_obj_, {_addr_: Model, _file_: /nonexistent.py}]",
+            "--backend",
+            "torch",
+            "--learner",
+            "[_obj_, {_addr_: nothing.Learner}]",
+            "--training-dataset",
+            DATASET,
+            "--compile",
+            "true",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "builds no compiled step" in str(result.exception)
 
 
 def test_train_records_the_shapes_the_models_declared_when_none_are_given(

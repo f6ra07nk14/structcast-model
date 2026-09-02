@@ -1,7 +1,8 @@
 """Keras related commands for the StructCast Model CLI application."""
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -132,6 +133,45 @@ def create_learner(
     """
     builder = keras_builder.KerasLearnerBuilder.from_path(cfg_path)
     builder(parameters=reduce_dict(parameters), classname=classname)(output)
+
+
+@contextmanager
+def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Iterator[None]:
+    """Put a run's `--compile` choice on the backend adapter, and take it off again afterwards.
+
+    A generated learner reads the choice off the adapter while it builds its steps, in its own
+    constructor, so the choice has to be there before the learner is built; the `dp` preset reads it
+    once more, when `wrap_steps` traces its replicated call. The adapter is `@cache`d for the
+    process, so what is set here would otherwise be inherited by every learner built afterwards --
+    the next run in the same process included.
+
+    The torch backend is refused before any of that: it builds no compiled step, so the flag cannot
+    be honored, and ignoring it would report a compiled run that never happened. Refused here, where
+    `--backend` is known and nothing has been built yet, and again in the adapter for a hand-written
+    learner that reaches it without this command (`keras/adapters.py`).
+
+    Args:
+        backend (str): The Keras backend the run was told to use.
+        compile_pattern (dict[str, Any] | None): The parsed --compile value, None for an eager run.
+
+    Yields:
+        None: while the choice is the adapter's.
+
+    Raises:
+        ValueError: If the torch backend was asked to compile.
+    """
+    if backend == "torch" and compile_pattern is not None:
+        raise ValueError(
+            'The "torch" Keras backend builds no compiled step, so --compile cannot be honored: its steps assign '
+            "to Keras variables and run a Keras optimizer, which torch.compile graph-breaks on rather than "
+            "accelerates. Drop --compile, or run the same learner on the tensorflow or jax backend."
+        )
+    adapter = scm_keras.select_backend_adapter()
+    adapter.compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
+    try:
+        yield
+    finally:
+        adapter.compile_kw = None
 
 
 def _get_sync_fn(device: str) -> Any:
@@ -360,6 +400,18 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     ),
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
+    compile_pattern: dict[str, Any] | None = Option(
+        None,
+        "--compile",
+        "-c",
+        parser=bool_or_path_or_dict_parser,
+        help="Whether to compile the Learner's training and inference steps, with the compiler the "
+        '--backend has: "tf.function" on tensorflow, "jax.jit" on jax. Omitted, null or false runs them '
+        'eagerly; "true" compiles with default options. Can also be a dictionary of keyword arguments for that '
+        "compiler -- or a path to a YAML/JSON file holding one. The torch backend builds no compiled step at "
+        "all and refuses the option rather than ignoring it, and the arguments deciding what is static and what "
+        'is donated on jax, and "input_signature" on tensorflow, are the step\'s own contract and are dropped.',
+    ),
     trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "KerasTrainer"
     ),
@@ -417,43 +469,45 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     _cap_torch_gpu_memory(backend, gpu_memory_fraction)
     device = scm_keras.get_keras_device(device)
     keras.utils.set_random_seed(seed)
-    # Resolved before the models: the class itself is what carries the policy the models are built
-    # under, and instantiating it needs them.
-    factory = instantiate_object(learner_pattern)
-    if (policy := _mixed_precision_policy(factory)) is not None:
-        # A policy only reaches the layers built after it is set, and the learner receives models
-        # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
-        print(f'Setting the global mixed precision policy to "{policy}"...')
-        keras.mixed_precision.set_global_policy(policy)
-    strategy = _resolve_strategy(strategy_pattern, device)
-    models: OrderedDict[str, Any] = OrderedDict()
-    declared: dict[str, Any] = {}
-    # Everything a run allocates is built inside the activation: a JAX variable reads the active
-    # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
-    # -- the models above all, and the optimizers the learner builds against their variables.
-    with strategy.activate():
-        for raw in model_patterns:
-            if len(raw) != 1:
-                raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
-            model_name, pattern = next(iter(raw.items()))
-            built = instantiate_object(pattern)
-            # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
-            # which carries none of the layer's attributes, so the shapes it was traced with would be
-            # unrecoverable afterwards and the run would record none.
-            declared.update(scm_keras.resolve_input_shapes(built) or {})
-            models[model_name] = scm_keras.initial_model(built, reduce_dict(shapes))
-        strategy.sync_initial_weights(models)
-        # Before the learner: it captures the model objects it is handed, and its optimizers are
-        # built against their variables while it is constructed.
-        models = strategy.wrap(models)
-        learner = factory(**models)
-    # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
-    # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
-    input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
-    config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
-    # After the learner: the steps this rewires are the ones the backend adapter built in its
-    # constructor, and each one runs the replicas itself rather than being traced into a scope.
-    strategy.wrap_steps(learner)
+    # Spanning everything that builds or traces a step: the learner's constructor, and `wrap_steps`.
+    with _compile_choice(backend, compile_pattern):
+        # Resolved before the models: the class itself is what carries the policy the models are built
+        # under, and instantiating it needs them.
+        factory = instantiate_object(learner_pattern)
+        if (policy := _mixed_precision_policy(factory)) is not None:
+            # A policy only reaches the layers built after it is set, and the learner receives models
+            # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
+            print(f'Setting the global mixed precision policy to "{policy}"...')
+            keras.mixed_precision.set_global_policy(policy)
+        strategy = _resolve_strategy(strategy_pattern, device)
+        models: OrderedDict[str, Any] = OrderedDict()
+        declared: dict[str, Any] = {}
+        # Everything a run allocates is built inside the activation: a JAX variable reads the active
+        # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
+        # -- the models above all, and the optimizers the learner builds against their variables.
+        with strategy.activate():
+            for raw in model_patterns:
+                if len(raw) != 1:
+                    raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+                model_name, pattern = next(iter(raw.items()))
+                built = instantiate_object(pattern)
+                # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
+                # which carries none of the layer's attributes, so the shapes it was traced with would be
+                # unrecoverable afterwards and the run would record none.
+                declared.update(scm_keras.resolve_input_shapes(built) or {})
+                models[model_name] = scm_keras.initial_model(built, reduce_dict(shapes))
+            strategy.sync_initial_weights(models)
+            # Before the learner: it captures the model objects it is handed, and its optimizers are
+            # built against their variables while it is constructed.
+            models = strategy.wrap(models)
+            learner = factory(**models)
+        # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
+        # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
+        input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
+        config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
+        # After the learner: the steps this rewires are the ones the backend adapter built in its
+        # constructor, and each one runs the replicas itself rather than being traced into a scope.
+        strategy.wrap_steps(learner)
     outputs = get_module_outputs(learner, learner_outputs, "learner")
     provider = scm.SimpleDataProvider(
         training_dataset=instantiate_object(training_dataset_pattern),
@@ -508,6 +562,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "mixed_precision_policy": policy,
         "learner": learner_pattern,
         "learner_outputs": outputs,
+        "compile": compile_pattern,
         "trainer": trainer_pattern,
         "epochs": epochs,
         "start_epoch": start_epoch,

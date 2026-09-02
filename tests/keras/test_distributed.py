@@ -27,6 +27,7 @@ import pytest
 
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
+from structcast_model.keras.adapters import select_backend_adapter
 from structcast_model.keras.distributed import REJECTED, KerasDistributedStrategy
 
 # The protocol the trainer and the checkpoint callbacks are written against lives on the torch side;
@@ -699,6 +700,7 @@ if __name__ == "__main__":
         "--training-dataset", "[_obj_, {_addr_: batches, _file_: " + __file__ + "}, _call_]",
         "--trainer", "[_obj_, {_addr_: Recorder, _file_: " + __file__ + "}]",
         "--strategy", "dp",
+        "--compile", "true",
         "--epochs", "1",
         "--lower-criterion", "loss",
         "--experiment", "keras-tf-dp",
@@ -725,6 +727,37 @@ def test_the_training_command_builds_the_learner_under_the_mirrored_scope(tmp_pa
     result = _run(TENSORFLOW_CLI_SCRIPT, tmp_path, str(generated), str(output), backend="tensorflow")
 
     assert result == {"model": "MirroredVariable", "optimizer": "MirroredVariable"}
+
+
+@pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow path traces the replicated call.")
+def test_the_mirrored_wrapper_takes_the_runs_compile_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The graph this preset wraps the replicated call in is traced with the run's own options.
+
+    The preset needs that graph whether or not `--compile` was given, so a bare `tf.function` here
+    looks right and silently runs the one case the flag has no say over: a `jit_compile` or a
+    `reduce_retracing` the run asked for would be honored by every step the adapter built and
+    dropped by the one call that spans them. Nothing in a run's output tells the two apart, so the
+    proof is an argument `tf.function` cannot take: it has to reach it and be refused. One device is
+    enough, since what is asserted is the tracing, not the reduction.
+    """
+    monkeypatch.setattr(select_backend_adapter(), "compile_kw", {"not_a_tf_function_argument": True})
+
+    class _Learner:
+        """The smallest learner reaching the tracing: one inner flow, and the mapping naming it."""
+
+        def _training_step(self, **batch: Any) -> dict[str, Any]:
+            return batch
+
+        @property
+        def flow_functions(self) -> dict[str, Any]:
+            return {"_training_step": self._training_step}
+
+    strategy = KerasDistributedStrategy(preset="dp", devices=1)
+    with strategy.activate():
+        pass
+
+    with pytest.raises(TypeError, match="not_a_tf_function_argument"):
+        strategy.wrap_steps(_Learner())
 
 
 @pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow path needs the inner flows.")
