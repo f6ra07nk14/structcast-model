@@ -1,5 +1,10 @@
 # Cross-framework CLI declarations live in `commands/shared_args.py`
 
+> **Amended by ADR-0024.** Keras `--compile` is graph compilation like the others, so it is no
+> longer the third rule's example, and all six declarations (`torch|flax|keras` × `time|train`) come
+> from one factory, `compile_option(api, tail)` — rule two's compile text, which named only torch
+> and flax, now covers every command. Both rules below are edited to match.
+
 The torch, keras and flax sub-apps declare largely parallel Typer options, and the copies drift: one
 round of parallel edits left the same "path form" sentence spelled three ways across the three
 `model_pattern` declarations, and the `--compile` skeleton differing between torch and flax for no
@@ -20,13 +25,13 @@ help-text builder (`TEMPLATE_PARAM_HELP`, `object_pattern_help`, the shapes/comp
   `parser` callable, so parsers must stay stateless, and each signature still needs its own correct
   annotation). A pair qualifies — `training_mode` is shared by torch and keras while flax keeps its
   own `nnx.view` variant next to the code that needs it.
-- **Near-identical → a factory with the differences as explicit arguments.** The shapes and
-  torch/flax compile texts share one skeleton with framework-specific slots (example shape order,
-  initializer module, compile API). Drift now has to get past a function signature instead of a
-  copy-paste.
-- **Framework-specific semantics stay in `cmd_*.py`.** `--device` means three different things,
-  keras `--compile` is run configuration rather than graph compilation, `--strategy` takes a preset name in
-  flax and only a pattern in torch; centralizing them would buy no drift protection and cost locality.
+- **Near-identical → a factory with the differences as explicit arguments.** The shapes and the
+  compile texts share one skeleton with framework-specific slots (example shape order, initializer
+  module, compile API, and the sentence each command adds after it). Drift now has to get past a
+  function signature instead of a copy-paste.
+- **Framework-specific semantics stay in `cmd_*.py`.** `--device` means three different things, and
+  `--strategy` takes a preset name in flax and only a pattern in torch; centralizing them would buy
+  no drift protection and cost locality.
 
 "One letter, one meaning" is enforced by a test that walks the whole app tree and asserts every
 short flag maps to exactly one long option, so the convention survives the planned keras/flax

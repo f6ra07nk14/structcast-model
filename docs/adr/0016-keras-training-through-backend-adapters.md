@@ -4,6 +4,11 @@
 > returning true every step and the accepted update-counter divergence — is replaced by the
 > private-counter gate of ADR-0017. The rest stands.
 
+> **Amended by ADR-0024.** Step compilation through the adapter is opt-in: `scm keras train
+> --compile` sets the adapter's `compile_kw`, which is `None` — eager — unless asked, where the
+> adapters previously compiled every step they built. The torch adapter refuses a value rather than
+> ignoring it, and the keys that are the step's own contract are stripped from the ones that pass.
+
 Keras 3 runs on three backends whose training mechanics disagree: TensorFlow allows only stateful
 `optimizer.apply` under a `GradientTape`, JAX requires the stateless `stateless_call` /
 `stateless_apply` path under `jax.jit`, and torch uses autograd with path-keyed parameters. We

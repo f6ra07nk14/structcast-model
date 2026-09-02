@@ -10,6 +10,11 @@
 > legitimate models: the errors land inside `nnx.Embed`'s gather and a class-token concatenate,
 > library code no model template can annotate.
 
+> **Amended by ADR-0024.** The `compile()` seam itself is unchanged; what changed is who asks for
+> it. `scm flax train` no longer compiles by default — 14915c2 made the flag default-on without
+> recording it here, and steps are eager unless `--compile` is given, as on every other command —
+> and `"none"` is no longer a spelling of eager, YAML null being the one that survives.
+
 JAX has no strategy zoo: one mechanism — a device mesh plus a `PartitionSpec` per tensor — expresses
 single-device, data-parallel, and FSDP execution, with XLA inserting every collective. The Flax
 `DistributedStrategy` implementation is therefore **one class**, not a mirror of the three torch classes: on

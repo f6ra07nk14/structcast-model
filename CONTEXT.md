@@ -69,6 +69,13 @@ selecting how a distributed strategy partitions parameters, optimizer state, and
 devices of one host.
 _Avoid_: ZeRO stage, parallelism mode, sharding config
 
+**Compile unit**:
+What `--compile` hands to a framework's graph compiler: the timed forward call under `time`, and under
+`train` the Learner's generated step functions — the flow functions on torch, where the models are compile
+units too and the Distributed strategy decides the boundaries. Compiled only where `--compile` asks for it;
+eager everywhere else.
+_Avoid_: jit, graph mode, keras.Model.compile
+
 **Keras backend**:
 The engine — TensorFlow, JAX, or PyTorch — that Keras executes on, fixed for the whole process
 before Keras first imports. Each training run names exactly one; it is not a Distributed strategy.
