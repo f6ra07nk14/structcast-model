@@ -1,6 +1,6 @@
 # The "--compile" counterpart of "cfg/torch/others/compile_default.yaml", for "flax.nnx.jit".
-# A Flax run compiles by default, so this file is only needed to change one of the knobs below;
-# "--compile none" turns compilation off instead.
+# Compilation is off unless "--compile" asks for it: "--compile true" compiles with nnx.jit's own
+# defaults, and this file is only needed to change one of the knobs below.
 # The arguments deciding what is static and what is donated are the generated step's contract and
 # are dropped from whatever is passed here, so they are deliberately absent.
 backend: null # null, "cpu", "gpu" or "tpu"; null lets JAX choose

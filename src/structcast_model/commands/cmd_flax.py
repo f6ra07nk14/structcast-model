@@ -116,10 +116,10 @@ def measure_inference_time(
         "--training-mode-kwargs",
         parser=bool_or_path_or_dict_parser,
         help='Keyword arguments for "nnx.view", e.g. --training-mode-kwargs "{training: true, deterministic: false, '
-        'use_running_average: false}". Can also be a path to a YAML/JSON file holding them; "false" is the same as '
-        'omitting the option, and "true" applies no view flags at all. When given, the mapping applies whether or '
-        "not --training-mode is set, replacing the view flags derived from it. If not specified, the view is "
-        "derived from --training-mode as {training: <flag>, deterministic: <not flag>, "
+        'use_running_average: false}". Can also be a path to a YAML/JSON file holding them; "null" or "false" is '
+        'the same as omitting the option, and "true" applies no view flags at all. When given, the mapping applies '
+        "whether or not --training-mode is set, replacing the view flags derived from it. If not specified, the "
+        "view is derived from --training-mode as {training: <flag>, deterministic: <not flag>, "
         "use_running_average: <not flag>}.",
     ),
     warmup_runs: int = scm_args.warmup_runs,
@@ -162,21 +162,6 @@ def measure_inference_time(
 
 MATMUL_PRECISIONS: Mapping[str, str] = {"highest": "highest", "high": "high", "medium": "bfloat16"}
 """JAX spelling of the shared precision names; its lowest float32 setting is named after the dtype."""
-
-
-def _compile_parser(value: str) -> dict[str, Any] | None:
-    """Parse `--compile`, where "none" and "false" disable compilation.
-
-    Args:
-        value (str): The raw option value; empty when the option is left at its default.
-
-    Returns:
-        dict[str, Any] | None: The `nnx.jit` keyword arguments to compile with, or None to skip
-            compilation.
-    """
-    if value.strip().lower() in ("none", "false"):
-        return None
-    return bool_or_path_or_dict_parser(value) or {}
 
 
 def _cap_gpu_memory(fraction: float | None) -> None:
@@ -259,16 +244,14 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
     compile_pattern: dict[str, Any] | None = Option(
-        "",
+        None,
         "--compile",
         "-c",
-        parser=_compile_parser,
-        show_default="nnx.jit",
-        help='Whether to compile the Learner\'s steps with "flax.nnx.jit", which is what a Flax run is expected to '
-        'do and therefore the default. Pass "none" or "false" to run them eagerly, or a dictionary of extra '
-        '"nnx.jit" keyword arguments -- or a path to a YAML/JSON file holding one -- to add to the defaults. The '
-        "arguments deciding what is static and what is donated are the generated step's contract and cannot be "
-        "overridden.",
+        parser=bool_or_path_or_dict_parser,
+        help='Whether to compile the Learner\'s steps with "flax.nnx.jit". Omitted, "null" or "false" runs them '
+        'eagerly; "true" compiles with default options. Can also be a dictionary of extra "nnx.jit" keyword '
+        "arguments -- or a path to a YAML/JSON file holding one. The arguments deciding what is static and what is "
+        "donated are the generated step's contract and cannot be overridden.",
     ),
     trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "FlaxTrainer"

@@ -425,9 +425,9 @@ def test_train_end_to_end(tmp_path: Path, cli_runner: CliRunner, patterns: tuple
 
 
 def test_train_without_compilation(tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]) -> None:
-    """--compile none runs the steps eagerly, and must reach the same loss as the compiled run."""
-    _train(cli_runner, patterns, tmp_path, experiment="flax-eager", epochs=1, extra=["--compile", "none"])
-    _train(cli_runner, patterns, tmp_path, experiment="flax-eager", epochs=1)
+    """--compile null runs the steps eagerly, and must reach the same loss as the compiled run."""
+    _train(cli_runner, patterns, tmp_path, experiment="flax-eager", epochs=1, extra=["--compile", "null"])
+    _train(cli_runner, patterns, tmp_path, experiment="flax-eager", epochs=1, extra=["--compile", "true"])
     eager, compiled = _runs("flax-eager")
     assert eager.data.metrics["loss"] == pytest.approx(compiled.data.metrics["loss"], rel=1e-6)
 
@@ -453,7 +453,7 @@ def test_train_keeps_the_contract_compilation_arguments(
     """
     override = "{static_argnums: 0, donate_argnums: 0}"
     _train(cli_runner, patterns, tmp_path, experiment="flax-compile-kw", epochs=1, extra=["--compile", override])
-    _train(cli_runner, patterns, tmp_path, experiment="flax-compile-kw", epochs=1)
+    _train(cli_runner, patterns, tmp_path, experiment="flax-compile-kw", epochs=1, extra=["--compile", "true"])
     overridden, plain = _runs("flax-compile-kw")
     assert overridden.data.metrics["loss"] == plain.data.metrics["loss"]
 
@@ -500,7 +500,7 @@ def test_train_resumes_from_a_saved_training_state(
     tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """--resume continues at the epoch after the saved one, with the state the first run left."""
-    _train(cli_runner, patterns, tmp_path, experiment="flax-resume", epochs=2)
+    _train(cli_runner, patterns, tmp_path, experiment="flax-resume", epochs=2, extra=["--compile", "true"])
     (state,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
     with caplog.at_level(logging.INFO, logger="structcast_model.flax.trainer"):
         _train(
@@ -509,7 +509,7 @@ def test_train_resumes_from_a_saved_training_state(
             tmp_path,
             experiment="flax-resume",
             epochs=3,
-            extra=["--resume", str(state), "--start-epoch", "2"],
+            extra=["--compile", "true", "--resume", str(state), "--start-epoch", "2"],
         )
     assert "Ignoring --start-epoch 2: the resumed state continues at epoch 3." in caplog.text
     first, resumed = _runs("flax-resume")
@@ -534,7 +534,14 @@ def test_train_resumes_the_averaged_shadow_models_the_learner_declares(
     FlaxLearnerBuilder(raw=raw, current_path=LEARNER_CFG)()(tmp_path / "averaging.py")
     model_pattern, _ = patterns
     averaging = (model_pattern, f"[_obj_, {{_addr_: Learner, _file_: {tmp_path / 'averaging.py'}}}]")
-    one_batch = ["--training-dataset", f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: {{count: 1}}}}]"]
+    # Compiled on purpose: an `nnx.EMA` a compiled step closes over is mutated at another trace
+    # level, which flax rejects, so only a compiled run can go red for the eager update moving.
+    one_batch = [
+        "--compile",
+        "true",
+        "--training-dataset",
+        f"[_obj_, {{_addr_: {__name__}.linear_batches}}, {{_call_: {{count: 1}}}}]",
+    ]
     _train(cli_runner, averaging, tmp_path, experiment="flax-ema-resume", epochs=1, extra=one_batch)
     (first,) = (tmp_path / "mlruns").rglob("training_state.tar.gz")
     saved = FlaxStateBackend().load(first)["models"]
@@ -650,6 +657,21 @@ def test_train_refuses_a_learner_that_names_no_criteria(cli_runner: CliRunner, p
 
     assert isinstance(error, ValueError)
     assert 'Module "learner" does not have an "outputs" attribute' in str(error)
+
+
+def test_train_refuses_the_retired_none_spelling(cli_runner: CliRunner) -> None:
+    """The local "none" spelling of off was retired by ADR-0024, and must not come back silently.
+
+    One value grammar over every command is the decision: "none" is a bare YAML word, so the shared
+    parser reads it as a path and fails to find it, exactly as `scm torch train` and every `time`
+    command already do with it. A special case honoring it here would be invisible to every other
+    test -- an eager run reaches the same numbers -- so this is what keeps it out. The value is
+    rejected while the option is parsed, before the rest of the command line is read.
+    """
+    error = _train_error(cli_runner, ["--compile", "none"])
+
+    assert isinstance(error, FileNotFoundError)
+    assert "Path does not exist: none" in str(error)
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +822,14 @@ def test_train_compiles_each_flow_under_its_own_contract(
     """
     COMPILE_CALLS.clear()
     strategy = f"[_obj_, {{_addr_: {__name__}.RecordingStrategy}}]"
-    _train(cli_runner, patterns, tmp_path, experiment="flax-compile", epochs=1, extra=["--strategy", strategy])
+    _train(
+        cli_runner,
+        patterns,
+        tmp_path,
+        experiment="flax-compile",
+        epochs=1,
+        extra=["--strategy", strategy, "-c", "true"],
+    )
 
     contracts = dict(COMPILE_CALLS)
     assert contracts["_training_step"] == {
@@ -834,19 +863,22 @@ def test_the_optimizer_digests_are_read_off_the_learner_class(patterns: tuple[st
 def test_train_without_compilation_binds_nothing(
     tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str]
 ) -> None:
-    """--compile none must leave the steps as the learner defined them, not compile them anyway."""
-    COMPILE_CALLS.clear()
-    strategy = f"[_obj_, {{_addr_: {__name__}.RecordingStrategy}}]"
-    _train(
-        cli_runner,
-        patterns,
-        tmp_path,
-        experiment="flax-no-compile",
-        epochs=1,
-        extra=["--strategy", strategy, "--compile", "none"],
-    )
+    """Compilation is opt-in: omitting --compile, like "null" and "false", must leave the steps as defined.
 
-    assert COMPILE_CALLS == []
+    Omission is the case that pins the contract `scm torch train` and `scm keras train` already
+    follow -- a run compiles only when it asks to -- and it is invisible in the losses, which an
+    eager run reaches all the same.
+    """
+    strategy = f"[_obj_, {{_addr_: {__name__}.RecordingStrategy}}]"
+    for extra in (
+        ["--strategy", strategy],
+        ["--strategy", strategy, "--compile", "null"],
+        ["--strategy", strategy, "--compile", "false"],
+    ):
+        COMPILE_CALLS.clear()
+        _train(cli_runner, patterns, tmp_path, experiment="flax-no-compile", epochs=1, extra=extra)
+
+        assert COMPILE_CALLS == []
 
 
 def test_train_runs_the_trainer_the_option_names(
@@ -934,6 +966,8 @@ def run(experiment, strategy, size):
         "--epochs", "1",
         "--experiment", experiment,
         "--strategy", strategy,
+        # Compiled: a sharding or donation mistake is a trace-time error, invisible to an eager run.
+        "--compile", "true",
         "--ci",
     ])
     if result.exit_code != 0:
