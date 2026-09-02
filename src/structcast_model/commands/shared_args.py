@@ -107,14 +107,20 @@ def shapes_option(help_text: str) -> Any:
     return Option(None, "--shape", "-s", parser=tensor_shape_parser, help=help_text)
 
 
-def compile_option(api: str) -> Any:
-    """Build the `--compile` option for the frameworks that compile the model graph.
+def compile_option(api: str, tail: str = "") -> Any:
+    """Build the `--compile` option, the one declaration behind all six `time` and `train` commands.
 
-    Not the keras commands yet: `docs/adr/0024` puts all six declarations on this factory, and the
-    two in `cmd_keras` still declare their own until the commit that unifies them.
+    `docs/adr/0024` gives the flag a single meaning -- what the command runs, handed to the
+    framework's own graph compiler -- so the only differences left are which compiler to name and
+    what each command has to add about it.
 
     Args:
-        api (str): The compilation entry point, e.g. "torch.compile" or "nnx.jit".
+        api (str): The compiler, spelled as the sentence "compile ... with <api>" needs it, quotes
+            included: '"torch.compile"' for a bare symbol, or a phrase where the compiler depends on
+            something the run decides.
+        tail (str): The command's own trailing sentence(s), with a leading space, e.g. what it drops
+            from a given mapping. A declaration shared by `time` and `train` leaves out anything true
+            of only one of them, which would read as a lie under the other.
 
     Returns:
         Any: The typer `Option` declaration for `--compile`.
@@ -124,9 +130,9 @@ def compile_option(api: str) -> Any:
         "--compile",
         "-c",
         parser=bool_or_path_or_dict_parser,
-        help=f'Whether to compile the model using "{api}". Omitted, null or false leaves the model uncompiled; '
-        "true compiles with default options. Can also be a path to an existing YAML/JSON file, or a dictionary of "
-        f'keyword arguments for "{api}".',
+        help=f'Whether to compile the timed forward ("time") or the Learner\'s compile units ("train") with {api}. '
+        'Omitted, "null" or "false" runs them eagerly; "true" compiles with default options. Can also be a '
+        f"dictionary of keyword arguments for that compiler, or a path to a YAML/JSON file holding one.{tail}",
     )
 
 

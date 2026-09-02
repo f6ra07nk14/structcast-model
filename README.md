@@ -374,7 +374,7 @@ Use `scm [torch/flax/keras] time` to benchmark the average forward-pass latency 
 | positional pattern | StructCast object pattern to instantiate the model                |
 | `-s/--shape`       | Input tensor shapes, e.g. `'image: [3, 224, 224]'`                |
 | `-d/--device`      | Computation device (`cpu`, `cuda`, `gpu:0`, …)                    |
-| `-c/--compile`     | Compile the model before measurement (`true`, YAML path, or dict) |
+| `-c/--compile`     | Compile the timed forward before measurement (`true`, YAML path, or dict) |
 | `--training-mode`  | Measure in training mode instead of evaluation mode               |
 | `-w/--warmup-runs` | Number of warmup iterations (default: 2)                          |
 | `-t/--times`       | Number of timed iterations (default: 10)                          |

@@ -18,7 +18,6 @@ from typer import Argument, Option, Typer
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
-    bool_or_path_or_dict_parser,
     check_gpu_memory_fraction,
     config_hash,
     dict_parser,
@@ -82,19 +81,22 @@ backend_option = Option(
     "sets it before importing Keras and fails when a different one is already live. There is no default: the "
     "backend decides what a run computes on, so it is stated rather than inherited from ~/.keras/keras.json.",
 )
-compile_pattern: dict[str, Any] | None = Option(
-    None,
-    "--compile",
-    "-c",
-    parser=bool_or_path_or_dict_parser,
-    help="Whether to compile the timed forward with the compiler the active Keras backend has: "
-    '"tf.function" on tensorflow, "jax.jit" on jax. Omitted, null or false times the eager call; "true" compiles '
-    "with default options. Can also be a dictionary of keyword arguments for that compiler, or a path to a "
-    "YAML/JSON file holding one. The torch backend builds no compiled step at all and refuses the option rather "
-    "than ignoring it. On jax the compiled step runs inside the adapter's stateless scope, so under "
-    "--training-mode the moving statistics and dropout seeds it touches do not advance between timed calls, "
-    "where the tensorflow step and both eager paths do advance them; the work timed is the same either way.",
+COMPILE_API = 'the compiler the active Keras backend has ("tf.function" on tensorflow, "jax.jit" on jax)'
+# Both commands compile through the same backend adapter, so they say the same thing about it. The
+# stateless scope is `time`'s alone to mention: it is a caveat about --training-mode, which only
+# `time` has, and about numbers, which only `time` reports.
+COMPILE_TAIL = (
+    " The torch backend builds no compiled step at all and refuses the option rather than ignoring it, and the "
+    'arguments deciding what is static and what is donated on jax, and "input_signature" on tensorflow, are the '
+    "step's own contract and are dropped."
 )
+compile_pattern: dict[str, Any] | None = scm_args.compile_option(
+    COMPILE_API,
+    tail=COMPILE_TAIL + " On jax the compiled step runs inside the adapter's stateless scope, so under "
+    "--training-mode the moving statistics and dropout seeds it touches do not advance between timed calls, where "
+    "the tensorflow step and both eager paths do advance them; the work timed is the same either way.",
+)
+train_compile_pattern: dict[str, Any] | None = scm_args.compile_option(COMPILE_API, tail=COMPILE_TAIL)
 
 
 @creator.command(name="model")
@@ -417,18 +419,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     ),
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
-    compile_pattern: dict[str, Any] | None = Option(
-        None,
-        "--compile",
-        "-c",
-        parser=bool_or_path_or_dict_parser,
-        help="Whether to compile the Learner's training and inference steps, with the compiler the "
-        '--backend has: "tf.function" on tensorflow, "jax.jit" on jax. Omitted, null or false runs them '
-        'eagerly; "true" compiles with default options. Can also be a dictionary of keyword arguments for that '
-        "compiler -- or a path to a YAML/JSON file holding one. The torch backend builds no compiled step at "
-        "all and refuses the option rather than ignoring it, and the arguments deciding what is static and what "
-        'is donated on jax, and "input_signature" on tensorflow, are the step\'s own contract and are dropped.',
-    ),
+    compile_pattern: dict[str, Any] | None = train_compile_pattern,
     trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "KerasTrainer"
     ),

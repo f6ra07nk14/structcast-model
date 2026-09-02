@@ -14,6 +14,7 @@ from typer.models import ArgumentInfo, OptionInfo
 from typer.testing import CliRunner
 
 from structcast_model.commands.main import app
+from structcast_model.commands.utils import bool_or_path_or_dict_parser
 
 
 def _iter_commands(typer_app: Typer, path: tuple[str, ...] = ()) -> Iterator[tuple[str, Callable[..., Any]]]:
@@ -37,6 +38,38 @@ def test_every_cli_parameter_has_help() -> None:
         if isinstance(param.default, OptionInfo | ArgumentInfo) and not (param.default.help or "").strip()
     ]
     assert not missing, f"CLI parameters without help text: {missing}"
+
+
+def test_every_compile_option_comes_from_one_factory() -> None:
+    """`--compile` means one thing on all six commands (`docs/adr/0024`), so one factory declares all six.
+
+    Written per command, the flag came to carry four meanings and no two texts agreed on the value
+    grammar. Pinning the parser identity and the shared sentence catches the way that comes back: a
+    command hand-rolling its own `Option` again, or editing its copy of the prose in place. The
+    per-command fragments are the other half -- a factory ignoring its `tail` would pass the rest.
+    """
+    options = {
+        command_path: param.default
+        for command_path, callback in _iter_commands(app)
+        for param in inspect.signature(callback).parameters.values()
+        if isinstance(param.default, OptionInfo) and "--compile" in (param.default.param_decls or ())
+    }
+
+    assert set(options) == {"torch time", "torch train", "flax time", "flax train", "keras time", "keras train"}
+    shared = 'Omitted, "null" or "false" runs them eagerly; "true" compiles with default options.'
+    for command_path, option in options.items():
+        assert shared in (option.help or ""), command_path
+        assert option.parser is bool_or_path_or_dict_parser, command_path
+    for command_path, fragment in (
+        ("torch time", 'with "torch.compile"'),
+        ("flax time", 'with "nnx.jit"'),
+        ("flax train", 'with "nnx.jit"'),
+        ("flax train", "what is static and what is donated"),
+        ("keras time", "builds no compiled step"),
+        ("keras time", "stateless scope"),
+        ("keras train", "builds no compiled step"),
+    ):
+        assert fragment in (options[command_path].help or ""), command_path
 
 
 def test_short_flags_are_globally_unique() -> None:

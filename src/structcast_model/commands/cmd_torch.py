@@ -66,7 +66,7 @@ shapes = scm_args.shapes_option(
     "neither exists."
 )
 device = Option(None, "--device", "-d", help=DEVICE_HELP)
-compile_pattern: dict[str, Any] | None = scm_args.compile_option("torch.compile")
+compile_pattern: dict[str, Any] | None = scm_args.compile_option('"torch.compile"')
 matmul_precision: Literal["highest", "high", "medium"] = scm_args.matmul_precision_option()
 
 

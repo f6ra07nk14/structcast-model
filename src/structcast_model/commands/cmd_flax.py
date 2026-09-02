@@ -59,7 +59,7 @@ device = Option(
     help='Device the dummy inputs are placed on, named "<platform>:<index>" as listed by JAX (e.g. "cpu:0", '
     '"gpu:0"). If not specified, the first available JAX device is used.',
 )
-compile_pattern: dict[str, Any] | None = scm_args.compile_option("nnx.jit")
+compile_pattern: dict[str, Any] | None = scm_args.compile_option('"nnx.jit"')
 
 
 @creator.command(name="model")
@@ -243,15 +243,10 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     ),
     learner_pattern: Any = scm_args.learner_pattern,
     learner_outputs: list[str] | None = scm_args.learner_outputs,
-    compile_pattern: dict[str, Any] | None = Option(
-        None,
-        "--compile",
-        "-c",
-        parser=bool_or_path_or_dict_parser,
-        help='Whether to compile the Learner\'s steps with "flax.nnx.jit". Omitted, "null" or "false" runs them '
-        'eagerly; "true" compiles with default options. Can also be a dictionary of extra "nnx.jit" keyword '
-        "arguments -- or a path to a YAML/JSON file holding one. The arguments deciding what is static and what is "
-        "donated are the generated step's contract and cannot be overridden.",
+    compile_pattern: dict[str, Any] | None = scm_args.compile_option(
+        '"nnx.jit"',
+        tail=" The arguments deciding what is static and what is donated are the generated step's contract and "
+        "cannot be overridden.",
     ),
     trainer_pattern: Any | None = scm_args.trainer_option(
         "trainer(learner=..., tracker=..., data=..., callbacks=[])", "FlaxTrainer"
