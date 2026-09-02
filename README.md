@@ -395,7 +395,7 @@ scm torch time \
 
 PyTorch-specific option: `--matmul-precision` (`highest`, `high`, `medium`) controls [`torch.set_float32_matmul_precision`](https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html).
 
-> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Both use channel-last shapes (e.g., `'image: [224, 224, 3]'`). Flax additionally accepts `--training-mode-kwargs` to override keyword arguments for [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html). Keras compilation uses [`keras.Model.compile`](https://keras.io/api/models/model_training_apis/#compile-method). When using the Keras JAX backend on GPU, you may need to set `LD_LIBRARY_PATH` to include NVIDIA shared libraries from your virtual environment.
+> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Both use channel-last shapes (e.g., `'image: [224, 224, 3]'`). Flax additionally accepts `--training-mode-kwargs` to override keyword arguments for [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html). Keras compilation hands the timed forward to the compiler the ambient backend has ([`tf.function`](https://www.tensorflow.org/api_docs/python/tf/function) on tensorflow, [`jax.jit`](https://docs.jax.dev/en/latest/_autosummary/jax.jit.html) on jax); the torch backend builds no compiled step and refuses the flag. When using the Keras JAX backend on GPU, you may need to set `LD_LIBRARY_PATH` to include NVIDIA shared libraries from your virtual environment.
 
 ### 6. Train a Generated Model
 

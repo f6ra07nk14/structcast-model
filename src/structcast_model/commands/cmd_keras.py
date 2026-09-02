@@ -87,10 +87,13 @@ compile_pattern: dict[str, Any] | None = Option(
     "--compile",
     "-c",
     parser=bool_or_path_or_dict_parser,
-    help='Whether to configure the model with "keras.Model.compile" (Keras run configuration, e.g. jit_compile, not '
-    "graph compilation). Omitted or false skips the call; true calls it with defaults. Can also be a path to an "
-    'existing YAML/JSON file, or a dictionary of keyword arguments for "keras.Model.compile"; "optimizer" is always '
-    "passed as None and cannot be set here.",
+    help="Whether to compile the timed forward with the compiler the active Keras backend has: "
+    '"tf.function" on tensorflow, "jax.jit" on jax. Omitted, null or false times the eager call; "true" compiles '
+    "with default options. Can also be a dictionary of keyword arguments for that compiler, or a path to a "
+    "YAML/JSON file holding one. The torch backend builds no compiled step at all and refuses the option rather "
+    "than ignoring it. On jax the compiled step runs inside the adapter's stateless scope, so under "
+    "--training-mode the moving statistics and dropout seeds it touches do not advance between timed calls, "
+    "where the tensorflow step and both eager paths do advance them; the work timed is the same either way.",
 )
 
 
@@ -141,17 +144,19 @@ def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Ite
 
     A generated learner reads the choice off the adapter while it builds its steps, in its own
     constructor, so the choice has to be there before the learner is built; the `dp` preset reads it
-    once more, when `wrap_steps` traces its replicated call. The adapter is `@cache`d for the
-    process, so what is set here would otherwise be inherited by every learner built afterwards --
-    the next run in the same process included.
+    once more, when `wrap_steps` traces its replicated call. `time` spans one call instead, the
+    `build_inference_step` it hands its timed forward to. The adapter is `@cache`d for the process,
+    so what is set here would otherwise be inherited by every step built afterwards -- the next run
+    in the same process included.
 
     The torch backend is refused before any of that: it builds no compiled step, so the flag cannot
     be honored, and ignoring it would report a compiled run that never happened. Refused here, where
-    `--backend` is known and nothing has been built yet, and again in the adapter for a hand-written
-    learner that reaches it without this command (`keras/adapters.py`).
+    the backend is known and before any step is built -- `train` enters it before its models too --
+    and again in the adapter for a hand-written learner that reaches it without this command
+    (`keras/adapters.py`).
 
     Args:
-        backend (str): The Keras backend the run was told to use.
+        backend (str): The Keras backend the run was told to use; `time` passes the ambient one.
         compile_pattern (dict[str, Any] | None): The parsed --compile value, None for an eager run.
 
     Yields:
@@ -162,9 +167,10 @@ def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Ite
     """
     if backend == "torch" and compile_pattern is not None:
         raise ValueError(
-            'The "torch" Keras backend builds no compiled step, so --compile cannot be honored: its steps assign '
-            "to Keras variables and run a Keras optimizer, which torch.compile graph-breaks on rather than "
-            "accelerates. Drop --compile, or run the same learner on the tensorflow or jax backend."
+            'The "torch" Keras backend builds no compiled step, so --compile cannot be honored: the '
+            "learner's steps assign to Keras variables and run a Keras optimizer, which torch.compile "
+            "graph-breaks on, and the adapter builds no other kind of step. Drop --compile, or run on the "
+            "tensorflow or jax backend."
         )
     adapter = scm_keras.select_backend_adapter()
     adapter.compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
@@ -204,17 +210,28 @@ def measure_inference_time(
     model = instantiate_object(model_pattern)
     shapes = scm_keras.resolve_input_shapes(model, shapes)
     model = scm_keras.initial_model(model, shapes)
+    sync = _get_sync_fn(device)
+
+    def flow(inputs: Any) -> Any:
+        # One keyword, not **batch: `create_numpy_inputs` answers with an array for a bare shape and
+        # a list for a sequence (keras/trainer.py), and only the mapping form could be splatted.
+        return model(inputs, training=training_mode)
+
     if compile_pattern is None:
         print("Skipping compilation...")
+        step = flow
     else:
-        print("Compiling the model...")
-        model.compile(optimizer=None, **instantiator.instantiate(compile_pattern))
-    sync = _get_sync_fn(device)
+        print("Compiling the timed forward...")
+        # The seam `train` compiles through, so the number describes the step a run executes. The
+        # context manager is what refuses the torch backend, which builds no compiled step at all,
+        # and what puts the choice back afterwards: the adapter is one cached instance per process.
+        with _compile_choice(keras.backend.backend(), compile_pattern):
+            step = scm_keras.select_backend_adapter().build_inference_step(flow, models=[model])
 
     def _measure_single_run() -> float:
         inputs = scm_keras.create_numpy_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        sync(model(inputs, training=training_mode))
+        sync(step(inputs=inputs))
         return time() - start_time
 
     print(f"Running {warmup_runs} warmup runs...")

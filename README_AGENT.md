@@ -192,7 +192,7 @@ Purpose:
 
 - Instantiate a model from a StructCast object pattern.
 - Create dummy inputs (PyTorch tensors, JAX arrays, or NumPy arrays).
-- Optionally compile the model (`torch.compile`, `nnx.jit`, or `keras.Model.compile`).
+- Optionally compile the timed forward (`torch.compile`, `nnx.jit`, or the Keras backend's own compiler — `tf.function` on tensorflow, `jax.jit` on jax).
 - Execute warmup runs, then time averaged inference iterations.
 
 Key differences per framework:

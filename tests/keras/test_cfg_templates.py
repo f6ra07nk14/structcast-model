@@ -19,9 +19,11 @@ from typing import Any
 
 import numpy as np
 import pytest
+from structcast.core import instantiator
 
 import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
+from structcast_model.keras.adapters import select_backend_adapter
 from structcast_model.keras.trainer import initial_model
 from structcast_model.utils.base import load_any
 from tests import CFG_DIR
@@ -29,6 +31,7 @@ from tests import CFG_DIR
 MODELS = CFG_DIR / "keras" / "models"
 LEARNERS = CFG_DIR / "keras" / "learners"
 STRATEGIES = CFG_DIR / "keras" / "strategies"
+OTHERS = CFG_DIR / "keras" / "others"
 
 BACKEND = keras.backend.backend()
 
@@ -568,3 +571,26 @@ def test_the_cyclegan_pair_evaluates_every_criterion_without_training(tmp_path: 
     assert all(np.isfinite(value) for value in criteria.values())
     for name, model in models.items():
         assert _moved(before[name], _values(model.trainable_variables)) == 0.0, name
+
+
+@pytest.mark.skipif(BACKEND == "torch", reason="The torch backend builds no compiled step to hand the template to.")
+def test_compile_default_template_only_carries_arguments_this_backends_compiler_accepts() -> None:
+    """`--compile <file>` becomes the adapter's `compile_kw`, so the template has to survive that call.
+
+    One file serves two compilers that share no keyword, so it can only ship the empty mapping
+    `--compile true` already passes; that it stays a *mapping* is the thing worth pinning, because
+    a template trimmed down to its comments would load as null and silently time an eager run
+    instead of a compiled one. Built here rather than through the CLI so both backends' compilers
+    are exercised from the same assertion, on a fresh adapter so the process-wide cached one keeps
+    its own choice.
+    """
+    compile_kw = instantiator.instantiate(load_any(OTHERS / "compile_default.yaml"))
+    assert isinstance(compile_kw, dict)
+    model = initial_model(keras.layers.Dense(2), {"inputs": [4]})
+    adapter = type(select_backend_adapter())()
+    adapter.compile_kw = compile_kw
+
+    step = adapter.build_inference_step(model, models=[model])
+
+    outputs: Any = step(inputs={"inputs": np.zeros((1, 4), dtype="float32")})
+    assert tuple(outputs.shape) == (1, 2)

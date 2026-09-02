@@ -156,7 +156,7 @@ What happens:
 
 1. The model is instantiated from the StructCast pattern.
 2. Dummy inputs are created (`create_torch_inputs`, `create_jax_inputs`, or `create_numpy_inputs`).
-3. Optional compilation is applied (`torch.compile`, `nnx.jit`, or `keras.Model.compile`).
+3. Optional compilation is applied (`torch.compile`, `nnx.jit`, or the Keras backend's own compiler — `tf.function` on tensorflow, `jax.jit` on jax).
 4. Warmup runs are executed, then timed iterations are averaged.
 
 ### Workflow 7: Distributed Training with `torchrun`

@@ -584,8 +584,10 @@ def select_backend_adapter() -> BackendAdapter:
     Cached, so it is one adapter per process, and that is what `compile_kw` travels on: a generated
     learner builds its steps in its own constructor, calling this with no arguments, so a caller
     choosing how those steps are compiled -- `scm keras train --compile` -- sets `compile_kw` on the
-    adapter this returns *before* it builds the learner. Setting it afterwards changes nothing: the
-    steps are already built, and `cache_clear()` drops the choice with the adapter that carried it.
+    adapter this returns *before* it builds the learner. `scm keras time --compile` is the other
+    writer, around the single `build_inference_step` call it times. Setting it afterwards changes
+    nothing: the steps are already built, and `cache_clear()` drops the choice with the adapter that
+    carried it.
 
     Returns:
         The adapter, the same instance on every call.

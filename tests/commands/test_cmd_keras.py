@@ -67,11 +67,10 @@ def test_time_help_exits_zero(cli_runner: CliRunner) -> None:
     assert result.exit_code == 0
 
 
-def test_time_help_documents_both_pattern_spellings_and_optimizer_constraint() -> None:
-    """'time' must document both object pattern spellings and that "optimizer" cannot be passed to --compile.
+def test_time_help_documents_both_pattern_spellings() -> None:
+    """'time' must document both object pattern spellings.
 
-    Both spellings are accepted by the instantiator, so documenting only one hides a valid input, and
-    `--compile "{optimizer: adam}"` raises a TypeError because the command already passes `optimizer=None`.
+    Both spellings are accepted by the instantiator, so documenting only one hides a valid input.
     """
     command = next(cmd for cmd in app.registered_commands if cmd.name == "time")
     assert command.callback is not None
@@ -79,7 +78,6 @@ def test_time_help_documents_both_pattern_spellings_and_optimizer_constraint() -
     pattern_help = params["model_pattern"].default.help
     assert "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" in pattern_help
     assert "[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]" in pattern_help
-    assert '"optimizer" is always passed as None' in params["compile_pattern"].default.help
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +138,139 @@ def test_time_dense(cli_runner: CliRunner) -> None:
     )
     assert result.exit_code == 0, result.output
     assert f'Timing on the "{BACKEND}" Keras backend' in result.output
+    assert "Average inference time" in result.output
+
+
+TIME_DENSE = ["time", "[_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: 2}}]", "--shape", "inputs: [4]"]
+"""The `time` invocation the compilation tests below vary, over the same Dense as the run above."""
+
+
+def bare_input_dense() -> Any:
+    """Return a Dense declaring one unnamed input, as a generated model with a bare INPUT_SHAPES does.
+
+    A factory rather than a subclass because `input_shapes` is read off the instance either way, and
+    a keras base class reaches mypy as `Any`, which only the `structcast_model.keras` modules take.
+    """
+    layer = keras.layers.Dense(2)
+    layer.input_shapes = [4]
+    return layer
+
+
+@pytest.fixture
+def timed_steps(monkeypatch: pytest.MonkeyPatch) -> list[tuple[dict[str, Any] | None, list[Any], bool, list[Any]]]:
+    """Watch how each `time` run builds the step it measures -- and whether that step is what runs.
+
+    Reading `compile_kw` off the adapter after a run proves nothing, and neither does the number the
+    command prints: a compiled and an eager forward both report an average of the same shape. The
+    build call is the only moment that decides anything, so it is what is recorded -- together with
+    the models handed to it, which the JAX step has to be given to stay correct, and with whether
+    the step handed back is a traced one: a `tf.function` carries the `python_function` it was built
+    from, an eager step does not. That trace is read before the step is wrapped, because the wrapper
+    hides it. The wrapper is there to count the calls, which is the half a build alone cannot show:
+    a command that builds the compiled step and then times a forward beside it is the no-op this
+    replaced wearing a new coat, and it records exactly the same build.
+    """
+    adapter: Any = select_backend_adapter()
+    built: list[tuple[dict[str, Any] | None, list[Any], bool, list[Any]]] = []
+    build = adapter.build_inference_step
+
+    def recording(flow: Any, *, models: Sequence[Any] = ()) -> Any:
+        step = build(flow, models=models)
+        choice = None if adapter.compile_kw is None else dict(adapter.compile_kw)
+        calls: list[Any] = []
+        built.append((choice, list(models), hasattr(step, "python_function"), calls))
+
+        def counted(**batch: Any) -> Any:
+            calls.append(batch)
+            return step(**batch)
+
+        return counted
+
+    monkeypatch.setattr(adapter, "build_inference_step", recording)
+    return built
+
+
+@pytest.mark.skipif(BACKEND == "torch", reason="The torch backend builds no compiled step; it refuses the flag below.")
+def test_time_builds_the_timed_step_through_the_adapter_only_when_compile_asks(
+    cli_runner: CliRunner, timed_steps: list[tuple[dict[str, Any] | None, list[Any], bool, list[Any]]]
+) -> None:
+    """--compile must hand the timed forward to the seam a run executes, and nothing else may.
+
+    The flag used to configure the model instead, on a path the timed call never read, so a printed
+    average is no evidence at all: what makes the number attributable is that the very step the
+    adapter builds for a training run is the one being timed. Four runs in one process, because the
+    three spellings of off are three separate paths through the parser and any of them reaching the
+    adapter would report a compiled forward that was never asked for -- and the adapter is cached
+    for the process, so a choice left behind by the first run would silently compile the rest. The
+    model travels with the call because the JAX step is only correct when it is threaded the
+    variables to read. The call count is what closes it: one warmup and one timed iteration make
+    exactly two calls into the step that was built, and a run building it and timing something else
+    would record the very same build.
+    """
+    for extra in (["--compile", "true"], [], ["--compile", "null"], ["--compile", "false"]):
+        result = cli_runner.invoke(app, [*TIME_DENSE, "-w", "1", "-t", "1", *extra])
+        assert result.exit_code == 0, result.output
+
+    assert len(timed_steps) == 1, timed_steps
+    compile_kw, models, _, calls = timed_steps[0]
+    assert compile_kw == {}
+    assert len(models) == 1
+    assert isinstance(models[0], keras.Model)
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow step is a traceable object to inspect.")
+def test_time_hands_the_backend_compiler_the_keywords_it_was_given(
+    cli_runner: CliRunner, timed_steps: list[tuple[dict[str, Any] | None, list[Any], bool, list[Any]]]
+) -> None:
+    """A mapping under --compile is `tf.function`'s keyword arguments, not run configuration.
+
+    `jit_compile` names something on both spellings of the flag, which is what makes it the one that
+    proves which is in force: passed to `keras.Model.compile` it is stored for a trainer loop this
+    command never runs, and passed here it decides how the timed forward itself is traced. Asserting
+    it arrived is not enough on its own -- the step has to come back traced, since a mapping stored
+    on an adapter that then built an eager step would read the same, and the two calls the loop
+    makes have to land on that traced step rather than on a forward timed beside it.
+    """
+    result = cli_runner.invoke(app, [*TIME_DENSE, "-w", "1", "-t", "1", "--compile", "{jit_compile: true}"])
+
+    assert result.exit_code == 0, result.output
+    assert len(timed_steps) == 1, timed_steps
+    compile_kw, _, traced, calls = timed_steps[0]
+    assert compile_kw == {"jit_compile": True}
+    assert traced
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(BACKEND != "torch", reason="The other two backends have a compiler to hand the forward to.")
+def test_time_refuses_compilation_on_the_backend_that_has_none(cli_runner: CliRunner) -> None:
+    """The torch backend has no step compiler, so `time` must refuse the flag rather than ignore it.
+
+    Ignoring it is the failure mode with real cost: the command would print an average under a
+    "Compiling..." line and the operator would record a compiled measurement that never happened.
+    """
+    result = cli_runner.invoke(app, [*TIME_DENSE, "-w", "1", "-t", "1", "--compile", "true"])
+
+    assert result.exit_code != 0
+    assert "builds no compiled step" in str(result.exception)
+
+
+@pytest.mark.skipif(BACKEND == "torch", reason="The torch backend builds no compiled step; it refuses the flag below.")
+def test_time_compiles_a_model_whose_inputs_are_one_bare_array(
+    cli_runner: CliRunner, timed_steps: list[tuple[dict[str, Any] | None, list[Any], bool, list[Any]]]
+) -> None:
+    """A model declaring a bare INPUT_SHAPES must compile too, which is why the step takes one keyword.
+
+    Its dummy inputs are a single array rather than a mapping, so a step splatting the batch into
+    keyword arguments -- what every learner step does, since a learner's batch is always named --
+    would fail here and only here, on the models that carry their own shapes. The build is asserted
+    alongside the average, because a run that never reached the adapter would print the same line.
+    """
+    pattern = f"[_obj_, {{_addr_: {__name__}.bare_input_dense}}, _call_]"
+    result = cli_runner.invoke(app, ["time", pattern, "-w", "1", "-t", "1", "--compile", "true"])
+
+    assert result.exit_code == 0, result.output
+    assert len(timed_steps) == 1, timed_steps
     assert "Average inference time" in result.output
 
 
