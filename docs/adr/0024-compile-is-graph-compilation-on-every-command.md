@@ -66,8 +66,9 @@ second spelling of off with no prior art); and refusing the contract keys instea
 - The generated-code contract is untouched — `select_backend_adapter()`, `adapter.prepare`,
   `build_train_step`, `build_inference_step(..., models=[...])` and `flow_functions` are called
   exactly as before — so byte-pinned learners keep working without regeneration.
-- `cfg/keras/others/compile_default.yaml` is rewritten for the new grammar: backend-compiler keyword
-  arguments, not `keras.Model.compile` ones.
+- `cfg/keras/others/compile_default.yaml` is dropped rather than rewritten: the two backend
+  compilers share no keyword, so the only mapping it could ship is the `{}` that `--compile true`
+  already passes, and the per-backend keys are documented in the README instead.
 - Amends ADR-0010 (the keras example leaves its third rule), ADR-0014 (flax's default flips to off
   and `"none"` stops being a spelling) and ADR-0016 (adapter compilation becomes opt-in).
 - If TensorFlow rejects a forwarded keyword argument at the `dp` path's outer `tf.function`, that
