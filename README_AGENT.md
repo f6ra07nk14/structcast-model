@@ -7,10 +7,10 @@
 
 StructCast-Model turns YAML templates into executable models and training systems across multiple frameworks. It has four responsibilities:
 
-1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports learner class generation (the object owning the models, the optimizers, and the training and inference steps), including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
+1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. All three also support learner class generation (the object owning the models, the optimizers, and the training and inference steps), including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
 2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
 3. **Inference benchmarking**: Measure model inference time via `scm [torch/flax/keras] time`.
-4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` or `scm flax train` (Keras training is planned).
+4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train`, `scm flax train`, or `scm keras train`.
 
 ## Repository Map
 
@@ -96,7 +96,7 @@ StructCast object patterns
   v
 Live model objects
   |  Inference benchmarking                          <- scm [torch/flax/keras] time
-  |  Training (PyTorch, Flax)                        <- scm [torch/flax] train
+  |  Training (PyTorch, Flax, Keras)                 <- scm [torch/flax/keras] train
   v
 TorchTrainer.fit(...)  (PyTorch training path)
   |  train/evaluate loop + routed callbacks          <- base_trainer.py + torch/trainer.py
@@ -109,7 +109,7 @@ The repository's signature workflow (the "generate-then-reimport" loop) is:
 1. Render specialized YAML from templates with `scm format`.
 2. Generate model Python modules with `scm [torch/flax/keras] create model` (plus `create learner` for PyTorch).
 3. Re-import those modules through StructCast `_file_` patterns at runtime.
-4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm [torch/flax] train`.
+4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm [torch/flax/keras] train`.
 
 ## CLI Surface
 
@@ -125,9 +125,13 @@ The CLI entry point is defined in `pyproject.toml` as `scm = "structcast_model.c
 - `scm torch time`
 - `scm torch train` (also supports distributed training via `torchrun`)
 - `scm flax create model`
+- `scm flax create learner`
 - `scm flax time`
+- `scm flax train`
 - `scm keras create model`
+- `scm keras create learner`
 - `scm keras time`
+- `scm keras train`
 
 ### `scm format`
 
@@ -153,9 +157,9 @@ Purpose:
 Key options:
 
 - `-p/--parameter`
-- `-c/--classname`
+- `-n/--classname`
 - `--structured-output/--no-structured-output`
-- `-s/--sublayer`
+- `--sublayer`
 - `-o/--output`
 
 ### `scm torch create learner`
@@ -166,7 +170,7 @@ Purpose:
 - Build a `TorchLearnerIntermediate`.
 - Optionally write generated Python to disk.
 
-Key options: `-p/--parameter`, `-c/--classname` (default `Learner`), `-o/--output`.
+Key options: `-p/--parameter`, `-n/--classname` (default `Learner`), `-o/--output`.
 
 The generated learner class supports:
 
@@ -188,6 +192,8 @@ Purpose:
 
 ### `scm [torch/flax/keras] time`
 
+Defined as `measure_inference_time()` in `commands/cmd_torch.py`, `commands/cmd_flax.py`, and `commands/cmd_keras.py`.
+
 Purpose:
 
 - Instantiate a model from a StructCast object pattern.
@@ -198,8 +204,8 @@ Purpose:
 Key differences per framework:
 
 - PyTorch: `--matmul-precision` option; channel-first shapes (*C × H × W*).
-- Flax: `--training-mode-kwargs` option; channel-last shapes (*H × W × C*); uses `nnx.jit` for compilation.
-- Keras: channel-last shapes (*H × W × C*); may require `LD_LIBRARY_PATH` for JAX+NVIDIA GPU.
+- Flax: `--training-mode-kwargs` option; channel-last shapes (*H × W × C*); wraps the model in `nnx.jit` when `--compile` is given.
+- Keras: channel-last shapes (*H × W × C*); compiles the timed forward through the active backend adapter's `build_inference_step` when `--compile` is given, and refuses the flag on the torch backend; may require `LD_LIBRARY_PATH` for JAX+NVIDIA GPU.
 
 ### `scm flax create model` / `scm keras create model`
 
@@ -211,7 +217,7 @@ Purpose:
 - Build a `FlaxLayerIntermediate` or `KerasLayerIntermediate`.
 - Generate Python source implementing a `flax.nnx.Module` or `keras.layers.Layer`.
 
-Key options are the same as `scm torch create model`: `-p`, `-c`, `--structured-output/--no-structured-output`, `-s`, `-o`.
+Key options are the same as `scm torch create model`: `-p`, `-n`, `--structured-output/--no-structured-output`, `--sublayer`, `-o`.
 
 ### `scm torch train`
 
@@ -372,23 +378,21 @@ timm data integrations — example code in `examples/torch/data.py`, not package
 
 ### Flax runtime layer
 
-`flax/trainer.py` provides inference timing utilities for Flax models.
+`flax/trainer.py` is the Flax runtime layer of a `scm flax train` run: dummy inputs, the tracker, the trainer and its checkpointing callbacks.
 
 Utility functions:
 
 - `create_jax_inputs(shape)` — creates JAX arrays from shape specs
 - `get_jax_device(device=None)` (in `flax/utils.py`) — resolves JAX device (cpu, gpu:N)
-- `measure_inference_time(...)` — benchmarks Flax model inference with optional `nnx.jit` compilation
 
 ### Keras runtime layer
 
-`keras/trainer.py` provides inference timing utilities for Keras models.
+`keras/trainer.py` is the Keras runtime layer of a `scm keras train` run: dummy inputs, the tracker, the trainer and its checkpointing callbacks.
 
 Utility functions:
 
 - `create_numpy_inputs(shape)` — creates NumPy arrays from shape specs
 - `get_keras_device(device=None)` (in `keras/utils.py`) — resolves Keras/JAX device
-- `measure_inference_time(...)` — benchmarks Keras model inference with optional compilation
 
 ### Training flow in practice
 
@@ -504,4 +508,4 @@ The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 
 This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the CLI (inference benchmarking or training).
 
-Model generation is available for all three frameworks and training for PyTorch and Flax; for distributed PyTorch training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation (Flax drives all local devices from one process). The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.
+Model generation and training are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`); for distributed PyTorch training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation (Flax drives all local devices from one process). The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.

@@ -58,8 +58,8 @@ advance its count, which is not what the torch scaler does).
   positional-or-keyword, so `donate_argnames` picks them up — and an unscaled learner emits the
   signature ADR-0019 describes, byte for byte.
 - The carry is pinned to float32/int32 at construction rather than left on the dataclass's Python
-  scalars, without which the second call retraces the whole step and the first call's donation has
-  nothing to donate.
+  scalars, without which a compiled run (`--compile`) retraces the whole step on the second call and
+  the first call's donation has nothing to donate.
 - A `DynamicScale` is immutable, so the resume path rebinds it by name: the key of `grad_scalers`
   names the learner attribute holding it, where the torch loader mutates its scaler in place.
 - The rollback holds a second copy of the parameters and the optimizer state live across the

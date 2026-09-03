@@ -5,6 +5,9 @@
 > `MIXED_PRECISION` is on, and the step returns one more value per scale; the donation contract
 > below is unchanged, and an unscaled learner emits exactly the signature described here.
 
+> **Amended by ADR-0024.** Donation is derived only when `--compile` is given; an eager
+> `scm flax train` never reaches `nnx.jit`.
+
 A generated learner module used to carry user-named flow layers, `OPTIMIZER_HASHES` and the two
 step functions at module scope, and the flax steps took the models and the optimizers as
 dictionaries. Everything a learner template names comes from the user's configuration — and the

@@ -12,7 +12,8 @@ Run it standalone::
     uv run python examples/keras/simple_training.py
 
 Or hand the same three objects to the CLI, which instantiates them from object patterns and adds
-what the tutorial leaves out -- an experiment logger and the checkpoint savers::
+what the tutorial leaves out -- `tf.function` over the adapter's steps, an experiment logger and the
+checkpoint savers::
 
     FILE=examples/keras/simple_training.py
 
@@ -21,7 +22,7 @@ what the tutorial leaves out -- an experiment logger and the checkpoint savers::
         --learner "[_obj_, {_addr_: SimpleLearner, _file_: $FILE}]" \
         --training-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 20, seed: 0}}]" \
         --validation-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 5, seed: 1}}]" \
-        --epochs 3 --ci -LC val_loss -HC val_accuracy -E simple-training
+        --epochs 3 --compile true --ci -LC val_loss -HC val_accuracy -E simple-training
 
 Nothing is generated for that: `_addr_` names a symbol of this file and `_file_` the path to load
 it from, resolved from the working directory, so run it from the repository root. `--logger` needs

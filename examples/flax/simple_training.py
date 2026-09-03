@@ -22,7 +22,7 @@ checkpoint savers::
         --learner "[_obj_, {_addr_: SimpleLearner, _file_: $FILE}]" \
         --training-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 20, seed: 0}}]" \
         --validation-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 5, seed: 1}}]" \
-        -s "x: [8]" -d cpu:0 --epochs 3 --ci -LC val_loss -HC val_accuracy -E simple-training
+        -s "x: [8]" -d cpu:0 --epochs 3 --compile true --ci -LC val_loss -HC val_accuracy -E simple-training
 
 Nothing is generated for that: `_addr_` names a symbol of this file and `_file_` the path to load
 it from, resolved from the working directory, so run it from the repository root. The model pattern
@@ -162,7 +162,7 @@ class SimpleLearner:
             return {"loss": loss, "accuracy": accuracy}
 
         # Bound as attributes rather than written as methods, exactly as a generated learner binds
-        # its steps: `scm flax train` rebinds every name of `flow_functions` with
+        # its steps: `scm flax train --compile` rebinds every name of `flow_functions` with
         # `setattr(learner, name, nnx.jit(...))`, and the public steps below call them back through
         # `self`, so the compiled version is what runs.
         self._training_step = _training_step
@@ -203,8 +203,9 @@ class SimpleLearner:
 
         Unlike the torch side, where the flow inside the step is compiled (`docs/adr/0004`), a Flax
         run compiles the whole step: `nnx.jit` owns the state transfer, so the optimizer apply
-        belongs inside the traced region. The CLI walks this mapping and rebinds each name with the
-        compiled wrapper, donating the state parameters of `_training_step` alone.
+        belongs inside the traced region. Under `--compile` the CLI walks this mapping and rebinds
+        each name with the compiled wrapper, donating the state parameters of `_training_step`
+        alone; without the flag the steps stay as they are bound here and run eager.
         """
         return {"_training_step": self._training_step, "_inference_step": self._inference_step}
 

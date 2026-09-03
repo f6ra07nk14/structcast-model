@@ -343,7 +343,7 @@ uv run python examples/flax/simple_training.py
 **steps**, not a flow inside them: `nnx.jit` owns the state transfer, so the optimizer apply belongs
 inside the traced region, where `torch.compile` wants it outside (`docs/adr/0004`). The signature is
 the donation contract — `_training_step(model, optimizer, *, x, y, **kwargs)`, every model and
-optimizer positional-or-keyword and the batch keyword-only — and `scm flax train` reads
+optimizer positional-or-keyword and the batch keyword-only — and `scm flax train --compile` reads
 `donate_argnames` straight off it (`docs/adr/0019`). A hand-written learner opts into donation by
 writing that signature and nothing else. There is no `on_epoch_end`: the schedule is an optax
 schedule counting updates, and `optax.inject_hyperparams` is what keeps its current value readable
@@ -431,7 +431,7 @@ uv run scm keras train "model: [_obj_, {_addr_: build_model, _file_: $FILE}, _ca
     --learner "[_obj_, {_addr_: SimpleLearner, _file_: $FILE}]" \
     --training-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 20, seed: 0}}]" \
     --validation-dataset "[_obj_, {_addr_: make_dataset, _file_: $FILE}, {_call_: {batches: 5, seed: 1}}]" \
-    --epochs 3 --ci -LC val_loss -HC val_accuracy -E simple-training
+    --epochs 3 --compile true --ci -LC val_loss -HC val_accuracy -E simple-training
 ```
 
 `--backend` has no default: Keras resolves its backend once, while it is first imported, so the
@@ -443,8 +443,8 @@ command states it rather than inheriting `~/.keras/keras.json`.
   active backend, `prepare` builds the optimizer against the segment's variables, and
   `build_train_step` / `build_inference_step` return the steps. `prepare` has to run first:
   JAX refuses an unbuilt optimizer inside the step it threads, and above all inside a jitted one (`docs/adr/0016`).
-- **There is no compile stage.** `flow_functions` names the two steps rather than a flow the CLI
-  would wrap: whether they are compiled is the adapter's doing, from the `compile_kw` that
+- **The compile stage is the adapter's.** `flow_functions` names the two steps rather than a flow
+  the CLI would wrap: whether they are compiled is the adapter's doing, from the `compile_kw` that
   `scm keras train --compile` leaves on it before the learner is built — `tf.function` or `jax.jit`,
   and eager when nothing asked. It is the mapping a distributed strategy rebinds when it replicates
   a step.
@@ -571,7 +571,7 @@ scm flax train \
     -s 'image: [256, 256, 3]' \
     --training-dataset '[_obj_, {_addr_: UnpairedImageLoader, _file_: examples/flax/cyclegan.py},
                          {_call_: {root_A: data/horse2zebra/trainA, root_B: data/horse2zebra/trainB}}]' \
-    -e 200 -LC loss_G -E cyclegan
+    -e 200 --compile true -LC loss_G -E cyclegan
 ```
 
 The Keras command is the same one with `keras` in place of `flax`, `KERAS_BACKEND` (or `--backend`)

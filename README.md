@@ -46,7 +46,7 @@ Model code generation, training workflow generation and the full training CLI ar
 - **Format reusable templates** — Render parameterized YAML templates into concrete runtime configurations.
 - **Inspect model complexity** — Compute FLOPs and parameter counts with [`ptflops`](https://github.com/sovrasov/flops-counter.pytorch) and [`calflops`](https://github.com/MrYxJ/calculate-flops.pytorch) (PyTorch only).
 - **Measure inference time** — Benchmark average forward-pass latency of generated models across all three frameworks via `scm [torch/flax/keras] time`.
-- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) or [Weights & Biases](https://docs.wandb.ai/) experiment logging — or Flax training on a JAX device mesh with [`nnx.jit`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) compilation and the same loggers.
+- **Train end-to-end** — Run PyTorch training with [Automatic Mixed Precision (AMP)](https://docs.pytorch.org/docs/stable/amp.html), [timm](https://github.com/huggingface/pytorch-image-models) datasets, optional [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html), and [MLflow](https://mlflow.org/docs/latest/ml/deep-learning/pytorch/) or [Weights & Biases](https://docs.wandb.ai/) experiment logging — or Flax training on a JAX device mesh with optional [`nnx.jit`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html) compilation and the same loggers.
 - **Train programmatically** — Use the same trainer directly from Python, without any YAML. See [`examples/`](examples/) for a runnable tutorial.
 
 ## Installation
@@ -335,7 +335,7 @@ scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
 > scm flax create learner cfg/flax/learners/ConvNeXtV2.yaml -o learner.py
 > ```
 >
-> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys, plus `EMA` and a `MIXED_PRECISION` of its own: `CLIP` is not declared, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER`, while `MIXED_PRECISION` turns on a [`flax.training.dynamic_scale.DynamicScale`](https://flax-linen.readthedocs.io/en/latest/api_reference/flax.training.html) over each segment's loss. The element type stays a model-construction property — `dtype`/`param_dtype` on the layers — so no `MIXED_PRECISION_TYPE` sits beside it. `ACCUMULATE_GRADIENTS` is rejected too: gradient accumulation is an `optax.MultiSteps` wrapper in that same chain, whose window the generated `__init__` reads back from the built optimizers to validate; the learner then counts real applies by reading `MultiStepsState.gradient_step` after each step ([`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md), [`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol — its `flow_functions` being the module-level step functions a trainer compiles — and adds `outputs`, plus `grad_scalers` when `MIXED_PRECISION` is on, but no `weight_decays` or `param_group_names`.
+> It takes the same `-p/--parameter`, `-n/--classname`, and `-o/--output` options. The template schema is the shared one minus the torch-only keys, plus `EMA` and a `MIXED_PRECISION` of its own: `CLIP` is not declared, because in Flax clipping is a stage of the [optax](https://optax.readthedocs.io/) chain written inside `OPTIMIZER`, while `MIXED_PRECISION` turns on a [`flax.training.dynamic_scale.DynamicScale`](https://flax-linen.readthedocs.io/en/latest/api_reference/flax.training.html) over each segment's loss. The element type stays a model-construction property — `dtype`/`param_dtype` on the layers — so no `MIXED_PRECISION_TYPE` sits beside it. `ACCUMULATE_GRADIENTS` is rejected too: gradient accumulation is an `optax.MultiSteps` wrapper in that same chain, whose window the generated `__init__` reads back from the built optimizers to validate; the learner then counts real applies by reading `MultiStepsState.gradient_step` after each step ([`docs/adr/0017`](docs/adr/0017-accumulation-gating-follows-each-backends-native-mechanism.md), [`docs/adr/0018`](docs/adr/0018-the-learner-owns-the-training-counters.md)). The `OPTIMIZER` pattern builds an [`nnx.Optimizer`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/training/optimizer.html) over the entry's trainable layers, and the builder wraps the factory carrying `learning_rate` in [`optax.inject_hyperparams`](https://optax.readthedocs.io/en/latest/api/utilities.html#optax.inject_hyperparams) so the rate stays readable at run time. The generated class implements the `Learner` protocol — its `flow_functions` being the module-level step functions a trainer compiles under `--compile` — and adds `outputs`, plus `grad_scalers` when `MIXED_PRECISION` is on, but no `weight_decays` or `param_group_names`.
 
 > **Keras** — `scm keras create learner` generates a backend-neutral learner class from the same schema:
 >
@@ -395,7 +395,7 @@ scm torch time \
 
 PyTorch-specific option: `--matmul-precision` (`highest`, `high`, `medium`) controls [`torch.set_float32_matmul_precision`](https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html).
 
-> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Both use channel-last shapes (e.g., `'image: [224, 224, 3]'`). Flax additionally accepts `--training-mode-kwargs` to override keyword arguments for [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html). Keras compilation hands the timed forward to the compiler the ambient backend has ([`tf.function`](https://www.tensorflow.org/api_docs/python/tf/function) on tensorflow, [`jax.jit`](https://docs.jax.dev/en/latest/_autosummary/jax.jit.html) on jax); the torch backend builds no compiled step and refuses the flag. When using the Keras JAX backend on GPU, you may need to set `LD_LIBRARY_PATH` to include NVIDIA shared libraries from your virtual environment.
+> **Flax and Keras** — Replace `scm torch` with `scm flax` or `scm keras`. Both use channel-last shapes (e.g., `'image: [224, 224, 3]'`). The `-c` mapping is the keyword arguments of the compiler the command runs, so swap the file above for [`cfg/flax/others/compile_default.yaml`](cfg/flax/others/compile_default.yaml) or for `--compile true` — no Keras template ships (*Configuration Examples → Keras* lists the keys each backend takes). Flax additionally accepts `--training-mode-kwargs` to override keyword arguments for [`nnx.view`](https://flax.readthedocs.io/en/stable/api_reference/flax.nnx/transforms.html). Keras compilation hands the timed forward to the compiler the ambient backend has ([`tf.function`](https://www.tensorflow.org/api_docs/python/tf/function) on tensorflow, [`jax.jit`](https://docs.jax.dev/en/latest/_autosummary/jax.jit.html) on jax); the torch backend builds no compiled step and refuses the flag. When using the Keras JAX backend on GPU, you may need to set `LD_LIBRARY_PATH` to include NVIDIA shared libraries from your virtual environment.
 
 ### 6. Train a Generated Model
 
@@ -454,9 +454,9 @@ Key arguments:
 What the train command does internally:
 
 1. Instantiates the datasets and composes them into a `SimpleDataProvider`, which reports `steps_per_epoch` and `validation_steps`. The trainer scans the provider datasets for event protocols, so a dataset implementing one receives the lifecycle events it defines.
-2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers on rank 0 and broadcasts the result (`sync_initial_weights`), then compiles each model where the strategy places the units and hands it to the strategy, which wraps it. The learner is built from the already-wrapped models.
+2. Builds the models from their patterns on the training device, initializes them with optional dummy-input forward passes, applies the initializers on rank 0 and broadcasts the result (`sync_initial_weights`), then compiles each model where the strategy places the units when `--compile` asks for it, leaves it eager otherwise, and hands it to the strategy, which wraps it. The learner is built from the already-wrapped models.
 3. Builds a `TorchTracker` from the learner's output names, still inside the device scope so its buffers live on the training device.
-4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step — on a single device only. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager.
+4. Compiles the learner's generated `_flow_*` functions — the pure-compute part of each step — when `--compile` asks for it, on a single device only, and leaves them eager otherwise. `train()`/`eval()`, backward, optimizer steps, and `zero_grad()` stay eager either way.
 5. Creates the `TorchTrainer` with the learner, the tracker, and the data provider.
 6. Collects the callbacks from the trainer's prefixes: a `ProgressBar` (or a `Printer` under `--ci`) and the logger on rank 0 only, plus a training-state saver and one `TorchBestCriterion` per monitored criterion on every rank — producing their states is a collective, and off rank 0 they hold a `NullLogger` and write nothing. They join the trainer's events on first use, and the resulting routing is printed.
 7. Runs `fit()` inside the logger's run context, recording metrics, arguments, model states, optimizer states, gradient scaler states, and best checkpoints.
@@ -609,6 +609,7 @@ scm flax train \
     -s 'image: [224, 224, 3]' \
     -L '[_obj_, {_addr_: learner.Learner, _file_: learner.py}]' \
     -e 5 \
+    -c true \
     --training-dataset '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: train}}]' \
     -V '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: validation}}]' \
     -f 1 \
@@ -662,6 +663,7 @@ scm keras train \
     -s 'image: [224, 224, 3]' \
     -L '[_obj_, {_addr_: Learner, _file_: learner.py}]' \
     -e 5 \
+    -c true \
     --training-dataset '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: train}}]' \
     -V '[_obj_, {_addr_: batches, _file_: my_data.py}, {_call_: {split: validation}}]' \
     -f 1 \
@@ -971,6 +973,12 @@ The repository includes tests for:
 - Custom torch layers
 
 ## Migration Notes
+
+### Upgrading to v6.x
+
+`--compile` now names one thing on every command — it hands what the command runs to the framework's own graph compiler — and it is off unless given ([`docs/adr/0024-compile-is-graph-compilation-on-every-command.md`](docs/adr/0024-compile-is-graph-compilation-on-every-command.md)):
+
+- **`--compile` is off everywhere** — `scm flax train` no longer compiles the generated steps by default, and the Keras adapters no longer compile every step they build; pass `--compile true` to keep either one compiled. The flax-only `none` spelling of off goes with it: off is omitting the flag, or `null`, `~`, or `false`, on every command.
 
 ### Upgrading to v2.x
 

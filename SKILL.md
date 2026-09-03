@@ -1,6 +1,6 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus PyTorch training workflows — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and the distributed strategies (DistributedDataParallel (DDP) or FSDP2).
+description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus training workflows for all three — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch/flax/keras train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and the distributed strategies (DistributedDataParallel (DDP) or FSDP2).
 ---
 
 # StructCast-Model
@@ -152,6 +152,9 @@ scm keras time \
   -s 'image: [224, 224, 3]' -c true -d gpu:0
 ```
 
+`scm keras time` inherits the ambient Keras backend; `-c` compiles the timed forward through that
+backend's compiler and is refused on the torch backend.
+
 What happens:
 
 1. The model is instantiated from the StructCast pattern.
@@ -208,9 +211,13 @@ What happens:
 | `scm torch time` | `commands.cmd_torch` | `measure_inference_time()` |
 | `scm torch train` | `commands.cmd_torch` | `train()` |
 | `scm flax create model` | `commands.cmd_flax` | `create_model()` |
+| `scm flax create learner` | `commands.cmd_flax` | `create_learner()` |
 | `scm flax time` | `commands.cmd_flax` | `measure_inference_time()` |
+| `scm flax train` | `commands.cmd_flax` | `train()` |
 | `scm keras create model` | `commands.cmd_keras` | `create_model()` |
+| `scm keras create learner` | `commands.cmd_keras` | `create_learner()` |
 | `scm keras time` | `commands.cmd_keras` | `measure_inference_time()` |
+| `scm keras train` | `commands.cmd_keras` | `train()` |
 
 ### Important CLI conventions
 
@@ -432,10 +439,10 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 The repository operates as a two-phase system:
 
 1. **Generation phase**: YAML templates under `cfg/[torch/flax/keras]/` are transformed into Python modules through framework-specific builders (`TorchBuilder`, `FlaxBuilder`, `KerasBuilder`).
-2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm [torch/flax] train` (training).
+2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm [torch/flax/keras] train` (training).
 
 Both phases are optional for training: any object implementing the `Learner` protocol can be handed to `TorchTrainer` directly, as `examples/torch/simple_training.py` shows.
 
-Model code generation is available for all three frameworks, and training workflow generation for PyTorch (`scm torch train`) and Flax (`scm flax train`); Keras training support is planned.
+Model code generation and training workflow generation are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`).
 
 If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, inference benchmarking, or the training command, this skill is the correct reference.
