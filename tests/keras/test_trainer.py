@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import logging
 from typing import Any
 
@@ -10,12 +11,17 @@ import numpy as np
 import pytest
 
 import keras
+from structcast_model.base_trainer import EVENTS, BaseInfo, BestCriterion, SimpleDataProvider
 from structcast_model.keras.trainer import (
+    KerasBestCriterion,
+    KerasTracker,
+    KerasTrainer,
     create_keras_inputs,
     create_numpy_inputs,
-    get_keras_device,
     initial_model,
 )
+from structcast_model.keras.utils import get_keras_device
+from tests.fakes import CountingLearner
 
 
 def test_create_numpy_inputs_from_int_tuple_returns_array() -> None:
@@ -129,6 +135,12 @@ def test_create_numpy_inputs_honours_explicit_initializer() -> None:
     assert np.array_equal(result, np.ones((1, 4), dtype=ml_dtypes.bfloat16))
 
 
+def test_create_numpy_inputs_rejects_non_callable_initializer() -> None:
+    """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
+    with pytest.raises(TypeError, match="not callable as a tensor initializer"):
+        create_numpy_inputs({"_SHAPE_": [4], "_INIT_": "numpy.pi"})
+
+
 # ---------------------------------------------------------------------------
 # create_keras_inputs — additional branches
 # ---------------------------------------------------------------------------
@@ -190,20 +202,197 @@ def test_initial_model_with_list_inputs() -> None:
 
 
 def test_get_keras_device_default() -> None:
-    """get_keras_device with no arg returns a device from the available list."""
+    """get_keras_device with no arg returns an available device in the gpu:N / cpu:N spelling."""
     device = get_keras_device()
     assert isinstance(device, str)
-    assert device in keras.distribution.list_devices()
+    assert ":" in device
 
 
 def test_get_keras_device_explicit_valid() -> None:
-    """get_keras_device returns the specified device when it exists."""
-    available = keras.distribution.list_devices()
-    device = get_keras_device(available[0])
-    assert device == available[0]
+    """get_keras_device returns the specified device when it exists; cpu:0 exists on every backend."""
+    assert get_keras_device("cpu:0") == "cpu:0"
 
 
 def test_get_keras_device_invalid_raises() -> None:
     """get_keras_device raises ValueError for a non-existent device."""
     with pytest.raises(ValueError, match="not available"):
         get_keras_device("nonexistent_device:99")
+
+
+# ---------------------------------------------------------------------------
+# KerasTracker
+# ---------------------------------------------------------------------------
+
+
+class _StubLearner(CountingLearner):
+    """A minimal Learner reporting one criterion, so the loop can run without a generated learner."""
+
+    def __init__(self, loss: float = 1.0) -> None:
+        """Report *loss* from every step."""
+        super().__init__()
+        self.loss = loss
+
+    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Count the Step as one Update and report the current loss as a backend tensor."""
+        self.count_step()
+        return {"loss": keras.ops.convert_to_tensor(self.loss)}
+
+    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Report twice the current loss, so a validation average cannot be confused with a training one."""
+        return {"loss": keras.ops.convert_to_tensor(2 * self.loss)}
+
+
+class _Recorder:
+    """Records the events it receives, implementing exactly the protocols it is asked to."""
+
+    def __init__(self, log: list[str]) -> None:
+        """Attach a recording method for every lifecycle event."""
+        self.log = log
+        for event in EVENTS:
+            setattr(self, event, partial(self._record, event))
+
+    def _record(self, event: str, info: BaseInfo) -> None:
+        """Append the event name to the shared log."""
+        self.log.append(event)
+
+
+def _trainer(tracker: Any, learner: _StubLearner | None = None, **kwargs: Any) -> KerasTrainer:
+    """Build a trainer over one training and one validation batch."""
+    return KerasTrainer(
+        learner=learner or _StubLearner(),
+        tracker=tracker,
+        data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),
+        **kwargs,
+    )
+
+
+def test_keras_tracker_reports_the_running_mean_as_floats() -> None:
+    """The trainer writes what the tracker returns into the history the loggers read.
+
+    Floats, not backend tensors: `BaseTrainer.tracker` is typed to return them, `BestCriterion`
+    compares them against a float infinity, and the loggers take `float` metric values.
+    """
+    tracker = KerasTracker.from_criteria(["loss"])
+
+    means = [tracker(loss=keras.ops.convert_to_tensor(value)) for value in (1.0, 2.0, 6.0)]
+
+    assert means == [{"loss": 1.0}, {"loss": 1.5}, {"loss": 3.0}]
+    assert all(type(value) is float for mean in means for value in mean.values())
+
+
+def test_keras_tracker_from_criteria_keeps_the_requested_order() -> None:
+    """The criteria come from the generated learner's outputs, which are read once as any iterable."""
+    tracker = KerasTracker.from_criteria(iter(["loss", "accuracy"]))
+
+    assert tracker.criteria == ("loss", "accuracy")
+    assert sorted(tracker.sums) == ["accuracy", "loss"]
+
+
+def test_keras_tracker_logs_are_empty_before_the_first_step() -> None:
+    """A split that ran no step has no average to report, and reporting 0.0 would be a lie."""
+    assert KerasTracker.from_criteria(["loss"]).logs() == {}
+
+
+def test_keras_tracker_resets_between_the_splits_of_one_epoch() -> None:
+    """Without the reset, the validation average of an epoch would carry its training values.
+
+    The tracker is routed by protocol, so this drives the real loop: the reset only happens if
+    `on_training_begin` and `on_validation_begin` are the names the trainer dispatches.
+    """
+    tracker = KerasTracker.from_criteria(["loss"])
+    trainer = _trainer(tracker)
+
+    trainer.fit(epochs=2)
+
+    # The stub reports 1.0 while training and 2.0 while validating, one step each: a tracker that
+    # never reset would report 1.5 for the validation split and 1.0 again for the second epoch.
+    for epoch in (1, 2):
+        assert trainer.logs(epoch)["loss"] == pytest.approx(1.0)
+        assert trainer.logs(epoch)["val_loss"] == pytest.approx(2.0)
+
+
+def test_keras_tracker_is_routed_into_the_two_reset_events_only() -> None:
+    """The tracker takes part in the loop by protocol alone, exactly as the torch tracker does."""
+    assert _trainer(KerasTracker.from_criteria(["loss"])).describe() == {
+        "on_training_begin": ["KerasTracker"],
+        "on_validation_begin": ["KerasTracker"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# KerasTrainer
+# ---------------------------------------------------------------------------
+
+
+def test_keras_trainer_dispatches_the_documented_event_order() -> None:
+    """The Keras trainer inherits the loop, so its lifecycle must be the base trainer's, unchanged."""
+    log: list[str] = []
+
+    _trainer(KerasTracker.from_criteria(["loss"]), callbacks=[_Recorder(log)]).fit(epochs=1)
+
+    assert log == [
+        "on_epoch_begin",
+        "on_training_begin",
+        "on_training_step_begin",
+        "on_update",
+        "on_training_step_end",
+        "on_training_end",
+        "on_validation_begin",
+        "on_validation_step_begin",
+        "on_validation_step_end",
+        "on_validation_end",
+        "on_epoch_end",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# KerasBestCriterion
+# ---------------------------------------------------------------------------
+
+
+class _LossSchedule:
+    """Gives the stub learner a different loss per epoch, so a run has exactly one best epoch."""
+
+    def __init__(self, learner: _StubLearner, losses: dict[int, float]) -> None:
+        """Drive *learner* through the loss of each epoch of *losses*."""
+        self.learner = learner
+        self.losses = losses
+
+    def on_epoch_begin(self, info: BaseInfo) -> None:
+        """Set the loss the coming epoch reports."""
+        self.learner.loss = self.losses[info.epoch]
+
+
+class _BestRecorder:
+    """Records what the monitor announced after each checked epoch."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.seen: list[tuple[int, float]] = []
+
+    def on_best(self, info: BaseInfo, best: BestCriterion) -> None:
+        """Record the best value and the step that reached it."""
+        self.seen.append((best.step, best.value))
+
+
+def test_keras_best_criterion_keeps_the_lowest_value_and_the_step_that_reached_it() -> None:
+    """The monitor is what a run's best weights and best metrics are keyed on.
+
+    A later, worse epoch must not overwrite either, and the announcement must reach the registered
+    `OnBest` participants on every checked epoch -- that is how the state savers learn whether the
+    epoch that just ended is the one to write.
+    """
+    learner = _StubLearner()
+    monitor = KerasBestCriterion(target="loss", mode="min")
+    recorder = _BestRecorder()
+    monitor.callbacks.append(recorder)
+    trainer = _trainer(
+        KerasTracker.from_criteria(["loss"]),
+        learner=learner,
+        callbacks=[monitor, _LossSchedule(learner, {1: 1.0, 2: 0.25, 3: 0.5})],
+    )
+
+    trainer.fit(epochs=3)
+
+    assert (monitor.value, monitor.step) == (0.25, 2)
+    assert recorder.seen == [(1, 1.0), (2, 0.25), (2, 0.25)]

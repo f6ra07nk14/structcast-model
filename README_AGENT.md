@@ -7,10 +7,10 @@
 
 StructCast-Model turns YAML templates into executable models and training systems across multiple frameworks. It has four responsibilities:
 
-1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. PyTorch also supports learner class generation (the object owning the models, the optimizers, and the training and inference steps), including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
+1. **Code generation**: Generate model classes from declarative YAML templates — PyTorch `nn.Module`, Flax `nnx.Module`, and Keras `Layer`. All three also support learner class generation (the object owning the models, the optimizers, and the training and inference steps), including multi-optimizer setups (e.g., GAN training with separate generator and discriminator optimizers).
 2. **Template rendering**: Format parameterized YAML templates into concrete runtime configurations.
 3. **Inference benchmarking**: Measure model inference time via `scm [torch/flax/keras] time`.
-4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train` (PyTorch only; Flax and Keras training is planned).
+4. **Training execution**: Instantiate generated artifacts through [StructCast](https://github.com/f6ra07nk14/structcast) object patterns and run them via `scm torch train`, `scm flax train`, or `scm keras train`.
 
 ## Repository Map
 
@@ -33,11 +33,11 @@ examples/torch/
 src/structcast_model/
 ├── base_trainer.py            # Generic trainer, event protocols, best-criterion handling
 ├── builders/
-│   ├── base_builder.py        # Generic template -> intermediate -> script pipeline
+│   ├── base.py                # Generic template -> intermediate -> script pipeline
 │   ├── schema.py              # Pydantic schemas for layer/learner templates
-│   ├── torch_builder.py       # PyTorch-specific code generation
-│   ├── flax_builder.py        # Flax-specific code generation
-│   └── keras_builder.py       # Keras-specific code generation
+│   ├── torch.py               # PyTorch-specific code generation
+│   ├── flax.py                # Flax-specific code generation
+│   └── keras.py               # Keras-specific code generation
 ├── commands/
 │   ├── main.py                # Top-level scm CLI
 │   ├── cmd_torch.py           # PyTorch CLI commands
@@ -48,12 +48,13 @@ src/structcast_model/
 │   ├── trainer.py             # Trainer, tracker, best criterion, training-state saver
 │   ├── distributed.py         # Distributed strategies, sync_gate, compile placement
 │   ├── utils.py               # get_torch_device / get_torch_device_type
-│   ├── logger.py              # Logger protocol shared by the experiment tracking backends
-│   ├── mlflow_logger.py       # MLflowLogger
-│   ├── wandb_logger.py        # WandbLogger
 │   ├── optimizers.py          # create_opt: regex parameter grouping; get_decays: decay metrics
 │   ├── layers/                # Reusable torch layers referenced by templates
 │   └── types.py               # Tensor aliases and related typing
+├── loggers/
+│   ├── base.py                # Logger protocol shared by the experiment tracking backends
+│   ├── mlflow.py              # MLflowLogger
+│   └── wandb.py               # WandbLogger
 ├── flax/
 │   ├── trainer.py             # Flax inference time measurement
 │   └── layers/                # Reusable Flax layers (e.g. GlobalResponseNorm)
@@ -79,22 +80,23 @@ The following diagram shows how data moves through the system. Use this to under
 ```text
 YAML template in cfg/[torch/flax/keras]/
   |  TemplateLayer / TemplateLearner validation      <- builders/schema.py
+  |  TorchTemplateLearner (torch-only learner keys)  <- builders/torch.py
   v
 Builder intermediate objects
-  |  BaseModelBuilder / BaseLearnerBuilder           <- builders/base_builder.py
-  |  TorchBuilder / FlaxBuilder / KerasBuilder       <- builders/{torch,flax,keras}_builder.py
-  |  TorchLearnerBuilder                             <- builders/torch_builder.py
+  |  BaseModelBuilder / BaseLearnerBuilder           <- builders/base.py
+  |  TorchBuilder / FlaxBuilder / KerasBuilder       <- builders/{torch,flax,keras}.py
+  |  TorchLearnerBuilder                             <- builders/torch.py
   v
 Generated Python source files
   |  scm [torch/flax/keras] create model
-  |  scm torch create learner (PyTorch only)
+  |  scm [torch/flax] create learner
   v
 StructCast object patterns
   |  _obj_ + _addr_ + _file_ + _call_               <- commands/cmd_{torch,flax,keras}.py
   v
 Live model objects
   |  Inference benchmarking                          <- scm [torch/flax/keras] time
-  |  Training (PyTorch only)                         <- scm torch train
+  |  Training (PyTorch, Flax, Keras)                 <- scm [torch/flax/keras] train
   v
 TorchTrainer.fit(...)  (PyTorch training path)
   |  train/evaluate loop + routed callbacks          <- base_trainer.py + torch/trainer.py
@@ -107,7 +109,7 @@ The repository's signature workflow (the "generate-then-reimport" loop) is:
 1. Render specialized YAML from templates with `scm format`.
 2. Generate model Python modules with `scm [torch/flax/keras] create model` (plus `create learner` for PyTorch).
 3. Re-import those modules through StructCast `_file_` patterns at runtime.
-4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm torch train` (PyTorch only).
+4. Benchmark with `scm [torch/flax/keras] time`, or train through `scm [torch/flax/keras] train`.
 
 ## CLI Surface
 
@@ -123,9 +125,13 @@ The CLI entry point is defined in `pyproject.toml` as `scm = "structcast_model.c
 - `scm torch time`
 - `scm torch train` (also supports distributed training via `torchrun`)
 - `scm flax create model`
+- `scm flax create learner`
 - `scm flax time`
+- `scm flax train`
 - `scm keras create model`
+- `scm keras create learner`
 - `scm keras time`
+- `scm keras train`
 
 ### `scm format`
 
@@ -151,9 +157,9 @@ Purpose:
 Key options:
 
 - `-p/--parameter`
-- `-c/--classname`
+- `-n/--classname`
 - `--structured-output/--no-structured-output`
-- `-s/--sublayer`
+- `--sublayer`
 - `-o/--output`
 
 ### `scm torch create learner`
@@ -164,7 +170,7 @@ Purpose:
 - Build a `TorchLearnerIntermediate`.
 - Optionally write generated Python to disk.
 
-Key options: `-p/--parameter`, `-c/--classname` (default `Learner`), `-o/--output`.
+Key options: `-p/--parameter`, `-n/--classname` (default `Learner`), `-o/--output`.
 
 The generated learner class supports:
 
@@ -186,18 +192,20 @@ Purpose:
 
 ### `scm [torch/flax/keras] time`
 
+Defined as `measure_inference_time()` in `commands/cmd_torch.py`, `commands/cmd_flax.py`, and `commands/cmd_keras.py`.
+
 Purpose:
 
 - Instantiate a model from a StructCast object pattern.
 - Create dummy inputs (PyTorch tensors, JAX arrays, or NumPy arrays).
-- Optionally compile the model (`torch.compile`, `nnx.jit`, or `keras.Model.compile`).
+- Optionally compile the timed forward (`torch.compile`, `nnx.jit`, or the Keras backend's own compiler — `tf.function` on tensorflow, `jax.jit` on jax).
 - Execute warmup runs, then time averaged inference iterations.
 
 Key differences per framework:
 
 - PyTorch: `--matmul-precision` option; channel-first shapes (*C × H × W*).
-- Flax: `--training-mode-kwargs` option; channel-last shapes (*H × W × C*); uses `nnx.jit` for compilation.
-- Keras: channel-last shapes (*H × W × C*); may require `LD_LIBRARY_PATH` for JAX+NVIDIA GPU.
+- Flax: `--training-mode-kwargs` option; channel-last shapes (*H × W × C*); wraps the model in `nnx.jit` when `--compile` is given.
+- Keras: channel-last shapes (*H × W × C*); compiles the timed forward through the active backend adapter's `build_inference_step` when `--compile` is given, and refuses the flag on the torch backend; may require `LD_LIBRARY_PATH` for JAX+NVIDIA GPU.
 
 ### `scm flax create model` / `scm keras create model`
 
@@ -209,7 +217,7 @@ Purpose:
 - Build a `FlaxLayerIntermediate` or `KerasLayerIntermediate`.
 - Generate Python source implementing a `flax.nnx.Module` or `keras.layers.Layer`.
 
-Key options are the same as `scm torch create model`: `-p`, `-c`, `--structured-output/--no-structured-output`, `-s`, `-o`.
+Key options are the same as `scm torch create model`: `-p`, `-n`, `--structured-output/--no-structured-output`, `--sublayer`, `-o`.
 
 ### `scm torch train`
 
@@ -233,6 +241,7 @@ Distributed training behavior (when launched through `torchrun`):
 - `initial_distributed_env()` detects `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars and initializes the NCCL process group.
 - Each process is assigned to `cuda:<LOCAL_RANK>`.
 - All models are wrapped by the selected `DistributedStrategy` before the learner is constructed; `--strategy` chooses it (called with `device` and `local_rank`), defaulting to `DistributedDataParallelStrategy` under `torchrun` and `SingleDeviceStrategy` otherwise. `FullyShardedDataParallelStrategy` (FSDP2, `torch>=2.6`) is the sharded alternative.
+- Both multi-rank strategies convert every `BatchNorm` layer to `SyncBatchNorm` at the top of `wrap()`, before DDP construction or FSDP2 sharding; `SingleDeviceStrategy` never converts and CPU devices are skipped. The conversion goes through timm's `convert_sync_batchnorm`, so a fused `BatchNormAct2d` becomes a `SyncBatchNormAct` (a `torch.nn.SyncBatchNorm` subclass) with its activation intact. The conversion is idempotent: a layer that already is a `torch.nn.SyncBatchNorm` (`SyncBatchNormAct` included) passes through untouched, `process_group` and all, so models that ran a converter themselves keep working — the call is just no longer needed. Opt out with `_bind_: {sync_batchnorm: false}` on the strategy pattern — there is no CLI flag, per ADR-0003. Known edges (ADR-0008): a non-timm third-party `_BatchNorm` subclass is flattened to a plain `SyncBatchNorm`, `torch.compile` graph-breaks on `SyncBatchNorm`, and every replaced layer is a new object, so hooks on it — and an in-place `--compile` of a `BatchNorm` root or `shard_modules` match — are lost.
 - The example `TimmDataLoaderWrapper` creates `DistributedSampler` automatically and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank, so the sampler epoch advances on all of them.
 - `TorchTracker` uses `all_reduce(ReduceOp.AVG)` to synchronize metrics across ranks.
 - Experiment logging and progress bars are gated to rank 0. Checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
@@ -247,9 +256,11 @@ torchrun --nproc_per_node=gpu -m structcast_model.commands.main torch train ...
 
 ## Builder Architecture
 
+The builder modules are named after the framework they emit (`builders/torch.py`, `builders/flax.py`, `builders/keras.py`). Import them under an alias -- `from structcast_model.builders import torch as torch_builder` -- because a bare `from structcast_model.builders import torch` shadows the real `torch` in the importing module.
+
 ### Generic builder layer
 
-`builders/base_builder.py` is the generic code generation engine.
+`builders/base.py` is the generic code generation engine.
 
 Key responsibilities:
 
@@ -270,7 +281,7 @@ Key APIs:
 
 ### PyTorch builder layer
 
-`builders/torch_builder.py` specializes the generic intermediates into concrete PyTorch code.
+`builders/torch.py` specializes the generic intermediates into concrete PyTorch code.
 
 Important classes:
 
@@ -283,14 +294,14 @@ Important generation details:
 
 - Model code uses `self.<layer_name>` submodules.
 - Inference flow is rendered separately when `INFERENCE_FLOW` is present.
-- Learner code supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`.
+- Learner code supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP` (torch only, added by `TorchLearnerBehavior`).
 - Each entry's trainable layers are set to training mode before its flow executes and set back to eval mode after the optimizer step.
 - Learner code can include gradient accumulation, AMP scaler logic, clipping, optimizer stepping, and optimizer metadata properties.
 - The optimizer pattern receives the named parameters of the entry's trainable layers, so it works with `create_opt` and with file-addressed optimizer compositions alike.
 
 ### Flax builder layer
 
-`builders/flax_builder.py` specializes the generic intermediates into Flax (JAX) code.
+`builders/flax.py` specializes the generic intermediates into Flax (JAX) code.
 
 Important classes:
 
@@ -305,7 +316,7 @@ Important generation details:
 
 ### Keras builder layer
 
-`builders/keras_builder.py` specializes the generic intermediates into Keras code.
+`builders/keras.py` specializes the generic intermediates into Keras code.
 
 Important classes:
 
@@ -355,9 +366,9 @@ Training/evaluation helpers:
 
 Loggers (run-owning context managers that also implement `on_epoch_end`):
 
-- `Logger` — the shared protocol, in `structcast_model.torch.logger`
-- `MLflowLogger` — in `structcast_model.torch.mlflow_logger`
-- `WandbLogger` — in `structcast_model.torch.wandb_logger`
+- `Logger` — the shared protocol, in `structcast_model.loggers.base`
+- `MLflowLogger` — in `structcast_model.loggers.mlflow`
+- `WandbLogger` — in `structcast_model.loggers.wandb`
 
 timm data integrations — example code in `examples/torch/data.py`, not package API; a configuration loads them by file path (`_addr_` plus `_file_`):
 
@@ -367,23 +378,21 @@ timm data integrations — example code in `examples/torch/data.py`, not package
 
 ### Flax runtime layer
 
-`flax/trainer.py` provides inference timing utilities for Flax models.
+`flax/trainer.py` is the Flax runtime layer of a `scm flax train` run: dummy inputs, the tracker, the trainer and its checkpointing callbacks.
 
 Utility functions:
 
 - `create_jax_inputs(shape)` — creates JAX arrays from shape specs
-- `get_jax_device(device=None)` — resolves JAX device (cpu, gpu:N)
-- `measure_inference_time(...)` — benchmarks Flax model inference with optional `nnx.jit` compilation
+- `get_jax_device(device=None)` (in `flax/utils.py`) — resolves JAX device (cpu, gpu:N)
 
 ### Keras runtime layer
 
-`keras/trainer.py` provides inference timing utilities for Keras models.
+`keras/trainer.py` is the Keras runtime layer of a `scm keras train` run: dummy inputs, the tracker, the trainer and its checkpointing callbacks.
 
 Utility functions:
 
 - `create_numpy_inputs(shape)` — creates NumPy arrays from shape specs
-- `get_keras_device(device=None)` — resolves Keras/JAX device
-- `measure_inference_time(...)` — benchmarks Keras model inference with optional compilation
+- `get_keras_device(device=None)` (in `keras/utils.py`) — resolves Keras/JAX device
 
 ### Training flow in practice
 
@@ -460,7 +469,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 - Google-style docstrings are expected.
 - Dataclasses use `@dataclass(kw_only=True, slots=True)`.
 - Lazy import wrappers are used broadly:
-  - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
+  - `LazyModuleImporter` defers heavy imports in the command modules (torch, numpy, ptflops, calflops) and the framework imports in `structcast_model.loggers` (torch in all three modules, plus `mlflow.pytorch`, whose top level imports torch); the optional logger backends (mlflow, wandb) are guarded with `try_import()` and an unconditional `_imports.check()` in the logger constructors; timm is a hard dependency imported eagerly.
   - `LazySelectedImporter` for module export surfaces (`__all__`) — except `structcast_model.torch.distributed`, deliberately exempt: generated compiled flows call `sync_gate` and the shim breaks dynamo's tracer (see the module tail comment and ADR-0004).
 - Generated code should stay minimal and preserve current public APIs.
 - The `outputs` attribute on a generated learner is significant — the CLI reads it to determine which keys `TorchTracker` should track, falling back to `--learner-outputs`.
@@ -469,7 +478,7 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 ## Testing Notes
 
 - Tests mirror the source layout: builders, commands, trainer, and torch layers each have dedicated test modules.
-- CLI tests patch command callback globals directly because lazy import wrappers make normal monkeypatching less reliable.
+- CLI tests patch command callback globals directly because lazy import wrappers make normal monkeypatching less reliable; the globals are package handles (`scm_loggers`, `scm_torch`), so a patch replaces one handle with a namespace serving the submodules.
 - Trainer tests often patch function globals instead of module attributes for the same reason.
 - The pytest configuration runs doctests in `src/` as well as tests under `tests/`.
 
@@ -499,4 +508,4 @@ The ConvNeXtV2 example demonstrates the full end-to-end workflow:
 
 This **generate-then-reimport** loop is the core mental model for the entire repository: YAML templates become Python modules through the builders (generation phase), then those modules are re-imported through StructCast patterns and executed by the CLI (inference benchmarking or training).
 
-Model generation is available for all three frameworks. Training is currently PyTorch-only; for distributed training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation. The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.
+Model generation and training are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`); for distributed PyTorch training, the execution phase is launched through `torchrun` instead of a direct `scm` invocation (Flax drives all local devices from one process). The generation phase is identical — the same generated files and dataset YAML work for both single-GPU and multi-GPU training.

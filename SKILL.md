@@ -1,6 +1,6 @@
 ---
 name: structcast-model
-description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus PyTorch training workflows — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and the distributed strategies (DistributedDataParallel (DDP) or FSDP2).
+description: StructCast-Model generates PyTorch, Flax (JAX), and Keras models — plus training workflows for all three — from YAML templates built on StructCast. Use this skill when working with scm CLI commands (format, torch/flax/keras create, torch/flax/keras time, torch/flax/keras train, torch ptflops, torch calflops), StructCast object patterns (_obj_, _addr_, _file_, _call_, _bind_, _attr_), YAML template formatting, code generation through TorchBuilder, FlaxBuilder, KerasBuilder, or TorchLearnerBuilder, PyTorch training orchestration through Learner, DataProvider, TorchTracker, TorchTrainer and its protocol-routed callbacks, timm dataset wrappers, MLflow- or wandb-integrated training runs, or distributed multi-GPU training with torchrun and the distributed strategies (DistributedDataParallel (DDP) or FSDP2).
 ---
 
 # StructCast-Model
@@ -66,7 +66,7 @@ What happens:
 scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs: 5}' -o learner.py
 ```
 
-Losses and metrics are declared inline in the learner's `FLOW`, so there is no separate loss or metric command. The learner template supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP`. This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
+Losses and metrics are declared inline in the learner's `FLOW`, so there is no separate loss or metric command. The learner template supports multiple `LEARNERS` entries, each with its own `FLOW`, `INFERENCE_FLOW`, `OPTIMIZER`, `TRAINABLE_LAYERS`, and `CLIP` (torch only, added by `TorchLearnerBehavior`). This enables multi-optimizer training (e.g., GAN with separate generator and discriminator optimizers):
 
 ```bash
 scm torch create learner cfg/torch/learners/CycleGAN.yaml -o learner.py
@@ -152,11 +152,14 @@ scm keras time \
   -s 'image: [224, 224, 3]' -c true -d gpu:0
 ```
 
+`scm keras time` inherits the ambient Keras backend; `-c` compiles the timed forward through that
+backend's compiler and is refused on the torch backend.
+
 What happens:
 
 1. The model is instantiated from the StructCast pattern.
 2. Dummy inputs are created (`create_torch_inputs`, `create_jax_inputs`, or `create_numpy_inputs`).
-3. Optional compilation is applied (`torch.compile`, `nnx.jit`, or `keras.Model.compile`).
+3. Optional compilation is applied (`torch.compile`, `nnx.jit`, or the Keras backend's own compiler — `tf.function` on tensorflow, `jax.jit` on jax).
 4. Warmup runs are executed, then timed iterations are averaged.
 
 ### Workflow 7: Distributed Training with `torchrun`
@@ -190,10 +193,11 @@ What happens:
 1. `torchrun` sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` environment variables.
 2. `initial_distributed_env()` detects the distributed environment and initializes the NCCL process group.
 3. The selected `DistributedStrategy` wraps every model before the learner is constructed — `DistributedDataParallelStrategy` by default in a distributed environment, `SingleDeviceStrategy` or `FullyShardedDataParallelStrategy` (FSDP2) via `--strategy`.
-4. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
-5. `TorchTracker` uses `all_reduce` to average metrics across ranks.
-6. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
-7. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
+4. Both multi-rank strategies convert `BatchNorm` layers to `SyncBatchNorm` at the top of `wrap()`, before DDP construction or FSDP2 sharding — no manual `convert_sync_batchnorm` call in the model definition. timm's converter is used, so a fused `BatchNormAct2d` becomes a `SyncBatchNormAct` with its activation intact. Skipped on CPU; opt out with `_bind_: {sync_batchnorm: false}` on the strategy pattern (no CLI flag). The conversion is idempotent: pre-existing `SyncBatchNorm` layers pass through untouched, `process_group` included. Watch out for `torch.compile` graph breaks on `SyncBatchNorm`, non-timm `_BatchNorm` subclasses flattened to a plain `SyncBatchNorm`, and hooks (or an in-place root/`shard_modules` compile) lost on a replaced layer.
+5. The example `TimmDataLoaderWrapper` creates a `DistributedSampler` and calls `set_epoch()` from its own `on_epoch_begin`; the trainer scans the provider datasets on every rank.
+6. `TorchTracker` uses `all_reduce` to average metrics across ranks.
+7. Experiment logging is gated to rank 0; checkpoint states are produced on every rank (the strategy's state dict is a collective) and written only by rank 0.
+8. Generated learners precede every model call with a `sync_gate(model, armed)` statement, so gradient synchronization fires only on the last call of a model that its optimizer segment owns, on update steps — this subsumes gradient-accumulation `no_sync`.
 
 ## CLI Surface
 
@@ -207,9 +211,13 @@ What happens:
 | `scm torch time` | `commands.cmd_torch` | `measure_inference_time()` |
 | `scm torch train` | `commands.cmd_torch` | `train()` |
 | `scm flax create model` | `commands.cmd_flax` | `create_model()` |
+| `scm flax create learner` | `commands.cmd_flax` | `create_learner()` |
 | `scm flax time` | `commands.cmd_flax` | `measure_inference_time()` |
+| `scm flax train` | `commands.cmd_flax` | `train()` |
 | `scm keras create model` | `commands.cmd_keras` | `create_model()` |
+| `scm keras create learner` | `commands.cmd_keras` | `create_learner()` |
 | `scm keras time` | `commands.cmd_keras` | `measure_inference_time()` |
+| `scm keras train` | `commands.cmd_keras` | `train()` |
 
 ### Important CLI conventions
 
@@ -220,7 +228,7 @@ What happens:
 
 ## Builder APIs
 
-**Modules**: `structcast_model.builders.base_builder`, `structcast_model.builders.torch_builder`, `structcast_model.builders.flax_builder`, `structcast_model.builders.keras_builder`
+**Modules**: `structcast_model.builders.base`, `structcast_model.builders.torch`, `structcast_model.builders.flax`, `structcast_model.builders.keras`
 
 ### Generic generation layer
 
@@ -258,7 +266,7 @@ What happens:
 ### Builder usage pattern
 
 ```python
-from structcast_model.builders.torch_builder import TorchBuilder
+from structcast_model.builders.torch import TorchBuilder
 
 built = TorchBuilder.from_path("cfg/torch/models/ConvNeXtV2.yaml")(
     parameters={"DEFAULT": {"backbone": "femto"}},
@@ -295,7 +303,7 @@ The same `.from_path(...)(...)(output_path)` pattern applies to `FlaxBuilder` an
 | Criteria tracking | `TorchTracker.from_criteria(...)` | Average criteria per pass, reset on training/validation begin, reduce across ranks |
 | Device-aware trainer | `TorchTrainer(...)` | Specialize `BaseTrainer` with CUDA synchronization; gradient sync is gated inside the generated training step |
 | Best criterion | `TorchBestCriterion(target=..., mode=...)` | Track the best value of one criterion; `.from_criteria(...)` builds the CLI's wired monitors |
-| Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.torch.mlflow_logger`) / `WandbLogger(experiment=...)` (`structcast_model.torch.wandb_logger`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.torch.logger` |
+| Experiment logging | `MLflowLogger(experiment=...)` (`structcast_model.loggers.mlflow`) / `WandbLogger(experiment=...)` (`structcast_model.loggers.wandb`) | Own the run as a context manager; log epoch metrics via `on_epoch_end`; both follow the `Logger` protocol in `structcast_model.loggers.base` |
 | Distributed env init | `initial_distributed_env(...)` | Detect torchrun env, init process group, resolve per-rank device |
 
 ### timm integration layer (example code)
@@ -313,7 +321,7 @@ These live in `examples/torch/data.py` and are referenced from a configuration b
 | Capability | Entry point | Purpose |
 | -- | -- | -- |
 | Distributed environment detection | `initial_distributed_env(device, ...)` | Read `RANK`/`LOCAL_RANK`/`WORLD_SIZE` env vars, init process group |
-| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, place the compile units, and produce wrapper-free state dicts |
+| Model wrapping and checkpoint states | `DistributedStrategy` implementations (`structcast_model.torch.distributed`): `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy` | Wrap the models before the learner is built, synchronize the initial weights, convert `BatchNorm` to `SyncBatchNorm` on the multi-rank strategies, place the compile units, and produce wrapper-free state dicts |
 | Cross-rank metric averaging | `TorchTracker.__call__()` | `all_reduce` with `ReduceOp.AVG` when distributed |
 | Gradient sync gating | `sync_gate(model, armed)` (in generated learners) | Let gradients synchronize only on the owning segment's last model call of an update step |
 
@@ -431,10 +439,10 @@ uv sync --extra torch-cu130 --extra mlflow --extra flops
 The repository operates as a two-phase system:
 
 1. **Generation phase**: YAML templates under `cfg/[torch/flax/keras]/` are transformed into Python modules through framework-specific builders (`TorchBuilder`, `FlaxBuilder`, `KerasBuilder`).
-2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm torch train` (training, PyTorch only).
+2. **Execution phase**: Generated modules are re-imported through StructCast `_file_` patterns and executed by `scm [torch/flax/keras] time` (inference benchmarking) or `scm [torch/flax/keras] train` (training).
 
 Both phases are optional for training: any object implementing the `Learner` protocol can be handed to `TorchTrainer` directly, as `examples/torch/simple_training.py` shows.
 
-Model code generation is available for all three frameworks. Training workflow generation and `scm torch train` are currently PyTorch-only; Flax and Keras training support is planned.
+Model code generation and training workflow generation are available for all three frameworks (`scm torch train`, `scm flax train`, `scm keras train`).
 
 If a task relates to YAML templates, import resolution, generated source code, optimizer orchestration, inference benchmarking, or the training command, this skill is the correct reference.

@@ -1,5 +1,6 @@
 """Main entry point for the StructCast Model CLI application."""
 
+import logging
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -7,7 +8,8 @@ from structcast.utils.base import dump_yaml, dump_yaml_to_string
 from typer import Argument, Option, Typer
 
 from structcast_model.commands import cmd_flax, cmd_keras, cmd_torch
-from structcast_model.commands.utils import dict_parser, reduce_dict
+from structcast_model.commands.shared_args import template_param_option
+from structcast_model.commands.utils import reduce_dict
 
 if TYPE_CHECKING:
     import jinja2
@@ -26,6 +28,21 @@ app.add_typer(cmd_keras.app, name="keras", help="Keras related commands.")
 app.add_typer(cmd_flax.app, name="flax", help="Flax nnx related commands.")
 
 
+@app.callback()
+def configure_logging(
+    log_level: str = Option(
+        "INFO",
+        "--log-level",
+        help="Lowest severity of log message the run prints, e.g. DEBUG, INFO, WARNING, ERROR.",
+    ),
+) -> None:
+    """Set the logging level every command below runs with."""
+    logging.basicConfig(level=log_level.upper())
+    # `basicConfig` only sets the level when it installs the handler, so anything that configured
+    # logging first (a library imported on the way, a test harness) would keep its own level.
+    logging.getLogger().setLevel(log_level.upper())
+
+
 @app.command(name="format")
 def format_template(
     cfg_path: str = Argument(..., help="Path to the template file."),
@@ -35,15 +52,8 @@ def format_template(
         "-o",
         help="Path to save the formatted template. If not provided, the formatted template will be printed to stdout.",
     ),
-    parameters: list[dict] | None = Option(
-        None,
-        "--parameter",
-        "-p",
-        parser=dict_parser,
-        help="Parameters to format the template configuration file with. "
-        'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
-        "and the value is a dictionary of keyword arguments for formatting the template. "
-        'For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"',
+    parameters: list[dict] | None = template_param_option(
+        'For example: -p "default: {a: 1, b: 2}" -p "SHARED: {c: 3}" -p "extra: {d: 4}"'
     ),
 ) -> None:
     """Format a template configuration file with the provided parameters and print or save the result."""

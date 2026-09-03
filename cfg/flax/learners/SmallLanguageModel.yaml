@@ -1,0 +1,108 @@
+# Next-token prediction for "cfg/flax/models/SmallLanguageModel.yaml", which reads "tokens" and
+# emits a structured output whose only key is "logits".
+# The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
+# learning rate, and "flax.nnx.Optimizer" only binds that chain to the module.
+# There is no "CLIP" key either -- it is torch-only, and the chain below is where clipping lives.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.1
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+INPUTS: [tokens, targets]
+OUTPUTS: [ce_loss]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # Clipping comes first in the chain, so it applies once per update to the accumulated gradients.
+    # "no_weight_decay_mask" matches the dotted parameter path, so the three regexes exempt every
+    # "flax.nnx.Linear" bias, every "flax.nnx.LayerNorm" scale and the "flax.nnx.Embed" table --
+    # leaving the "kernel" arrays of the projections as the only decayed parameters.
+    # "accumulate_gradients", when set, wraps the whole chain in "optax.MultiSteps": accumulation
+    # gates on the device, and the generated step reads the applied count back off the outermost
+    # optimizer state across its own update, so the wrapper has to stay outermost to be seen.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _jinja_yaml_: |-
+          {% if accumulate_gradients is none %}
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.chain
+                - _call_:
+                    {% if clip_grad_norm is not none %}
+                    - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                    {% endif %}
+                    - - _obj_
+                      - _addr_: optax.adamw
+                      - _call_:
+                          learning_rate: {{lr}}
+                          weight_decay: {{weight_decay}}
+                          b1: 0.9
+                          b2: 0.95
+                          mask:
+                            - _obj_
+                            - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                            - _call_:
+                                - ^(?:\w+\.)*bias$
+                                - ^(?:\w+\.)*scale$
+                                - ^(?:\w+\.)*embedding$
+          {% else %}
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.MultiSteps
+                - _call_:
+                    opt:
+                      - _obj_
+                      - _addr_: optax.chain
+                      - _call_:
+                          {% if clip_grad_norm is not none %}
+                          - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                          {% endif %}
+                          - - _obj_
+                            - _addr_: optax.adamw
+                            - _call_:
+                                learning_rate: {{lr}}
+                                weight_decay: {{weight_decay}}
+                                b1: 0.9
+                                b2: 0.95
+                                mask:
+                                  - _obj_
+                                  - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                                  - _call_:
+                                      - ^(?:\w+\.)*bias$
+                                      - ^(?:\w+\.)*scale$
+                                      - ^(?:\w+\.)*embedding$
+                    every_k_schedule: {{accumulate_gradients}}
+          {% endif %}
+    EXTRA: {}
+    # Next-token prediction: the model reads "tokens" and the loss compares its logits against
+    # "targets", the same sequence shifted by one. Nothing is flattened, unlike the torch template:
+    # "optax.softmax_cross_entropy_with_integer_labels" reduces the class axis alone and leaves the
+    # batch and time axes as they are, so the mean below already averages one prediction per
+    # position.
+    FLOW:
+      - INPUTS: tokens
+        OUTPUTS: {logits: logits}
+        NAME: model
+      - INPUTS: {logits: logits, labels: targets}
+        OUTPUTS: sample_losses
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: optax.softmax_cross_entropy_with_integer_labels}]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+    INFERENCE_FLOW:
+      - INPUTS: tokens
+        OUTPUTS: {logits: logits}
+        NAME: model
+      - [{logits: logits, labels: targets}, sample_losses, cross_entropy_loss]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

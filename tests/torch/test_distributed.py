@@ -1,16 +1,24 @@
 """Tests for the distributed strategies and the sync gate."""
 
 from collections import OrderedDict
+from collections.abc import Callable
+from functools import partial
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from timm.layers import BatchNormAct2d, SyncBatchNormAct
 
+from structcast_model.torch import distributed
 from structcast_model.torch.distributed import (
     DistributedDataParallelStrategy,
     DistributedStrategy,
     FullyShardedDataParallelStrategy,
+    FullyShardedTensorParallelStrategy,
     SingleDeviceStrategy,
+    TensorParallelStrategy,
     matched_shard_modules,
+    split_mixed_param_groups,
     sync_gate,
 )
 import torch
@@ -92,7 +100,18 @@ def test_single_device_strategy_satisfies_the_protocol() -> None:
     """All strategies are used through the DistributedStrategy protocol by the CLI."""
     strategy = SingleDeviceStrategy(device="cpu")
     assert isinstance(strategy, DistributedStrategy)
-    assert strategy.grad_scaler_creator is torch.amp.GradScaler
+
+
+def test_the_protocol_is_checkable_by_instance_only() -> None:
+    """`data_rank` and `data_world_size` made it a data protocol, and those refuse `issubclass`.
+
+    Pinned rather than worked around: no spelling of the two members keeps `issubclass` working
+    (attribute annotations are counted the same as properties), so a caller reaching for it has to
+    read this instead of discovering a `TypeError` at runtime.
+    """
+    with pytest.raises(TypeError, match="non-method members"):
+        # mypy rejects the call statically for the same reason the runtime does, which is the point.
+        issubclass(SingleDeviceStrategy, DistributedStrategy)  # type: ignore[misc]
 
 
 def test_single_device_wrap_and_sync_are_no_ops() -> None:
@@ -205,6 +224,98 @@ def test_single_device_load_without_state_fails_loud() -> None:
         strategy.load_state_dict(_linear_models(), {}, None, None)
 
 
+@pytest.mark.parametrize(
+    "optimizer_creator",
+    [partial(torch.optim.SGD, lr=0.1, momentum=0.9), partial(torch.optim.Adam, lr=0.1)],
+    ids=["sgd-momentum", "adam"],
+)
+def test_single_device_refuses_index_keyed_optimizer_state(
+    optimizer_creator: Callable[..., torch.optim.Optimizer], tmp_path: Path
+) -> None:
+    """A state saved without a pairing keys optimizer state by position and must be refused, not restored.
+
+    The name-keyed load path cannot resolve positions, and today it fails differently per optimizer:
+    SGD momentum is silently discarded, so the run resumes with fresh moments, while Adam dies with an
+    opaque ``KeyError: 'state.0.step'``. Both must become one explicit refusal (ADR-0008).
+    """
+    strategy = SingleDeviceStrategy(device="cpu")
+    models = _linear_models()
+    optimizer = optimizer_creator(models["model"].parameters())
+    models["model"](torch.randn(1, 4)).sum().backward()
+    optimizer.step()
+    saved = strategy.state_dict(models, {"opt": optimizer})  # no pairing -> state keyed 0, 1, ...
+    path = tmp_path / "legacy.pt"
+    torch.save(saved, path)
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    assert set(state["optimizers"]["opt"]["state"]) == {0, 1}
+
+    fresh = _linear_models()
+    fresh_optimizer = optimizer_creator(fresh["model"].parameters())
+    with pytest.raises(ValueError, match="keyed by parameter index"):
+        strategy.load_state_dict(fresh, {"opt": fresh_optimizer}, {"opt": ["model"]}, state)
+
+
+def _trunk_and_head() -> "OrderedDict[str, torch.nn.Module]":
+    """Two paired models of which a warmup step exercises only the trunk, leaving the head unstepped."""
+    torch.manual_seed(0)
+    return OrderedDict(trunk=torch.nn.Linear(4, 2), head=torch.nn.Linear(2, 1))
+
+
+def test_single_device_resumes_partial_optimizer_state_only_when_asked(tmp_path: Path) -> None:
+    """A parameter that has not been stepped yet has no optimizer state, and torch refuses the gap.
+
+    One optimizer pairs a trunk and a head that a warmup phase never runs, so a normal mid-run save
+    covers the trunk only. torch's default strict load rejects such a training state outright, which
+    would make the run unresumable; ``strict_optimizer_load=False`` accepts the gap and lets the
+    uncovered parameters start fresh. Missing state is never synthesized, so a zero-filled moment can
+    never masquerade as a restored one.
+    """
+    strategy = SingleDeviceStrategy(device="cpu")
+    models = _trunk_and_head()
+    pairing = {"opt": ["trunk", "head"]}
+    optimizer = torch.optim.SGD([p for m in models.values() for p in m.parameters()], lr=0.1, momentum=0.9)
+    models["trunk"](torch.randn(3, 4)).sum().backward()
+    optimizer.step()
+    saved = strategy.state_dict(models, {"opt": optimizer}, pairing)
+    assert set(saved["optimizers"]["opt"]["state"]) == {"trunk.weight", "trunk.bias"}
+    path = tmp_path / "partial.pt"
+    torch.save(saved, path)
+    covered = {n: e["momentum_buffer"].clone() for n, e in saved["optimizers"]["opt"]["state"].items()}
+
+    strict_models = _trunk_and_head()
+    strict_optimizer = torch.optim.SGD([p for m in strict_models.values() for p in m.parameters()], lr=0.5)
+    with pytest.raises(RuntimeError, match="Missing optimizer state"):
+        strategy.load_state_dict(
+            strict_models,
+            {"opt": strict_optimizer},
+            pairing,
+            torch.load(path, map_location="cpu", weights_only=True),
+        )
+
+    lenient = SingleDeviceStrategy(device="cpu", strict_optimizer_load=False)
+    resumed = _trunk_and_head()
+    resumed_optimizer = torch.optim.SGD([p for m in resumed.values() for p in m.parameters()], lr=0.5, momentum=0.9)
+    lenient.load_state_dict(
+        resumed,
+        {"opt": resumed_optimizer},
+        pairing,
+        torch.load(path, map_location="cpu", weights_only=True),
+    )
+    parameters = {f"trunk.{n}": p for n, p in resumed["trunk"].named_parameters()}
+    for name, buffer in covered.items():
+        assert torch.equal(resumed_optimizer.state[parameters[name]]["momentum_buffer"], buffer)
+    # Nothing is synthesized for the head, but its entries are not absent either: torch materializes
+    # state for every parameter (a step with lr=0) before loading, so the head keeps zero-filled
+    # moments. For SGD momentum that is arithmetically the unstepped state (buf = 0 * momentum + grad),
+    # so no restored-looking moment can reach it.
+    head_buffers = [resumed_optimizer.state[p]["momentum_buffer"] for p in resumed["head"].parameters()]
+    assert len(head_buffers) == 2
+    assert not any(buffer.any() for buffer in head_buffers)
+    assert resumed_optimizer.param_groups[0]["lr"] == 0.1
+    resumed["trunk"](torch.randn(3, 4)).sum().backward()
+    resumed_optimizer.step()
+
+
 # ---------------------------------------------------------------------------
 # DistributedDataParallelStrategy
 # ---------------------------------------------------------------------------
@@ -311,6 +422,28 @@ def test_fsdp2_strategy_refuses_optimizer_state_without_pairing(single_process_g
     optimizer = torch.optim.SGD(wrapped["model"].parameters(), lr=0.25)
     with pytest.raises(ValueError, match="optimizer_models"):
         strategy.state_dict(wrapped, {"opt": optimizer}, None)
+
+
+def test_fsdp2_strategy_refuses_index_keyed_optimizer_state(single_process_gloo: None) -> None:
+    """The shared refusal must reach FSDP2, where a positional load would corrupt sharded state silently.
+
+    Today an index-keyed state passes torch's int-key passthrough and installs unsharded tensors
+    beside DTensor parameters without an error (ADR-0008) — the worst of the silent outcomes, so the
+    mixin guard must fire here and not be shadowed by FSDP2's own overrides.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    single = SingleDeviceStrategy(device="cpu")
+    models = _linear_models()
+    optimizer = torch.optim.SGD(models["model"].parameters(), lr=0.1, momentum=0.9)
+    models["model"](torch.randn(1, 4)).sum().backward()
+    optimizer.step()
+    legacy = single.state_dict(models, {"opt": optimizer})  # no pairing -> state keyed 0, 1, ...
+
+    strategy = FullyShardedDataParallelStrategy(device="cpu")
+    wrapped = strategy.wrap(_linear_models())
+    sharded_optimizer = torch.optim.SGD(wrapped["model"].parameters(), lr=0.1, momentum=0.9)
+    with pytest.raises(ValueError, match="keyed by parameter index"):
+        strategy.load_state_dict(wrapped, {"opt": sharded_optimizer}, {"opt": ["model"]}, legacy)
 
 
 # ---------------------------------------------------------------------------
@@ -492,3 +625,590 @@ def test_fsdp2_compile_falls_back_to_the_root_when_the_patterns_match_nothing() 
     model = torch.nn.Linear(4, 2)
     assert strategy.compile(model, {}) is model
     assert _is_compiled(model)
+
+
+# ---------------------------------------------------------------------------
+# Tensor parallelism
+# ---------------------------------------------------------------------------
+
+
+class _MLPModel(torch.nn.Module):
+    """The shape a tensor-parallel plan targets: a column-parallel layer feeding a row-parallel one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = torch.nn.Linear(4, 8)
+        self.down = torch.nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the pair."""
+        return self.down(torch.relu(self.up(x)))
+
+
+_PLAN = [("up", "column"), ("down", "row")]
+
+
+def _mlp_models() -> "OrderedDict[str, torch.nn.Module]":
+    torch.manual_seed(0)
+    return OrderedDict(model=_MLPModel())
+
+
+def _placements(model: torch.nn.Module, name: str) -> Any:
+    """One parameter's DTensor placements; ``parallelize_module`` replaces the parameter with one."""
+    return cast(Any, model.get_parameter(name)).placements
+
+
+def test_tensor_parallel_strategy_satisfies_the_protocol_and_reports_one_data_slice() -> None:
+    """The ranks of a tensor-parallel group split one model, so they consume one and the same batch.
+
+    A strategy reporting the global rank here would have the CLI seed each rank differently and a
+    rank-aware loader hand each of them different items — two silently wrong runs, not two errors.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+
+    assert isinstance(strategy, DistributedStrategy)
+    assert (strategy.data_rank, strategy.data_world_size) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        (SingleDeviceStrategy(device="cpu"), (0, 1)),
+        (DistributedDataParallelStrategy(device="cpu"), (0, 1)),
+    ],
+    ids=["single", "ddp"],
+)
+def test_data_coordinates_of_the_replicating_strategies(
+    strategy: DistributedStrategy, expected: tuple[int, int]
+) -> None:
+    """One replica per rank: outside a process group that is one slice, and the seed is the plain seed."""
+    assert (strategy.data_rank, strategy.data_world_size) == expected
+
+
+def test_tensor_parallel_strategy_requires_the_torch_tensor_parallel_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Selecting it on a torch without parallelize_module must fail with an actionable message."""
+    # The lazy-import shim hides module privates, so patch the globals the class actually reads.
+    monkeypatch.setitem(TensorParallelStrategy.__post_init__.__globals__, "_tp_imports", _FailedImports())
+    with pytest.raises(ImportError, match="torch>=2.4"):
+        TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+
+
+def test_tensor_parallel_strategy_refuses_an_empty_plan() -> None:
+    """Without a plan the strategy would parallelize nothing and run every rank on the whole model."""
+    with pytest.raises(ValueError, match="parallel_modules"):
+        TensorParallelStrategy(device="cpu")
+
+
+def test_a_parallel_modules_pattern_matching_nothing_is_refused(single_process_gloo: None) -> None:
+    """A typo'd path would silently leave the layer unsplit; the message must name the option to fix."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=[("up", "column"), ("dwon", "row")])
+    with pytest.raises(ValueError, match="parallel_modules pattern"):
+        strategy.wrap(_mlp_models())
+
+
+def test_an_unknown_parallel_style_is_refused(single_process_gloo: None) -> None:
+    """A mistyped style is a configuration error, not a reason to leave the layer replicated."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=[("up", "colwise")])
+    with pytest.raises(ValueError, match="Unknown parallel style"):
+        strategy.wrap(_mlp_models())
+
+
+def test_tensor_parallel_refuses_a_tie_across_two_parallelized_modules(single_process_gloo: None) -> None:
+    """The two ends would become separately placed DTensors — the same silent split fully_shard has."""
+    models = _mlp_models()
+    # The shapes do not match, which is irrelevant: the guard runs before anything is placed or run.
+    models["model"].get_submodule("down").weight = models["model"].get_parameter("up.weight")
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    with pytest.raises(RuntimeError, match="Tied parameter"):
+        strategy.wrap(models)
+    assert type(models["model"].get_parameter("up.weight")) is torch.nn.Parameter  # nothing was parallelized
+
+
+def test_tensor_parallel_places_the_styles_the_vocabulary_names(single_process_gloo: None) -> None:
+    """Column splits a weight by its output dimension and row by its input one, bias replicated.
+
+    The bias is what the check is for: a row-parallel layer all-reduces its partial products, so a
+    split bias would be added once per shard and counted as many times as the group is wide.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    placements = {name: _placements(model, name) for name, _ in model.named_parameters()}
+    assert placements["up.weight"] == (torch.distributed.tensor.Shard(0),)
+    assert placements["up.bias"] == (torch.distributed.tensor.Shard(0),)
+    assert placements["down.weight"] == (torch.distributed.tensor.Shard(1),)
+    assert placements["down.bias"] == (torch.distributed.tensor.Replicate(),)
+
+
+def test_the_gate_stays_a_no_op_on_a_tensor_parallel_model(single_process_gloo: None) -> None:
+    """Pure tensor parallelism has no deferred bucket, so the generated steps' gate must find nothing.
+
+    ``parallelize_module`` returns the plain ``nn.Module`` it was given -- neither a DDP wrapper nor
+    an ``FSDPModule`` -- and DTensor emits each layer's collective inside the operation that needs
+    it, so gradients arrive with the gate never having been armed.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    sync_gate(model, armed=False)
+
+    assert not hasattr(model, "require_backward_grad_sync")
+    model(torch.randn(2, 4)).sum().backward()
+    assert model.get_parameter("up.weight").grad is not None
+
+
+def test_tensor_parallel_takes_a_style_instance_from_the_plan(single_process_gloo: None) -> None:
+    """The escape hatch for the styles the vocabulary lacks: an object pattern the CLI instantiated."""
+    parallel = pytest.importorskip("torch.distributed.tensor.parallel")
+    strategy = TensorParallelStrategy(
+        device="cpu",
+        parallel_modules=[("up", parallel.RowwiseParallel(input_layouts=torch.distributed.tensor.Replicate()))],
+    )
+    model = strategy.wrap(_mlp_models())["model"]
+
+    assert _placements(model, "up.weight") == (torch.distributed.tensor.Shard(1),)
+
+
+def test_the_column_heads_style_keeps_its_output_a_dtensor() -> None:
+    """An attention head reshape must see the sharded head count, which a local tensor hides."""
+    parallel = pytest.importorskip("torch.distributed.tensor.parallel")
+    style = distributed._parallel_style("column_heads")
+
+    assert isinstance(style, parallel.ColwiseParallel)
+    assert style.use_local_output is False
+
+
+def test_tensor_parallel_state_dict_gathers_plain_tensors(single_process_gloo: None) -> None:
+    """A checkpoint must not depend on the tensor-parallel degree that wrote it."""
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_PLAN)
+    models = _mlp_models()
+    reference = models["model"].get_parameter("up.weight").clone()
+    states = strategy.state_dict(strategy.wrap(models))
+
+    weight = states["models"]["model"]["up.weight"]
+    assert type(weight) is torch.Tensor
+    assert torch.equal(weight, reference)
+
+
+def test_fsdp2_tensor_parallel_shards_the_parallelized_models_and_arms_the_gate(single_process_gloo: None) -> None:
+    """fully_shard must land on the parallelized root, or the gate has nothing to arm.
+
+    Generated steps gate the model root, and only an ``FSDPModule`` reads that flag: if the
+    combination stopped at ``parallelize_module``, gradient synchronization would never be deferred
+    and accumulation would reduce on every micro-step.
+    """
+    fsdp = pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=1, parallel_modules=_PLAN)
+    model = strategy.wrap(_mlp_models())["model"]
+
+    assert isinstance(model, fsdp.FSDPModule)
+    sync_gate(model, armed=False)
+    assert _param_group(model).reduce_grads is False
+    model(torch.randn(2, 4)).sum().backward()  # the two wrappers must still compose into one model
+
+
+def test_fsdp2_tensor_parallel_refuses_a_degree_the_world_does_not_divide(single_process_gloo: None) -> None:
+    """A degree that leaves a partial group cannot be a mesh, and would drop ranks out of the run.
+
+    Refused at construction, where the process group already exists: the CLI reads `data_rank` on
+    the next line, so a degree that only failed at wrap would have gone through the seeding first.
+    """
+    with pytest.raises(ValueError, match="does not divide the world size"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=3, parallel_modules=_PLAN)
+
+
+@pytest.mark.parametrize("degree", [0, -1], ids=["zero", "negative"])
+def test_fsdp2_tensor_parallel_refuses_a_degree_below_one(degree: int) -> None:
+    """The data coordinates divide by the degree, so a degree below 1 is arithmetic, not a strategy.
+
+    Zero reached the CLI's seeding line as a bare ZeroDivisionError and -1 published a negative data
+    world size for the loader to shard on; both are configuration errors that must say so.
+    """
+    with pytest.raises(ValueError, match="at least 1"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=degree, parallel_modules=_PLAN)
+
+
+def test_fsdp2_tensor_parallel_refuses_an_empty_plan() -> None:
+    """Without a plan the combination is plain FSDP2, and saying so beats pretending otherwise."""
+    with pytest.raises(ValueError, match="parallel_modules"):
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=2)
+
+
+# ---------------------------------------------------------------------------
+# The shared state-dict API field
+# ---------------------------------------------------------------------------
+
+
+def test_every_strategy_resolves_the_state_dict_api_at_construction() -> None:
+    """The DCP module is resolved once into a field, so every constructor must reach the mixin's hook.
+
+    `TensorParallelStrategy` and `FullyShardedDataParallelStrategy` define a `__post_init__` of
+    their own, which shadows the mixin's unless it chains: the field would then stay unset and every
+    save and load raise `AttributeError` at the first checkpoint rather than at construction.
+    """
+    dcp = pytest.importorskip("torch.distributed.checkpoint.state_dict")
+    pytest.importorskip("torch.distributed.fsdp")
+    # Annotated at the mixin owning `_api`: the join of the five classes is `_CompileMixin`, which does not.
+    strategies: list[distributed._StateDictMixin] = [
+        SingleDeviceStrategy(device="cpu"),
+        DistributedDataParallelStrategy(device="cpu"),
+        TensorParallelStrategy(device="cpu", parallel_modules=_PLAN),
+        FullyShardedDataParallelStrategy(device="cpu"),
+        FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=1, parallel_modules=_PLAN),
+    ]
+
+    assert [strategy._api for strategy in strategies] == [dcp] * len(strategies)
+
+
+# ---------------------------------------------------------------------------
+# split_mixed_param_groups
+# ---------------------------------------------------------------------------
+
+_MIXED_PLAN = [("up", "column")]
+"""A plan naming one of the two layers; the other one's parameters are what stays plain."""
+
+_MIXED_INPUT = torch.linspace(-1.0, 1.0, 8).reshape(2, 4)
+"""A fixed batch, so two optimizers stepped separately see the very same gradients."""
+
+_MIXED_PARAMETERS = ("up.weight", "up.bias", "down.weight", "down.bias")
+
+
+def _mixed_optimizer(*, foreach: bool) -> tuple[torch.nn.Module, torch.optim.AdamW]:
+    """A partly parallelized model and one AdamW holding all of its parameters in one group.
+
+    The shape of every tensor-parallel run: the plan converts the layers it names to DTensors, and
+    the learner hands the whole model -- parallelized layers and untouched ones alike -- to one
+    optimizer.
+    """
+    model = TensorParallelStrategy(device="cpu", parallel_modules=_MIXED_PLAN).wrap(_mlp_models())["model"]
+    return model, torch.optim.AdamW(model.parameters(), lr=0.1, foreach=foreach)
+
+
+def _stepped(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    """Run the backward and the optimizer step the mixed group crashes on."""
+    model(_MIXED_INPUT).sum().backward()
+    optimizer.step()
+
+
+def _kinds(group: dict[str, Any]) -> set[str]:
+    """The tensor types one parameter group holds; a fused ``_foreach_*`` call admits exactly one."""
+    return {type(parameter).__name__ for parameter in group["params"]}
+
+
+def _local(tensor: torch.Tensor) -> torch.Tensor:
+    """The rank-local values of a tensor, so a DTensor and a plain one compare the same way."""
+    to_local = getattr(tensor, "to_local", None)
+    return cast(torch.Tensor, to_local()) if to_local else tensor
+
+
+def test_a_group_mixing_dtensor_and_plain_parameters_crashes_the_first_step(single_process_gloo: None) -> None:
+    """The shipped defect: `cfg/torch/strategies/tp.yaml` plus any learner dies on `optimizer.step()`.
+
+    torch's default multi-tensor path fuses a parameter group into one ``_foreach_*`` call and the
+    DTensor dispatcher refuses a list holding both kinds, so the run never reports a loss. Every plan
+    leaves something plain -- an untouched head is the least a transformer has -- so this is not an
+    exotic configuration but the only one tensor parallelism produces.
+    """
+    model, optimizer = _mixed_optimizer(foreach=True)
+    model(_MIXED_INPUT).sum().backward()
+
+    with pytest.raises(RuntimeError, match="mixed torch.Tensor and DTensor"):
+        optimizer.step()
+
+
+def test_splitting_makes_the_mixed_group_uniform_and_keeps_its_hyperparameters(single_process_gloo: None) -> None:
+    """The split must buy the step back without moving a parameter between hyperparameter sets.
+
+    A subgroup that lost the group's learning rate or weight decay would train the head on the
+    optimizer's defaults instead of the configured schedule -- silently, and only under tensor
+    parallelism.
+    """
+    model, optimizer = _mixed_optimizer(foreach=True)
+    settings = {k: v for k, v in optimizer.param_groups[0].items() if k != "params"}
+
+    split_mixed_param_groups(optimizer)
+
+    assert [_kinds(group) for group in optimizer.param_groups] == [{"DTensor"}, {"Parameter"}]
+    assert [{k: v for k, v in g.items() if k != "params"} for g in optimizer.param_groups] == [settings, settings]
+    assert [id(p) for group in optimizer.param_groups for p in group["params"]] == [
+        id(model.get_parameter(name)) for name in _MIXED_PARAMETERS
+    ]
+    _stepped(model, optimizer)  # the crash the split exists for
+
+
+def test_splitting_leaves_an_already_uniform_optimizer_exactly_as_it_was() -> None:
+    """Every run calls this, tensor-parallel or not, so anywhere it is not needed it must do nothing.
+
+    Rebuilding the groups unconditionally would hand every single-device and DDP run new dictionaries
+    -- and anything holding on to one, an LR scheduler above all, would then be writing into objects
+    the optimizer no longer reads.
+    """
+    model = _mlp_models()["model"]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    groups, group = optimizer.param_groups, optimizer.param_groups[0]
+
+    split_mixed_param_groups(optimizer)
+
+    assert optimizer.param_groups is groups
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0] is group
+
+
+def test_the_split_optimizer_updates_exactly_as_an_unfused_one(single_process_gloo: None) -> None:
+    """The claim that makes splitting the fix rather than a workaround: grouping is fusion, not math.
+
+    ``foreach=False`` is the other way out of the crash and is the arithmetic reference here; it is
+    not the fix, because it also unfuses the DTensor majority the strategy exists for, and the H200
+    isolation measured its numerics moving.
+    """
+    split_model, split_optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(split_optimizer)
+    reference_model, reference_optimizer = _mixed_optimizer(foreach=False)
+    initial = _local(reference_model.get_parameter("down.weight")).clone()
+
+    _stepped(split_model, split_optimizer)
+    _stepped(reference_model, reference_optimizer)
+
+    assert not torch.equal(_local(reference_model.get_parameter("down.weight")), initial)  # a step really landed
+    for name in _MIXED_PARAMETERS:
+        updated = _local(split_model.get_parameter(name))
+        assert torch.allclose(updated, _local(reference_model.get_parameter(name)), rtol=0.0, atol=1e-7)
+
+
+def test_a_state_saved_from_a_split_optimizer_resumes_into_a_freshly_split_one(single_process_gloo: None) -> None:
+    """The CLI splits before `restore_training_state`, so both ends of a resume have the same groups.
+
+    Optimizer state is keyed by parameter name rather than by group, so the split changes nothing a
+    checkpoint carries -- which is what lets the fix be unconditional instead of a checkpoint format
+    change. Splitting after the load would instead hand torch a group count the saved state lacks.
+    """
+    strategy = TensorParallelStrategy(device="cpu", parallel_modules=_MIXED_PLAN)
+    pairing = {"opt": ["model"]}
+    model, optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(optimizer)
+    _stepped(model, optimizer)
+    state = strategy.state_dict(OrderedDict(model=model), {"opt": optimizer}, pairing)
+    assert set(state["optimizers"]["opt"]["state"]) == {f"model.{name}" for name in _MIXED_PARAMETERS}
+
+    fresh_model, fresh_optimizer = _mixed_optimizer(foreach=True)
+    split_mixed_param_groups(fresh_optimizer)
+    strategy.load_state_dict(OrderedDict(model=fresh_model), {"opt": fresh_optimizer}, pairing, state)
+
+    assert len(fresh_optimizer.param_groups) == 2
+    for name in _MIXED_PARAMETERS:
+        restored = fresh_optimizer.state[fresh_model.get_parameter(name)]
+        assert torch.equal(_local(restored["exp_avg"]), _local(optimizer.state[model.get_parameter(name)]["exp_avg"]))
+    _stepped(fresh_model, fresh_optimizer)  # the resumed optimizer still steps
+
+
+# ---------------------------------------------------------------------------
+# SyncBatchNorm conversion
+# ---------------------------------------------------------------------------
+
+
+class _BatchNormModel(torch.nn.Module):
+    """A model carrying a nested BatchNorm layer, the shape the conversion targets."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.body = torch.nn.Sequential(torch.nn.Conv2d(2, 2, 1), torch.nn.BatchNorm2d(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the body."""
+        return self.body(x)
+
+
+def _unreachable_conversion(
+    models: "OrderedDict[str, torch.nn.Module]",
+    device: str,
+) -> "OrderedDict[str, torch.nn.Module]":
+    """Stand in for the conversion in the tests that require wrap never to reach it."""
+    raise AssertionError("wrap must not convert when sync_batchnorm is off")
+
+
+def test_convert_sync_batchnorm_replaces_nested_layers_and_keeps_the_tensors() -> None:
+    """Converted layers must reuse the parameter objects, or the pre-wrap rank-0 broadcast is discarded."""
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    weight = models["model"].get_parameter("body.1.weight")
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    layer = converted["model"].get_submodule("body.1")
+    assert isinstance(layer, torch.nn.SyncBatchNorm)
+    assert layer.weight is weight
+
+
+def test_convert_sync_batchnorm_keeps_the_activation_of_timms_fused_norm_act_layers() -> None:
+    """Fused ``BatchNormAct2d`` layers from timm must keep running their activation after the conversion.
+
+    torch's stock converter replaces it with a plain ``SyncBatchNorm`` whose forward never calls the
+    fused activation, and the ``state_dict`` keys stay identical — the model silently trains without
+    the activation. This pins the timm converter that keeps it.
+    """
+    fused = BatchNormAct2d(4, act_layer=torch.nn.ReLU)
+    weight = fused.weight
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(
+        model=torch.nn.Sequential(fused, torch.nn.BatchNorm2d(4)),
+    )
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    sync_fused = converted["model"].get_submodule("0")
+    assert isinstance(sync_fused, SyncBatchNormAct)
+    assert isinstance(sync_fused, torch.nn.SyncBatchNorm)
+    assert sync_fused.weight is weight
+    assert type(converted["model"].get_submodule("1")) is torch.nn.SyncBatchNorm
+    inputs = torch.linspace(-1.0, 1.0, 8).reshape(1, 4, 2, 1)
+    assert inputs.min() < 0  # eval mode leaves the values untouched, so only the ReLU can clamp them
+    assert sync_fused.eval()(inputs).min() >= 0
+
+
+def test_convert_sync_batchnorm_is_idempotent_for_timms_fused_layers() -> None:
+    """Converting twice must not undo the first conversion, which timm's raw converter would.
+
+    ``SyncBatchNormAct`` subclasses ``torch.nn.SyncBatchNorm`` but not ``BatchNormAct2d``, so a second
+    pass through timm's converter rebuilds it as a plain ``SyncBatchNorm`` and silently drops the fused
+    activation while the ``state_dict`` keys stay identical. A model converted by hand, or wrapped a
+    second time, must keep its activation.
+    """
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(
+        model=torch.nn.Sequential(BatchNormAct2d(4, act_layer=torch.nn.ReLU)),
+    )
+    once = distributed._convert_sync_batchnorm(models, "cuda:0")
+    converted_layer = once["model"].get_submodule("0")
+    twice = distributed._convert_sync_batchnorm(once, "cuda:0")
+    layer = twice["model"].get_submodule("0")
+    assert layer is converted_layer  # the second pass left the already-converted layer alone
+    assert isinstance(layer, SyncBatchNormAct)
+    inputs = torch.linspace(-1.0, 1.0, 8).reshape(1, 4, 2, 1)
+    assert inputs.min() < 0  # eval mode leaves the values untouched, so only the ReLU can clamp them
+    assert layer.eval()(inputs).min() >= 0
+
+
+def test_convert_sync_batchnorm_leaves_an_existing_sync_batch_norm_and_its_process_group_untouched() -> None:
+    """A hand-converted layer must pass through as the very same object, process group included.
+
+    Re-creating it would reset ``process_group`` to the default group, silently discarding a hand-built
+    subgroup, and would drop everything else attached to the layer.
+    """
+    group = object()
+    layer = torch.nn.SyncBatchNorm(4, process_group=group)
+    converted = distributed._convert_sync_batchnorm(OrderedDict(model=layer), "cuda:0")
+    assert converted["model"] is layer
+    assert layer.process_group is group
+
+
+def test_convert_sync_batchnorm_leaves_a_model_without_batch_norm_untouched() -> None:
+    """A model with no ``BatchNorm`` must come out identical: every distributed run walks through this.
+
+    The conversion is on by default, so models that have nothing to convert must keep their identity and
+    their layer types — the strategies wrap whatever it returns.
+    """
+    model = torch.nn.Sequential(torch.nn.Linear(4, 2), torch.nn.LayerNorm(2))
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=model)
+    converted = distributed._convert_sync_batchnorm(models, "cuda:0")
+    assert converted["model"] is model
+    assert [type(child) for child in model] == [torch.nn.Linear, torch.nn.LayerNorm]
+
+
+def test_convert_sync_batchnorm_returns_a_new_module_when_the_root_is_a_batch_norm() -> None:
+    """A root BatchNorm cannot be converted in place, so the strategies must wrap the returned object."""
+    root = torch.nn.BatchNorm1d(2)
+    converted = distributed._convert_sync_batchnorm(OrderedDict(model=root), "cuda:0")
+    assert isinstance(converted["model"], torch.nn.SyncBatchNorm)
+    assert converted["model"] is not root
+
+
+def test_convert_sync_batchnorm_skips_cpu_devices() -> None:
+    """SyncBatchNorm's training forward rejects CPU input once a process group exists, even with one rank."""
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    assert distributed._convert_sync_batchnorm(models, "cpu") is models
+    assert type(models["model"].get_submodule("body.1")) is torch.nn.BatchNorm2d
+
+
+def test_ddp_wrap_wraps_the_conversion_result_and_converts_for_its_own_device(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DDP must wrap what the conversion returned, and convert for the device the strategy trains on.
+
+    A model that is itself a BatchNorm comes back as a new object, so wrapping the input would wrap a
+    discarded module. The device decides whether the conversion runs at all, so a hardcoded one would
+    convert (or skip) against hardware this rank does not train on.
+    """
+    converted = torch.nn.Linear(4, 2)
+    seen: list[str] = []
+
+    def _spy(
+        models: "OrderedDict[str, torch.nn.Module]",
+        device: str,
+    ) -> "OrderedDict[str, torch.nn.Module]":
+        """Record the device wrap passes down and hand back a different module."""
+        seen.append(device)
+        return OrderedDict(model=converted)
+
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _spy)
+    wrapped = DistributedDataParallelStrategy(device="cpu:0").wrap(_linear_models())
+    assert wrapped["model"].get_submodule("module") is converted
+    assert seen == ["cpu:0"]  # the strategy's own device, not a hardcoded "cpu"
+
+
+def test_ddp_wrap_leaves_the_models_alone_when_sync_batchnorm_is_off(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The YAML off-switch (`_bind_: {sync_batchnorm: false}`) is the only way out, so it must really opt out."""
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _unreachable_conversion)
+    models = _linear_models()
+    original = models["model"]
+    wrapped = DistributedDataParallelStrategy(device="cpu", sync_batchnorm=False).wrap(models)
+    assert wrapped["model"].get_submodule("module") is original
+
+
+def test_fsdp2_wrap_converts_before_the_mesh_and_shards_the_converted_tree(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conversion must come first: the mesh and the shard matching would otherwise see replaced modules.
+
+    The device it runs for is the strategy's own; a hardcoded one would convert (or skip) against
+    hardware this rank does not train on.
+    """
+    fsdp = pytest.importorskip("torch.distributed.fsdp")
+    strategy = FullyShardedDataParallelStrategy(device="cpu:0", shard_modules=["block?"])
+    converted = _block_models()
+    seen: list[Any] = []
+
+    def _spy(
+        models: "OrderedDict[str, torch.nn.Module]",
+        device: str,
+    ) -> "OrderedDict[str, torch.nn.Module]":
+        """Record the mesh state and device the conversion runs under, and hand back a different module tree."""
+        seen.append((strategy._mesh, device))
+        return converted
+
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _spy)
+    wrapped = strategy.wrap(_block_models())
+    assert seen == [(None, "cpu:0")]  # ran before the mesh was derived, for the strategy's own device
+    assert wrapped["model"] is converted["model"]
+    assert isinstance(converted["model"].block0, fsdp.FSDPModule)
+
+
+def test_fsdp2_wrap_leaves_the_models_alone_when_sync_batchnorm_is_off(
+    single_process_gloo: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The off-switch must reach FSDP2 too, its field being a separate one from DDP's."""
+    pytest.importorskip("torch.distributed.fsdp")
+    monkeypatch.setattr(distributed, "_convert_sync_batchnorm", _unreachable_conversion)
+    strategy = FullyShardedDataParallelStrategy(device="cpu", sync_batchnorm=False)
+    models = _linear_models()
+    assert strategy.wrap(models)["model"] is models["model"]
+
+
+def test_single_device_wrap_never_converts_batch_norm() -> None:
+    """A single device has no ranks to synchronize statistics across, so SyncBatchNorm is pure overhead.
+
+    The device is the only thing the conversion gates on, so a non-CPU one here would convert if the
+    single-device strategy ever grew the call. ``wrap`` never touches the device itself.
+    """
+    models: OrderedDict[str, torch.nn.Module] = OrderedDict(model=_BatchNormModel())
+    wrapped = SingleDeviceStrategy(device="cuda:0").wrap(models)
+    assert wrapped is models
+    assert type(models["model"].get_submodule("body.1")) is torch.nn.BatchNorm2d

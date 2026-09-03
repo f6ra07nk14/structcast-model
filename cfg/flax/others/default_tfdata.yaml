@@ -1,0 +1,95 @@
+# The Flax counterpart of "cfg/torch/others/default_timm.yaml": one rendered dataset pattern for
+# "scm flax train --training-dataset" / "--validation-dataset".
+# "crop_pct" picks the transform. Left null it is the small-image one this pipeline has always had
+# (a square resize, then a random crop while training or a central one while evaluating), which is
+# what a CIFAR-sized set wants. Set, it is the one timm gives "cfg/torch/others/default_timm.yaml" --
+# a random resized crop, a horizontal flip and colour jitter while training, a shortest-edge resize
+# and a central crop while evaluating, ImageNet channel statistics either way -- so a flax run and a
+# torch run over the same tree are drawn from the same distributions rather than from two recipes.
+# That is the one an ImageNet run wants, and 0.875 is the ratio timm defaults to.
+# The source is given one of two ways, and one of them must be:
+#   - "data_dir": the root of a dataset laid out one directory per split and one folder per class
+#     inside it, which is the tree the timm loader and "cfg/keras/others/default_keras.yaml" read
+#     too, so one dataset directory on the host serves all three frameworks. The images are decoded
+#     a batch at a time, so this is the form a run at ImageNet's size uses; "split" names the
+#     directory under the root, and "training" is what derives it.
+#   - "dataset": a "tensorflow_datasets" name, e.g. "cifar10", loaded through that package.
+# Render it twice, once per split, e.g.
+#   scm format cfg/flax/others/default_tfdata.yaml -o dataset_train.yaml \
+#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true, image_size: 224, crop_pct: 0.875}'
+#   scm format cfg/flax/others/default_tfdata.yaml -o dataset_valid.yaml \
+#       -p 'DEFAULT: {dataset: cifar10, split: test}'
+PARAMETERS:
+  DEFAULT:
+    training: false
+    # The split follows "training", as in "default_timm.yaml", so a validation loader can never be
+    # pointed at the training split by forgetting one of the two. It is both the tfds split and the
+    # directory under "data_dir". Set it to override the derived name, e.g.
+    # -p "DEFAULT: {split: test}" for a dataset whose evaluation split is called that.
+    split: null
+    batch_size: 128
+    # One of these two is required.
+    # "data_dir" is the root of a class-per-folder tree; the split directory under it is what the
+    # loader is pointed at.
+    data_dir: null
+    # "dataset" is a "tensorflow_datasets" name; the catalogue is at
+    # https://www.tensorflow.org/datasets/catalog.
+    dataset: null
+    dataset_dir: data # where tensorflow_datasets caches and downloads; unused by "data_dir"
+    download: false
+    image_size: 224
+    image_dtype: float32 # "float32", "float16", or "bfloat16"
+    # null keeps the small-image transform; a ratio switches to the ImageNet one, where the
+    # shortest edge is resized to image_size / crop_pct before the evaluation crop. Bounded to (0, 1].
+    crop_pct: null
+    hflip: true # random horizontal flip, training split only
+    seed: 42
+    # Items decoded and augmented at once, and batches held ready ahead of the device; null is
+    # "tf.data.AUTOTUNE" for both. They are this pipeline's "num_workers: 32", the number
+    # "cfg/torch/others/default_timm.yaml" hands timm: AUTOTUNE sizes itself from what it is already
+    # achieving, which on a host shared with a busy JAX process settles below what the CPU has, and a
+    # starved input pipeline costs step time rather than raising anything. The file read is the first
+    # op of the decode, so one number is both the reading and the augmentation budget.
+    num_parallel_calls: null
+    prefetch: null
+    # Whether the final short batch is dropped; null drops it on the training split alone, so a
+    # validation epoch covers the whole split -- 50 000 ImageNet images in batches of 512 are 97
+    # whole batches and a tail of 336 the torch example scores and this one would otherwise not.
+    # The tail still has to divide the data axis of the strategy's mesh; where it does not, the
+    # strategy says so and "true" here is the way out, at the price of that tail.
+    drop_remainder: null
+_obj_:
+  - _addr_: TFDataLoader
+    _file_: examples/flax/data.py
+  - _attr_: model_validate
+  - - _call_
+    # A plain mapping, not the FlexSpec of "default_timm.yaml": the loader yields NumPy batches and
+    # builds the dictionary itself, so the strategy places each entry in one transfer.
+    - spec: {image: 0, label: 1}
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      # Items the training shuffle of a "tensorflow_datasets" set holds at once; it does not bound
+      # a directory, whose file list is shuffled whole, before the decode.
+      shuffle_buffer: 1024
+      _jinja_yaml_: |-
+        {% set split_name = split if split is not none else ("train" if training else "validation") %}
+        {% if data_dir is not none %}
+        name: {{data_dir}}/{{split_name}}
+        {% elif dataset is not none %}
+        name: "{{dataset}}"
+        {% else %}
+        {{ 'A source is required and has no default: pass -p "DEFAULT: {data_dir: /path/to/dataset}" for a directory of class folders, or -p "DEFAULT: {dataset: cifar10}" for a tensorflow_datasets set.' | raise_error }}
+        {% endif %}
+        split: {{split_name}}
+        data_dir: {{dataset_dir}}
+        download: {{download}}
+        is_training: {{training}}
+        batch_size: {{batch_size}}
+        image_size: {{image_size}}
+        image_dtype: {{image_dtype}}
+        crop_pct: {{crop_pct | tojson}}
+        hflip: {{hflip}}
+        seed: {{seed}}
+        num_parallel_calls: {{num_parallel_calls | tojson}}
+        prefetch: {{prefetch | tojson}}
+        drop_remainder: {{drop_remainder | tojson}}

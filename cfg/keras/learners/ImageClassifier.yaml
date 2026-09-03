@@ -1,0 +1,107 @@
+# Supervised image classification for any Keras model whose root reads "image" and emits a
+# structured output whose only key is "cls", i.e. both "cfg/keras/models/VisionTransformer.yaml" and
+# "cfg/keras/models/ConvNeXtV2.yaml". One learner for both keeps a strategy comparison honest:
+# single, dp and fsdp runs differ only in the strategy configuration.
+# There is no CLIP field on this backend and no ACCUMULATE_GRADIENTS one: a Keras optimizer clips its
+# own gradients ("global_clipnorm") and accumulates them itself ("gradient_accumulation_steps"), so
+# both are keywords of the OPTIMIZER pattern below.
+PARAMETERS:
+  DEFAULT:
+    lr: 1.0e-3
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+    mixed_precision_type: null # null for the float32 run below, or "bfloat16" / "float16"
+IMPORTS: {}
+# "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the training CLI sets before it
+# builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
+# wraps every optimizer in a "keras.optimizers.LossScaleOptimizer" (a mapping here carries that
+# wrapper's keyword arguments), or "bfloat16", which shares float32's exponent range and stays
+# unscaled. Either field alone is refused, which is one difference in default precision from the
+# torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
+# bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
+# That pairing rule is also why one parameter carries both fields: -p "SHARED:
+# {mixed_precision_type: bfloat16}" is the mixed arm of a precision comparison, and the default below
+# is its float32 one.
+_jinja_yaml_: |-
+  {% if mixed_precision_type is none %}
+  MIXED_PRECISION: false
+  MIXED_PRECISION_TYPE: null
+  {% else %}
+  MIXED_PRECISION: true
+  MIXED_PRECISION_TYPE: {{mixed_precision_type}}
+  {% endif %}
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # "create_optimizer" is only there for "no_weight_decay_names": Keras exempts variables from
+    # weight decay through a method call, not a constructor keyword. Everything else is a plain
+    # "keras.optimizers.AdamW" keyword. Biases, the normalization scale ("gamma") and offset
+    # ("beta"), the lookup tables ("embeddings" -- the class token and the position table of the
+    # Vision Transformer) and the "scale" of ConvNeXt V2's global response normalization are the
+    # parameters that must not be decayed; this learner serves both models, so it names both sets.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: create_optimizer
+        _file_: examples/keras/optimizers.py
+      - _call_:
+          name: AdamW
+          no_weight_decay_names: [bias, gamma, beta, scale, embeddings]
+          beta_1: 0.9
+          beta_2: 0.999
+          _jinja_yaml_: |-
+            learning_rate: {{lr}}
+            weight_decay: {{weight_decay}}
+            {% if clip_grad_norm is not none %}
+            global_clipnorm: {{clip_grad_norm}}
+            {% endif %}
+            {% if accumulate_gradients is not none %}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% endif %}
+    EXTRA: {}
+    # The cast is what the mixed arm of "mixed_precision_type" costs this flow, and an identity on the
+    # float32 default: the head emits MIXED_PRECISION_TYPE, and the accuracies want float32 --
+    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16
+    # prediction outright on the tensorflow backend (jax and torch compute it, and the
+    # "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). This is the
+    # "float32 output layer" rule of the Keras mixed precision guide, written in the flow rather than
+    # as a "dtype" on the head, so that one model template serves both arms unchanged.
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - INPUTS: {y_true: label, y_pred: logits}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: keras.losses.SparseCategoricalCrossentropy}, {_call_: {from_logits: true}}]
+      # The accuracy functions report one 0/1 value per sample, so each is averaged over the batch.
+      - INPUTS: {y_true: label, y_pred: logits}
+        OUTPUTS: correct1
+        NAME: accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - INPUTS: {y_true: label, y_pred: logits, k: 5}
+        OUTPUTS: correct5
+        NAME: top_5_accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - [{y_true: label, y_pred: logits}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: logits}, correct1, accuracy]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - [{y_true: label, y_pred: logits, k: 5}, correct5, top_5_accuracy]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

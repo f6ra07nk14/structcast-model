@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from timm.layers.grn import GlobalResponseNorm as TimmGRN
 
+import keras
 from structcast_model.keras.layers.grn import GlobalResponseNormalization
 import torch
 
@@ -25,7 +26,9 @@ def _run_keras_grn(x_np: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
     layer = GlobalResponseNormalization(epsilon=eps)
     layer.build(x_np.shape)
     out = layer(x_np.astype(np.float32))
-    return np.array(out)
+    # stop_gradient is the backend-neutral detach: the torch backend refuses numpy() on a tensor
+    # that requires grad.
+    return np.asarray(keras.ops.convert_to_numpy(keras.ops.stop_gradient(out)))
 
 
 def test_grn_matches_timm_simple() -> None:

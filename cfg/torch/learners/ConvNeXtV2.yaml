@@ -115,6 +115,8 @@ LEARNERS:
             _jinja_yaml_: |-
               warmup_epochs: {{warmup_epochs}}
               num_epochs: {{epochs}}
+    # "clip_grad_norm" is the L2 threshold the global gradient norm is scaled down to -- timm's
+    # "value", the bound the Flax and Keras twins spell "max_norm" and "global_clipnorm".
     _jinja_yaml_: |-
       {% if clip_grad_norm is none %}
       CLIP: null
@@ -122,7 +124,7 @@ LEARNERS:
       CLIP:
         - _obj_
         - _addr_: timm.utils.clip_grad.dispatch_clip_grad
-        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+        - _bind_: {value: {{clip_grad_norm}}, mode: norm, norm_type: 2.0}
       {% endif %}
     EXTRA: {}
     FLOW:

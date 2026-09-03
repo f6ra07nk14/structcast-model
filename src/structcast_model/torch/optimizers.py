@@ -1,6 +1,6 @@
 """Build optimizers."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from logging import getLogger
 from re import Pattern as RePattern, compile as re_compile
 from typing import TYPE_CHECKING, Any
@@ -159,6 +159,50 @@ def set_lr_scale(optimizer: Optimizer, delete_lr_scale: bool = False) -> None:
                 del group["lr_scale"]
 
 
+def get_learning_rate(optimizer: Optimizer) -> float:
+    """Return the current learning rate of the first parameter group.
+
+    Optimizers created by `create_opt` always have at least one group, and the base learning rate
+    lives in group 0.  Surfacing it as a helper keeps generated learner scripts free of index
+    magic that silently breaks when the optimizer API changes.
+    """
+    return optimizer.param_groups[0]["lr"]
+
+
+def get_named_parameters(
+    models: Iterable["torch.nn.Module | Iterable[tuple[str, Parameter]]"],
+) -> list[tuple[str, Parameter]]:
+    """Collect named parameters from a mix of modules and pre-named iterables.
+
+    Optimizer state is keyed by parameter name (the repo's *Pairing* concept), so every
+    parameter that reaches `create_opt` must carry a name.  This helper lets generated
+    learner scripts pass both ``nn.Module`` instances and pre-named iterables (e.g. from a
+    custom parameter source) in the same call.
+    """
+    return [p for m in models for p in (m.named_parameters() if isinstance(m, torch.nn.Module) else m)]
+
+
+def get_param_groups(optimizer: Optimizer) -> list[dict[str, Any]]:
+    """Return the optimizer's parameter groups with the heavy ``params`` tensor list stripped.
+
+    The remaining metadata (learning rate, weight decay, momentum, …) is what a logger or
+    checkpoint inspector needs; the actual tensors are redundant for reporting and break
+    serialization.
+    """
+    return [{k: v for k, v in pg.items() if k != "params"} for pg in optimizer.param_groups]
+
+
+def restore_requires_grad(module: "torch.nn.Module", defaults: Iterable[bool]) -> None:
+    """Reset each parameter's ``requires_grad`` flag to its construction-time default.
+
+    Partially frozen models must stay frozen across optimizer segments: between segments,
+    the training step blanket-freezes everything and then restores only the trainable
+    model's original flags via this helper.
+    """
+    for p, d in zip(module.parameters(), defaults, strict=True):
+        p.requires_grad_(d)
+
+
 def create_opt(
     params: list[tuple[str, Parameter]],
     *,
@@ -239,7 +283,15 @@ def create_opt(
     return optimizer
 
 
-__all__ = ["create_opt", "get_decays", "set_lr_scale"]
+__all__ = [
+    "create_opt",
+    "get_decays",
+    "get_learning_rate",
+    "get_named_parameters",
+    "get_param_groups",
+    "restore_requires_grad",
+    "set_lr_scale",
+]
 
 
 if not TYPE_CHECKING:
