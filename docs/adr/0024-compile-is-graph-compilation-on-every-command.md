@@ -40,8 +40,8 @@ trainer to consume in `make_train_function` and its test and predict twins, whil
 calls `model(x)` directly — `Layer.__call__` and `Operation.__call__` in keras 3.15.1 contain no
 reference to it. On a ConvNeXtV2-atto CPU run the medians with and without the flag differ by 3–5%,
 inside run-to-run noise, and `model.predict_function` is still `None` after the loop, while the
-compiled predict path is 4.3× (tensorflow) / 1.9× (jax) faster on that same model
-(`docs/references/keras-time-compile-cpu.md`). So `time` hands the forward to the ambient backend
+compiled predict path is 4.3× (tensorflow) / 1.9× (jax) faster on that same model — a one-off
+local CPU run, summarized here and nowhere else. So `time` hands the forward to the ambient backend
 adapter's `build_inference_step` — the seam `train` uses — when the flag is given, and keeps the
 direct call when it is not; no command calls `keras.Model.compile`.
 
