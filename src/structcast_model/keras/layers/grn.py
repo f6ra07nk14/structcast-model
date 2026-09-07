@@ -76,6 +76,14 @@ class GlobalResponseNormalization(keras.layers.Layer):
 
     def call(self, inputs: keras.KerasTensor) -> keras.KerasTensor:
         """Applies Global Response Normalization to the input."""
-        x_g = ops.sqrt(ops.sum(ops.square(inputs), axis=self.reduction_axes, keepdims=True))
+        # `sqrt` has an infinite derivative at 0, so an all-zero channel back-propagates `inf * 0 = NaN`.
+        # This mirrors `optax.safe_norm`: mask the zero vector to ones and renorm, so the untaken branch
+        # stays finite and the zero-norm sub-gradient is 0, matching PyTorch `norm_backward` (timm). See
+        # https://github.com/google-deepmind/optax/blob/main/optax/_src/numerics.py#L48-L83 and
+        # https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where on the inner `where`.
+        norm = ops.sqrt(ops.sum(ops.square(inputs), axis=self.reduction_axes, keepdims=True))
+        masked = ops.where(ops.less_equal(norm, 0.0), ops.ones_like(inputs), inputs)
+        masked_norm = ops.sqrt(ops.sum(ops.square(masked), axis=self.reduction_axes, keepdims=True))
+        x_g = ops.where(ops.less_equal(norm, 0.0), 0.0, masked_norm)
         x_n = x_g / (ops.mean(x_g, axis=self.feature_axes, keepdims=True) + self.epsilon)
         return inputs + (inputs * x_n) * self.scale + self.bias

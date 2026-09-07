@@ -44,6 +44,14 @@ class GlobalResponseNorm(Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """Applies Global Response Normalization to the input."""
         x, scale, bias = self.promote_dtype((x, self.scale, self.bias), dtype=self.dtype)
-        x_g = jnp.sqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
+        # `sqrt` has an infinite derivative at 0, so an all-zero channel back-propagates `inf * 0 = NaN`.
+        # Mirrors `optax.safe_norm`: mask that zero vector to ones and renorm, so the untaken branch stays
+        # finite and the zero-norm sub-gradient is 0, matching PyTorch `norm_backward` (the timm reference). See
+        # https://github.com/google-deepmind/optax/blob/main/optax/_src/numerics.py#L48-L83 and
+        # https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where on the inner `where`.
+        norm = jnp.sqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
+        masked = jnp.where(norm <= 0, jnp.ones_like(x), x)
+        masked_norm = jnp.sqrt((masked * masked).sum(axis=self.reduction_axes, keepdims=True))
+        x_g = jnp.where(norm <= 0, 0, masked_norm)
         x_n = x_g / (x_g.mean(axis=self.feature_axes, keepdims=True) + self.epsilon)
         return x + (x * x_n) * scale + bias
