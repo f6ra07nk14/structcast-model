@@ -30,7 +30,7 @@ class GlobalResponseNormalization(keras.layers.Layer):
         feature_axes: int | tuple[int, ...] = -1,
         epsilon: float = 1e-6,
         beta_initializer: Any = "zeros",
-        gamma_initializer: Any = "ones",
+        gamma_initializer: Any = "zeros",
         beta_regularizer: Any | None = None,
         gamma_regularizer: Any | None = None,
         beta_constraint: Any | None = None,

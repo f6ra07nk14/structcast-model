@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flax.nnx import Rngs
+from flax.nnx import Rngs, initializers
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -46,7 +46,7 @@ def _zero_channel_input() -> np.ndarray:
 
 def _run_flax_grn(x_np: np.ndarray, *, dim: int, eps: float = 1e-6) -> np.ndarray:
     """Run Flax GRN with scale=1, bias=0 and return NumPy result."""
-    grn = FlaxGRN(num_features=dim, epsilon=eps, rngs=Rngs(0))
+    grn = FlaxGRN(num_features=dim, epsilon=eps, scale_init=initializers.ones_init(), rngs=Rngs(0))
     out = grn(jnp.array(x_np))
     return np.array(out)
 
@@ -102,7 +102,7 @@ def test_grn_initializes_scale_and_bias() -> None:
     grn = FlaxGRN(num_features=8, rngs=Rngs(0))
     assert grn.scale[...].shape == (8,)
     assert grn.bias[...].shape == (8,)
-    np.testing.assert_allclose(np.array(grn.scale[...]), np.ones(8), atol=1e-7)
+    np.testing.assert_allclose(np.array(grn.scale[...]), np.zeros(8), atol=1e-7)
     np.testing.assert_allclose(np.array(grn.bias[...]), np.zeros(8), atol=1e-7)
 
 
@@ -125,7 +125,7 @@ def test_grn_zero_channel_gradient_matches_timm() -> None:
     x = _zero_channel_input()
     np.testing.assert_allclose(_run_flax_grn(x, dim=8), _run_timm_grn(x, dim=8), rtol=1e-5, atol=1e-6)
 
-    grn = FlaxGRN(num_features=8, epsilon=1e-6, rngs=Rngs(0))
+    grn = FlaxGRN(num_features=8, epsilon=1e-6, scale_init=initializers.ones_init(), rngs=Rngs(0))
     grad = np.array(jax.grad(lambda v: grn(v).sum())(jnp.array(x)))
     assert np.isfinite(grad).all()
     np.testing.assert_allclose(grad, _timm_grn_input_grad(x, dim=8), rtol=1e-5, atol=1e-6)
@@ -139,14 +139,27 @@ def test_grn_bfloat16_zero_channel_gradient_is_finite() -> None:
     layer to bfloat16 tolerance and that the all-zero channel still back-propagates a finite gradient.
     """
     x_bf16 = jnp.array(_zero_channel_input(), dtype=jnp.bfloat16)
-    grn = FlaxGRN(num_features=8, dtype=jnp.bfloat16, rngs=Rngs(0))
+    grn = FlaxGRN(num_features=8, dtype=jnp.bfloat16, scale_init=initializers.ones_init(), rngs=Rngs(0))
     out = grn(x_bf16)
     assert out.dtype == jnp.bfloat16
 
-    reference = FlaxGRN(num_features=8, rngs=Rngs(0))(x_bf16.astype(jnp.float32)).astype(jnp.bfloat16)
+    reference = FlaxGRN(num_features=8, scale_init=initializers.ones_init(), rngs=Rngs(0))(
+        x_bf16.astype(jnp.float32)
+    ).astype(jnp.bfloat16)
     np.testing.assert_allclose(
         np.array(out.astype(jnp.float32)), np.array(reference.astype(jnp.float32)), rtol=1e-2, atol=1e-2
     )
 
     grad = jax.grad(lambda v: grn(v).sum())(x_bf16)
     assert np.isfinite(np.array(grad.astype(jnp.float32))).all()
+
+
+def test_grn_default_is_identity_like_timm() -> None:
+    """Zero-initialized GRN leaves the residual branch unchanged, matching timm."""
+    x = _zero_channel_input()
+    grn = FlaxGRN(num_features=8, rngs=Rngs(0))
+    expected = TimmGRN(dim=8)(torch.from_numpy(x)).detach().numpy()
+    np.testing.assert_array_equal(np.asarray(grn(jnp.asarray(x))), expected)
+    np.testing.assert_array_equal(expected, x)
+    grad = jax.grad(lambda v: grn(v).sum())(jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(grad), np.ones_like(x))

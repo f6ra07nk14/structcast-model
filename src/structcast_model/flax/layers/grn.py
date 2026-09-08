@@ -21,7 +21,7 @@ class GlobalResponseNorm(Module):
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
         bias_init: Initializer = initializers.zeros_init(),  # noqa: B008
-        scale_init: Initializer = initializers.ones_init(),  # noqa: B008
+        scale_init: Initializer = initializers.zeros_init(),  # noqa: B008
         reduction_axes: Axes = (1, 2),
         feature_axes: Axes = -1,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,

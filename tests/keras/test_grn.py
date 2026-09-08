@@ -65,8 +65,8 @@ def _input_gradient(layer: GlobalResponseNormalization, x_np: np.ndarray) -> np.
 
 
 def _run_keras_grn(x_np: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
-    """Run Keras GRN with default initializers (scale=1, bias=0) and return NumPy result."""
-    layer = GlobalResponseNormalization(epsilon=eps)
+    """Run Keras GRN with scale=1, bias=0 and return NumPy result."""
+    layer = GlobalResponseNormalization(epsilon=eps, gamma_initializer="ones")
     layer.build(x_np.shape)
     out = layer(x_np.astype(np.float32))
     # stop_gradient is the backend-neutral detach: the torch backend refuses numpy() on a tensor
@@ -126,6 +126,8 @@ def test_grn_build_sets_weights() -> None:
     layer.build((1, 4, 4, 8))
     assert layer.scale.shape == (8,)
     assert layer.bias.shape == (8,)
+    np.testing.assert_array_equal(keras.ops.convert_to_numpy(layer.scale), np.zeros(8))
+    np.testing.assert_array_equal(keras.ops.convert_to_numpy(layer.bias), np.zeros(8))
 
 
 def test_grn_feature_axes_tuple() -> None:
@@ -146,7 +148,7 @@ def test_grn_zero_channel_gradient_matches_timm() -> None:
     x = _zero_channel_input()
     np.testing.assert_allclose(_run_keras_grn(x), _run_timm_grn(x, dim=8), rtol=1e-5, atol=1e-6)
 
-    layer = GlobalResponseNormalization()
+    layer = GlobalResponseNormalization(gamma_initializer="ones")
     layer.build(x.shape)
     grad = _input_gradient(layer, x)
     assert np.isfinite(grad).all()
@@ -166,7 +168,7 @@ def test_grn_bfloat16_zero_channel_gradient_is_finite() -> None:
     previous = keras.mixed_precision.global_policy()
     try:
         keras.mixed_precision.set_global_policy("mixed_bfloat16")
-        layer = GlobalResponseNormalization()
+        layer = GlobalResponseNormalization(gamma_initializer="ones")
         layer.build(x.shape)
         out = layer(x)
         assert keras.backend.standardize_dtype(out.dtype) == "bfloat16"
@@ -175,3 +177,15 @@ def test_grn_bfloat16_zero_channel_gradient_is_finite() -> None:
         assert np.isfinite(_input_gradient(layer, x)).all()
     finally:
         keras.mixed_precision.set_global_policy(previous)
+
+
+def test_grn_default_is_identity_like_timm() -> None:
+    """Zero-initialized GRN leaves the residual branch unchanged, matching timm."""
+    x = _zero_channel_input()
+    layer = GlobalResponseNormalization()
+    layer.build(x.shape)
+    expected = TimmGRN(dim=8)(torch.from_numpy(x)).detach().numpy()
+    actual = keras.ops.convert_to_numpy(keras.ops.stop_gradient(layer(x)))
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(expected, x)
+    np.testing.assert_array_equal(_input_gradient(layer, x), np.ones_like(x))
