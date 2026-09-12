@@ -151,7 +151,7 @@ CREW=(
   'reviewers|reviewer_opus|claude|--model claude-opus-5 --effort xhigh --dangerously-skip-permissions'
   'reviewers|reviewer_astra|codex|-m gpt-6-astra -c model_reasoning_effort="low"'
   'reviewers|reviewer_sol|codex|-m gpt-5.6-sol -c model_reasoning_effort="xhigh"'
-  'websearch|worker_gemini|agy|--model gemini-3.8-flash-high'
+  'websearch|worker_gemini|agy|--model gemini-3.8-flash-high --dangerously-skip-permissions'
 )
 
 cur_tab=""; last_pane=""; n=0
