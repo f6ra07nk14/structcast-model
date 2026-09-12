@@ -1,0 +1,12 @@
+# Distributed strategy pattern: data parallel. Every replica holds a full copy of the variables and
+# each batch is split across them along its leading dimension, so a batch must be divisible by the
+# number of replicas. The mechanism is the active Keras backend's own: keras.distribution.DataParallel
+# on jax, tf.distribute.MirroredStrategy on tensorflow, DistributedDataParallel on torch -- where the
+# ranks come from the launcher (torchrun) and the loader owns each rank's slice of the data. The
+# pattern is called with device=..., which selects the device type the run spans. Bind devices to use
+# only the first N of them (jax and tensorflow only).
+- _obj_
+- _addr_: structcast_model.keras.distributed.KerasDistributedStrategy
+- _bind_:
+    preset: dp
+    # devices: 4

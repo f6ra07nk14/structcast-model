@@ -7,6 +7,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import pathlib
@@ -23,10 +24,14 @@ from typer import Typer
 from typer.testing import CliRunner
 
 from structcast_model.base_trainer import BaseInfo
+from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
 from structcast_model.commands.cmd_torch import app
-from structcast_model.commands.utils import instantiate_object
-from structcast_model.torch.trainer import TorchTrainer
+from structcast_model.commands.utils import get_module_outputs as _get_module_outputs, instantiate_object
+from structcast_model.loggers.base import NullLogger
+from structcast_model.torch.distributed import SingleDeviceStrategy
+from structcast_model.torch.trainer import TorchTrainer, initial_model, restore_training_state
 from tests import CFG_DIR, FIXTURES_DIR
+from tests.fakes import CountingLearner
 import torch
 import torch.distributed as dist
 
@@ -43,8 +48,8 @@ assert _FIRST_CALLBACK is not None, "cmd_torch registers every command with a ca
 _CMD_GLOBALS: dict[str, Any] = _FIRST_CALLBACK.__globals__
 
 # Access private functions from cmd_torch via its module globals
-_get_module_outputs = _CMD_GLOBALS["_get_module_outputs"]
 _instantiate_models = _CMD_GLOBALS["_instantiate_models"]
+_cap_gpu_memory = _CMD_GLOBALS["_cap_gpu_memory"]
 
 
 @contextmanager
@@ -128,13 +133,14 @@ class _SimpleLoss(torch.nn.Module):
         return {"loss": torch.nn.functional.cross_entropy(logits, target)}
 
 
-class SimpleLearner:
+class SimpleLearner(CountingLearner):
     """Minimal learner implementing the Learner protocol with a real optimizer."""
 
     outputs: list[str] = ["loss", "acc"]
 
     def __init__(self, **models: torch.nn.Module) -> None:
         """Keep the models and build one optimizer over the first of them."""
+        super().__init__()
         self._models = models
         model = next(iter(models.values()))
         self._optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -144,12 +150,9 @@ class SimpleLearner:
         """Return models."""
         return self._models
 
-    def update(self, step: int) -> bool:
-        """Always signal update."""
-        return True
-
     def training_step(self, **kwargs: Any) -> dict[str, Any]:
-        """Return fixed training criteria."""
+        """Count one step that always lands an update, returning fixed training criteria."""
+        self.count_step()
         return {"loss": torch.tensor(0.5), "acc": torch.tensor(0.9)}
 
     def inference_step(self, **kwargs: Any) -> dict[str, Any]:
@@ -189,7 +192,38 @@ class LearnerWithoutOutputs(SimpleLearner):
     outputs = property(lambda self: (_ for _ in ()).throw(AttributeError))  # type: ignore[assignment]
 
 
-class GradientLearner:
+class AveragingLearner(SimpleLearner):
+    """A learner declaring an averaged shadow of its model, the way a generated one does.
+
+    Public so an object pattern can address it. The weights move by a fixed step per training step,
+    so the average's trajectory is arithmetic: a resume that dropped it is visible in the numbers,
+    not only in the blend counter.
+    """
+
+    def __init__(self, **models: torch.nn.Module) -> None:
+        """Build the average over the model, at a decay far enough from torch's to be unmistakable."""
+        super().__init__(**models)
+        self._model = next(iter(models.values()))
+        self._ema = torch.optim.swa_utils.AveragedModel(
+            self._model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.5)
+        )
+        self._ema.eval()
+
+    @property
+    def models(self) -> dict[str, Any]:
+        """Return the trained models and the average, which is what a checkpoint carries."""
+        return {**self._models, "ema_model": self._ema}
+
+    def training_step(self, **kwargs: Any) -> dict[str, Any]:
+        """Move the weights by one, then blend the average, as an Update-gated learner does."""
+        criteria = super().training_step(**kwargs)
+        with torch.no_grad():
+            next(self._model.parameters()).add_(1.0)
+        self._ema.update_parameters(self._model)
+        return criteria
+
+
+class GradientLearner(CountingLearner):
     """Learner running one squared-error step and dumping the gradient it produced to disk.
 
     The command builds the learner with the models the strategy wrapped, so the gradient read here
@@ -201,6 +235,7 @@ class GradientLearner:
 
     def __init__(self, **models: torch.nn.Module) -> None:
         """Keep the models the command built."""
+        super().__init__()
         self._models = models
 
     @property
@@ -208,27 +243,9 @@ class GradientLearner:
         """Return models."""
         return self._models
 
-    @property
-    def optimizers(self) -> dict[str, Any]:
-        """Return no optimizers: the run reads gradients, it never applies them."""
-        return {}
-
-    @property
-    def optimizer_models(self) -> dict[str, list[str]]:
-        """Return no pairing, there being no optimizer."""
-        return {}
-
-    @property
-    def learning_rates(self) -> dict[str, float]:
-        """Return no learning rates, there being no optimizer."""
-        return {}
-
-    def update(self, step: int) -> bool:
-        """Always signal update."""
-        return True
-
     def training_step(self, x: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         """Run one step and write the model's gradient, right after the backward, to `GRADIENT_DIR`."""
+        self.count_step()
         model = self._models["model"]
         loss = ((model(x) - target) ** 2).sum()
         loss.backward()
@@ -325,6 +342,18 @@ def test_create_help_exits_zero(cli_runner: CliRunner) -> None:
     assert cli_runner.invoke(app, ["create", "learner", "--help"]).exit_code == 0
     assert cli_runner.invoke(app, ["ptflops", "--help"]).exit_code == 0
     assert cli_runner.invoke(app, ["calflops", "--help"]).exit_code == 0
+
+
+def test_train_help_shows_no_python_repr(cli_runner: CliRunner) -> None:
+    """'train --help' must describe values, never Python objects.
+
+    The three criterion options pair `...` with `default_factory=list`, which Typer renders as
+    "[default: <class 'list'>]" unless show_default is off; a user shown a class repr cannot tell that
+    the real default is "no criteria monitored".
+    """
+    result = cli_runner.invoke(app, ["train", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "<class" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +465,14 @@ def test_create_learner_calls_torch_learner_builder(tmp_path: Any, cli_runner: C
     script = (tmp_path / "learner.py").read_text()
     assert "class Learner" in script
     # The generated class is a Learner by shape, not by inheritance: these members are the protocol.
-    for member in ("def update(self", "def training_step(self", "def inference_step(self"):
+    for member in (
+        "def training_step(self",
+        "def inference_step(self",
+        "def steps(self",
+        "def updates(self",
+        "def has_updated(self",
+        "def restore_counters(self",
+    ):
         assert member in script
     assert "def models(self" in script
 
@@ -603,6 +639,7 @@ def test_train_raises_for_invalid_model_pattern_shape() -> None:
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=None,
             learner_pattern=_learner_pattern(),
             learner_outputs=None,
             compile_pattern=None,
@@ -638,6 +675,7 @@ def test_train_raises_when_module_outputs_missing_and_not_provided() -> None:
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=None,
             learner_pattern=_learner_pattern("LearnerWithoutOutputs"),
             learner_outputs=None,
             compile_pattern=None,
@@ -713,6 +751,7 @@ def _invoke_train(
     log_artifacts: list[pathlib.Path] | None = None,
     epochs: int = 2,
     resume: str | None = None,
+    gpu_memory_fraction: float | None = None,
 ) -> None:
     """Invoke the ``train`` callback with real modules, patching only the dataset instantiation."""
     if training_data is None:
@@ -730,6 +769,7 @@ def _invoke_train(
             initializer_patterns=None,
             shapes=[{"x": (4,)}],
             device="cpu",
+            gpu_memory_fraction=gpu_memory_fraction,
             learner_pattern=_learner_pattern(learner_classname),
             learner_outputs=learner_outputs,
             compile_pattern=None,
@@ -770,20 +810,149 @@ def test_train_ci_mode_end_to_end(tmp_path: pathlib.Path) -> None:
     assert run.data.metrics["val_loss"] == pytest.approx(0.3)
     assert run.data.metrics["best_acc"] == pytest.approx(0.9)
     artifacts = [artifact.path for artifact in MlflowClient().list_artifacts(run.info.run_id)]
-    assert {"training_state", "best_acc", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
+    # The state backend writes one artifact file per state, where `mlflow.pytorch` wrote a directory.
+    assert {"training_state.pt", "best_acc.pt", "arguments.yaml", "param_groups.yaml"} <= set(artifacts)
+
+
+def test_train_publishes_the_strategys_data_coordinates_for_the_dataset_patterns(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataset is an object pattern the CLI hands nothing to, so the coordinates travel by environment.
+
+    They are the strategy's, not the process's: the ranks of a tensor-parallel group share one data
+    slice, and a loader keyed on the global rank would hand each of them a different batch
+    (`docs/adr/0022`). The seed derivation reads the same coordinate.
+    """
+    # Set, not deleted, so the teardown restores whatever the session had rather than the value the
+    # run leaves behind.
+    monkeypatch.setenv("DATA_RANK", "unset")
+    monkeypatch.setenv("DATA_WORLD_SIZE", "unset")
+
+    _invoke_train(tmp_path, epochs=1)
+
+    assert (os.environ["DATA_RANK"], os.environ["DATA_WORLD_SIZE"]) == ("0", "1")
 
 
 def test_train_resumes_from_a_saved_training_state(tmp_path: pathlib.Path) -> None:
-    """--resume must continue at the epoch after the saved one instead of training the run again."""
+    """--resume must continue at the epoch after the saved one, with the loop counters seeded.
+
+    The step and update counts were saved into the meta but never restored -- the pre-existing hole
+    `docs/adr/0018` closes -- so the resumed run's own saved state must count on from the first
+    run's six steps instead of restarting at zero.
+    """
     _invoke_train(tmp_path, epochs=2)
-    # `mlflow.pytorch.log_state_dict` writes the tensors to a file inside the artifact directory.
-    (state,) = (tmp_path / "mlruns").rglob("training_state/state_dict.pth")
+    (state,) = (tmp_path / "mlruns").rglob("training_state.pt")
     _invoke_train(tmp_path, epochs=3, resume=str(state))
     runs = mlflow.search_runs(experiment_names=["test-e2e"], output_format="list")
     assert len(runs) == 2
     resumed = max(runs, key=lambda run: run.info.start_time)
     history = MlflowClient().get_metric_history(resumed.info.run_id, "val_loss")
     assert [metric.step for metric in history] == [3]
+    resumed_state = next(
+        path for path in (tmp_path / "mlruns").rglob("training_state.pt") if resumed.info.run_id in str(path)
+    )
+    # 2 epochs of 3 batches ran before the save; the resumed epoch adds 3 more on top of them.
+    meta = torch.load(resumed_state, map_location="cpu", weights_only=True)["meta"]
+    assert (meta["epoch"], meta["step"], meta["update"]) == (3, 9, 9)
+
+
+def test_train_resumes_the_averaged_shadow_models_the_learner_declares(tmp_path: pathlib.Path) -> None:
+    """A resume restores everything the learner calls a model, which is more than the command built.
+
+    The command builds the models named on its own command line; the average is the learner's, and
+    the saver writes it because it writes `learner.models`. Restoring the command's mapping instead
+    would leave the average at its construction value with nothing blended into it -- a checkpoint
+    that saves what it cannot resume. One batch per epoch makes the blend exact: the resumed run's
+    average must be the saved one blended once with the weights the resumed epoch left.
+    """
+    batches = _make_training_dataset()[:1]
+    _invoke_train(tmp_path, learner_classname="AveragingLearner", epochs=1, training_data=batches)
+    (first,) = (tmp_path / "mlruns").rglob("training_state.pt")
+    saved = torch.load(first, map_location="cpu", weights_only=True)["models"]
+
+    _invoke_train(tmp_path, learner_classname="AveragingLearner", epochs=2, resume=str(first), training_data=batches)
+
+    path = next(p for p in (tmp_path / "mlruns").rglob("training_state.pt") if p != first)
+    resumed = torch.load(path, map_location="cpu", weights_only=True)["models"]
+    assert int(resumed["ema_model"]["n_averaged"]) == 2
+    expected = torch.lerp(saved["ema_model"]["module.fc.weight"], resumed["model"]["fc.weight"], 0.5)
+    assert torch.equal(resumed["ema_model"]["module.fc.weight"], expected)
+
+
+def _load_generated(path: pathlib.Path, name: str) -> Any:
+    """Load a generated module by file path, the way a configuration does: not by import name."""
+    spec = spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _StateLogger(NullLogger):
+    """Logger handing back one prepared state, standing in for a fetch from a tracking service."""
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        """Remember the state to hand back."""
+        self.state = state
+
+    # `Any`, not `dict[str, Any]`: `NullLogger` fetches nothing and narrows the return to None.
+    def fetch_training_state(self, reference: str) -> Any:
+        """Return the prepared state whatever the reference is."""
+        return self.state
+
+
+def test_restore_training_state_seeds_the_counters_of_a_generated_learner(tmp_path: pathlib.Path) -> None:
+    """Resuming must seed the generated learner's counters so the accumulation cadence continues.
+
+    With `ACCUMULATE_GRADIENTS: 3` the gate lands the updates on steps 2, 5, 8, ...: after four
+    steps the counts read (4, 1) and the next window closes on step 5. A resume that restored the
+    weights but left the counters at zero would read (0, 0) and hold the next apply back for two
+    extra steps -- the saved-but-never-restored hole `docs/adr/0018` closes.
+    """
+    generated = tmp_path / "generated"
+    TorchBuilder.from_path(LINEAR_CFG)()(generated / "model.py")
+    TorchLearnerBuilder.from_path(str(FIXTURES_DIR / "cfg" / "torch" / "LinearLearner.yaml"))(
+        parameters={"DEFAULT": {"accumulate_gradients": 3}}
+    )(generated / "learner.py")
+    model_type = _load_generated(generated / "model.py", "generated_model").Model
+    learner_type = _load_generated(generated / "learner.py", "generated_learner").Learner
+
+    def _build(seed: int) -> Any:
+        """Build a learner over a seeded model, materializing the lazy layer before the optimizer scans it."""
+        torch.manual_seed(seed)
+        model = model_type()
+        initial_model(model, {"x": (4,)})
+        return learner_type(model)
+
+    batch = {
+        "x": torch.tensor([[1.0, 0.5, -0.5, 2.0], [0.0, 1.0, 1.0, -1.0]]),
+        "y": torch.tensor([[1.0, -1.0], [0.5, 0.25]]),
+    }
+    strategy = SingleDeviceStrategy(device="cpu")
+    trained = _build(0)
+    for _ in range(4):
+        trained.training_step(**batch)
+    assert (trained.steps, trained.updates) == (4, 1)
+    states = strategy.state_dict(dict(trained.models), trained.optimizers, trained.optimizer_models)
+    states["grad_scalers"] = {}
+    states["meta"] = {"epoch": 1, "step": trained.steps, "update": trained.updates}
+
+    resumed = _build(7)
+    epoch = restore_training_state(
+        resume="whatever",
+        strategy=strategy,
+        models=OrderedDict(resumed.models),
+        learner=resumed,
+        start_epoch=1,
+        is_main=True,
+        logger=_StateLogger(states),
+    )
+
+    assert epoch == 2
+    assert (resumed.steps, resumed.updates) == (4, 1)
+    resumed.training_step(**batch)
+    assert (resumed.steps, resumed.updates, resumed.has_updated) == (5, 2, True)
 
 
 def test_train_ci_mode_with_learner_outputs_fallback(tmp_path: pathlib.Path) -> None:
@@ -883,9 +1052,10 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
     fake = _FakeWandb(tmp_path / "wandb_run")
     artifact = tmp_path / "artifact.bin"
     artifact.write_text("dummy")
-    # The command's lazy handle caches the module it first loaded, so it needs the reloaded one.
-    with patch_cmd_globals(wandb_logger=wandb_logger_with(fake)):
-        _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
+    # The fixture publishes the fake through `loggers.WandbLogger`, the attribute the command reads,
+    # so the run exercises the real `scm_loggers` flat access rather than a stand-in for it.
+    wandb_logger_with(fake)
+    _invoke_train(tmp_path, ci=True, logger_name="wandb", log_artifacts=[artifact])
     assert fake.projects == ["test-e2e"]
     assert fake.finished == 1
     assert fake.params["epochs"] == 2
@@ -894,6 +1064,57 @@ def test_train_logs_the_whole_run_through_the_selected_logger(
     assert fake.metrics[0][0]["val_loss"] == pytest.approx(0.3)
     assert (tmp_path / "wandb_run" / "arguments.yaml").exists()
     assert (tmp_path / "wandb_run" / "training_state.pt").exists()
+
+
+# ---------------------------------------------------------------------------
+# `train` — --gpu-memory-fraction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.5, 1.5])
+def test_train_refuses_a_memory_fraction_outside_the_unit_interval(tmp_path: pathlib.Path, fraction: float) -> None:
+    """A fraction at 0 or outside (0, 1] caps nothing, and would otherwise be applied as if it did.
+
+    torch itself only refuses a negative one, so a 0 would hand the run an allocator it can never
+    allocate from and a 1.5 would read as a cap while raising the limit above the device.
+    """
+    with pytest.raises(ValueError, match=r"must be in \(0, 1\]"):
+        _invoke_train(tmp_path, epochs=1, gpu_memory_fraction=fraction)
+
+
+def test_cap_gpu_memory_caps_the_device_the_run_resolved_to(monkeypatch: Any) -> None:
+    """The cap must land on the run's own device, and on nothing at all without CUDA or a fraction.
+
+    Every rank of a torchrun launch runs this command against its own "cuda:<LOCAL_RANK>", so a cap
+    aimed anywhere else would either leave the rank uncapped or claim a share of a sibling's device.
+    The torch call is stubbed because the machine running the suite need not have a GPU: what the cap
+    is asked to do is under test, not CUDA. A CPU run must reach neither.
+    """
+    capped: list[tuple[float, Any]] = []
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction", lambda fraction, device: capped.append((fraction, device))
+    )
+
+    _cap_gpu_memory("cuda:1", 0.5)
+    assert capped == [(0.5, 1)]
+
+    _cap_gpu_memory("cpu", 0.5)
+    _cap_gpu_memory("cuda:1", None)
+    assert capped == [(0.5, 1)]
+
+
+def test_train_caps_the_device_it_resolved_rather_than_the_one_asked_for(tmp_path: pathlib.Path) -> None:
+    """The fraction has to be applied to the device the run resolved to, before anything allocates.
+
+    Under a distributed launch the resolved device is the rank's own, and a CUDA device requested on
+    a machine without CUDA resolves to the CPU -- so passing the raw --device through would cap the
+    wrong device, or a device that is not being used at all.
+    """
+    calls: list[tuple[str, float | None]] = []
+    with patch_cmd_globals(_cap_gpu_memory=lambda device, fraction: calls.append((device, fraction))):
+        _invoke_train(tmp_path, epochs=1, gpu_memory_fraction=0.5)
+
+    assert calls == [("cpu", 0.5)]
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1164,7 @@ def _ddp_train_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1008,6 +1230,7 @@ def _ddp_rank_gating_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1074,6 +1297,7 @@ def _ddp_seed_offset_worker(
                 initializer_patterns=None,
                 shapes=[{"x": (4,)}],
                 device="cpu",
+                gpu_memory_fraction=None,
                 learner_pattern=_learner_pattern(),
                 learner_outputs=None,
                 compile_pattern=None,
@@ -1137,6 +1361,7 @@ def _run_train_on_rank(
         "initializer_patterns": None,
         "shapes": [{"x": (4,)}],
         "device": "cpu",
+        "gpu_memory_fraction": None,
         "learner_pattern": _learner_pattern(),
         "learner_outputs": None,
         "compile_pattern": None,

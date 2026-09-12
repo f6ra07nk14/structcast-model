@@ -8,9 +8,14 @@ framework-agnostic training loop specialized for PyTorch, Keras, and Flax.
 ### Training loop
 
 **Learner**:
-The object that owns the models being trained and defines how they learn: when an update should happen, how a
-training step runs, and how an inference step runs.
+The object that owns the models being trained and the training counters: how a training step runs, how an
+inference step runs, and whether the just-finished step landed an Update.
 _Avoid_: Backward, backward class, backward pass configuration
+
+**Pairing**:
+The Learner's declaration of which models each optimizer updates (`optimizer_models`). What allows a training
+state to key optimizer state by parameter name rather than by position.
+_Avoid_: optimizer mapping, optimizer-model map
 
 **Trainer**:
 Runs the training loop — epochs, steps, and validation — over a Learner, dispatching lifecycle events to callbacks.
@@ -52,10 +57,41 @@ Monitors one criterion for its best value seen so far and notifies its on-best p
 that produced the criterion.
 
 **Distributed strategy**:
-The replaceable unit that decides how models are wrapped, gradient-synchronized, weight-initialized across
-ranks, compiled (where the compile units sit), and turned into checkpointable state. Exactly one strategy
+The replaceable unit that decides how models are distributed across devices — wrapped or partitioned,
+gradient-synchronized, weight-initialized, compiled (where the compile units sit) — and turned into
+checkpointable state. Exactly one strategy
 is active per training run; single-device training uses a strategy too, not a special case.
 _Avoid_: dist_fn, wrapper function, backend
+
+**Strategy preset**:
+A named sharding-rule table (`single`, `dp`, `fsdp`, `tp`, and combined forms such as `fsdp_tp`)
+selecting how a distributed strategy partitions parameters, optimizer state, and batches across the
+devices of one host.
+_Avoid_: ZeRO stage, parallelism mode, sharding config
+
+**Compile unit**:
+What `--compile` hands to a framework's graph compiler: the timed forward call under `time`, and under
+`train` the Learner's generated step functions — the flow functions on torch, where the models are compile
+units too and the Distributed strategy decides the boundaries. Compiled only where `--compile` asks for it;
+eager everywhere else.
+_Avoid_: jit, graph mode, keras.Model.compile
+
+**Keras backend**:
+The engine — TensorFlow, JAX, or PyTorch — that Keras executes on, fixed for the whole process
+before Keras first imports. Each training run names exactly one; it is not a Distributed strategy.
+_Avoid_: backend (unqualified), framework (for the engine under Keras)
+
+**Backend adapter**:
+The single component owning everything Keras-backend-specific in a training run — gradient
+computation, optimizer application, variable state handling, and step compilation — selected once
+from the active Keras backend.
+_Avoid_: backend branch, per-backend conditional
+
+**State backend**:
+The serialization component behind a Logger's training-state methods: it turns a training state into one
+artifact file and back into host-memory state. Each framework supplies one; loggers default to the torch
+backend.
+_Avoid_: serializer, checkpoint writer
 
 **Training state**:
 The checkpoint artifact produced at epoch end — model weights, optimizer states, gradient-scaler states, and
@@ -78,4 +114,9 @@ _Avoid_: DataModule, dataset wrapper
 
 **Object pattern**:
 A YAML/CLI expression describing how to instantiate an object (`_obj_` / `_addr_` / `_call_`).
+
+**Optimizer segment**:
+One `LEARNERS` entry of a learner template: a loss, the flow computing it, the trainable layers that
+entry's optimizer owns, and that optimizer. A learner has one segment per optimizer, applied in order.
+_Avoid_: optimizer block, learner behavior
 

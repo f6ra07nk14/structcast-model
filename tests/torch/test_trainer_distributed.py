@@ -2,8 +2,8 @@
 
 Each test spawns 2 CPU worker processes, has them write their observations into ``tmp_path``
 and asserts on the collected files, so the assertions cover what actually crossed the ranks:
-deferred gradient all-reduce, rank-0 authority, tracker averaging, checkpoint broadcast and
-``found_inf`` propagation through the DTensor dispatcher.
+deferred gradient all-reduce, rank-0 authority, tracker averaging, checkpoint broadcast,
+``found_inf`` propagation through the DTensor dispatcher, and what a tensor-parallel split computes.
 """
 
 from collections import OrderedDict
@@ -19,6 +19,9 @@ import torch.multiprocessing as mp
 from structcast_model.torch.distributed import (
     DistributedDataParallelStrategy,
     FullyShardedDataParallelStrategy,
+    FullyShardedTensorParallelStrategy,
+    SingleDeviceStrategy,
+    TensorParallelStrategy,
     sync_gate,
 )
 from structcast_model.torch.trainer import TorchTracker
@@ -44,10 +47,14 @@ def _report(result_dir: str, rank: int, payload: dict[str, Any]) -> None:
     torch.save(payload, str(pathlib.Path(result_dir) / f"rank{rank}.pt"))
 
 
-def _spawn(worker: Callable[..., None], tmp_path: pathlib.Path) -> list[dict[str, Any]]:
-    """Run *worker* on 2 gloo ranks and return their reported payloads, rank-ordered."""
-    mp.spawn(worker, args=(WORLD_SIZE, str(tmp_path / "dist_init"), str(tmp_path)), nprocs=WORLD_SIZE, join=True)
-    return [torch.load(str(tmp_path / f"rank{r}.pt"), weights_only=False) for r in range(WORLD_SIZE)]
+def _spawn(
+    worker: Callable[..., None],
+    tmp_path: pathlib.Path,
+    world_size: int = WORLD_SIZE,
+) -> list[dict[str, Any]]:
+    """Run *worker* on *world_size* gloo ranks and return their reported payloads, rank-ordered."""
+    mp.spawn(worker, args=(world_size, str(tmp_path / "dist_init"), str(tmp_path)), nprocs=world_size, join=True)
+    return [torch.load(str(tmp_path / f"rank{r}.pt"), weights_only=False) for r in range(world_size)]
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +366,181 @@ def test_fsdp2_per_block_sharding_round_trips_across_two_ranks(tmp_path: pathlib
 
     assert rank0["keys"] == ["block0.bias", "block0.weight", "block1.bias", "block1.weight"]
     _assert_round_trip(rank0, rank1)
+
+
+# ---------------------------------------------------------------------------
+# Tensor parallelism
+# ---------------------------------------------------------------------------
+
+
+class _MLPModel(torch.nn.Module):
+    """A column-parallel layer feeding a row-parallel one: the pair a plan is written in."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = torch.nn.Linear(4, 8)
+        self.down = torch.nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the pair."""
+        return self.down(torch.relu(self.up(x)))
+
+
+_PLAN = [("up", "column"), ("down", "row")]
+_TP_INPUT = torch.linspace(-1.0, 1.0, 12).reshape(3, 4)
+"""The batch every rank of a tensor-parallel group must see: one model, one batch (ADR-0022)."""
+
+_TP_TARGET = torch.linspace(1.0, -1.0, 12).reshape(3, 4)
+
+
+def _single_process_step() -> tuple[float, dict[str, torch.Tensor]]:
+    """Run the same model, batch and step on one process, as the yardstick the ranks must match."""
+    torch.manual_seed(0)
+    model = _MLPModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    loss = ((model(_TP_INPUT) - _TP_TARGET) ** 2).sum()
+    loss.backward()
+    optimizer.step()
+    return float(loss.detach()), {name: p.detach().clone() for name, p in model.named_parameters()}
+
+
+def _full(parameter: torch.Tensor) -> torch.Tensor:
+    """Gather a (possibly sharded) parameter into a plain tensor; collective, so every rank calls it."""
+    if isinstance(parameter, torch.distributed.tensor.DTensor):
+        parameter = parameter.full_tensor()
+    return parameter.detach().clone()
+
+
+def _tensor_parallel_step(strategy: Any, rank: int, result_dir: str) -> None:
+    """Train one step under *strategy* and report the loss and the gathered parameters."""
+    # Both ranks build from the same seed, which is what sync_initial_weights does in a real run.
+    torch.manual_seed(0)
+    model = strategy.wrap(OrderedDict(model=_MLPModel()))["model"]
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    loss = ((model(_TP_INPUT) - _TP_TARGET) ** 2).sum()
+    loss.backward()
+    optimizer.step()
+    _report(
+        result_dir,
+        rank,
+        {
+            "loss": float(loss.detach()),
+            "data": (strategy.data_rank, strategy.data_world_size),
+            # One entry per mesh axis: the combination places on the data axis and the model axis at
+            # once, so the tensor-parallel placement is the last one either way.
+            "placements": {name: [repr(x) for x in p.placements] for name, p in model.named_parameters()},
+            "parameters": {name: _full(p) for name, p in model.named_parameters()},
+        },
+    )
+
+
+def _tensor_parallel_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Split a two-layer MLP over both ranks and train one step on the identical batch."""
+    _init(rank, world_size, init_file)
+    try:
+        _tensor_parallel_step(TensorParallelStrategy(device="cpu", parallel_modules=_PLAN), rank, result_dir)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def _fsdp2_tensor_parallel_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """The same step with ``fully_shard`` on the data axis of a (1, 2) mesh."""
+    _init(rank, world_size, init_file)
+    try:
+        _tensor_parallel_step(
+            FullyShardedTensorParallelStrategy(device="cpu", tensor_parallel_size=2, parallel_modules=_PLAN),
+            rank,
+            result_dir,
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def _assert_matches_one_process(results: list[dict[str, Any]]) -> None:
+    """Assert every rank trained the model one process would have, and holds the same weights."""
+    loss, expected = _single_process_step()
+    for result in results:
+        assert result["loss"] == pytest.approx(loss, rel=1e-5)
+        for name, value in expected.items():
+            # Loose: the split reduces the products in a different order, and a step's worth of that
+            # difference is what a tensor-parallel run is allowed to cost (ADR-0014's tolerance).
+            assert torch.allclose(result["parameters"][name], value, atol=1e-6), name
+
+
+def test_tensor_parallel_trains_the_model_one_process_would_have(tmp_path: pathlib.Path) -> None:
+    """A split model must compute what the whole one does, or the whole strategy is a silent defect.
+
+    The placements are asserted beside the numbers because replicating everything would pass the
+    numeric comparison too: what makes it tensor parallelism is that each rank holds half of each
+    weight, and that the row-parallel bias is *not* split -- a split one is added once per shard and
+    counted twice by the all-reduce that follows.
+    """
+    results = _spawn(_tensor_parallel_worker, tmp_path)
+
+    for result in results:
+        assert result["data"] == (0, 1)
+        assert result["placements"]["up.weight"] == ["Shard(dim=0)"]
+        assert result["placements"]["down.weight"] == ["Shard(dim=1)"]
+        assert result["placements"]["down.bias"] == ["Replicate()"]
+    _assert_matches_one_process(results)
+
+
+def test_fsdp2_tensor_parallel_trains_the_model_one_process_would_have(tmp_path: pathlib.Path) -> None:
+    """The two wrappers must compose: parallelize first, ``fully_shard`` the result on the data axis.
+
+    Two CPU ranks only reach a ``(1, 2)`` mesh, so this pins the composition -- the mesh, the order,
+    and one training step through both -- and not a data axis wider than one. A real ``(2, 2)`` needs
+    four ranks and is left to the GPU validation the ADR asks for.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    results = _spawn(_fsdp2_tensor_parallel_worker, tmp_path)
+
+    for result in results:
+        assert result["data"] == (0, 1)
+        assert result["placements"]["up.weight"][-1] == "Shard(dim=0)"
+        assert result["placements"]["down.weight"][-1] == "Shard(dim=1)"
+    _assert_matches_one_process(results)
+
+
+def _data_coordinates_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Report what each strategy calls this rank's data slice, without wrapping anything."""
+    _init(rank, world_size, init_file)
+    try:
+        strategies: dict[str, Any] = {
+            "single": SingleDeviceStrategy(device="cpu"),
+            "ddp": DistributedDataParallelStrategy(device="cpu"),
+            "fsdp2": FullyShardedDataParallelStrategy(device="cpu"),
+            "tp": TensorParallelStrategy(device="cpu", parallel_modules=_PLAN),
+            "fsdp2_tp": FullyShardedTensorParallelStrategy(
+                device="cpu", tensor_parallel_size=2, parallel_modules=_PLAN
+            ),
+        }
+        _report(result_dir, rank, {n: (s.data_rank, s.data_world_size) for n, s in strategies.items()})
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def test_data_coordinates_follow_the_mesh_not_the_global_rank(tmp_path: pathlib.Path) -> None:
+    """The CLI seeds from these and publishes them to the loader, so each strategy must report its own.
+
+    Under the replicating strategies a rank is its own data slice; under the tensor-parallel ones the
+    two ranks share one model and therefore one slice, which is exactly what the global rank cannot
+    express.
+    """
+    pytest.importorskip("torch.distributed.fsdp")
+    rank0, rank1 = _spawn(_data_coordinates_worker, tmp_path)
+
+    assert rank0 == {"single": (0, 1), "ddp": (0, 2), "fsdp2": (0, 2), "tp": (0, 1), "fsdp2_tp": (0, 1)}
+    assert rank1 == {"single": (0, 1), "ddp": (1, 2), "fsdp2": (1, 2), "tp": (0, 1), "fsdp2_tp": (0, 1)}
 
 
 # ---------------------------------------------------------------------------

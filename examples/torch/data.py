@@ -23,6 +23,7 @@ give it to a trainer as `data=`.
 
 from collections.abc import Iterable
 from functools import cached_property
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -51,6 +52,23 @@ DTYPES = {
     "int32": torch.int32,
     "int64": torch.int64,
 }
+
+
+def data_shard() -> tuple[int | None, int | None]:
+    """The `rank` and `num_replicas` a sampler must shard on, both None when nothing published them.
+
+    `scm torch train` puts the run's coordinates on the *data* axis of the device mesh into
+    `DATA_RANK` and `DATA_WORLD_SIZE`, because a dataset is instantiated from its own pattern and
+    the CLI hands it nothing. They are the global rank and world size under DDP and FSDP2, but not
+    under a tensor-parallel strategy: the ranks of one tensor-parallel group split a single model
+    and must therefore read the identical slice of the dataset. Nothing publishes them in a
+    standalone run or under a plain `torchrun`, and None is what a sampler already reads as "take
+    the process group's rank and size".
+    """
+    rank, world_size = os.environ.get("DATA_RANK"), os.environ.get("DATA_WORLD_SIZE")
+    if rank is None or world_size is None:
+        return None, None
+    return int(rank), int(world_size)
 
 
 class TimmDatasetWrapper(WithExtra):
@@ -407,13 +425,33 @@ class TimmDataLoaderWrapper(WithExtra):
         elif self.distributed and hasattr(self.dataloader.sampler, "set_epoch"):
             self.dataloader.sampler.set_epoch(info.epoch - 1)
 
+    def _shard_on_data_coordinates(self, loader: Any) -> None:
+        """Re-point the sampler `create_loader` built at the run's data coordinates.
+
+        timm takes no sampler and builds its own from the process group's global rank and size,
+        which is the wrong shard under a tensor-parallel strategy (see `data_shard`); device
+        placement is unaffected, that one stays on the local rank. The sampler is rebuilt on the
+        published coordinates -- `num_samples` and `total_size` follow from them -- and its state
+        copied over the live object, which the loader, its batch sampler and the prefetcher all
+        hold by reference. A no-op without the coordinates, and for the rank-unaware samplers a
+        non-distributed loader builds.
+        """
+        sampler: Any = getattr(loader, "sampler", None)
+        rank, num_replicas = data_shard()
+        if rank is None or not hasattr(sampler, "num_replicas"):
+            return
+        # timm builds three sampler types, all of which take the dataset plus these coordinates.
+        repeats = {"num_repeats": sampler.num_repeats} if hasattr(sampler, "num_repeats") else {}
+        rebuilt = type(sampler)(sampler.dataset, rank=rank, num_replicas=num_replicas, **repeats)
+        sampler.__dict__.update(rebuilt.__dict__)
+
     @cached_property
     def dataloader(self) -> DataLoader:
         """Create a data loader using the timm library."""
         collate_fn, dataset = None, self.dataset_wrapper
         if self.dataset.is_training and self.mixup_active and self.use_prefetcher:
             collate_fn = self.mixup
-        return create_loader(
+        loader = create_loader(
             dataset=dataset,
             batch_size=self.dataset.batch_size,
             is_training=self.dataset.is_training,
@@ -421,6 +459,8 @@ class TimmDataLoaderWrapper(WithExtra):
             **self.default_kwargs,
             **self.model_extra,
         )
+        self._shard_on_data_coordinates(loader)
+        return loader
 
     def __len__(self) -> int:
         """Return the length of the data loader."""

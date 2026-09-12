@@ -8,14 +8,23 @@ PARAMETERS:
     weight_decay: 0.05
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: null # set to null or a positive integer
+    mixed_precision_type: bfloat16 # "bfloat16", "float16", or null for a float32 run
 IMPORTS: {}
 # "MIXED_PRECISION" enables gradient scaling ("torch.amp.GradScaler"), which only applies to
-# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler.
-MIXED_PRECISION: false
-MIXED_PRECISION_TYPE: bfloat16
+# float16; bfloat16 autocast (MIXED_PRECISION_TYPE alone) needs no scaler. One parameter carries
+# both, since a scaler that contradicts the type is a build-time error: -p "SHARED:
+# {mixed_precision_type: null}" is the float32 arm of a precision comparison, "float16" the scaled
+# one.
 # "ACCUMULATE_GRADIENTS" can be set to null or a positive integer to
 # specify the number of steps to accumulate gradients before updating parameters.
 _jinja_yaml_: |-
+  {% if mixed_precision_type is none %}
+  MIXED_PRECISION: false
+  MIXED_PRECISION_TYPE: null
+  {% else %}
+  MIXED_PRECISION: {{mixed_precision_type == "float16"}}
+  MIXED_PRECISION_TYPE: {{mixed_precision_type}}
+  {% endif %}
   {% if accumulate_gradients is none %}
   ACCUMULATE_GRADIENTS: null
   {% else %}
@@ -50,6 +59,8 @@ LEARNERS:
           _jinja_yaml_: |-
             lr: {{lr}}
             weight_decay: {{weight_decay}}
+    # "clip_grad_norm" is the L2 threshold the global gradient norm is scaled down to -- timm's
+    # "value", the bound the Flax and Keras twins spell "max_norm" and "global_clipnorm".
     _jinja_yaml_: |-
       {% if clip_grad_norm is none %}
       CLIP: null
@@ -57,7 +68,7 @@ LEARNERS:
       CLIP:
         - _obj_
         - _addr_: timm.utils.clip_grad.dispatch_clip_grad
-        - _bind_: {value: 1.0, mode: norm, norm_type: {{clip_grad_norm}}}
+        - _bind_: {value: {{clip_grad_norm}}, mode: norm, norm_type: 2.0}
       {% endif %}
     EXTRA: {}
     FLOW:

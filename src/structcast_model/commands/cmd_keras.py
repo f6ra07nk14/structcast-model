@@ -1,26 +1,40 @@
 """Keras related commands for the StructCast Model CLI application."""
 
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import sys
 from time import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
+# `scm`, `scm_keras` and `scm_loggers` are package shims routing to lazy submodules, so importing
+# them pulls in no framework, as in cmd_flax.
+import structcast_model as scm
+import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
-    bool_or_path_or_dict_parser,
+    check_gpu_memory_fraction,
+    config_hash,
     dict_parser,
+    get_module_outputs,
     instantiate_object,
-    path_or_any_parser,
     reduce_dict,
-    tensor_shape_parser,
+    strategy_parser,
 )
+import structcast_model.keras as scm_keras
+import structcast_model.loggers as scm_loggers
 
 if TYPE_CHECKING:
     import jax
     from structcast.core import instantiator
 
     import keras
-    from structcast_model.builders import keras_builder
-    from structcast_model.keras import trainer as keras_trainer
+    from structcast_model.builders import keras as keras_builder
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -28,75 +42,144 @@ else:
     jax = LazyModuleImporter("jax")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
     keras = LazyModuleImporter("keras")
-    keras_builder = LazyModuleImporter("structcast_model.builders.keras_builder")
-    keras_trainer = LazyModuleImporter("structcast_model.keras.trainer")
+    keras_builder = LazyModuleImporter("structcast_model.builders.keras")
     torch = LazyModuleImporter("torch")
 
 
 app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
-app.add_typer(creator, name="create", help="Commands for creating Keras layers.")
+app.add_typer(creator, name="create", help="Commands for creating Keras layer classes.")
 
-template_param = Option(
-    None,
-    "--parameter",
-    "-p",
-    parser=dict_parser,
-    help="Parameters to format the template configuration file with. "
-    'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
-    "and the value is a dictionary of keyword arguments for formatting the template. "
-    'For example: --parameter "model: {input_size: 128, output_size: 10}"',
-)
-output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
-model_pattern = Argument(
-    parser=path_or_any_parser,
-    help="The object pattern used to instantiate models. "
-    "For example, if the model is defined as `my_package.MyModel(...)`, "
-    'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
-    '"[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
-)
-shapes = Option(
-    None,
-    "--shape",
-    "-s",
-    parser=tensor_shape_parser,
-    help="Input tensor shapes as a dictionary, e.g., 'image: [224, 224, 3]'.",
+template_param = scm_args.template_param_option('For example: --parameter "model: {input_size: 128, output_size: 10}"')
+shapes = scm_args.shapes_option(
+    scm_args.shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+    + " Omit it only when the model declares INPUT_SHAPES itself."
 )
 device = Option(
     None,
     "--device",
     "-d",
-    help="The device to run the inference time measurement on. "
-    "If not specified, the first available device will be used.",
+    help='Device to time on, named as returned by "keras.distribution.list_devices()", e.g. "cpu:0" or "gpu:0"; '
+    "an unavailable name aborts. If not specified, the first listed device is used. It does not place the model or "
+    "the inputs; the Keras backend decides where the computation runs. The name only changes how the timing loop "
+    'synchronizes on the torch backend, where a name containing "gpu" selects a CUDA sync.',
 )
-compile_pattern: dict[str, Any] | None = Option(
+train_device = Option(
     None,
-    "--compile",
-    "-c",
-    parser=bool_or_path_or_dict_parser,
-    help='Whether to compile the model using "keras.Model.compile". '
-    'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "keras.Model.compile".',
+    "--device",
+    "-d",
+    help='Device the run is checked against, named as returned by "keras.distribution.list_devices()", e.g. '
+    '"cpu:0" or "gpu:0"; an unavailable name aborts and the first listed device is used when omitted. It places '
+    "nothing: which devices a Keras backend computes on is the backend's own choice (restrict it with "
+    "CUDA_VISIBLE_DEVICES), so the name is validated and recorded with the run.",
 )
+backend_option = Option(
+    ...,
+    "--backend",
+    envvar="KERAS_BACKEND",
+    help="Keras backend the run executes on. Keras resolves it once, while it is first imported, so the command "
+    "sets it before importing Keras and fails when a different one is already live. There is no default: the "
+    "backend decides what a run computes on, so it is stated rather than inherited from ~/.keras/keras.json.",
+)
+COMPILE_API = 'the compiler the active Keras backend has ("tf.function" on tensorflow, "jax.jit" on jax)'
+# Both commands compile through the same backend adapter, so they say the same thing about it. The
+# stateless scope is `time`'s alone to mention: it is a caveat about --training-mode, which only
+# `time` has, and about numbers, which only `time` reports.
+COMPILE_TAIL = (
+    " The torch backend builds no compiled step at all and refuses the option rather than ignoring it, and the "
+    'arguments deciding what is static and what is donated on jax, and "input_signature" on tensorflow, are the '
+    "step's own contract and are dropped."
+)
+compile_pattern: dict[str, Any] | None = scm_args.compile_option(
+    COMPILE_API,
+    tail=COMPILE_TAIL + " On jax the compiled step runs inside the adapter's stateless scope, so under "
+    "--training-mode the moving statistics and dropout seeds it touches do not advance between timed calls, where "
+    "the tensorflow step and both eager paths do advance them; the work timed is the same either way.",
+)
+train_compile_pattern: dict[str, Any] | None = scm_args.compile_option(COMPILE_API, tail=COMPILE_TAIL)
 
 
 @creator.command(name="model")
 def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Model", "--classname", "-c", help="Name the model class."),
-    structured_output: bool = Option(True, help="Enable structured output for the model."),
+    classname: str = Option("Model", "--classname", "-n", help="Name of the generated layer class."),
+    structured_output: bool = Option(
+        True,
+        help="Return the layer outputs as a dict keyed by output name instead of positionally. Defaults to true, "
+        "which overrides the configuration's STRUCTURED_OUTPUT; pass --no-structured-output for positional output. "
+        "Ignored with --sublayer: the selected layer's own configuration decides.",
+    ),
     sublayer: str | None = Option(
-        None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
+        None, "--sublayer", help="The reference to a sublayer in the template to build instead of the root layer."
     ),
 ) -> None:
-    """Create a Keras layer from the given configuration file and parameters."""
+    """Create a Keras layer class (a keras.layers.Layer subclass) from the given configuration file and parameters."""
     keras_builder.KerasBuilder.from_path(cfg_path)(
         parameters=reduce_dict(parameters),
         classname=classname,
         forced_structured_output=structured_output,
         user_defined_layer=sublayer,
     )(output)
+
+
+@creator.command(name="learner")
+def create_learner(
+    cfg_path: str = Argument(..., help="Path to the learner configuration file."),
+    output: str | None = scm_args.output_script_path,
+    parameters: list[dict] | None = template_param,
+    classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
+) -> None:
+    """Create a Keras learner class from the given configuration file and parameters.
+
+    The generated learner is backend-neutral -- it names no backend and imports no framework beyond
+    `keras` -- and this command only writes it, so it takes no --backend.
+    """
+    builder = keras_builder.KerasLearnerBuilder.from_path(cfg_path)
+    builder(parameters=reduce_dict(parameters), classname=classname)(output)
+
+
+@contextmanager
+def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Iterator[None]:
+    """Put a run's `--compile` choice on the backend adapter, and take it off again afterwards.
+
+    A generated learner reads the choice off the adapter while it builds its steps, in its own
+    constructor, so the choice has to be there before the learner is built; the `dp` preset reads it
+    once more, when `wrap_steps` traces its replicated call. `time` spans one call instead, the
+    `build_inference_step` it hands its timed forward to. The adapter is `@cache`d for the process,
+    so what is set here would otherwise be inherited by every step built afterwards -- the next run
+    in the same process included.
+
+    The torch backend is refused before any of that: it builds no compiled step, so the flag cannot
+    be honored, and ignoring it would report a compiled run that never happened. Refused here, where
+    the backend is known and before any step is built -- `train` enters it before its models too --
+    and again in the adapter for a hand-written learner that reaches it without this command
+    (`keras/adapters.py`).
+
+    Args:
+        backend (str): The Keras backend the run was told to use; `time` passes the ambient one.
+        compile_pattern (dict[str, Any] | None): The parsed --compile value, None for an eager run.
+
+    Yields:
+        None: while the choice is the adapter's.
+
+    Raises:
+        ValueError: If the torch backend was asked to compile.
+    """
+    if backend == "torch" and compile_pattern is not None:
+        raise ValueError(
+            'The "torch" Keras backend builds no compiled step, so --compile cannot be honored: the '
+            "learner's steps assign to Keras variables and run a Keras optimizer, which torch.compile "
+            "graph-breaks on, and the adapter builds no other kind of step. Drop --compile, or run on the "
+            "tensorflow or jax backend."
+        )
+    adapter = scm_keras.select_backend_adapter()
+    adapter.compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
+    try:
+        yield
+    finally:
+        adapter.compile_kw = None
 
 
 def _get_sync_fn(device: str) -> Any:
@@ -111,38 +194,46 @@ def _get_sync_fn(device: str) -> Any:
 
 @app.command(name="time")
 def measure_inference_time(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = Option(
-        False,
-        help="Whether to set the model to training mode during inference time measurement. "
-        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
-    ),
-    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
-    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
-    batch_size: int = Option(
-        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
-    ),
+    training_mode: bool = scm_args.training_mode,
+    warmup_runs: int = scm_args.warmup_runs,
+    times: int = scm_args.times,
+    batch_size: int = scm_args.batch_size,
 ) -> None:
     """Measure the average inference time of a Keras model."""
-    device = keras_trainer.get_keras_device(device)
+    device = scm_keras.get_keras_device(device)
+    # Unlike `train`, this command takes no --backend and inherits the ambient one (`docs/adr/0016`),
+    # so it says which one produced the number: the backend decides what actually executes.
+    print(f'Timing on the "{keras.backend.backend()}" Keras backend, device "{device}".')
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
-    shapes = keras_trainer.resolve_input_shapes(model, shapes)
-    model = keras_trainer.initial_model(model, shapes)
-    if compile_pattern is None:
-        print("Skipping compilation...")
-    else:
-        print("Compiling the model...")
-        model.compile(optimizer=None, **instantiator.instantiate(compile_pattern))
+    shapes = scm_keras.resolve_input_shapes(model, shapes)
+    model = scm_keras.initial_model(model, shapes)
     sync = _get_sync_fn(device)
 
+    def flow(inputs: Any) -> Any:
+        # One keyword, not **batch: `create_numpy_inputs` answers with an array for a bare shape and
+        # a list for a sequence (keras/trainer.py), and only the mapping form could be splatted.
+        return model(inputs, training=training_mode)
+
+    if compile_pattern is None:
+        print("Skipping compilation...")
+        step = flow
+    else:
+        print("Compiling the timed forward...")
+        # The seam `train` compiles through, so the number describes the step a run executes. The
+        # context manager is what refuses the torch backend, which builds no compiled step at all,
+        # and what puts the choice back afterwards: the adapter is one cached instance per process.
+        with _compile_choice(keras.backend.backend(), compile_pattern):
+            step = scm_keras.select_backend_adapter().build_inference_step(flow, models=[model])
+
     def _measure_single_run() -> float:
-        inputs = keras_trainer.create_numpy_inputs(shapes, batch_size=batch_size)
+        inputs = scm_keras.create_numpy_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        sync(model(inputs, training=training_mode))
+        sync(step(inputs=inputs))
         return time() - start_time
 
     print(f"Running {warmup_runs} warmup runs...")
@@ -154,6 +245,363 @@ def measure_inference_time(
         elapsed_time += _measure_single_run()
     mode_str = "training" if training_mode else "evaluation"
     print(f'Average inference time over {times} runs ("{mode_str}" mode): {elapsed_time / times:.6f} seconds.')
+
+
+def _activate_backend(backend: str) -> None:
+    """Bind the Keras backend for this process, before anything imports Keras.
+
+    Keras reads `KERAS_BACKEND` once, while it is first imported, and never switches afterwards: a
+    command that set the variable after the import would run on the old backend while reporting the
+    requested one. Both checks exist because there are two ways to get there -- Keras already
+    imported by the caller, and Keras importing something else than the variable asked for.
+    """
+    imported = sys.modules.get("keras")
+    if imported is not None and (active := imported.backend.backend()) != backend:
+        raise ValueError(
+            f'Keras is already running on the "{active}" backend, so --backend {backend} cannot take effect: '
+            "the backend is resolved once, when Keras is first imported. Run the command in a fresh process."
+        )
+    os.environ["KERAS_BACKEND"] = backend
+    # The first attribute access is what imports Keras, hence after the assignment above.
+    if (active := keras.backend.backend()) != backend:
+        raise ValueError(f'Keras started on the "{active}" backend instead of the requested "{backend}".')
+
+
+def _cap_gpu_memory(backend: str, fraction: float | None) -> None:
+    """Ask *backend* to keep to *fraction* of each GPU, before anything imports Keras.
+
+    Only JAX takes an actual fraction: XLA sizes its device allocation by it. TensorFlow has no
+    fraction knob at all, so the honest stand-in is growth on demand -- the run then takes what it
+    uses instead of the whole device, which caps nothing but leaves room next to it. The torch
+    backend has neither, and is capped through the API in :func:`_cap_torch_gpu_memory` instead.
+
+    Raises:
+        ValueError: If the fraction is not greater than 0 and at most 1.
+    """
+    check_gpu_memory_fraction(fraction)
+    if fraction is None:
+        return
+    if backend == "jax":
+        # Preallocation is turned off alongside the fraction so the share is taken as the run needs
+        # it; `setdefault`, because an operator who set the variable deliberately keeps their choice.
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(fraction)
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    elif backend == "tensorflow":
+        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
+
+def _cap_torch_gpu_memory(backend: str, fraction: float | None) -> None:
+    """Cap every visible CUDA device at *fraction* of its memory, after Keras imported torch.
+
+    The torch backend has no environment variable for this, so the cap is an API call and it has to
+    come after the import: `torch.cuda` is what applies it, per device.
+    """
+    if fraction is None or backend != "torch" or not torch.cuda.is_available():
+        return
+    for index in range(torch.cuda.device_count()):
+        torch.cuda.set_per_process_memory_fraction(fraction, index)
+
+
+def _mixed_precision_policy(factory: Any) -> str | None:
+    """Return the global policy the generated learner asks for, or None for a plain run.
+
+    The factory this reads is the generated class itself, which carries the two constants as class
+    attributes: the policy has to be set before the models the learner is built over exist, and a
+    class attribute is readable before anything is instantiated. A hand-written learner declares none
+    and gets no policy.
+    """
+    raw = getattr(factory, "MIXED_PRECISION", None)
+    # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
+    # included, so that a run is not loss-scaled by the adapter while computing in float32.
+    enabled = raw if isinstance(raw, bool) else isinstance(raw, Mapping)
+    if not enabled:
+        return None
+    return f"mixed_{factory.MIXED_PRECISION_TYPE}"
+
+
+def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
+    """Return the `OPTIMIZER_HASHES` the learner's class declares, empty for anything else.
+
+    Read off the class, as `_mixed_precision_policy` reads the mixed precision constants. A
+    hand-written learner declares none, and the resume check skips what is missing.
+    """
+    return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
+
+
+def _resolve_strategy(strategy: Any, device: str | None) -> "scm_keras.KerasDistributedStrategy":
+    """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
+    if isinstance(strategy, str):
+        # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
+        # active backend supports, and rejects the rest with the reason -- which is the error to read.
+        preset = cast('Literal["single", "dp", "fsdp", "tp"]', strategy)
+        return scm_keras.KerasDistributedStrategy(preset=preset, device=device)
+    return instantiate_object(strategy)(device=device)
+
+
+def _build_logger(logger_name: str, experiment: str, is_main: bool) -> "scm_loggers.Logger":
+    """Return the run's logger: the real one on the main rank, a null one on every other.
+
+    Only the experiment name is stored here, so the run itself starts in `__enter__`. Under a
+    torchrun launch every rank reaches this, and only the main one may own the run: the others would
+    otherwise each open their own and write their own checkpoint next to it.
+    """
+    if not is_main:
+        return scm_loggers.NullLogger()
+    logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+    return logger_type(experiment=experiment, state_backend=scm_loggers.KerasStateBackend())
+
+
+def _build_callbacks(
+    *,
+    trainer: Any,
+    provider: "scm.SimpleDataProvider",
+    strategy: "scm_keras.KerasDistributedStrategy",
+    outputs: list[str],
+    higher_criteria: list[str],
+    lower_criteria: list[str],
+    save_criteria: list[str],
+    logger: "scm_loggers.Logger",
+    ci: bool,
+    extra_meta: Mapping[str, Any],
+) -> None:
+    """Install the logger and the saver/best/display callbacks on the trainer.
+
+    The twin of `cmd_torch._build_callbacks`: the saver and the best-criterion monitors are built on
+    every rank -- they read the state through the strategy -- and only the main rank holds a real
+    logger, so only it writes anything. The display is the main rank's alone, one per run.
+    """
+    saver = scm_keras.KerasTrainingStateSaver(logger=logger, strategy=strategy, extra_meta=extra_meta)
+    bests = scm_keras.KerasBestCriterion.from_criteria(
+        higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
+    )
+    display: list[Any] = []
+    if strategy.is_main:
+        display.append(
+            scm.Printer()
+            if ci
+            else scm.ProgressBar(
+                steps_per_epoch=provider.steps_per_epoch,
+                validation_steps=provider.validation_steps,
+                training_criteria=[f"{trainer.training_prefix}{name}" for name in outputs],
+                validation_criteria=[f"{trainer.validation_prefix}{name}" for name in outputs],
+            )
+        )
+    trainer.callbacks = [*display, logger, saver, *bests]
+
+
+@app.command()
+def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
+    model_patterns: list[dict] = Argument(
+        parser=dict_parser,
+        help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
+        + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
+        "inline; a file path is not accepted here. A pattern building a layer is traced into a model with the "
+        "run's shapes before the Learner is built, because a Keras layer owns no variables until it is. The names "
+        "are passed to the --learner factory as keyword arguments.",
+    ),
+    backend: Literal["tensorflow", "jax", "torch"] = backend_option,
+    shapes: list[dict] | None = scm_args.shapes_option(
+        scm_args.shapes_help('"image: [224, 224, 3]"', "numpy.zeros")
+        + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
+        "twice keeps only the last occurrence. When omitted, each model is traced with the INPUT_SHAPES it "
+        "declares itself; given, the same shapes are used for every model."
+    ),
+    device: str | None = train_device,
+    gpu_memory_fraction: float | None = Option(
+        None,
+        "--gpu-memory-fraction",
+        envvar="XLA_PYTHON_CLIENT_MEM_FRACTION",
+        help="Share of each GPU's memory the run may take, greater than 0 and at most 1. What it can mean follows "
+        "the backend: jax is capped through XLA_PYTHON_CLIENT_MEM_FRACTION (preallocation turned off with it), "
+        "torch through torch.cuda.set_per_process_memory_fraction on every visible device, and tensorflow has no "
+        "fraction knob at all -- it is only switched to growth on demand (TF_FORCE_GPU_ALLOW_GROWTH), which caps "
+        "nothing but stops the run from taking the whole device up front. Uncapped when omitted.",
+    ),
+    learner_pattern: Any = scm_args.learner_pattern,
+    learner_outputs: list[str] | None = scm_args.learner_outputs,
+    compile_pattern: dict[str, Any] | None = train_compile_pattern,
+    trainer_pattern: Any | None = scm_args.trainer_option(
+        "trainer(learner=..., tracker=..., data=..., callbacks=[])", "KerasTrainer"
+    ),
+    epochs: int = scm_args.epochs,
+    start_epoch: int = scm_args.start_epoch,
+    resume: str | None = scm_args.resume_option(
+        "Restores models and optimizers, and continues from the saved epoch. The state carries the Keras backend "
+        "it was written on and a resume onto another one is refused: normalization statistics and RNG "
+        "trajectories are not verified equivalent across backends.",
+        "data-order or RNG",
+    ),
+    training_dataset_pattern: Any = scm_args.training_dataset_option(
+        " Every batch it yields is passed to the Learner as it is; a multi-device strategy places it across the "
+        "replicas first, so each entry needs a leading dimension the replica count divides -- except on the "
+        "torch backend, where the loader hands each rank its own slice."
+    ),
+    validation_dataset_pattern: Any | None = scm_args.validation_dataset_pattern,
+    validation_frequency: int = scm_args.validation_frequency,
+    lower_criteria: list[str] = scm_args.lower_criteria,
+    higher_criteria: list[str] = scm_args.higher_criteria,
+    save_criteria: list[str] = scm_args.save_criteria,
+    seed: int = scm_args.seed_option(
+        ' It is applied with "keras.utils.set_random_seed" before the models are built, which seeds Python, NumPy '
+        "and the active backend, so it decides both the model initialization and every random draw a step makes."
+    ),
+    experiment: str = scm_args.experiment,
+    logger_name: Literal["mlflow", "wandb"] = scm_args.logger_name,
+    log_arguments: list[dict] | None = scm_args.log_arguments,
+    log_artifacts: list[Path] | None = scm_args.log_artifacts,
+    ci: bool = scm_args.ci,
+    strategy_pattern: Any = Option(
+        "single",
+        "--strategy",
+        parser=strategy_parser,
+        help='How the run uses the devices: the preset name "single" (one device), "dp" (the batch split across '
+        'the replicas, variables replicated) or "fsdp" (the batch split and the variables sharded too). Each '
+        "preset runs on the mechanism its Keras backend actually has -- keras.distribution on jax, "
+        "tf.distribute.MirroredStrategy on tensorflow, DistributedDataParallel on torch -- and fsdp is available "
+        'on jax alone; the other two cells are refused with the reason. The tensor-parallel preset "tp" splits '
+        "layers across a second mesh axis and needs a rule table naming which ones, so it is selected through its "
+        "cfg/keras/strategies template, not by name. "
+        + scm_args.object_pattern_help("a strategy factory", "MyStrategy", call=False, lead="Or the object pattern")
+        + scm_args.PATH_FORM_HELP
+        + " The factory is called with the resolved device; the templates under cfg/keras/strategies bind the "
+        "remaining knobs.",
+    ),
+) -> None:
+    """Train Keras models with a Learner, recording the run to an experiment-tracking service."""
+    if not model_patterns:
+        raise ValueError("At least one model pattern must be provided.")
+    # Before the activation below, which is what imports Keras: the variables it writes are read
+    # once, while the backend's framework starts up. The torch cap is an API call, so it waits.
+    _cap_gpu_memory(backend, gpu_memory_fraction)
+    _activate_backend(backend)
+    _cap_torch_gpu_memory(backend, gpu_memory_fraction)
+    device = scm_keras.get_keras_device(device)
+    keras.utils.set_random_seed(seed)
+    # Spanning everything that builds or traces a step: the learner's constructor, and `wrap_steps`.
+    with _compile_choice(backend, compile_pattern):
+        # Resolved before the models: the class itself is what carries the policy the models are built
+        # under, and instantiating it needs them.
+        factory = instantiate_object(learner_pattern)
+        if (policy := _mixed_precision_policy(factory)) is not None:
+            # A policy only reaches the layers built after it is set, and the learner receives models
+            # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
+            print(f'Setting the global mixed precision policy to "{policy}"...')
+            keras.mixed_precision.set_global_policy(policy)
+        strategy = _resolve_strategy(strategy_pattern, device)
+        models: OrderedDict[str, Any] = OrderedDict()
+        declared: dict[str, Any] = {}
+        # Everything a run allocates is built inside the activation: a JAX variable reads the active
+        # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
+        # -- the models above all, and the optimizers the learner builds against their variables.
+        with strategy.activate():
+            for raw in model_patterns:
+                if len(raw) != 1:
+                    raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
+                model_name, pattern = next(iter(raw.items()))
+                built = instantiate_object(pattern)
+                # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
+                # which carries none of the layer's attributes, so the shapes it was traced with would be
+                # unrecoverable afterwards and the run would record none.
+                declared.update(scm_keras.resolve_input_shapes(built) or {})
+                models[model_name] = scm_keras.initial_model(built, reduce_dict(shapes))
+            strategy.sync_initial_weights(models)
+            # Before the learner: it captures the model objects it is handed, and its optimizers are
+            # built against their variables while it is constructed.
+            models = strategy.wrap(models)
+            learner = factory(**models)
+        # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
+        # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
+        input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
+        config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
+        # After the learner: the steps this rewires are the ones the backend adapter built in its
+        # constructor, and each one runs the replicas itself rather than being traced into a scope.
+        strategy.wrap_steps(learner)
+    outputs = get_module_outputs(learner, learner_outputs, "learner")
+    provider = scm.SimpleDataProvider(
+        training_dataset=instantiate_object(training_dataset_pattern),
+        validation_dataset=(
+            None if validation_dataset_pattern is None else instantiate_object(validation_dataset_pattern)
+        ),
+    )
+    if strategy.is_main:
+        print("Count the dataset sizes...")
+        print(f"Training dataset size: {provider.steps_per_epoch} steps.")
+        print(f"Validation dataset size: {provider.validation_steps} steps.")
+    logger = _build_logger(logger_name, experiment, strategy.is_main)
+    optimizer_hashes = _optimizer_hashes(learner)
+    if resume is not None:
+        start_epoch = scm_keras.restore_training_state(
+            resume=resume,
+            strategy=strategy,
+            models=models,
+            learner=learner,
+            start_epoch=start_epoch,
+            logger=logger,
+            optimizer_hashes=optimizer_hashes,
+            config_hash=config_digest,
+            is_main=strategy.is_main,
+        )
+    trainer_type = scm_keras.KerasTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer = trainer_type(
+        learner=learner, tracker=scm_keras.KerasTracker.from_criteria(outputs), data=provider, callbacks=[]
+    )
+    _build_callbacks(
+        trainer=trainer,
+        provider=provider,
+        strategy=strategy,
+        outputs=outputs,
+        higher_criteria=higher_criteria,
+        lower_criteria=lower_criteria,
+        save_criteria=save_criteria,
+        logger=logger,
+        ci=ci,
+        extra_meta={"seed": seed, "config_hash": config_digest, "optimizer_hashes": dict(optimizer_hashes)},
+    )
+    arguments = {
+        **reduce_dict(log_arguments),
+        "models": model_patterns,
+        "parameters": {name: model.count_params() for name, model in models.items()},
+        "shapes": input_shapes,
+        "backend": backend,
+        "device": device,
+        "gpu_memory_fraction": gpu_memory_fraction,
+        "strategy": strategy_pattern,
+        "replicas": strategy.replicas,
+        "mixed_precision_policy": policy,
+        "learner": learner_pattern,
+        "learner_outputs": outputs,
+        "compile": compile_pattern,
+        "trainer": trainer_pattern,
+        "epochs": epochs,
+        "start_epoch": start_epoch,
+        "resume": resume,
+        "training_dataset": training_dataset_pattern,
+        "validation_dataset": validation_dataset_pattern,
+        "validation_frequency": validation_frequency,
+        "lower_criteria": lower_criteria,
+        "higher_criteria": higher_criteria,
+        "save_criteria": save_criteria,
+        "seed": seed,
+        "experiment": experiment,
+        "logger": logger_name,
+        "ci": ci,
+    }
+    with logger:
+        logger.log_params(
+            {
+                "keras_version": keras.__version__,
+                "keras_backend": backend,
+                "epochs": epochs,
+                "steps_per_epoch": provider.steps_per_epoch,
+                "validation_steps": provider.validation_steps,
+            }
+        )
+        logger.log_dict(arguments, "arguments.yaml")
+        for artifact in log_artifacts or []:
+            logger.log_artifact(str(artifact))
+        if strategy.is_main:
+            print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
+        trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
 
 
 __all__ = ["app"]

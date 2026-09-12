@@ -50,7 +50,7 @@ devcontainer rebuilds; `.worktrees/` is git-ignored. Keep the main working direc
 overwrite, or clean unrelated work.
 
 All commit messages must follow Conventional Commits using `<type>(<optional scope>): <imperative description>`. Use
-the types configured in `.releaserc.yaml`: `breaking`,
+the types configured in `.releaserc.json`: `breaking`,
 `build`, `chore`, `ci`, `docs`, `example`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, or `test`. Mark breaking
 changes with `!`, a `BREAKING CHANGE:` footer, or the `breaking` type. Ask before creating commits. Merge requests
 should state the change, verification performed, and any known limitations; keep each merge request focused.

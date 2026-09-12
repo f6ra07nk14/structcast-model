@@ -1,4 +1,7 @@
 # Distributed strategy pattern: DistributedDataParallel (the default when a distributed
-# environment is detected; listed here for explicitness and as a template).
+# environment is detected; listed here for explicitness and as a template). BatchNorm layers are
+# converted to SyncBatchNorm at wrap time (skipped on CPU); bind sync_batchnorm: false to opt out.
 - _obj_
 - _addr_: structcast_model.torch.distributed.DistributedDataParallelStrategy
+# - _bind_:
+#     sync_batchnorm: false

@@ -2,7 +2,7 @@
 
 from collections import OrderedDict
 from functools import partial
-import inspect
+import os
 from pathlib import Path
 import random
 from time import time
@@ -11,19 +11,21 @@ from typing import TYPE_CHECKING, Any, Literal
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-from structcast_model.base_trainer import (
-    Printer,
-    ProgressBar,
-    SimpleDataProvider,
-)
+# `scm`, `scm_loggers` and `scm_torch` are package shims routing to lazy submodules, so importing
+# them pulls in no framework. Wrapping them in `LazyModuleImporter` would not work: it copies the
+# shim's still unresolved submodule slots, so every access after the first would hand back `None`.
+import structcast_model as scm
+import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
-    bool_or_path_or_dict_parser,
+    check_gpu_memory_fraction,
     dict_parser,
+    get_module_outputs,
     instantiate_object,
     path_or_any_parser,
     reduce_dict,
-    tensor_shape_parser,
 )
+import structcast_model.loggers as scm_loggers
+import structcast_model.torch as scm_torch
 
 if TYPE_CHECKING:
     import calflops
@@ -31,14 +33,7 @@ if TYPE_CHECKING:
     import ptflops
     from structcast.core import instantiator
 
-    from structcast_model.builders import torch_builder
-    from structcast_model.torch import (
-        distributed as torch_distributed,
-        logger as torch_logger,
-        mlflow_logger,
-        trainer as torch_trainer,
-        wandb_logger,
-    )
+    from structcast_model.builders import torch as torch_builder
     import torch
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
@@ -47,12 +42,7 @@ else:
     np = LazyModuleImporter("numpy")
     ptflops = LazyModuleImporter("ptflops")
     instantiator = LazyModuleImporter("structcast.core.instantiator")
-    torch_builder = LazyModuleImporter("structcast_model.builders.torch_builder")
-    torch_distributed = LazyModuleImporter("structcast_model.torch.distributed")
-    torch_logger = LazyModuleImporter("structcast_model.torch.logger")
-    mlflow_logger = LazyModuleImporter("structcast_model.torch.mlflow_logger")
-    torch_trainer = LazyModuleImporter("structcast_model.torch.trainer")
-    wandb_logger = LazyModuleImporter("structcast_model.torch.wandb_logger")
+    torch_builder = LazyModuleImporter("structcast_model.builders.torch")
     torch = LazyModuleImporter("torch")
 
 
@@ -60,57 +50,32 @@ app = Typer(no_args_is_help=True)
 creator = Typer(no_args_is_help=True)
 app.add_typer(creator, name="create", help="Commands for creating PyTorch models and learner classes.")
 
-template_param = Option(
-    None,
-    "--parameter",
-    "-p",
-    parser=dict_parser,
-    help="Parameters to format the template configuration file with. "
-    'Each parameter should be in the format of "key: {...}", where `key` is the name of the parameter group, '
-    "and the value is a dictionary of keyword arguments for formatting the template. "
-    'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"',
+DEVICE_HELP = (
+    'Computation device to use: "cpu", "cuda", or an indexed form such as "cuda:1". '
+    'If not specified, "cuda" is used when available, otherwise "cpu"; an explicitly requested CUDA device '
+    "falls back to CPU with a warning when CUDA is unavailable."
 )
-output_script_path = Option(None, "--output", "-o", help="Output script path (Python).")
-model_pattern = Argument(
-    parser=path_or_any_parser,
-    help="The object pattern used to instantiate models. "
-    "For example, if the model is defined as `my_package.MyModel(...)`, "
-    'then the pattern should be "[_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
-    '"[_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+
+SHAPES_HELP = scm_args.shapes_help('"image: [3, 224, 224]"', "torch.zeros")
+template_param = scm_args.template_param_option(
+    'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"'
 )
-shapes = Option(
-    None,
-    "--shape",
-    "-s",
-    parser=tensor_shape_parser,
-    help="Input tensor shapes as a dictionary, e.g., 'image: [3, 224, 224]'.",
+# --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
+shapes = scm_args.shapes_option(
+    SHAPES_HELP + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
+    "neither exists."
 )
-device = Option(
-    None,
-    "--device",
-    "-d",
-    help='Computation device to use, either "cpu" or "cuda". '
-    'If not specified, it will use "cuda" if available, otherwise "cpu".',
-)
-compile_pattern: dict[str, Any] | None = Option(
-    None,
-    "--compile",
-    "-c",
-    parser=bool_or_path_or_dict_parser,
-    help='Whether to compile the model using "torch.compile". '
-    'Can be set to true/false, a path to a YAML file, or a dictionary of keyword arguments for "torch.compile".',
-)
-matmul_precision: Literal["highest", "high", "medium"] = Option(
-    "high", envvar="MATMUL_PRECISION", help="Matrix multiplication precision."
-)
+device = Option(None, "--device", "-d", help=DEVICE_HELP)
+compile_pattern: dict[str, Any] | None = scm_args.compile_option('"torch.compile"')
+matmul_precision: Literal["highest", "high", "medium"] = scm_args.matmul_precision_option()
 
 
 @creator.command(name="model")
 def create_model(
     cfg_path: str = Argument(..., help="Path to the model configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Model", "--classname", "-c", help="Name the model class."),
+    classname: str = Option("Model", "--classname", "-n", help="Name of the generated model class."),
     structured_output: bool | None = Option(
         None,
         "--structured-output/--no-structured-output",
@@ -119,7 +84,7 @@ def create_model(
         "selected layer's own configuration decides.",
     ),
     sublayer: str | None = Option(
-        None, "--sublayer", "-s", help="The reference to a sublayer in the template to build instead of the root layer."
+        None, "--sublayer", help="The reference to a sublayer in the template to build instead of the root layer."
     ),
 ) -> None:
     """Create a PyTorch model from the given configuration file and parameters."""
@@ -134,9 +99,9 @@ def create_model(
 @creator.command(name="learner")
 def create_learner(
     cfg_path: str = Argument(..., help="Path to the learner configuration file."),
-    output: str | None = output_script_path,
+    output: str | None = scm_args.output_script_path,
     parameters: list[dict] | None = template_param,
-    classname: str = Option("Learner", "--classname", "-c", help="Name the learner class."),
+    classname: str = Option("Learner", "--classname", "-n", help="Name of the generated Learner class."),
 ) -> None:
     """Create a PyTorch learner class from the given configuration file and parameters."""
     builder = torch_builder.TorchLearnerBuilder.from_path(cfg_path)
@@ -154,61 +119,41 @@ def _instantiate_models(patterns: list[dict]) -> "OrderedDict[str, Any]":
     return res
 
 
-def _get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
-    """Return output names from a module attribute or the provided default, raising if neither is available."""
-    if default:
-        return default
-    if hasattr(module, "outputs"):
-        return module.outputs
-    raise ValueError(
-        f'Module "{name}" does not have an "outputs" attribute. '
-        f'Please provide default outputs using the "--{name}-outputs" option.'
-    )
-
-
 @app.command(name="time")
 def measure_inference_time(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     device: str | None = device,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    training_mode: bool = Option(
-        False,
-        help="Whether to set the model to training mode during inference time measurement. "
-        "This can affect the inference time due to differences in behavior (e.g., dropout, batch norm).",
-    ),
-    warmup_runs: int = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time."),
-    times: int = Option(10, "--times", "-t", help="Number of iterations to measure the inference time."),
-    batch_size: int = Option(
-        1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement."
-    ),
+    training_mode: bool = scm_args.training_mode,
+    warmup_runs: int = scm_args.warmup_runs,
+    times: int = scm_args.times,
+    batch_size: int = scm_args.batch_size,
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
 ) -> None:
     """Measure the average inference time of a PyTorch model."""
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     print("Initializing the model...")
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        shapes = torch_trainer.resolve_input_shapes(model, shapes)
-        torch_trainer.initial_model(model, shapes)
+        shapes = scm_torch.resolve_input_shapes(model, shapes)
+        scm_torch.initial_model(model, shapes)
     print("Skipping compilation..." if compile_pattern is None else "Compiling the model...")
-    model = torch_distributed.SingleDeviceStrategy(device=device).compile(
-        model, instantiator.instantiate(compile_pattern)
-    )
+    model = scm_torch.SingleDeviceStrategy(device=device).compile(model, instantiator.instantiate(compile_pattern))
     if training_mode:
         model.train()
     else:
         model.eval()
     cuda_sync = torch.cuda.synchronize if "cuda" in device else lambda: None
-    device_type = torch_trainer.get_torch_device_type(device)
+    device_type = scm_torch.get_torch_device_type(device)
 
     def _measure_single_run() -> float:
         with torch.device(device):
-            inputs = torch_trainer.create_torch_inputs(shapes, batch_size=batch_size)
+            inputs = scm_torch.create_torch_inputs(shapes, batch_size=batch_size)
         start_time = time()
-        with torch_trainer.autocast_inputs(inputs, device_type):
+        with scm_torch.autocast_inputs(inputs, device_type):
             model(**inputs)
         cuda_sync()
         return time() - start_time
@@ -226,24 +171,27 @@ def measure_inference_time(
 
 @app.command(name="ptflops")
 def call_ptflops(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
-    flops_units: Literal["GMac", "MMac", "KMac"] = Option("GMac", help="Units for FLOPs: GMac, MMac, or KMac."),
+    flops_units: Literal["GMac", "MMac", "KMac"] = Option(
+        "GMac", help="Unit for the reported multiply-accumulate count."
+    ),
     param_units: Literal["M", "K", "B"] = Option(
         "M", help="Units for parameters: M (millions), K (thousands), or B (billions)."
     ),
     backend: Literal["pytorch", "aten"] = Option(
-        "aten", help='Backend for FLOPs computation. Note: Don\'t use "pytorch" backend for transformer architectures.'
+        "aten",
+        help='Backend for the FLOPs computation. Do not use the "pytorch" backend for transformer architectures.',
     ),
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using ptflops."""
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = torch_trainer.initial_model(model, shapes)
-        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.initial_model(model, shapes)
+        with scm_torch.autocast_inputs(inputs, scm_torch.get_torch_device_type(device)):
             flops, params = ptflops.get_model_complexity_info(
                 model=model,
                 input_res=(1,),
@@ -265,7 +213,7 @@ def call_ptflops(
 
 @app.command(name="calflops")
 def call_calflops(
-    model_pattern: Any = model_pattern,
+    model_pattern: Any = scm_args.model_pattern,
     shapes: dict | None = shapes,
     include_bp: bool = Option(False, help="Whether to include backpropagation in FLOPs computation."),
     output_precision: int = Option(4, help="Decimal precision for FLOPs and parameters output."),
@@ -273,11 +221,11 @@ def call_calflops(
     device: str | None = device,
 ) -> None:
     """Calculate the FLOPs and number of parameters of a PyTorch model using calflops."""
-    device = torch_trainer.get_torch_device(device)
+    device = scm_torch.get_torch_device(device)
     with torch.device(device):
         model = instantiate_object(model_pattern)
-        inputs, _ = torch_trainer.initial_model(model, shapes)
-        with torch_trainer.autocast_inputs(inputs, torch_trainer.get_torch_device_type(device)):
+        inputs, _ = scm_torch.initial_model(model, shapes)
+        with scm_torch.autocast_inputs(inputs, scm_torch.get_torch_device_type(device)):
             flops, macs, params = calflops.calculate_flops(
                 model=model,
                 input_shape=None,
@@ -298,15 +246,38 @@ def call_calflops(
     print(f"Parameters: {params}")
 
 
+def _cap_gpu_memory(device: str, fraction: float | None) -> None:
+    """Cap the run's CUDA device at *fraction* of its memory.
+
+    torch has no environment variable for this, so the cap is an API call, and it is applied to the
+    one device the run resolved to rather than to every visible one: under a distributed launch that
+    device is the process's own ``cuda:<LOCAL_RANK>``, so each rank caps what it allocates on and
+    none of them touches a sibling's share. A CPU run has nothing to cap, and the fraction is still
+    validated there so a bad value fails the same way on any machine.
+
+    Args:
+        device (str): The device the run resolved to, e.g. "cuda:1" or "cpu".
+        fraction (float | None): The share of the device the run may take, None to leave it uncapped.
+
+    Raises:
+        ValueError: If the fraction is not greater than 0 and at most 1.
+    """
+    check_gpu_memory_fraction(fraction)
+    if fraction is None or "cuda" not in device:
+        return
+    # A bare "cuda" carries no index; torch then caps the current device, which is the same one.
+    torch.cuda.set_per_process_memory_fraction(fraction, torch.device(device).index)
+
+
 def _resolve_strategy(
     strategy_pattern: Any, device: str, local_rank: int, distributed: bool
-) -> "torch_distributed.DistributedStrategy":
+) -> "scm_torch.DistributedStrategy":
     """Resolve the run's strategy: an explicit pattern wins, then DDP when distributed, else single-device."""
     if strategy_pattern is not None:
         return instantiate_object(strategy_pattern)(device=device, local_rank=local_rank)
     if distributed:
-        return torch_distributed.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
-    return torch_distributed.SingleDeviceStrategy(device=device, local_rank=local_rank)
+        return scm_torch.DistributedDataParallelStrategy(device=device, local_rank=local_rank)
+    return scm_torch.SingleDeviceStrategy(device=device, local_rank=local_rank)
 
 
 def _assemble_learner(
@@ -315,7 +286,7 @@ def _assemble_learner(
     input_shapes: dict[str, Any],
     initializers: dict[str, Any],
     resume: str | None,
-    strategy: "torch_distributed.DistributedStrategy",
+    strategy: "scm_torch.DistributedStrategy",
     compile_kw: dict[str, Any] | None,
     learner_pattern: Any,
     learner_outputs: list[str] | None,
@@ -329,8 +300,8 @@ def _assemble_learner(
     # CPU buffers.
     with torch.device(device):
         models = _instantiate_models(model_patterns)
-        input_shapes = torch_trainer.resolve_input_shapes(models, input_shapes) or {}
-        torch_trainer.initial_model(models, input_shapes)
+        input_shapes = scm_torch.resolve_input_shapes(models, input_shapes) or {}
+        scm_torch.initial_model(models, input_shapes)
         # A resumed run loads its weights later, which would overwrite whatever the initializers and
         # the initial-weight broadcast produce here.
         if is_main and resume is None:
@@ -342,82 +313,52 @@ def _assemble_learner(
         models = OrderedDict((n, strategy.compile(m, compile_kw)) for n, m in models.items())
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
-        # Only learners declaring the parameter get the strategy's scaler creator: a learner taking
-        # its models as **kwargs would otherwise record the creator as one more model.
-        try:
-            takes_scaler_creator = "__grad_scaler_creator__" in inspect.signature(factory).parameters
-        except (TypeError, ValueError):  # Callables implemented in C expose no signature.
-            takes_scaler_creator = False
-        if takes_scaler_creator:
-            learner = factory(**models, __grad_scaler_creator__=strategy.grad_scaler_creator)
-        else:
-            learner = factory(**models)
-        learner_outputs = _get_module_outputs(learner, learner_outputs, "learner")
-        tracker = torch_trainer.TorchTracker.from_criteria(
+        learner = factory(**models)
+        # Before the resume reads or writes a single optimizer state: a group mixing DTensor and
+        # plain parameters crashes the first step under tensor parallelism, and a state saved from a
+        # split optimizer must load back into an identically split one.
+        for optimizer in learner.optimizers.values():
+            scm_torch.split_mixed_param_groups(optimizer)
+        learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
+        tracker = scm_torch.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
         )
     # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
     # Flow functions compile only on a single device: distributed wrappers graph-break inside the
     # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
     # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
-    if hasattr(learner, "flow_functions") and not distributed:
+    if not distributed:
         for flow_name in list(learner.flow_functions):
             setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), compile_kw))
     return models, learner, learner_outputs, tracker
 
 
-def _restore_training_state(
-    *,
-    resume: str,
-    strategy: "torch_distributed.DistributedStrategy",
-    models: "OrderedDict[str, torch.nn.Module]",
-    learner: Any,
-    start_epoch: int,
-    is_main: bool,
-    logger: "torch_logger.Logger",
-) -> int:
-    """Load the resumed state into models, optimizers and scalers; the saved epoch wins over --start-epoch.
-
-    The logger owns the reference format, and only rank 0 holds a real one: the `NullLogger` ranks
-    fetch nothing and take the state from the strategy's broadcast.
-    """
-    raw_state = logger.fetch_training_state(resume)
-    state = strategy.load_state_dict(models, learner.optimizers, learner.optimizer_models, raw_state)
-    for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
-        if state.get("grad_scalers", {}).get(scaler_name):
-            scaler.load_state_dict(state["grad_scalers"][scaler_name])
-    resumed_epoch = state["meta"]["epoch"] + 1
-    if start_epoch != 1 and is_main:
-        print(f"Ignoring --start-epoch {start_epoch}: the resumed state continues at epoch {resumed_epoch}.")
-    return resumed_epoch
-
-
 def _build_callbacks(
     *,
     trainer: Any,
-    provider: SimpleDataProvider,
-    strategy: "torch_distributed.DistributedStrategy",
+    provider: "scm.SimpleDataProvider",
+    strategy: "scm_torch.DistributedStrategy",
     learner_outputs: list[str],
     higher_criteria: list[str],
     lower_criteria: list[str],
     save_criteria: list[str],
-    logger: "torch_logger.Logger",
+    logger: "scm_loggers.Logger",
     ci: bool,
     is_main: bool,
 ) -> None:
     """Install the logger and the saver/best/display callbacks on the trainer."""
     # The saver and the best-criterion monitors run collectives, so they are built on every rank;
     # only rank 0 holds a real logger and writes anything. See ADR-0005.
-    saver = torch_trainer.TrainingStateSaver(logger=logger, strategy=strategy)
-    bests = torch_trainer.TorchBestCriterion.from_criteria(
+    saver = scm_torch.TrainingStateSaver(logger=logger, strategy=strategy)
+    bests = scm_torch.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
     display: list[Any] = []
     if is_main:
         display.append(
-            Printer()
+            scm.Printer()
             if ci
-            else ProgressBar(
+            else scm.ProgressBar(
                 steps_per_epoch=provider.steps_per_epoch,
                 validation_steps=provider.validation_steps,
                 training_criteria=[f"{trainer.training_prefix}{n}" for n in learner_outputs],
@@ -431,152 +372,114 @@ def _build_callbacks(
 def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
-        help="The object patterns used to instantiate models. "
-        "For example, if the model is defined as `model_name = my_package.MyModel(...)`, then the pattern should be "
-        '"model_name: [_obj_, {_addr_: my_package.MyModel, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"model_name: [_obj_, [_addr_, my_package.MyModel, my_package.py], {_call_: {...}}]".',
+        help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
+        + ' Pass one positional argument per model, each a mapping with exactly one "name: pattern" entry given '
+        "inline; a file path is not accepted here. The names are passed to the --learner factory as keyword "
+        "arguments and are the keys used by --initializer.",
     ),
     initializer_patterns: list[dict] | None = Option(
         None,
         "--initializer",
         "-I",
         parser=dict_parser,
-        help="The object patterns used to instantiate initializers for the models. "
-        "For example, if the initializer is defined as `my_package.initialize_fn`, then the pattern should be "
-        '"model_name: [_obj_, {_addr_: my_package.initialize_fn, _file_: my_package.py}]" or '
-        '"model_name: [_obj_, [_addr_, my_package.initialize_fn, my_package.py]]".',
+        help=scm_args.object_pattern_help("the initializer", "initialize_fn", keyed=True, call=False)
+        + " Key each pattern by one of the model names given as positional arguments; a key matching no model is "
+        "ignored. Each initializer is applied to every submodule of its model on rank 0 and broadcast to the other "
+        "ranks, and the whole option is skipped when --resume is given, because the loaded state would overwrite it.",
     ),
-    shapes: list[dict] | None = shapes,
-    device: str | None = device,
-    learner_pattern: Any = Option(
-        ...,
-        "--learner",
-        "-L",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the learner class. "
-        "For example, if the learner class is defined as `my_package.MyLearner(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyLearner, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyLearner, my_package.py], {_call_: {...}}]".',
+    shapes: list[dict] | None = scm_args.shapes_option(
+        SHAPES_HELP
+        + " Repeat the option to declare more inputs; occurrences are merged at the top level, so an input named "
+        "twice keeps only the last occurrence. When omitted, the INPUT_SHAPES declared by the built models are "
+        "used, merged across them."
     ),
-    learner_outputs: list[str] | None = Option(
+    device: str | None = Option(
         None,
-        "--learner-outputs",
-        "-LO",
-        help="Default outputs for the learner module if it doesn't have an 'outputs' attribute.",
+        "--device",
+        "-d",
+        help=DEVICE_HELP + " Under a distributed launch the CUDA index is replaced by the process's LOCAL_RANK.",
     ),
+    gpu_memory_fraction: float | None = Option(
+        None,
+        "--gpu-memory-fraction",
+        help="Share of its GPU's memory the run may take, greater than 0 and at most 1. It is applied with "
+        "torch.cuda.set_per_process_memory_fraction to the --device the run resolved to, so under a distributed "
+        "launch each rank caps its own and a CPU run caps nothing. It bounds the caching allocator, which is what "
+        "a run's tensors come from, and not what the driver context or NCCL reserve beside it. Uncapped when "
+        "omitted.",
+    ),
+    learner_pattern: Any = scm_args.learner_pattern,
+    learner_outputs: list[str] | None = scm_args.learner_outputs,
     compile_pattern: dict[str, Any] | None = compile_pattern,
-    trainer_pattern: Any | None = Option(
-        None,
-        "--trainer",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the trainer. "
-        "For example, if the trainer is defined as `my_package.MyTrainer`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyTrainer, _file_: my_package.py}]" or '
-        '"[_obj_, [_addr_, my_package.MyTrainer, my_package.py]]".',
+    trainer_pattern: Any | None = scm_args.trainer_option(
+        "trainer(device=..., learner=..., tracker=..., data=..., callbacks=[])", "TorchTrainer"
     ),
-    epochs: int = Option(1, "--epochs", "-e", help="Number of training epochs."),
-    start_epoch: int = Option(1, help="Starting epoch number."),
-    resume: str | None = Option(
-        None,
-        "--resume",
-        help="Training state to resume from, in a form the active --logger understands: a local path always "
-        "works, 'runs:/<run_id>/<artifact>' requires --logger mlflow, and "
-        "'wandb://<entity>/<project>/<run_id>/<file>' requires --logger wandb; resuming across services is not "
-        "supported. Restores models, optimizers, grad scalers, and continues from the saved epoch.",
+    epochs: int = scm_args.epochs,
+    start_epoch: int = scm_args.start_epoch,
+    resume: str | None = scm_args.resume_option(
+        "Restores models, optimizers, grad scalers, and continues from the saved epoch.", "data-order, sampler or RNG"
     ),
-    training_dataset_pattern: Any = Option(
-        ...,
-        "--training-dataset",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the training dataset. "
-        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
-    ),
-    validation_dataset_pattern: Any | None = Option(
-        None,
-        "--validation-dataset",
-        "-V",
-        parser=path_or_any_parser,
-        help="The object pattern used to instantiate the validation dataset. "
-        "For example, if the dataset is defined as `my_package.MyDataset(...)`, then the pattern should be "
-        '"[_obj_, {_addr_: my_package.MyDataset, _file_: my_package.py}, {_call_: {...}}]" or '
-        '"[_obj_, [_addr_, my_package.MyDataset, my_package.py], {_call_: {...}}]".',
-    ),
-    validation_frequency: int = Option(1, "--validation-frequency", "-f", help="Frequency of validation (in epochs)."),
-    lower_criteria: list[str] = Option(
-        ...,
-        "--lower-criterion",
-        "-LC",
-        default_factory=list,
-        help="Criterion names that require lower values.",
-    ),
-    higher_criteria: list[str] = Option(
-        ...,
-        "--higher-criterion",
-        "-HC",
-        default_factory=list,
-        help="Criterion names that require higher values.",
-    ),
-    save_criteria: list[str] = Option(
-        ...,
-        "--save-criterion",
-        "-SC",
-        default_factory=list,
-        help="Criterion names to monitor for saving the best model. "
-        "Should be a subset of lower_criteria and higher_criteria.",
-    ),
-    seed: int = Option(42, envvar="SEED", help="Random seed for reproducibility."),
+    training_dataset_pattern: Any = scm_args.training_dataset_option(),
+    validation_dataset_pattern: Any | None = scm_args.validation_dataset_pattern,
+    validation_frequency: int = scm_args.validation_frequency,
+    lower_criteria: list[str] = scm_args.lower_criteria,
+    higher_criteria: list[str] = scm_args.higher_criteria,
+    save_criteria: list[str] = scm_args.save_criteria,
+    seed: int = scm_args.seed_option(),
     matmul_precision: Literal["highest", "high", "medium"] = matmul_precision,
-    experiment: str = Option(
-        "experiment", "--experiment", "-E", envvar="EXPERIMENT", help="Experiment name for the logger."
-    ),
-    logger_name: Literal["mlflow", "wandb"] = Option(
-        "mlflow", "--logger", help="Experiment tracking service to record the run to."
-    ),
-    log_arguments: list[dict] | None = Option(
-        None, "--log-arguments", "-K", parser=dict_parser, help="Additional arguments to log."
-    ),
-    log_artifacts: list[Path] | None = Option(None, "--log-artifacts", "-A", help="Artifacts to log."),
-    ci: bool = Option(
-        False,
-        help="Whether to run in CI mode. "
-        "If true, it will print the criteria at the end of each epoch instead of using a progress bar.",
-    ),
+    experiment: str = scm_args.experiment,
+    logger_name: Literal["mlflow", "wandb"] = scm_args.logger_name,
+    log_arguments: list[dict] | None = scm_args.log_arguments,
+    log_artifacts: list[Path] | None = scm_args.log_artifacts,
+    ci: bool = scm_args.ci,
     dist_backend: str | None = Option(
         None,
         envvar="DIST_BACKEND",
-        help="Distributed backend to use (e.g., 'nccl', 'gloo'). If None, it will be automatically selected.",
+        help='Communication library for the distributed process group (e.g. "nccl", "gloo"). '
+        "Selected automatically from the device when not specified.",
     ),
     dist_url: str | None = Option(
-        None, envvar="DIST_URL", help="URL to use for setting up distributed training. If None, it will use 'env://'."
+        None,
+        envvar="DIST_URL",
+        help='Rendezvous URL for setting up distributed training. Defaults to "env://" when not specified.',
     ),
     strategy_pattern: Any | None = Option(
         None,
         "--strategy",
         parser=path_or_any_parser,
-        help="Object pattern instantiating a distributed strategy factory; called with device=... and local_rank=.... "
-        "Defaults to DistributedDataParallelStrategy when a distributed environment is detected, "
-        "else SingleDeviceStrategy.",
+        help=scm_args.object_pattern_help("the distributed strategy factory", "MyStrategy", call=False)
+        + scm_args.PATH_FORM_HELP
+        + " The factory is called with the resolved device and local rank. Defaults to "
+        "DistributedDataParallelStrategy when a distributed environment is detected, otherwise SingleDeviceStrategy.",
     ),
 ) -> None:
-    """Train a PyTorch model, recording the run to an experiment tracking service."""
+    """Train PyTorch models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    device, global_rank, local_rank, world_size, distributed = torch_distributed.initial_distributed_env(
+    device, global_rank, local_rank, world_size, distributed = scm_torch.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
+    # After the resolution above, which is what decides the device the cap applies to, and before
+    # anything allocates on it.
+    _cap_gpu_memory(device, gpu_memory_fraction)
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    torch.manual_seed(seed + global_rank)
-    np.random.seed(seed + global_rank)
-    random.seed(seed + global_rank)
+    # Before the seeding, which is derived from the strategy's data coordinates rather than the
+    # global rank: the ranks of one tensor-parallel group split a model, so they must draw the same
+    # dropout masks as each other and read the same slice of the dataset (ADR-0022). The coordinates
+    # go into the environment too, because a dataset is an independently instantiated object pattern
+    # the CLI hands nothing to, and a rank-aware loader has no other way to reach them.
     strategy = _resolve_strategy(strategy_pattern, device, local_rank, distributed)
+    os.environ["DATA_RANK"] = str(strategy.data_rank)
+    os.environ["DATA_WORLD_SIZE"] = str(strategy.data_world_size)
+    torch.manual_seed(seed + strategy.data_rank)
+    np.random.seed(seed + strategy.data_rank)
+    random.seed(seed + strategy.data_rank)
     is_main = global_rank == 0
     input_shapes = reduce_dict(shapes)
     training_dataset = instantiate_object(training_dataset_pattern)
     validation_dataset = instantiate_object(validation_dataset_pattern) if validation_dataset_pattern else None
-    provider = SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
+    provider = scm.SimpleDataProvider(training_dataset=training_dataset, validation_dataset=validation_dataset)
     if is_main:
         print("Count the dataset sizes...")
         print(f"Training dataset size: {provider.steps_per_epoch} steps.")
@@ -597,21 +500,23 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     # Built before the resume, which fetches the state through it. Only the experiment name is stored
     # here: the run itself starts in __enter__.
     if is_main:
-        logger_type = mlflow_logger.MLflowLogger if logger_name == "mlflow" else wandb_logger.WandbLogger
-        logger: torch_logger.Logger = logger_type(experiment=experiment)
+        logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
+        logger: scm_loggers.Logger = logger_type(experiment=experiment)
     else:
-        logger = torch_logger.NullLogger()
+        logger = scm_loggers.NullLogger()
     if resume is not None:
-        start_epoch = _restore_training_state(
+        start_epoch = scm_torch.restore_training_state(
             resume=resume,
             strategy=strategy,
-            models=models,
+            # The learner's mapping, not the command's: the saver writes `learner.models`, which
+            # also carries the `ema_<model>` shadows the command never built (`docs/adr/0021`).
+            models=dict(learner.models),
             learner=learner,
             start_epoch=start_epoch,
             is_main=is_main,
             logger=logger,
         )
-    trainer_type = torch_trainer.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
+    trainer_type = scm_torch.TorchTrainer if trainer_pattern is None else instantiate_object(trainer_pattern)
     trainer = trainer_type(device=device, learner=learner, tracker=tracker, data=provider, callbacks=[])
     _build_callbacks(
         trainer=trainer,
@@ -632,6 +537,7 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "initializers": initializer_patterns,
         "shapes": input_shapes,
         "device": device,
+        "gpu_memory_fraction": gpu_memory_fraction,
         "distributed": distributed,
         "world_size": world_size,
         "learner": learner_pattern,

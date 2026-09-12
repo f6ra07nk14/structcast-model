@@ -1,0 +1,70 @@
+# The Keras twin of "cfg/torch/models/CycleGAN_generator.yaml": a ResNet generator reading "image"
+# and emitting "out". Three things differ, because Keras has no layer for them:
+# - Images are NHWC, so every convolution is written channels-last.
+# - Keras ships no reflection-padding layer, so the 7x7 stem and head and the 3x3 residual
+#   convolutions pad with zeros under "padding: same" where the torch twin reflects. Only the border
+#   pixels differ; reflection is what CycleGAN uses to keep them free of the seam a zero border
+#   leaves, so a run that cares about the frame edge needs its own padding layer here.
+# - Instance normalization is "keras.layers.GroupNormalization(groups=-1)", one group per channel,
+#   with center and scale off to match "torch.nn.InstanceNorm2d", whose "affine" defaults to false,
+#   and with "epsilon" set to torch's 1e-5: the Keras default is 1e-3, a hundred times larger, which
+#   measurably shifts the normalized activations.
+# - The stride-2 3x3 convolutions of "DownBlock" pad (0, 1) under "padding: same" where torch pads
+#   (1, 1), so the sampling grid sits one input pixel to the left and up of the torch twin's. Both
+#   produce the same output size and both train from scratch identically; only a run transplanting
+#   torch weights into this model would see it.
+# The root emits a structured output, as "cfg/keras/models/ConvNeXtV2.yaml" does and as
+# "scm keras create model" forces by default, so the learner reads "out" off the returned mapping.
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+    n_residual_blocks: 9
+    init_features: 64
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: true
+_jinja_yaml_: |-
+  FLOW:
+    # Initial convolution block
+    - [image, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{init_features}}, kernel_size: 7, padding: same, data_format: channels_last}}]]
+    - [_, _, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+    - [_, _, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: relu}}]]
+    # Downsampling
+    - [_, _, down0, {TYPE: DownBlock, PARAM: {DEFAULT: {fout: {{init_features * 2}}}}}]
+    - [_, _, down1, {TYPE: DownBlock, PARAM: {DEFAULT: {fout: {{init_features * 4}}}}}]
+    # Residual blocks
+    {% for i in range(n_residual_blocks) %}
+    - [_, _, "res_block{{i}}", {TYPE: ResidualBlock, PARAM: {DEFAULT: {features: {{init_features * 4}}}}}]
+    {% endfor %}
+    # Upsampling
+    - [_, _, up0, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features * 2}}}}}]
+    - [_, _, up1, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features}}}}}]
+    # Output layer
+    - [_, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{channels}}, kernel_size: 7, padding: same, data_format: channels_last}}]]
+    - [_, out, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: tanh}}]]
+ResidualBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{features}}, kernel_size: 3, padding: same, data_format: channels_last}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: relu}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{features}}, kernel_size: 3, padding: same, data_format: channels_last}}]]
+      - [_, feat, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+      - [[[inp, feat]], out, [_obj_, {_addr_: keras.layers.Add}, _call_]]
+DownBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{fout}}, kernel_size: 3, strides: 2, padding: same, data_format: channels_last}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+      - [_, out, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: relu}}]]
+UpBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.UpSampling2D}, {_call_: {size: 2, data_format: channels_last}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Conv2D}, {_call_: {filters: {{fout}}, kernel_size: 3, strides: 1, padding: same, data_format: channels_last}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.GroupNormalization}, {_call_: {groups: -1, epsilon: 1.0e-5, center: false, scale: false}}]]
+      - [_, out, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: relu}}]]

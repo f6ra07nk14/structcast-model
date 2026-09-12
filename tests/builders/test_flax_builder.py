@@ -1,12 +1,27 @@
 """API-level tests for flax builder classes."""
 
-import pytest
+import ast
+from collections import defaultdict
+from collections.abc import Callable
+import logging
+from pathlib import Path
+from re import findall, search
+from typing import Any
 
-from structcast_model.builders.flax_builder import (
+import pytest
+from structcast.core.exceptions import SpecError
+from structcast.core.instantiator import ObjectPattern
+
+from structcast_model.builders.flax import (
     FlaxBuilder,
     FlaxLayerIntermediate,
+    FlaxLearnerBuilder,
+    inject_learning_rate,
+    optimizer_hash,
 )
-from tests import CFG_DIR
+from structcast_model.builders.utils import resolve_object
+from structcast_model.utils.base import load_any
+from tests import CFG_DIR, FIXTURES_DIR
 
 
 def test_flax_layer_intermediate_generates_call_method_without_inference_flow() -> None:
@@ -47,7 +62,12 @@ def test_flax_layer_intermediate_generates_training_inference_branches() -> None
 
 
 def test_flax_layer_intermediate_init_accepts_rngs() -> None:
-    """Generated __init__ signature must include rngs: flax.nnx.Rngs."""
+    """Generated __init__ signature must include rngs: flax.nnx.Rngs and the precision pair.
+
+    The defaults are the contract: `dtype=None` leaves every layer on its own compute type and
+    `param_dtype=jax.numpy.float32` is the `flax.nnx` storage default, so a model built without
+    naming either is the model this builder emitted before it carried them.
+    """
     script = FlaxLayerIntermediate(
         classname="Unit",
         imports={},
@@ -58,7 +78,10 @@ def test_flax_layer_intermediate_init_accepts_rngs() -> None:
         inference_flow=[],
         structured_output=False,
     )._get_layer_script("Unit", [])
-    assert "def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True):" in script
+    assert (
+        "def __init__(self, *, rngs: flax.nnx.Rngs, training: bool = True, "
+        "dtype: flax.typing.Dtype | None = None, param_dtype: flax.typing.Dtype = jax.numpy.float32):"
+    ) in script
 
 
 def test_flax_layer_intermediate_uses_inputs_outputs_attributes() -> None:
@@ -189,3 +212,1017 @@ def test_flax_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> No
     assert "stem" in built.layers
     assert any("downsample" in k for k in built.layers)
     assert len(built.scripts) > 0
+
+
+@pytest.mark.parametrize(
+    ("name", "parameters", "outputs", "layer"),
+    [
+        ("CycleGAN_generator", {"DEFAULT": {"n_residual_blocks": 1, "init_features": 4}}, ["out"], "res_block0"),
+        ("CycleGAN_discriminator", {}, ["out"], "head"),
+        ("SmallLanguageModel", {"tiny": {"dim": 16, "heads": 2, "depth": 2}}, ["logits"], "backbone"),
+        ("VisionTransformer", {"base": {"dim": 16, "heads": 2, "depth": 2}}, ["cls"], "backbone"),
+    ],
+)
+def test_flax_builder_builds_every_shipped_model_template(
+    name: str, parameters: dict[str, dict[str, Any]], outputs: list[str], layer: str
+) -> None:
+    """Every model template under cfg/flax has to emit a module, whatever else it is asserted to do.
+
+    A template is only reachable through this builder, so a section that renders to invalid YAML or
+    names a layer the DSL cannot resolve fails nowhere else -- and the shipped templates are what a
+    validation run trains. The named layer of each is what a later flow line or a sharding rule
+    addresses it by, so it is pinned here rather than left to the emitted text.
+    """
+    built = FlaxBuilder.from_path(CFG_DIR / "flax" / "models" / f"{name}.yaml")(parameters=parameters)
+
+    assert built.outputs == outputs
+    assert built.structured_output is True
+    assert layer in built.layers
+    assert "class Model(flax.nnx.Module):" in built.scripts[-1]
+
+
+def _render(pattern: ObjectPattern) -> tuple[str, dict[str, set[str | None]]]:
+    """Render a pattern the way the learner builder does, returning the code and collected imports."""
+    imports: defaultdict[str, set[str | None]] = defaultdict(set)
+    return resolve_object(imports, pattern)[0], dict(imports)
+
+
+def test_inject_learning_rate_wraps_the_factory_carrying_the_learning_rate() -> None:
+    """The rate-carrying factory is wrapped so its rate lands in a readable `hyperparams` slot.
+
+    Every other keyword becomes a `static_args` entry: `inject_hyperparams` arrayifies numeric
+    keywords otherwise, and `bool` is an `int`, so `nesterov=True` would reach `adamw` as `Array(1)`.
+    """
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "flax.nnx.Optimizer"],
+                {
+                    "_bind_": {
+                        "tx": {
+                            "_obj_": [
+                                ["_addr_", "optax.chain"],
+                                {
+                                    "_call_": [
+                                        {
+                                            "_obj_": [
+                                                ["_addr_", "optax.clip_by_global_norm"],
+                                                {"_call_": {"max_norm": 2.0}},
+                                            ]
+                                        },
+                                        {
+                                            "_obj_": [
+                                                ["_addr_", "optax.adamw"],
+                                                {"_call_": {"learning_rate": 0.0002, "nesterov": True}},
+                                            ]
+                                        },
+                                    ]
+                                },
+                            ]
+                        },
+                        "wrt": "eval: Param",
+                    }
+                },
+            ]
+        }
+    )
+    rewritten, injected = inject_learning_rate(pattern)
+    assert injected is True
+    code, imports = _render(rewritten)
+    assert code == (
+        "(lambda *_arg0, **_kw0: Optimizer(*_arg0, tx=chain(clip_by_global_norm(max_norm=2.0), "
+        "inject_hyperparams(inner_factory=adamw, static_args=['nesterov'])"
+        "(learning_rate=0.0002, nesterov=True)), wrt=Param, **_kw0))"
+    )
+    assert imports == {
+        "flax.nnx": {"Optimizer"},
+        "optax": {"adamw", "chain", "clip_by_global_norm", "inject_hyperparams"},
+    }
+
+
+def test_inject_learning_rate_keeps_a_scheduled_rate_and_omits_empty_static_args() -> None:
+    """A schedule stays the value of the wrapped call, and a lone learning rate needs no `static_args`."""
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "optax.sgd"],
+                {
+                    "_call_": {
+                        "learning_rate": {
+                            "_obj_": [
+                                ["_addr_", "optax.linear_schedule"],
+                                {"_call_": {"init_value": 0.1, "end_value": 0.0, "transition_steps": 10}},
+                            ]
+                        }
+                    }
+                },
+            ]
+        }
+    )
+    rewritten, injected = inject_learning_rate(pattern)
+    assert injected is True
+    assert _render(rewritten)[0] == (
+        "inject_hyperparams(inner_factory=sgd)"
+        "(learning_rate=linear_schedule(init_value=0.1, end_value=0.0, transition_steps=10))"
+    )
+
+
+def test_inject_learning_rate_leaves_an_already_injected_pattern_alone() -> None:
+    """A hand-written `inject_hyperparams` already reports its rate and must not be wrapped twice."""
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "optax.inject_hyperparams"],
+                {"_call_": [{"_obj_": [["_addr_", "optax.adamw"]]}]},
+                {"_call_": {"learning_rate": 0.001}},
+            ]
+        }
+    )
+    rewritten, injected = inject_learning_rate(pattern)
+    assert rewritten is pattern
+    assert injected is True
+
+
+def test_inject_learning_rate_reports_a_pattern_without_a_learning_rate_keyword() -> None:
+    """A positional rate cannot be identified, so the pattern is left alone and flagged as unreported."""
+    pattern = ObjectPattern.model_validate({"_obj_": [["_addr_", "optax.sgd"], ["_call_", 0.1]]})
+    rewritten, injected = inject_learning_rate(pattern)
+    assert rewritten is pattern
+    assert injected is False
+
+
+def test_inject_learning_rate_reports_an_ambiguous_pattern() -> None:
+    """Two rate-carrying factories give no single rate to report, so neither is wrapped."""
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "optax.chain"],
+                {
+                    "_call_": [
+                        {"_obj_": [["_addr_", "optax.sgd"], {"_call_": {"learning_rate": 0.01}}]},
+                        {"_obj_": [["_addr_", "optax.adamw"], {"_call_": {"learning_rate": 0.001}}]},
+                    ]
+                },
+            ]
+        }
+    )
+    rewritten, injected = inject_learning_rate(pattern)
+    assert rewritten is pattern
+    assert injected is False
+
+
+LEARNER_YAML = FIXTURES_DIR / "cfg" / "flax" / "LinearLearner.yaml"
+SEGMENTS_YAML = FIXTURES_DIR / "cfg" / "flax" / "TwoSegmentLearner.yaml"
+
+
+def _learner_script(path: Path, parameters: dict[str, dict[str, Any]] | None = None) -> str:
+    """Build a learner from a configuration file and return the script holding its steps and class."""
+    return FlaxLearnerBuilder.from_path(path)(parameters=parameters).scripts[-1]
+
+
+def test_flax_learner_emits_the_steps_as_functions_over_named_state() -> None:
+    """The steps must be plain functions taking every model and optimizer as its own parameter.
+
+    That is the whole compile seam: `flax.nnx.jit` may not close over models or optimizers, and a
+    bound method cannot be wrapped, so a step that read `self` would be uncompilable. The batch is
+    keyword-only, which is what tells the caller donating the state apart from the batch.
+    """
+    script = _learner_script(LEARNER_YAML)
+
+    assert "def _training_step(model, optimizer, *, x, y, **kwargs):" in script
+    assert "def _inference_step(model, *, x, y, **kwargs):" in script
+    assert "(_, (loss,)), _grads = flax.nnx.value_and_grad(_flow_optimizer, has_aux=True)(model, x=x, y=y)" in script
+    assert "lrs = {'optimizer': get_learning_rate(optimizer)}" in script
+    assert "return {'loss': loss}, lrs, _has_updated\n" in script
+    # The keys are attribute names: a trainer compiles a step by rebinding the attribute it names.
+    assert 'return {"_training_step": self._training_step, "_inference_step": self._inference_step}' in script
+    assert "self._training_step = _training_step" in script
+    assert "criteria, learning_rates, has_updated = self._training_step(self.model, self.optimizer, x=x, y=y" in script
+
+
+def test_flax_learner_module_scope_holds_the_imports_and_the_class_alone() -> None:
+    """Every generated module-level name is a collision waiting for the right configuration.
+
+    The learner imports whatever the user's patterns reference into this module, so a flow layer or
+    a step left at module scope could be shadowed by -- or shadow -- one of those imports. Keeping
+    module scope to imports and the class itself is what makes that impossible.
+    """
+    script = FlaxLearnerBuilder.from_path(SEGMENTS_YAML)()
+    module = ast.parse("\n".join(script.scripts))
+
+    assert [type(node).__name__ for node in module.body] == ["ClassDef"]
+    # The flow layers, the flows and the steps are all built where only the learner can see them.
+    assert "mse = squared_error" in script.scripts[-1]
+    assert "def _flow_optimizer_ab(a, b, x, y):" in script.scripts[-1]
+
+
+def test_flax_learner_comments_describe_behavior_and_cite_no_repository_documents() -> None:
+    """A generated learner is read where this repository is not, so a citation there names nothing.
+
+    Its comments and docstring have to carry the caveat itself -- the flow layers being captured,
+    the rates being read at trace time -- rather than point at a document the reader cannot open.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "docs/adr" not in script
+    assert "they must be stateless" in script
+    assert "Read at trace time" in script
+
+
+def test_flax_learner_emits_the_optimizer_digests_as_a_class_attribute() -> None:
+    """The digests are read off the class by the CLI, so they may not sit next to it at module scope."""
+    (learner,) = ast.parse(_learner_script(LEARNER_YAML)).body
+    assert isinstance(learner, ast.ClassDef)
+
+    annotated = [node for node in learner.body if isinstance(node, ast.AnnAssign)]
+
+    assert [ast.unparse(node.target) for node in annotated] == ["OPTIMIZER_HASHES"]
+
+
+def test_flax_learner_applies_the_optimizer_pattern_to_the_models_it_owns() -> None:
+    """The pattern is a callable returning an optimizer, so the owned module and `wrt` complete it."""
+    script = _learner_script(LEARNER_YAML)
+
+    assert ")(model, wrt=Param)" in script
+    assert "optimizer.update(model, _grads)" in script
+
+
+def test_flax_learner_never_reads_a_variable_value_or_an_update_result() -> None:
+    """Two cross-version rules of the supported flax range (0.12.6..0.12.9) are pinned here.
+
+    `Variable.value` is deprecated in favour of `variable[...]`, and `nnx.Optimizer.update` returns
+    `None` on the floor version, so generated code that consumed either would break on one end of
+    the range.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    # `.value_and_grad` is the transform, not a variable read, hence the word boundary.
+    assert search(r"\.value(?!\w)", script) is None
+    assert search(r"=\s*\w+\.update\(", script) is None
+
+
+def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
+    """The generated steps call `get_learning_rate` and `gradient_steps` directly."""
+    imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
+
+    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
+    assert imports["flax.nnx"] == {None, "Param", "Optimizer"}
+    assert imports["jax"] == {None}
+    assert imports["jax.numpy"] == {None}
+
+
+def test_flax_learner_detects_its_updates_inside_the_step() -> None:
+    """Accumulation is the pattern's `optax.MultiSteps`: the device gates, and the step reads it back.
+
+    The pattern is never parsed for a window, and no window is stored: the step compares the count
+    the first optimizer advanced across its own update and hands the answer back with the criteria,
+    so the learner counts updates without a host read of its own -- detection, not prediction.
+    """
+    script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
+
+    assert "MultiSteps(" in script
+    assert "_before = gradient_steps(optimizer)" in script
+    assert "_has_updated = True if _before is None else gradient_steps(optimizer) > _before" in script
+    assert "self._steps += 1" in script
+    assert "self._has_updated = bool(has_updated)" in script
+    assert "self._updates += int(self._has_updated)" in script
+    assert "def restore_counters(self, steps: int, updates: int) -> None:" in script
+    assert "accumulation_window" not in script
+    assert "self._window" not in script
+    assert "def update(" not in script
+    assert "acc_grads" not in script
+    assert "need_update" not in script
+
+
+def test_flax_learner_scales_the_loss_it_differentiates_and_carries_the_scale_through_the_step() -> None:
+    """`MIXED_PRECISION` puts one `DynamicScale` per segment on the learner and threads it through.
+
+    The scale multiplies the loss inside the differentiated flow -- that is what keeps a float16
+    backward out of the underflow range -- while the criterion the step reports stays the plain one.
+    It reaches the flow as a parameter and leaves the step as a result, so a compiled step donates
+    and returns it with the models and the optimizers rather than closing over the value the learner
+    was built with, and the learner exposes it under the `grad_scalers` name a checkpoint saves.
+    """
+    script = _learner_script(LEARNER_YAML, {"DEFAULT": {"mixed_precision": {"growth_interval": 100}}})
+
+    assert "self.optimizer_dynamic_scale = loss_scale(growth_interval=100)" in script
+    assert "def _flow_optimizer(model, x, y, _loss_scale):" in script
+    assert "return loss * _loss_scale, (loss,)" in script
+    assert "def _training_step(model, optimizer, optimizer_dynamic_scale, *, x, y, **kwargs):" in script
+    assert "_loss_scale=optimizer_dynamic_scale.scale)" in script
+    assert (
+        "_has_updated, optimizer_dynamic_scale = update_with_loss_scale("
+        "model, optimizer, _grads, optimizer_dynamic_scale)"
+    ) in script
+    assert "return {'loss': loss}, lrs, _has_updated, optimizer_dynamic_scale\n" in script
+    assert (
+        "criteria, learning_rates, has_updated, self.optimizer_dynamic_scale = self._training_step("
+        "self.model, self.optimizer, self.optimizer_dynamic_scale, x=x, y=y"
+    ) in script
+    assert "return {'optimizer_dynamic_scale': self.optimizer_dynamic_scale}" in script
+    # The plain update path is gone with the scaled one in: only one of them may write the state.
+    assert "optimizer.update(model, _grads)" not in script
+
+
+def test_flax_learner_without_mixed_precision_emits_no_scale_at_all() -> None:
+    """The field defaults to off, and off has to mean the code a learner emitted before it existed.
+
+    Every learner in the repository is unscaled, so anything the scaled path emits unconditionally
+    -- an import, a step parameter, a helper call -- would change every generated file at once.
+    """
+    script = _learner_script(LEARNER_YAML)
+    imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
+
+    assert "loss_scale" not in script
+    assert "_loss_scale" not in script
+    assert "dynamic_scale" not in script
+    assert "grad_scalers" not in script
+    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
+
+
+def test_flax_learner_scales_every_segment_on_its_own_scale() -> None:
+    """One scale per optimizer, as the torch learner builds one gradient scaler per optimizer.
+
+    A segment whose gradients overflow may not stop the segments beside it from applying, and the
+    two converge on different factors because they differentiate different losses.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["MIXED_PRECISION"] = True
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "self.optimizer_ab_dynamic_scale = loss_scale()" in script
+    assert "self.optimizer_c_dynamic_scale = loss_scale()" in script
+    # The clock is still the first segment alone: the later ones report no update of their own.
+    assert "_has_updated, optimizer_ab_dynamic_scale = update_with_loss_scale((a, b), optimizer_ab," in script
+    assert "_, optimizer_c_dynamic_scale = update_with_loss_scale(c, optimizer_c," in script
+    assert "lrs, _has_updated, optimizer_ab_dynamic_scale, optimizer_c_dynamic_scale\n" in script
+
+
+def test_flax_learner_detects_on_the_first_optimizer_alone() -> None:
+    """One learner, one update count, and the first segment is the clock it runs on.
+
+    Segments need not share a window, so a second comparison would answer a question no counter of
+    the learner asks; the later segments emit their update and nothing else.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "_before = gradient_steps(optimizer_ab)" in script
+    assert "gradient_steps(optimizer_c)" not in script
+
+
+def test_flax_learner_passes_several_owned_models_as_a_plain_tuple() -> None:
+    """One optimizer over several models owns them as a tuple, wherever they are named.
+
+    The optimizer state, the differentiated arguments and the update have to key off the same module
+    paths, and the tuple is what gives all three the same structure without a container node the
+    learner would have to keep among its models.
+    """
+    script = _learner_script(SEGMENTS_YAML)
+
+    assert "def _flow_optimizer_ab(a, b, x, y):" in script
+    assert "flax.nnx.value_and_grad(_flow_optimizer_ab, argnums=(0, 1), has_aux=True)(a, b, x=x, y=y)" in script
+    assert "optimizer_ab.update((a, b), _grads)" in script
+    assert ")((a, b), wrt=Param)" in script
+    assert ")(c, wrt=Param)" in script
+    # No container: the models a trainer sees are the ones the learner was built over.
+    assert "return {'a': self.a, 'b': self.b, 'c': self.c}" in script
+    assert "return {'optimizer_ab': ['a', 'b'], 'optimizer_c': ['c']}" in script
+    assert "flax.nnx.List" not in script
+
+
+def test_flax_learner_passes_a_model_a_segment_only_reads_as_a_parameter() -> None:
+    """A model is state wherever a flow names it, not only where the flow calls it as its layer.
+
+    The flows are built in `__init__`, where every model is also a local: a model read in an
+    expression and not passed in would be captured from there and frozen into the compiled step,
+    so the segment would keep computing with the values that model had when the learner was built.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].insert(0, ["eval: a.fc.kernel[...].mean()", "reg_c", None])
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "def _flow_optimizer_c(c, a, x, y):" in script
+    assert "flax.nnx.value_and_grad(_flow_optimizer_c, has_aux=True)(c, a, x=x, y=y)" in script
+
+
+def test_flax_learner_carries_out_the_values_a_later_update_reads() -> None:
+    """`EXTRA` is evaluated in the step, so a later one reads an earlier flow's values there.
+
+    Those values only exist in the step if the flow that computed them returned them, and a keyword
+    naming one that did not emits a step that fails on the first batch.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["EXTRA"] = {"value": "eval: errors_a"}
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "return loss_ab, (errors_a, loss_ab,)" in script
+    assert "optimizer_c.update(c, _grads, value=errors_a)" in script
+
+
+NO_INPUT_LEARNER: dict[str, Any] = {
+    "INPUTS": [],
+    "OUTPUTS": ["loss"],
+    "LEARNERS": [
+        {
+            "NAME": "optimizer",
+            "LOSS": "loss",
+            "TRAINABLE_LAYERS": ["model"],
+            "OPTIMIZER": [
+                "_obj_",
+                {"_addr_": "flax.nnx.Optimizer"},
+                {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]}},
+            ],
+            "FLOW": [
+                ["eval: jax.numpy.ones((2, 4))", "prediction", "model"],
+                ["eval: jax.numpy.mean(prediction ** 2)", "loss", None],
+            ],
+        }
+    ],
+}
+"""A learner whose flow needs no batch at all, as a generative or a replay-buffer one does."""
+
+
+def test_flax_learner_emits_steps_without_a_batch() -> None:
+    """A learner declaring no inputs must still emit valid signatures and call sites.
+
+    The batch is a keyword-only section of every step, and an empty one may not leave a dangling
+    `*,` behind or a stray comma in the calls the learner makes.
+    """
+    script = FlaxLearnerBuilder(raw=NO_INPUT_LEARNER)().scripts[-1]
+
+    assert "def _training_step(model, optimizer, **kwargs):" in script
+    assert "def _inference_step(model, **kwargs):" in script
+    assert "def training_step(self, **kwargs):" in script
+    assert "self._training_step(self.model, self.optimizer, **kwargs)" in script
+    assert "return self._inference_step(self._view_model, **kwargs)" in script
+    compile(script, "<learner>", "exec")
+
+
+def test_flax_learner_builds_inference_views_of_every_model() -> None:
+    """Inference runs against views: arrays shared with the trained models, inference flags forced.
+
+    `raise_if_not_found=False` keeps a model without dropout or normalization from failing the build.
+    """
+    script = _learner_script(LEARNER_YAML)
+
+    assert (
+        "self._view_model = flax.nnx.view(model, raise_if_not_found=False, training=False, "
+        "deterministic=True, use_running_average=True)"
+    ) in script
+    assert "return self._inference_step(self._view_model, x=x, y=y, **kwargs)" in script
+
+
+def test_flax_learner_keeps_a_hand_bound_wrt() -> None:
+    """A pattern that binds `wrt` itself already says what to optimize, so nothing is appended."""
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2]["_bind_"]["wrt"] = "eval: flax.nnx.Param"
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+    # The hand-bound `wrt` survives inside the pattern, and none is appended to the applied call.
+    assert "wrt=flax.nnx.Param" in script
+    assert "(model, wrt=Param)" not in script
+    assert "))(model)" in script
+
+
+def test_flax_learner_warns_when_the_learning_rate_cannot_be_reported(caplog: pytest.LogCaptureFixture) -> None:
+    """A rate the rewrite cannot find is reported as NaN for the whole run, which has to be said out loud."""
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, ["_call_", 0.1]]}}
+
+    with caplog.at_level(logging.WARNING):
+        script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+    assert "reports no learning rate" in caplog.text
+    assert "inject_hyperparams" not in script
+
+
+def test_flax_learner_rejects_a_segment_that_does_not_compute_its_own_loss() -> None:
+    """A segment differentiates its own closure, so a loss computed by another segment is unreachable."""
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["LOSS"] = "loss_ab"
+
+    with pytest.raises(SpecError, match='its FLOW does not compute its LOSS "loss_ab"'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+def test_flax_convnext_learner_cfg_keeps_its_rate_readable_and_its_norms_undecayed() -> None:
+    """The shipped ConvNeXt V2 learner is the reference for the whole Flax optimizer story.
+
+    Its rate has to survive the rewrite as an injected hyperparameter while every other keyword --
+    including the mask callable, which `inject_hyperparams` would otherwise try to arrayify --
+    stays static, and the structured model output has to be unpacked before the criteria read it.
+    """
+    script = _learner_script(CFG_DIR / "flax" / "learners" / "ConvNeXtV2.yaml")
+
+    assert "cls = model_output['cls']" in script
+    assert (
+        "tx=chain(clip_by_global_norm(max_norm=1.0), "
+        "inject_hyperparams(inner_factory=adamw, static_args=['weight_decay', 'b1', 'b2', 'mask'])"
+        "(learning_rate=0.001, weight_decay=0.05, b1=0.9, b2=0.999, "
+        "mask=no_weight_decay_mask('^(?:\\\\w+\\\\.)*bias$', '^(?:\\\\w+\\\\.)*scale$'))"
+    ) in script
+
+
+@pytest.mark.parametrize("name", ["ImageClassifier", "SmallLanguageModel"])
+def test_flax_single_segment_learner_cfgs_wrap_the_whole_chain_in_multi_steps(name: str) -> None:
+    """Accumulation only counts when `optax.MultiSteps` is the outermost transformation.
+
+    The generated step reads its update gate off the optimizer's outermost `opt_state`, so a window
+    nested inside the `optax.chain` would accumulate exactly the same and still report an update on
+    every step (`docs/adr/0019`). Both templates offer clipping and accumulation as independent
+    parameters, so the combination is where a misplaced wrapper would hide.
+    """
+    parameters = {"DEFAULT": {"clip_grad_norm": 1.0, "accumulate_gradients": 4}}
+    script = _learner_script(CFG_DIR / "flax" / "learners" / f"{name}.yaml", parameters)
+
+    assert "tx=MultiSteps(opt=chain(clip_by_global_norm(max_norm=1.0), inject_hyperparams(" in script
+    assert "every_k_schedule=4" in script
+    # Without the clip the chain is the adamw alone, and the window still wraps the whole chain.
+    plain = _learner_script(CFG_DIR / "flax" / "learners" / f"{name}.yaml", {"DEFAULT": {"accumulate_gradients": 4}})
+    assert "tx=MultiSteps(opt=chain(inject_hyperparams(" in plain
+    assert "clip_by_global_norm" not in plain
+
+
+def test_flax_cycle_gan_learner_cfg_hands_the_generated_images_to_the_discriminators() -> None:
+    """The three segments are one program: what the generator flow computes is what the critics see.
+
+    The torch template feeds its discriminators a replay-buffer sample it takes as an input; a Flax
+    segment differentiates only what its own flow computes, so this template carries "fake_A" and
+    "fake_B" out of the generator closure and passes them in as plain values instead -- which is
+    also why no gradient can leak back into the generators from a discriminator step.
+    """
+    script = _learner_script(CFG_DIR / "flax" / "learners" / "CycleGAN.yaml")
+
+    assert "def __init__(self, G_AB, G_BA, D_A, D_B, **kwargs):" in script
+    # The generators are the leading parameters of their flow, so their positions are the argnums;
+    # the discriminators follow as read-only models.
+    assert "flax.nnx.value_and_grad(_flow_optimizer_G, argnums=(0, 1), has_aux=True)(G_AB, G_BA, D_B, D_A," in script
+    assert "_flow_optimizer_D_A, has_aux=True)(D_A, real_A=real_A, fake_A=fake_A)" in script
+    assert "_flow_optimizer_D_B, has_aux=True)(D_B, real_B=real_B, fake_B=fake_B)" in script
+
+
+def test_flax_learner_keeps_only_the_values_that_leave_the_closure_in_the_aux_tuple() -> None:
+    """A value a later segment reads has to ride out of the closure; one nothing reads must not.
+
+    The auxiliary tuple is the closure's contract with the enclosing step: everything in it is a
+    traced output the step then unpacks. Returning intermediates nothing reads makes every flow
+    value part of that contract, so a flow could no longer compute anything a traced output cannot
+    carry -- and the PyTorch flow functions already return only what is needed.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][1]["FLOW"].insert(0, ["eval: out_a * 2.0", "scaled_a", None])
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+    assert "return loss_ab, (out_a, loss_ab,)" in script
+    assert "return loss_c, (loss_c,)" in script
+
+
+def test_flax_learner_rejects_a_segment_that_reads_a_name_it_stores_later() -> None:
+    """A segment is one nested function, so a name it stores is local to all of it.
+
+    Reading it first is valid Python that raises `UnboundLocalError` on the first batch, long after
+    the script was written, so the order has to be refused while it is still being generated.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: out_b * 2.0", "doubled", None])
+
+    with pytest.raises(SpecError, match='reads "out_b" before its own FLOW stores it'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+def _rename_model(raw: dict[str, Any], name: str) -> None:
+    """Rename the single model of the linear fixture everywhere its learner names it."""
+    raw["LEARNERS"][0]["TRAINABLE_LAYERS"] = [name]
+    for key in ("FLOW", "INFERENCE_FLOW"):
+        raw["LEARNERS"][0][key][0][2] = name
+
+
+def _rename_input(raw: dict[str, Any], name: str) -> None:
+    """Rename the `y` input of the linear fixture, which its flows read as the regression target."""
+    raw["INPUTS"] = ["x", name]
+    raw["LEARNERS"][0]["FLOW"][1]["INPUTS"]["targets"] = name
+    raw["LEARNERS"][0]["INFERENCE_FLOW"][1][0]["targets"] = name
+
+
+def _build(raw: dict[str, Any]) -> None:
+    """Emit the learner of a mutated linear fixture, which is what runs the checks under test."""
+    # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+    _ = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda raw: raw["LEARNERS"][0].update(NAME="x"), 'Name "x" is both an input of the learner'),
+        (lambda raw: _rename_model(raw, "inputs"), 'Name "inputs" is reserved'),
+        (lambda raw: _rename_model(raw, "training_step"), 'Name "training_step" is reserved'),
+        (lambda raw: _rename_input(raw, "kwargs"), 'Name "kwargs" is reserved'),
+        # Reserved whether or not this learner scales anything: the property exists on the class as
+        # soon as one segment does, and a batch entry of that name would shadow it for every learner.
+        (lambda raw: _rename_input(raw, "grad_scalers"), 'Name "grad_scalers" is reserved'),
+        (lambda raw: raw["LEARNERS"][0].update(NAME="self"), 'Name "self" is reserved'),
+    ],
+    ids=[
+        "optimizer-named-like-an-input",
+        "model-named-inputs",
+        "model-named-training-step",
+        "input-kwargs",
+        "input-grad-scalers",
+        "self",
+    ],
+)
+def test_flax_learner_rejects_a_name_the_generated_class_cannot_carry(
+    mutate: Callable[[dict[str, Any]], Any], message: str
+) -> None:
+    """The steps name every model, every optimizer and every batch entry in one signature.
+
+    A name serving as two of those is emitted twice there -- a script that fails to import -- and one
+    equal to a member of the class is worse: `self.inputs = model` in `__init__` overwrites what the
+    trainer reads off the learner afterwards, or shadows a property with an attribute, and neither
+    failure points back at the name that caused it.
+    """
+    raw = load_any(LEARNER_YAML)
+    mutate(raw)
+
+    with pytest.raises(SpecError, match=message):
+        _build(raw)
+
+
+def test_flax_learner_rejects_a_model_named_like_the_view_of_another() -> None:
+    """Each model gets a `_view_<name>` attribute, which another model's name must not already be.
+
+    The two would be one attribute, and whichever `__init__` wrote last would be the one the
+    inference step runs against -- a model trained in place, or a view nobody can train.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["TRAINABLE_LAYERS"] = ["a", "_view_a"]
+    for key in ("FLOW", "INFERENCE_FLOW"):
+        raw["LEARNERS"][0][key][1][2] = "_view_a"
+
+    with pytest.raises(SpecError, match='Name "_view_a" is reserved'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "lrs", None]),
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_grads", None]),
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "model", None]),
+        # `_loss_scale` is the scaled flow's own parameter, refused on every learner: the guard is
+        # uniform, so an output that would shadow it cannot slip through on the unscaled path and
+        # then break when the template turns `MIXED_PRECISION` on.
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_loss_scale", None]),
+    ],
+    ids=["learning-rates", "gradients", "model", "loss-scale"],
+)
+def test_flax_learner_rejects_a_flow_output_the_step_already_binds(mutate: Callable[[dict[str, Any]], Any]) -> None:
+    """The step binds the flow results next to the names it computes itself, so the two may not meet.
+
+    An output named `lrs` would be returned in place of the learning rates it overwrote, and one
+    named like a model would rebind the module before the optimizer is handed it -- both silent,
+    both only visible in criteria nobody can explain.
+    """
+    raw = load_any(LEARNER_YAML)
+    mutate(raw)
+
+    with pytest.raises(SpecError, match="which the generated training step already binds"):
+        _build(raw)
+
+
+def test_inject_learning_rate_ignores_a_plain_string_that_looks_like_the_wrapper() -> None:
+    """Only an address suppresses the rewrite: a label that reads the same makes no rate readable.
+
+    Suppressing on any string would cost such a pattern both its injected rate and the warning that
+    is supposed to announce the loss, leaving the run reporting NaN with nothing said.
+    """
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "optax.named_chain"],
+                {
+                    "_call_": [
+                        [
+                            "sgd_inject_hyperparams",
+                            {"_obj_": [["_addr_", "optax.sgd"], {"_call_": {"learning_rate": 0.1}}]},
+                        ]
+                    ]
+                },
+            ]
+        }
+    )
+
+    rewritten, injected = inject_learning_rate(pattern)
+
+    assert injected is True
+    assert "inject_hyperparams(inner_factory=sgd)(learning_rate=0.1)" in _render(rewritten)[0]
+
+
+def test_flax_learner_forwards_extra_keywords_to_the_update() -> None:
+    """`EXTRA` is where a transformation that needs more than gradients -- a line search, say -- is fed."""
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["EXTRA"] = {"value": "eval: loss"}
+
+    script = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+    assert "optimizer.update(model, _grads, value=loss)" in script
+
+
+def test_the_learner_builder_never_uses_the_zero_argument_super() -> None:
+    """The builder is a `slots=True` dataclass, which rebuilds the class after its methods are compiled.
+
+    Below Python 3.12.4 -- the project floor is 3.11 -- the `__class__` cell those methods close over
+    still points at the discarded class, so a zero-argument `super()` raises
+    `TypeError: super(type, obj): obj must be an instance or subtype of type` and every generated
+    learner fails. The CI interpreters that carry the fix cannot see it, so the shape is asserted
+    instead of the behavior.
+    """
+    for name, member in vars(FlaxLearnerBuilder).items():
+        code = getattr(member, "__code__", None)
+        assert code is None or "__class__" not in code.co_freevars, name
+
+
+def _emitted_hashes(script: str) -> dict[str, str]:
+    """Read the `OPTIMIZER_HASHES` constant back out of a generated learner script."""
+    line = search(r"OPTIMIZER_HASHES: dict\[str, str\] = \{(.*)\}", script)
+    assert line is not None, script
+    return dict(findall(r"'(\w+)': '(\w+)'", line.group(1)))
+
+
+def test_flax_learner_emits_the_digest_of_the_optimizer_pattern_as_written() -> None:
+    """The emitted digest identifies the OPTIMIZER pattern, so a resume can report a rebuilt optimizer.
+
+    It is taken before `inject_learning_rate` rewrites the pattern, so the digest a run records is
+    the one the configuration itself hashes to -- turning the injection on or off must not read as a
+    changed optimizer. "As written" is after the jinja accumulation switch resolves: under the
+    default parameters the fixture renders the plain sgd tx spelled out here.
+    """
+    pattern = ObjectPattern.model_validate(
+        [
+            "_obj_",
+            {"_addr_": "flax.nnx.Optimizer"},
+            {"_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.1}}]}},
+        ]
+    )
+
+    assert _emitted_hashes(_learner_script(LEARNER_YAML)) == {"optimizer": optimizer_hash(pattern)}
+
+
+def test_flax_learner_optimizer_hashes_are_stable_but_move_with_the_schedule() -> None:
+    """Regenerating the same configuration must repeat the digest, and a new rate must change it.
+
+    A digest that drifted would make every resume warn; one that did not move with the rate would
+    never warn, and optax rebuilds `tx` from configuration without the restored state noticing.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["OPTIMIZER"][2] = {
+        "_bind_": {"tx": ["_obj_", {"_addr_": "optax.sgd"}, {"_call_": {"learning_rate": 0.2}}]}
+    }
+    rebuilt = FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+    assert _emitted_hashes(_learner_script(LEARNER_YAML)) == _emitted_hashes(_learner_script(LEARNER_YAML))
+    assert _emitted_hashes(rebuilt) != _emitted_hashes(_learner_script(LEARNER_YAML))
+
+
+def test_flax_learner_emits_one_optimizer_hash_per_segment() -> None:
+    """Two segments are two independently rebuildable optimizers, so each carries its own digest."""
+    hashes = _emitted_hashes(_learner_script(SEGMENTS_YAML))
+
+    assert sorted(hashes) == ["optimizer_ab", "optimizer_c"]
+    assert len(set(hashes.values())) == 2
+
+
+AVERAGED_INFERENCE = [
+    ["x", "prediction", "ema_model"],
+    [{"predictions": "prediction", "targets": "y"}, "errors", "mse"],
+    ["eval: errors.mean()", "loss", None],
+]
+"""An inference flow validating over the average instead of over the trained parameters."""
+
+
+def _ema_script(inference: list[Any] | None = None, **ema: Any) -> str:
+    """Build the linear learner with an `EMA` over its model and return the script holding the class."""
+    raw = {**load_any(LEARNER_YAML), "EMA": {"model": ema or True}}
+    if inference is not None:
+        raw["LEARNERS"][0]["INFERENCE_FLOW"] = inference
+    return FlaxLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts[-1]
+
+
+def test_flax_learner_emits_the_average_as_a_state_and_the_view_applied_from_it() -> None:
+    """`flax.nnx.EMA` holds the averaged variables; only the view it applies to a model is callable.
+
+    Both are kept: the state is what an Update blends, the view is what a flow runs and what the
+    `models` property carries to a checkpoint -- they share their variables, so saving the view saves
+    the average. The default filters to the parameters, which is the only thing that can be blended:
+    an RNG key cannot be multiplied by a float at all (`docs/adr/0021`).
+    """
+    script = _ema_script()
+
+    assert "self._ema_state_model = flax.nnx.EMA(model, decay=0.999, only=Param)" in script
+    assert "self.ema_model = self._ema_state_model.apply_to(model)" in script
+    assert "'model': self.model, 'ema_model': self.ema_model" in script
+
+
+def test_flax_learner_blends_the_average_on_the_host_after_the_step_returns() -> None:
+    """The blend is deliberately outside the traced step, and gated on the Update the step reported.
+
+    An `nnx.EMA` a compiled step closed over would be mutated from another trace level, which flax
+    rejects; threading it through the signature instead would change the donation contract for a host
+    call that costs nothing where it is. It may not reach the step's parameters either way.
+    """
+    script = _ema_script()
+    step = script.index("def _training_step(")
+    update = script.index("self._ema_state_model.update(self.model)")
+
+    assert "def _training_step(model, optimizer, *, x, y, **kwargs):" in script
+    assert script.index("self._has_updated = bool(has_updated)") < script.index("if self._has_updated:") < update
+    assert script.index("def training_step(self, x, y, **kwargs):") < update
+    assert step < script.index("def training_step(self, x, y, **kwargs):")
+
+
+def test_flax_learner_passes_the_average_to_the_inference_step_the_flow_runs_it_in() -> None:
+    """An average a flow runs is state the step takes, not a value it closes over.
+
+    Read from `__init__` it would be a constant to the tracer, so a compiled evaluation would keep
+    reporting the average as it stood when the learner was built. It gets an inference view of its
+    own for the same reason the models do: dropout off, running statistics frozen.
+    """
+    script = _ema_script(AVERAGED_INFERENCE)
+
+    assert "def _inference_step(model, ema_model, *, x, y, **kwargs):" in script
+    assert (
+        "self._view_ema_model = flax.nnx.view(self.ema_model, raise_if_not_found=False, training=False, "
+        "deterministic=True, use_running_average=True)"
+    ) in script
+    assert "return self._inference_step(self._view_model, self._view_ema_model, x=x, y=y, **kwargs)" in script
+
+
+def test_flax_learner_builds_no_inference_view_of_an_average_no_flow_runs() -> None:
+    """A view nothing runs is one more argument for a trainer to compile around, so it is not built."""
+    script = _ema_script()
+
+    assert "_view_ema_model" not in script
+    assert "def _inference_step(model, *, x, y, **kwargs):" in script
+
+
+def test_flax_learner_without_ema_is_emitted_as_it_was_before_the_field_existed() -> None:
+    """The field is opt-in: a learner that declares none may gain no line from it."""
+    built = FlaxLearnerBuilder.from_path(LEARNER_YAML)()
+
+    assert built.ema == ()
+    assert "ema_" not in built.scripts[-1]
+
+
+class ComputeOnlyLayer:
+    """A layer naming `dtype` and not `param_dtype`, which no shipped `flax.nnx` layer does.
+
+    Addressed by the test below so the forwarding is proven per keyword rather than as a pair: every
+    parameterized `flax.nnx` layer names both, so a builder that treated them as one would pass on
+    the whole shipped catalogue and hand a user's own layer an argument it cannot take.
+    """
+
+    def __init__(self, *, dtype: Any = None) -> None:
+        """Take the compute type and nothing else; the builder only ever reads this signature."""
+        self.dtype = dtype
+
+
+def _flow_layer(address: str, **keywords: Any) -> dict[str, Any]:
+    """One `LAYER` pattern calling *address* with *keywords*."""
+    return {"_obj_": [["_addr_", address], {"_call_": keywords}]}
+
+
+def test_flax_forwards_each_precision_keyword_only_to_the_layers_that_name_it() -> None:
+    """The constructor pair reaches a layer through its own signature, not through the template.
+
+    Which is what makes every generated Flax model a precision knob, the templates that thread
+    `dtype` themselves included. Read per keyword and per layer, because the alternatives all
+    generate code that imports: a pair forwarded together breaks the layer naming one, a pair
+    forwarded to everything breaks `flax.nnx.Dropout`, and a bare address is a function the flow
+    calls, not a constructor with arguments to add.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            ["x", "x", "fc", _flow_layer("flax.nnx.Linear", in_features=4, out_features=4, rngs="eval: rngs")],
+            ["x", "x", "drop", _flow_layer("flax.nnx.Dropout", rate=0.5, rngs="eval: rngs")],
+            ["x", "x", "act", {"_obj_": [["_addr_", "flax.nnx.relu"]]}],
+            ["x", "y", "half", _flow_layer("tests.builders.test_flax_builder.ComputeOnlyLayer")],
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert (
+        "self.fc = Linear(in_features=4, out_features=4, rngs=rngs, dtype=dtype, param_dtype=param_dtype)\n"
+    ) in script
+    assert "self.drop = Dropout(rate=0.5, rngs=rngs)\n" in script
+    assert "self.act = relu\n" in script
+    assert "self.half = ComputeOnlyLayer(dtype=dtype)\n" in script
+
+
+def test_a_precision_keyword_written_on_a_layer_wins_over_the_constructor_argument() -> None:
+    """A value the configuration chose for one layer is the one that layer keeps.
+
+    The templates that already thread `dtype` through their own parameters are the reason: their
+    per-layer value has to survive a model built with the constructor argument, or a size group's
+    `bfloat16` would become whatever the caller passed. The other keyword is still forwarded, so the
+    precedence is per keyword too.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            [
+                "x",
+                "y",
+                "fc",
+                _flow_layer(
+                    "flax.nnx.Linear",
+                    in_features=4,
+                    out_features=2,
+                    rngs="eval: rngs",
+                    dtype="eval: jax.numpy.bfloat16",
+                ),
+            ]
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert (
+        "self.fc = Linear(in_features=4, out_features=2, rngs=rngs, "
+        "dtype=jax.numpy.bfloat16, param_dtype=param_dtype)\n"
+    ) in script
+
+
+def test_a_layer_the_builder_cannot_read_is_left_unforwarded_and_said_so(caplog: pytest.LogCaptureFixture) -> None:
+    """Forwarding nothing is the safe fallback, and a silent one is the dangerous kind.
+
+    The commands import no framework, so a script can be rendered where the layers it addresses are
+    not installed. Failing the build there would break that; forwarding nothing quietly is worse --
+    the same configuration would emit a narrowed model in one environment and a float32 one in
+    another, and the generated script carries no trace of which. So the fallback logs the address it
+    could not read.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [["x", "y", "fc", _flow_layer("no_such_module.NoSuchLayer", units=2)]],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="structcast_model.builders.flax"):
+        script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.fc = NoSuchLayer(units=2)\n" in script
+    assert [r.message for r in caplog.records if "no_such_module.NoSuchLayer" in r.message]
+
+
+def test_no_precision_keyword_is_added_to_a_call_an_attribute_walked_to() -> None:
+    """The signature read is the address's; an `_attr_` moves the call somewhere else.
+
+    `flax.nnx.Linear.from_config(...)` would be given the `dtype` that `Linear.__init__` names and
+    that the classmethod does not, which is a `TypeError` the moment the model is built. The address
+    and the callable have to be the same object for the read to mean anything, so a pattern that
+    walks away from it is left exactly as the configuration wrote it.
+    """
+    pattern = {"_obj_": [["_addr_", "flax.nnx.Linear"], {"_attr_": "from_config"}, {"_call_": {"config": 2}}]}
+    raw = {"INPUTS": ["x"], "OUTPUTS": ["y"], "FLOW": [["x", "y", "fc", pattern]]}
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.fc = Linear.from_config(config=2)\n" in script
+
+
+def test_a_layer_that_declares_its_own_default_is_not_handed_the_builders() -> None:
+    """A keyword is forwarded only where forwarding this builder's default changes nothing.
+
+    `flax.nnx.SimpleCell` is the counterexample the rule exists for: alone in the zoo it computes in
+    float32 rather than in the input's type, so handing it `dtype=None` would silently make it
+    input-inferred -- the one layer where the pair would not be inert at its defaults. Its
+    `param_dtype` does default to float32, so that half is still forwarded, which is what keeps the
+    rule per keyword rather than per layer. The mask builders fall out of the same rule for a
+    different reason: their `dtype` is the element type of the mask they return, and it defaults to
+    float32 too, so a compute type must never reach it.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [
+            ["x", "x", "cell", _flow_layer("flax.nnx.SimpleCell", in_features=4, hidden_features=4, rngs="eval: rngs")],
+            ["x", "y", "mask", _flow_layer("flax.nnx.make_causal_mask", x="eval: x")],
+        ],
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
+
+    assert "self.cell = SimpleCell(in_features=4, hidden_features=4, rngs=rngs, param_dtype=param_dtype)\n" in script
+    assert "self.mask = make_causal_mask(x=x)\n" in script

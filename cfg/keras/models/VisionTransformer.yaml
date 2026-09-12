@@ -1,0 +1,151 @@
+# The Keras twin of "cfg/torch/models/VisionTransformer.yaml": ViT-B/16 reading "image" and emitting
+# "cls". Three things differ:
+# - Images are NHWC, so the patch convolution already produces channels-last patches and one
+#   "keras.layers.Reshape" replaces the flatten-and-transpose pair of the torch twin.
+# - Attention is "keras.layers.MultiHeadAttention", which owns its query/key/value projections, so
+#   there is no "SelfAttention" section to write. Its variable layout is Keras', not timm's, so the
+#   torch twin's state-dict transplant does not apply here.
+# - "DropPath" is "keras.layers.Dropout" with a per-sample noise shape, the same stand-in
+#   "cfg/keras/models/ConvNeXtV2.yaml" uses.
+# The class token is a "keras.layers.Embedding(1, dim)" read at index 0 -- the DSL has no free
+# parameter outside a layer, but a one-row embedding table is the same parameter -- and it is
+# broadcast over the batch by adding it to a zero slice of the patch sequence.
+# The root emits a structured output, as "cfg/keras/models/ConvNeXtV2.yaml" does and as
+# "scm keras create model" forces by default, so the learner reads "cls" off the returned mapping;
+# both models therefore train through "cfg/keras/learners/ImageClassifier.yaml" unchanged.
+PARAMETERS:
+  DEFAULT:
+    size: base
+  SHARED:
+    # As in "SmallLanguageModel.yaml" these are shared instead of default parameters: the flows below
+    # select a size group with "_jinja_group_", and a group sees its own parameters merged with the
+    # shared ones, never the default ones. Overriding them on the command line therefore means
+    # overriding them on the selected size group, e.g. -p "base: {num_classes: 10}".
+    patch_size: 16
+    image_size: 224
+    image_channels: 3
+    num_classes: 1000
+    mlp_ratio: 4
+    # Linearly ramped over the blocks, as in "ConvNeXtV2.yaml"; a single stage needs no cumulative
+    # depths, so the ramp is just "drop_path_rate * i / (depth - 1)".
+    drop_path_rate: 0.1
+    norm_eps: 1.0e-6
+    # Activation checkpointing on every transformer block, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on with -p "SHARED: {gradient_checkpointing: true}",
+    # which buys the block's activation memory with a second forward pass over it (REFERENCE.md,
+    # "GRADIENT_CHECKPOINTING"). Pair it with -p "base: {drop_path_rate: 0.0}", on the selected size
+    # group and not on SHARED: the ramp below is read inside a "_jinja_group_" scope, which a
+    # "SHARED:" override alone does not reach -- it leaves the rate at 0.1, silently. Without the
+    # pairing the build is refused: "keras.remat" re-draws "SeedGenerator"
+    # state on the recomputation, and the "DropPath" sublayer of a block is a "keras.layers.Dropout".
+    # At rate 0 that Dropout returns its input untouched and draws nothing, so the second pass
+    # matches and the build goes through.
+    gradient_checkpointing: false
+  # model size parameters
+  base:
+    dim: 768
+    heads: 12
+    depth: 12
+IMPORTS: {}
+INPUTS: [image]
+_jinja_yaml_: |-
+  _jinja_group_: {{size}}
+  {% raw %}
+  _jinja_yaml_: |-
+    INPUT_SHAPES:
+      image: {_SHAPE_: [{{image_size}}, {{image_size}}, {{image_channels}}], _DTYPE_: float32}
+  {% endraw %}
+OUTPUTS: [cls]
+STRUCTURED_OUTPUT: true
+FLOW:
+  - _jinja_yaml_: |-
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          # (batch, {{image_size}}, {{image_size}}, {{image_channels}})
+          # -> (batch, {{image_size // patch_size}}, {{image_size // patch_size}}, {{dim}})
+          # -> (batch, {{(image_size // patch_size) ** 2}}, {{dim}})
+          - INPUTS: image
+            OUTPUTS: feature
+            NAME: patchify
+            LAYER:
+              - _obj_
+              - _addr_: keras.layers.Conv2D
+              - _call_:
+                  filters: {{dim}}
+                  kernel_size: {{patch_size}}
+                  strides: {{patch_size}}
+                  padding: valid
+                  data_format: channels_last
+          - INPUTS: feature
+            OUTPUTS: feature
+            NAME: flatten_patches
+            LAYER: [_obj_, {_addr_: keras.layers.Reshape}, {_call_: {target_shape: [{{(image_size // patch_size) ** 2}}, {{dim}}]}}]
+          # The class token: one row of a one-row embedding table, broadcast over the batch by
+          # adding it to a zeroed slice of the patch sequence, then prepended.
+          - ["eval: keras.ops.zeros((1, 1), dtype='int32')", class_index, null]
+          - [class_index, class_token, cls_token_embedding, [_obj_, {_addr_: keras.layers.Embedding}, {_call_: {input_dim: 1, output_dim: {{dim}}}}]]
+          - ["eval: class_token + keras.ops.zeros_like(feature[:, :1])", class_tokens, null]
+          - INPUTS: [[class_tokens, feature]]
+            OUTPUTS: feature
+            NAME: concat_class_token
+            LAYER: [_obj_, {_addr_: keras.layers.Concatenate}, {_call_: {axis: 1}}]
+          # A learned position table, unlike the rotary embedding of "SmallLanguageModel.yaml": the
+          # patch grid is fixed by "image_size" and "patch_size", so there is nothing to extrapolate.
+          # It is added after the class token is prepended, so it covers one position more.
+          - ["eval: keras.ops.arange({{(image_size // patch_size) ** 2 + 1}})", index, null]
+          - INPUTS: index
+            OUTPUTS: position
+            NAME: position_embedding
+            LAYER:
+              - _obj_
+              - _addr_: keras.layers.Embedding
+              - _call_: {input_dim: {{(image_size // patch_size) ** 2 + 1}}, output_dim: {{dim}}}
+          - ["eval: feature + position", feature, null]
+          - [feature, feature, backbone, {TYPE: Backbone}]
+          - [feature, feature, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+          # The whole sequence is normalized and only then is the class token read, so the two cannot
+          # be swapped.
+          - ["eval: feature[:, 0]", pooled, null]
+          - [pooled, cls, head, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{num_classes}}}}]]
+      {% endraw %}
+Backbone:
+  OUTPUTS: [feature]
+  _jinja_yaml_: |-
+    FLOW:
+      - _jinja_group_: {{size}}
+      {% raw %}
+        _jinja_yaml_: |-
+          {% for i in range(depth) %}
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1) if depth > 1 else 0.0}}}}}]
+          {% endfor %}
+      {% endraw %}
+Block:
+  # Pre-norm attention and pre-norm MLP, each on a residual branch. "LayerScale" is left out because
+  # "vit_base_patch16_224" sets "init_values=None", which makes it an identity.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    GRADIENT_CHECKPOINTING: {{gradient_checkpointing}}
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+      # Bidirectional self-attention: every patch may read every patch, so no causal mask.
+      - INPUTS: {query: _, value: _}
+        OUTPUTS: attended
+        NAME: attention
+        LAYER: [_obj_, {_addr_: keras.layers.MultiHeadAttention}, {_call_: {num_heads: {{heads}}, key_dim: {{dim // heads}}}}]
+      - [attended, attended, drop_path_attention, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: inp + attended", residual, null]
+      - [residual, _, [_obj_, {_addr_: keras.layers.LayerNormalization}, {_call_: {epsilon: {{norm_eps}}}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: "eval: {{dim}} * {{mlp_ratio}}"}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Activation}, {_call_: {activation: gelu}}]]
+      - [_, _, [_obj_, {_addr_: keras.layers.Dense}, {_call_: {units: {{dim}}}}]]
+      - [_, projected, drop_path_mlp, {TYPE: DropPath, PARAM: {DEFAULT: {drop_prob: {{drop_path}}}}}]
+      - ["eval: residual + projected", out, null]
+DropPath:
+  # Stochastic depth: one Bernoulli draw per batch element, which is what the per-sample noise shape
+  # of a "keras.layers.Dropout" over a (batch, tokens, features) tensor produces. Dropout is inactive
+  # outside training, so no INFERENCE_FLOW is needed.
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, out, [_obj_, {_addr_: keras.layers.Dropout}, {_call_: {rate: {{drop_prob}}, noise_shape: [null, 1, 1]}}]]

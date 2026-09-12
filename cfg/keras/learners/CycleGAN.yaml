@@ -1,0 +1,197 @@
+# Unpaired image-to-image translation over "cfg/keras/models/CycleGAN_generator.yaml" (twice) and
+# "cfg/keras/models/CycleGAN_discriminator.yaml" (twice), the Keras twin of
+# "cfg/torch/learners/CycleGAN.yaml": one generator segment and one discriminator segment per domain.
+# Two things differ from the torch twin, both forced by how a Keras learner runs its segments.
+# - A segment is one function the backend adapter calls with the batch alone, so it can read nothing
+#   another segment computed. The discriminator segments therefore build their own "valid" target and
+#   generate their own fake image instead of reading the generator segment's.
+# - That fake image is the current generator's output, not a sample from a replay buffer of earlier
+#   ones ("fake_A_sample" / "fake_B_sample" in the torch twin), so the batch carries only the two real
+#   images. Add the buffer as two more batch entries if the training is unstable without it.
+# A generator runs with "training=false" inside the discriminator segments, because only the segment
+# that owns a model runs it in training mode; its normalization statistics are therefore untouched
+# there, which is what the torch twin's detached buffer sample achieves.
+PARAMETERS:
+  DEFAULT:
+    epochs: 200
+    decay_epoch: 100 # epochs the rate is held before it starts decaying
+    # The number of training batches in one epoch. A Keras schedule counts optimizer calls, not
+    # epochs, and it advances once per call whether or not that call applied an update, so this is
+    # what turns the epoch counts above into the step counts the schedule takes. Set it to
+    # len(training_dataset).
+    steps_per_epoch: 1000
+    lr: 0.0002
+    b1: 0.5
+    b2: 0.999
+    lambda_cyc: 10.0
+    lambda_id: 5.0
+IMPORTS: {}
+# Float32, like the torch twin, which also enables no mixed precision here. Setting MIXED_PRECISION
+# needs MIXED_PRECISION_TYPE alongside it: "float16" wraps every optimizer in a
+# "keras.optimizers.LossScaleOptimizer" (a mapping here carries that wrapper's keyword arguments)
+# and "bfloat16" stays unscaled. Either field alone is refused.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: null
+INPUTS: [real_A, real_B]
+OUTPUTS: [loss_G, loss_GAN, loss_cycle, loss_identity, loss_D_A, loss_D_B]
+LEARNERS:
+  # ==================== Generator learner ====================
+  - NAME: optimizer_G
+    LOSS: loss_G
+    TRAINABLE_LAYERS: [G_AB, G_BA]
+    # The rate is held for "decay_epoch" epochs and then decayed to zero, as in the torch twin:
+    # a "CosineDecay" whose warmup starts and ends at "lr" is a constant hold, and its decay phase
+    # begins once the hold is over. Only the shape of the tail differs -- a cosine here, the straight
+    # line of the torch twin's LambdaLR there -- and no "keras.optimizers.schedules" class holds and
+    # then decays linearly; a schedule of your own passed here restores that.
+    OPTIMIZER: &optimizer
+      - _obj_
+      - _addr_: keras.optimizers.Adam
+      - _jinja_yaml_: |-
+          - _call_:
+              beta_1: {{b1}}
+              beta_2: {{b2}}
+              learning_rate:
+                - _obj_
+                - _addr_: keras.optimizers.schedules.CosineDecay
+                - _call_:
+                    initial_learning_rate: {{lr}}
+                    warmup_target: {{lr}}
+                    warmup_steps: {{decay_epoch * steps_per_epoch}}
+                    decay_steps: {{(epochs - decay_epoch) * steps_per_epoch}}
+                    alpha: 0.0
+    EXTRA: {}
+    FLOW:
+      # Identity loss
+      - INPUTS: real_A
+        OUTPUTS: {id_A: out}
+        NAME: G_BA
+      - INPUTS: real_B
+        OUTPUTS: {id_B: out}
+        NAME: G_AB
+      - INPUTS: {y_true: real_A, y_pred: id_A}
+        OUTPUTS: loss_id_A
+        NAME: criterion_identity
+        LAYER: [_obj_, {_addr_: keras.losses.MeanAbsoluteError}, _call_]
+      - [{y_true: real_B, y_pred: id_B}, loss_id_B, criterion_identity]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity, null]
+      # GAN loss
+      - INPUTS: real_A
+        OUTPUTS: {fake_B: out}
+        NAME: G_AB
+      - INPUTS: fake_B
+        OUTPUTS: {pred_fake_B: out}
+        NAME: D_B
+      - ["eval: keras.ops.ones_like(pred_fake_B)", valid_B, null]
+      - INPUTS: {y_true: valid_B, y_pred: pred_fake_B}
+        OUTPUTS: loss_GAN_AB
+        NAME: criterion_GAN
+        LAYER: [_obj_, {_addr_: keras.losses.MeanSquaredError}, _call_]
+      - INPUTS: real_B
+        OUTPUTS: {fake_A: out}
+        NAME: G_BA
+      - INPUTS: fake_A
+        OUTPUTS: {pred_fake_A: out}
+        NAME: D_A
+      - ["eval: keras.ops.ones_like(pred_fake_A)", valid_A, null]
+      - [{y_true: valid_A, y_pred: pred_fake_A}, loss_GAN_BA, criterion_GAN]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN, null]
+      # Cycle loss
+      - INPUTS: fake_B
+        OUTPUTS: {recov_A: out}
+        NAME: G_BA
+      - INPUTS: {y_true: real_A, y_pred: recov_A}
+        OUTPUTS: loss_cycle_A
+        NAME: criterion_cycle
+        LAYER: [_obj_, {_addr_: keras.losses.MeanAbsoluteError}, _call_]
+      - INPUTS: fake_A
+        OUTPUTS: {recov_B: out}
+        NAME: G_AB
+      - [{y_true: real_B, y_pred: recov_B}, loss_cycle_B, criterion_cycle]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle, null]
+      # Total generator loss
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G, null]'
+    # The same computation with the models in inference mode; the losses and metrics above are
+    # referenced by name here, because a flow line that repeated their LAYER would define a second
+    # layer under the same name.
+    INFERENCE_FLOW:
+      - INPUTS: real_A
+        OUTPUTS: {id_A: out}
+        NAME: G_BA
+      - INPUTS: real_B
+        OUTPUTS: {id_B: out}
+        NAME: G_AB
+      - [{y_true: real_A, y_pred: id_A}, loss_id_A, criterion_identity]
+      - [{y_true: real_B, y_pred: id_B}, loss_id_B, criterion_identity]
+      - ["eval: (loss_id_A + loss_id_B) / 2", loss_identity, null]
+      - INPUTS: real_A
+        OUTPUTS: {fake_B: out}
+        NAME: G_AB
+      - INPUTS: fake_B
+        OUTPUTS: {pred_fake_B: out}
+        NAME: D_B
+      - ["eval: keras.ops.ones_like(pred_fake_B)", valid_B, null]
+      - [{y_true: valid_B, y_pred: pred_fake_B}, loss_GAN_AB, criterion_GAN]
+      - INPUTS: real_B
+        OUTPUTS: {fake_A: out}
+        NAME: G_BA
+      - INPUTS: fake_A
+        OUTPUTS: {pred_fake_A: out}
+        NAME: D_A
+      - ["eval: keras.ops.ones_like(pred_fake_A)", valid_A, null]
+      - [{y_true: valid_A, y_pred: pred_fake_A}, loss_GAN_BA, criterion_GAN]
+      - ["eval: (loss_GAN_AB + loss_GAN_BA) / 2", loss_GAN, null]
+      - INPUTS: fake_B
+        OUTPUTS: {recov_A: out}
+        NAME: G_BA
+      - [{y_true: real_A, y_pred: recov_A}, loss_cycle_A, criterion_cycle]
+      - INPUTS: fake_A
+        OUTPUTS: {recov_B: out}
+        NAME: G_AB
+      - [{y_true: real_B, y_pred: recov_B}, loss_cycle_B, criterion_cycle]
+      - ["eval: (loss_cycle_A + loss_cycle_B) / 2", loss_cycle, null]
+      - _jinja_yaml_: '- ["eval: loss_GAN + {{lambda_cyc}} * loss_cycle + {{lambda_id}} * loss_identity", loss_G, null]'
+  # ==================== Discriminator A learner ====================
+  - NAME: optimizer_D_A
+    LOSS: loss_D_A
+    TRAINABLE_LAYERS: [D_A]
+    OPTIMIZER: *optimizer
+    EXTRA: {}
+    FLOW:
+      - INPUTS: real_A
+        OUTPUTS: {pred_real_A: out}
+        NAME: D_A
+      - ["eval: keras.ops.ones_like(pred_real_A)", valid_A, null]
+      - [{y_true: valid_A, y_pred: pred_real_A}, loss_real_A, criterion_GAN]
+      - INPUTS: real_B
+        OUTPUTS: {fake_A: out}
+        NAME: G_BA
+      - INPUTS: fake_A
+        OUTPUTS: {pred_fake_A: out}
+        NAME: D_A
+      - ["eval: keras.ops.zeros_like(pred_fake_A)", invalid_A, null]
+      - [{y_true: invalid_A, y_pred: pred_fake_A}, loss_fake_A, criterion_GAN]
+      - ["eval: (loss_real_A + loss_fake_A) / 2", loss_D_A, null]
+  # ==================== Discriminator B learner ====================
+  - NAME: optimizer_D_B
+    LOSS: loss_D_B
+    TRAINABLE_LAYERS: [D_B]
+    OPTIMIZER: *optimizer
+    EXTRA: {}
+    FLOW:
+      - INPUTS: real_B
+        OUTPUTS: {pred_real_B: out}
+        NAME: D_B
+      - ["eval: keras.ops.ones_like(pred_real_B)", valid_B, null]
+      - [{y_true: valid_B, y_pred: pred_real_B}, loss_real_B, criterion_GAN]
+      - INPUTS: real_A
+        OUTPUTS: {fake_B: out}
+        NAME: G_AB
+      - INPUTS: fake_B
+        OUTPUTS: {pred_fake_B: out}
+        NAME: D_B
+      - ["eval: keras.ops.zeros_like(pred_fake_B)", invalid_B, null]
+      - [{y_true: invalid_B, y_pred: pred_fake_B}, loss_fake_B, criterion_GAN]
+      - ["eval: (loss_real_B + loss_fake_B) / 2", loss_D_B, null]
+LOSSES: []
+MODELS: []

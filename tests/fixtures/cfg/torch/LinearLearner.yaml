@@ -1,0 +1,29 @@
+# Minimal single-segment torch learner over "tests/fixtures/cfg/torch/Linear.yaml": a squared error
+# whose optimum is analytic, so a runtime test can assert the loss actually falls.
+PARAMETERS:
+  DEFAULT:
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+_jinja_yaml_: |-
+  {% if accumulate_gradients is none %}
+  ACCUMULATE_GRADIENTS: null
+  {% else %}
+  ACCUMULATE_GRADIENTS: {{accumulate_gradients}}
+  {% endif %}
+OUTPUTS: [loss]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: loss
+    TRAINABLE_LAYERS: [model]
+    OPTIMIZER: [_obj_, {_addr_: torch.optim.SGD}, {_bind_: {lr: 0.1}}]
+    FLOW:
+      - [x, prediction, model]
+      - INPUTS: {input: prediction, target: y}
+        OUTPUTS: loss
+        NAME: mse
+        LAYER: [_obj_, {_addr_: torch.nn.MSELoss}, _call_]
+    INFERENCE_FLOW:
+      - [x, prediction, model]
+      - [{input: prediction, target: y}, loss, mse]
+LOSSES: []
+MODELS: []

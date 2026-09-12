@@ -1,0 +1,60 @@
+# The Flax mirror of "cfg/torch/models/CycleGAN_discriminator.yaml": the 70x70 PatchGAN critic,
+# written against the NHWC layout Flax convolutions read and against explicit input feature counts,
+# since "flax.nnx.Conv" has no lazy form.
+# "torch.nn.ZeroPad2d" has no nnx twin and is folded into the convolution that followed it: torch
+# pads (left, right, top, bottom) = (1, 0, 1, 0) and then convolves with padding 1, which is the
+# ((2, 1), (2, 1)) explicit padding of a single "flax.nnx.Conv" over (height, width).
+# "flax.nnx.InstanceNorm" is built without scale or bias, matching the "affine=False" default of
+# "torch.nn.InstanceNorm2d" the torch template relies on, and with the "eps=1e-5" of that layer
+# rather than the 1e-6 flax defaults to.
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: true
+_jinja_yaml_: |-
+  FLOW:
+    # Block 1 (no normalization)
+    - [image, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fin: {{channels}}, fout: 64, normalize: false}}}]
+    # Block 2
+    - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fin: 64, fout: 128, normalize: true}}}]
+    # Block 3
+    - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fin: 128, fout: 256, normalize: true}}}]
+    # Block 4
+    - [_, _, {TYPE: DiscriminatorBlock, PARAM: {DEFAULT: {fin: 256, fout: 512, normalize: true}}}]
+    # Output
+    - INPUTS: _
+      OUTPUTS: out
+      NAME: head
+      LAYER:
+        - _obj_
+        - _addr_: flax.nnx.Conv
+        - _call_:
+            in_features: 512
+            out_features: 1
+            kernel_size: [4, 4]
+            # Tuples, not lists: "flax.nnx.Conv" only accepts a pair of ints per spatial dimension.
+            padding: "eval: ((2, 1), (2, 1))"
+            rngs: "eval: rngs"
+DiscriminatorBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - INPUTS: inp
+        OUTPUTS: _
+        LAYER:
+          - _obj_
+          - _addr_: flax.nnx.Conv
+          - _call_:
+              in_features: {{fin}}
+              out_features: {{fout}}
+              kernel_size: [4, 4]
+              strides: [2, 2]
+              padding: 1
+              rngs: "eval: rngs"
+      {% if normalize %}
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      {% endif %}
+      - [_, out, [_obj_, {_addr_: flax.nnx.leaky_relu}, {_bind_: {negative_slope: 0.2}}]]

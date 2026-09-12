@@ -1,0 +1,27 @@
+# Distributed strategy pattern: tensor parallelism over every rank (torch>=2.4). Each rank holds a
+# shard of the layers parallel_modules names and runs the *same* batch through them, so the loader
+# must hand every rank identical items: the CLI publishes the run's data coordinates as DATA_RANK
+# and DATA_WORLD_SIZE (0 and 1 here) for a rank-aware loader to read instead of the global rank.
+# The pattern is called with device=... and local_rank=...; parallel_modules takes ordered
+# (glob over named_modules() paths, style) pairs -- the shard_modules globs, where * and ? never
+# cross a "." -- and the first pair matching a path wins. A style is one of column, row, sequence,
+# column_heads (a column split whose output stays a DTensor, so the head reshape after a fused qkv
+# projection still sees the full head count), or an object pattern for any other ParallelStyle.
+#
+# The plan below is written for cfg/torch/models/VisionTransformer.yaml and must be adapted to the
+# model it runs on: a pattern matching no module anywhere is refused at wrap time. Every generated
+# block exposes the same four layers -- swap self_attention for causal_self_attention under
+# cfg/torch/models/SmallLanguageModel.yaml (commented below).
+- _obj_
+- _addr_: structcast_model.torch.distributed.TensorParallelStrategy
+- _bind_:
+    parallel_modules:
+      - ["backbone.block*.self_attention.qkv_proj", column_heads]
+      - ["backbone.block*.self_attention.out_proj", row]
+      - ["backbone.block*.linear", column]
+      - ["backbone.block*.linear_1", row]
+      # SmallLanguageModel.yaml, whose attention is causal:
+      # - ["backbone.block*.causal_self_attention.qkv_proj", column_heads]
+      # - ["backbone.block*.causal_self_attention.out_proj", row]
+      # Any ParallelStyle the vocabulary lacks, as an object pattern:
+      # - ["head", [_obj_, {_addr_: torch.distributed.tensor.parallel.ColwiseParallel}, _call_]]

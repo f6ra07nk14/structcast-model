@@ -1,0 +1,130 @@
+# Supervised image classification for the Keras model "cfg/keras/models/ConvNeXtV2.yaml", which
+# reads "image" and emits a structured output whose only key is "cls".
+# The Keras twin of "cfg/torch/learners/ConvNeXtV2.yaml" and "cfg/flax/learners/ConvNeXtV2.yaml", and
+# it is the shortest of the three because a Keras optimizer already carries what the other two
+# assemble: the schedule, the clipping, the weight decay and the accumulation window are all
+# keywords of the OPTIMIZER pattern below, so this template has no CLIP field, no ACCUMULATE_GRADIENTS
+# field and no scheduler wrapper.
+# Two things the torch twin offers are missing, both because one Keras optimizer applies one rate to
+# every variable it owns: there is no layer-wise learning-rate decay ("layer_decay_type"), and the
+# weight-decay exemptions are anchor words matched against variable names rather than regexes over
+# parameter paths.
+# The two twins also disagree on "weight_decay" -- 0.001 in the torch one, 0.05 in the flax one --
+# and this template follows the flax value, which is the published ConvNeXt V2 recipe. Both
+# optimizers decay in the decoupled, rate-scaled way, so the two settings are 50 times apart and not
+# a unit difference: pass -p "DEFAULT: {weight_decay: 0.001}" to reproduce the torch runs.
+PARAMETERS:
+  DEFAULT:
+    epochs: 300
+    warmup_epochs: 1
+    # The number of training batches in one epoch. A Keras schedule counts optimizer calls, not
+    # epochs, and it advances once per call whether or not that call applied an update, so this is
+    # what turns the epoch counts above into the step counts "keras.optimizers.schedules.CosineDecay"
+    # takes. Set it to len(training_dataset).
+    steps_per_epoch: 1000
+    lr: 4.0e-3
+    warmup_lr: 1.0e-5
+    min_lr: 1.0e-6
+    weight_decay: 0.05
+    label_smoothing: 0.0
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+# "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the training CLI sets before it
+# builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
+# wraps every optimizer in a "keras.optimizers.LossScaleOptimizer" (a mapping here carries that
+# wrapper's keyword arguments), or "bfloat16", which shares float32's exponent range and stays
+# unscaled. Either field alone is refused, which is one difference in default precision from the
+# torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
+# bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
+MIXED_PRECISION: false
+MIXED_PRECISION_TYPE: null
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # "create_optimizer" is only there for "no_weight_decay_names": Keras exempts variables from
+    # weight decay through a method call, not a constructor keyword. Everything else is a plain
+    # "keras.optimizers.AdamW" keyword. Biases, the normalization scale ("gamma") and offset
+    # ("beta") and the scale and bias of the global response normalization are what must not decay;
+    # the convolution kernels and the two projections of each block are what is left.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: create_optimizer
+        _file_: examples/keras/optimizers.py
+      - _call_:
+          name: AdamW
+          no_weight_decay_names: [bias, gamma, beta, scale]
+          beta_1: 0.9
+          beta_2: 0.999
+          _jinja_yaml_: |-
+            weight_decay: {{weight_decay}}
+            learning_rate:
+              - _obj_
+              - _addr_: keras.optimizers.schedules.CosineDecay
+              - _call_:
+                  initial_learning_rate: {{warmup_lr}}
+                  warmup_target: {{lr}}
+                  warmup_steps: {{warmup_epochs * steps_per_epoch}}
+                  decay_steps: {{(epochs - warmup_epochs) * steps_per_epoch}}
+                  alpha: {{min_lr / lr}}
+            {% if clip_grad_norm is not none %}
+            global_clipnorm: {{clip_grad_norm}}
+            {% endif %}
+            {% if accumulate_gradients is not none %}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% endif %}
+    EXTRA: {}
+    # "keras.losses.SparseCategoricalCrossentropy" has no label smoothing, so the integer labels are
+    # one-hot encoded against the width of the logits and the categorical loss carries the smoothing.
+    # At "label_smoothing: 0.0" the two are the same loss.
+    # The cast is the one the two image classifier learners spell: it is an identity under the float32
+    # policy above, and the reason it is here anyway is that the accuracies want float32 --
+    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16
+    # prediction outright on the tensorflow backend (jax and torch compute it, and the
+    # "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). So turning
+    # MIXED_PRECISION on here is a two-line edit rather than a broken run.
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - ["eval: keras.ops.one_hot(label, cls.shape[-1])", one_hot_label, null]
+      - INPUTS: {y_true: one_hot_label, y_pred: logits}
+        OUTPUTS: ce_loss
+        NAME: cross_entropy_loss
+        _jinja_yaml_: |-
+          LAYER:
+            - _obj_
+            - _addr_: keras.losses.CategoricalCrossentropy
+            - _call_: {from_logits: true, label_smoothing: {{label_smoothing}}}
+      # The accuracy functions report one 0/1 value per sample, so each is averaged over the batch.
+      - INPUTS: {y_true: label, y_pred: logits}
+        OUTPUTS: correct1
+        NAME: accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - INPUTS: {y_true: label, y_pred: logits, k: 5}
+        OUTPUTS: correct5
+        NAME: top_5_accuracy
+        LAYER: [_obj_, {_addr_: keras.metrics.sparse_top_k_categorical_accuracy}]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - ["eval: keras.ops.cast(cls, 'float32')", logits, null]
+      - ["eval: keras.ops.one_hot(label, cls.shape[-1])", one_hot_label, null]
+      - [{y_true: one_hot_label, y_pred: logits}, ce_loss, cross_entropy_loss]
+      - [{y_true: label, y_pred: logits}, correct1, accuracy]
+      - ["eval: keras.ops.mean(correct1)", acc1, null]
+      - [{y_true: label, y_pred: logits, k: 5}, correct5, top_5_accuracy]
+      - ["eval: keras.ops.mean(correct5)", acc5, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []

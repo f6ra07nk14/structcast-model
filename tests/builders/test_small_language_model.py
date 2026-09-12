@@ -10,7 +10,7 @@ from types import ModuleType
 
 import pytest
 
-from structcast_model.builders.torch_builder import TorchBuilder
+from structcast_model.builders.torch import TorchBuilder
 from structcast_model.torch.distributed import matched_shard_modules
 from tests import TEST_DIR
 import torch

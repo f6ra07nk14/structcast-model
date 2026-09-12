@@ -1,10 +1,17 @@
 # A distributed strategy owns the distributed lifecycle
 
+> **Amended by ADR-0022.** The strategy set grows beyond the three named here (tensor-parallel and
+> the FSDP2+TP combination), and the protocol gains `data_rank`/`data_world_size` — added under
+> this ADR's own rule, for the demonstrated defect that a TP group must consume one batch and one
+> dropout seed while datasets and seeding only knew the global rank.
+
 This ADR supersedes the "excluding … DDP wrapping" boundary and its recorded limitation in ADR-0002:
 distributed wrapping becomes part of learner assembly, ordered before learner construction, and every
 distributed concern lives behind one replaceable object.
 
 ## Why the wrap moves before learner construction
+
+> **Renamed by ADR-0011.** `torch_builder.py` is now `builders/torch.py`; the reasoning below is unchanged.
 
 Generated learner step closures and optimizers capture the exact module objects handed to `__init__`
 (`torch_builder.py` emits the step functions as closures over the constructor arguments). Wrapping after
@@ -21,8 +28,8 @@ synchronization, checkpoint state production, and checkpoint loading — used to
 `isinstance` branches spread over the CLI, the trainer, and the saver callbacks. They are collapsed into a
 `DistributedStrategy` protocol (`torch/distributed.py`) with three implementations, named in full:
 `SingleDeviceStrategy`, `DistributedDataParallelStrategy`, `FullyShardedDataParallelStrategy`. The
-interface is deliberately minimal: `wrap`, `sync_initial_weights`, `state_dict`, `load_state_dict`, a
-`grad_scaler_creator` attribute, and — added by ADR-0004 — `compile`, placing the compile units. Every member exists because a verified defect required strategy-specific
+interface is deliberately minimal: `wrap`, `sync_initial_weights`, `state_dict`, `load_state_dict`,
+and — added by ADR-0004 — `compile`, placing the compile units. Every member exists because a verified defect required strategy-specific
 behavior; nothing speculative is included. PyTorch Lightning's `Strategy` hierarchy and MMEngine's
 `_strategy` package are the same shape, independently converged on.
 
@@ -47,9 +54,9 @@ The CLI takes `--strategy`, an object pattern like every other configurable in t
 the instantiated factory with the runtime arguments (`device`, `local_rank`). Without a pattern, a detected
 distributed environment defaults to `DistributedDataParallelStrategy` (preserving the existing torchrun UX)
 and a single device to `SingleDeviceStrategy`. FSDP2's wrap-time knobs (`reshard_after_forward`,
-`mp_policy`) are constructor arguments expressed in the pattern; the device mesh derives from the default
-process group. Dedicated CLI flags per knob were rejected as surface-area growth that breaks the
-"everything is a pattern" convention.
+`mp_policy`) and both multi-rank strategies' `sync_batchnorm` (ADR-0009) are constructor arguments expressed
+in the pattern; the device mesh derives from the default process group. Dedicated CLI flags per knob were
+rejected as surface-area growth that breaks the "everything is a pattern" convention.
 
 ## torch floor stays; FSDP2 is import-guarded
 
@@ -59,14 +66,13 @@ actionable `ImportError` when `torch.distributed.fsdp.fully_shard` is missing, a
 working on old torch. Raising the floors per extra was the alternative; the guard was chosen to avoid
 forcing upgrades on users who never touch FSDP2.
 
-## Gradient scalers are created through the strategy, and only for float16
+## Gradient scalers are created only for float16, and not through the strategy
 
 `MIXED_PRECISION` now means "gradient scaling", which only applies to `float16`: bfloat16 shares float32's
 exponent range, so scaling it is pure overhead (the shipped bf16-plus-scaler default config was exactly this
 mistake, invisible only because the scaler also silently self-disabled on CPU by defaulting to
-`device="cuda"`). Generated fp16 learners take `__grad_scaler_creator__` as an explicit constructor
-parameter defaulting to `torch.amp.GradScaler`, and the CLI passes `strategy.grad_scaler_creator` — the
-scaler is captured by step closures at construction, so its class must be right before the learner exists.
-All three strategies currently return the plain `torch.amp.GradScaler`: since torch 2.5 (pytorch/pytorch
+`device="cuda"`). Generated fp16 learners construct `torch.amp.GradScaler` directly on the training device.
+An earlier revision routed the scaler class through a `grad_scaler_creator` strategy member; it was removed
+because every strategy named the same class: since torch 2.5 (pytorch/pytorch
 PR #132816) the DTensor dispatcher all-reduces `found_inf` inside `unscale_`, so FSDP2 needs no sharded
 scaler class; `ShardedGradScaler` is an FSDP1 artifact that double-reduces and is soft-deprecated upstream.
