@@ -145,7 +145,6 @@ CWD="${1:-$PWD}"
 CREW=(
   'lead|project_leader|claude|--model claude-fable-5-1 --effort low --dangerously-skip-permissions'
   'workers|worker_opus|claude|--model claude-opus-5 --effort ultracode --dangerously-skip-permissions'
-  'workers|worker_sonnet|claude|--model claude-sonnet-5 --effort max --dangerously-skip-permissions'
   'workers|worker_astra|codex|-m gpt-6-astra -c model_reasoning_effort="xhigh"'
   'workers|worker_sol|codex|-m gpt-5.6-sol -c model_reasoning_effort="xhigh"'
   'reviewers|reviewer_opus|claude|--model claude-opus-5 --effort xhigh --dangerously-skip-permissions'
@@ -154,9 +153,29 @@ CREW=(
   'websearch|worker_gemini|agy|--model gemini-3.8-flash-high --dangerously-skip-permissions'
 )
 
+# Tear down a previous crew first. Tabs are matched by label inside the current
+# workspace; the caller's own tab is never closed (closing it would kill this
+# script), so entries that target it are skipped with a warning instead.
+declare -A labels=()
+for entry in "${CREW[@]}"; do IFS='|' read -r tab _ <<<"$entry"; labels[$tab]=1; done
+while IFS=$'\t' read -r tab_id label; do
+  [[ -n ${labels[$label]:-} ]] || continue
+  if [[ $tab_id == "${HERDR_TAB_ID:-}" ]]; then
+    echo "WARN: tab '$label' ($tab_id) is this script's own tab; keeping it" >&2
+    continue
+  fi
+  echo "Closing previous crew tab '$label' ($tab_id)"
+  herdr tab close "$tab_id" >/dev/null
+done < <(herdr tab list --workspace "${HERDR_WORKSPACE_ID:-}" \
+           | jq -r '.result.tabs[] | "\(.tab_id)\t\(.label)"')
+
 cur_tab=""; last_pane=""; n=0
 for entry in "${CREW[@]}"; do
   IFS='|' read -r tab name kind args <<<"$entry"
+  if herdr agent get "$name" >/dev/null 2>&1; then
+    echo "WARN: agent '$name' still exists (probably in this script's own tab); skipping" >&2
+    continue
+  fi
   if [[ $tab != "$cur_tab" ]]; then
     pane=$(herdr tab create --label "$tab" --cwd "$CWD" | jq -r '.result.root_pane.pane_id')
     cur_tab=$tab; n=0
