@@ -144,9 +144,11 @@ CWD="${1:-$PWD}"
 # tab-label|agent-name|kind|native args
 CREW=(
   'lead|project_leader|claude|--model claude-fable-5-1 --effort low --dangerously-skip-permissions'
+  'workers|worker_fable|claude|--model claude-fable-5-1 --effort xhigh --dangerously-skip-permissions'
   'workers|worker_opus|claude|--model claude-opus-5 --effort ultracode --dangerously-skip-permissions'
   'workers|worker_astra|codex|-m gpt-6-astra -c model_reasoning_effort="xhigh"'
   'workers|worker_sol|codex|-m gpt-5.6-sol -c model_reasoning_effort="xhigh"'
+  'reviewers|reviewer_fable|claude|--model claude-fable-5-1 --effort low --dangerously-skip-permissions'
   'reviewers|reviewer_opus|claude|--model claude-opus-5 --effort xhigh --dangerously-skip-permissions'
   'reviewers|reviewer_astra|codex|-m gpt-6-astra -c model_reasoning_effort="low"'
   'reviewers|reviewer_sol|codex|-m gpt-5.6-sol -c model_reasoning_effort="xhigh"'
