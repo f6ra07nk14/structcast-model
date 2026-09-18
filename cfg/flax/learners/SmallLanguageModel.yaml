@@ -45,7 +45,7 @@ LEARNERS:
                           b2: 0.95
                           mask:
                             - _obj_
-                            - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                            - _addr_: structcast_model.flax.no_weight_decay_mask
                             - _call_:
                                 - ^(?:\w+\.)*bias$
                                 - ^(?:\w+\.)*scale$
@@ -72,7 +72,7 @@ LEARNERS:
                                 b2: 0.95
                                 mask:
                                   - _obj_
-                                  - _addr_: structcast_model.flax.optimizers.no_weight_decay_mask
+                                  - _addr_: structcast_model.flax.no_weight_decay_mask
                                   - _call_:
                                       - ^(?:\w+\.)*bias$
                                       - ^(?:\w+\.)*scale$
