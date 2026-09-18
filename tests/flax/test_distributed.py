@@ -163,8 +163,11 @@ from flax import nnx
 from structcast_model.flax.distributed import FlaxDistributedStrategy
 
 # Leading dimensions of 2 and 6 divide the data axis but not the four devices of the whole mesh; 3
-# divides neither.
-strategy = FlaxDistributedStrategy(preset="fsdp_tp", model_devices=2, min_size=0)
+# divides neither. The biases take the one column rule the preset requires, so every kernel is left
+# to the fsdp tactic under test.
+strategy = FlaxDistributedStrategy(
+    preset="fsdp_tp", model_devices=2, min_size=0, rules=[(r"\\.bias$", "column"), (".*", "fsdp")]
+)
 models = nnx.Dict(
     two=nnx.Linear(2, 8, rngs=nnx.Rngs(0)),
     six=nnx.Linear(6, 8, rngs=nnx.Rngs(0)),
@@ -370,6 +373,21 @@ def test_a_tensor_parallel_preset_without_rules_is_refused(preset: str) -> None:
         FlaxDistributedStrategy(preset=preset, model_devices=1, rules=[])  # type: ignore[arg-type]  # runtime guard
 
 
+def test_a_tensor_parallel_table_without_a_column_or_row_rule_is_refused() -> None:
+    """The `fsdp_tp` table is not empty, but its one `fsdp` rule shards along the data axis alone.
+
+    The model axis would split nothing, its devices holding the same parameters, and the run would
+    report success -- the failure the empty-table check exists for, slipping past it because the
+    table has an entry. What the check needs is a rule that uses the model axis.
+    """
+    with pytest.raises(ValueError, match="splits the layers its rules name"):
+        FlaxDistributedStrategy(preset="fsdp_tp", model_devices=2)
+
+    # One `column` rule is enough. The model axis is one device wide because the process has one:
+    # two would be refused by the mesh, for a reason of its own.
+    FlaxDistributedStrategy(preset="fsdp_tp", model_devices=1, rules=[(".*", "column")])
+
+
 def test_a_rule_matching_no_parameter_is_refused() -> None:
     """A typo'd rule leaves its layers on the preset's default placement and says nothing.
 
@@ -398,7 +416,7 @@ def test_a_model_axis_option_is_refused_on_a_preset_without_one() -> None:
 def test_the_fsdp_tp_preset_requires_a_model_axis_size() -> None:
     """Without it the data axis would be one device wide, and the preset would shard nothing on it."""
     with pytest.raises(ValueError, match="model_devices"):
-        FlaxDistributedStrategy(preset="fsdp_tp", rules=[(".*", "fsdp")])
+        FlaxDistributedStrategy(preset="fsdp_tp", rules=[(".*", "column")])
 
 
 def test_a_model_axis_the_devices_do_not_divide_is_refused() -> None:

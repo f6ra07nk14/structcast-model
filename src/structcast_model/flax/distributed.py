@@ -31,9 +31,8 @@ PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
     "single": ((r".*", "replicate"),),
     "dp": ((r".*", "replicate"),),
     "fsdp": ((r".*", "fsdp"),),
-    # No default plan: which layers pair up into a column/row split is the model's own shape, and an
-    # empty table leaves every parameter on the sharding it was constructed with, so a template that
-    # annotates itself needs no rules at all.
+    # No default plan: which layers pair up into a column/row split is the model's own shape, so the
+    # tables carry no such rule and the strategy refuses to run without one.
     "tp": (),
     "fsdp_tp": ((r".*", "fsdp"),),
 }
@@ -177,13 +176,14 @@ class FlaxDistributedStrategy:
         if self.preset not in PRESET_RULES:
             raise ValueError(f"Unknown preset {self.preset!r}. Available presets: {', '.join(PRESET_RULES)}.")
         rules = PRESET_RULES[self.preset] if self.rules is None else self.rules
-        if self.preset in TP_PRESETS and not rules:
+        if self.preset in TP_PRESETS and not any(tactic in ("column", "row") for _, tactic in rules):
             raise ValueError(
-                f"The {self.preset!r} preset splits the layers its rules name across the model axis, and the "
-                '"tp" table is empty because which layers pair up into a column/row split is the model\'s own '
-                "shape. Without rules every parameter would keep its construction sharding, so the run would "
-                "replicate the whole model and report success. Bind rules through the strategy pattern "
-                '(cfg/flax/strategies/tp.yaml ships one), or select the "fsdp" preset, which shards by size.'
+                f"The {self.preset!r} preset splits the layers its rules name across the model axis, and no "
+                "column/row rule names one: the preset tables carry none because which layers pair up into a "
+                "split is the model's own shape. Without one the model axis would split nothing, so the run "
+                "would replicate the model across it and report success. Bind rules through the strategy "
+                f'pattern (cfg/flax/strategies/{self.preset}.yaml ships them), or select the "fsdp" preset, '
+                "which shards by size."
             )
         for _, tactic in rules:
             if tactic not in TACTICS:
