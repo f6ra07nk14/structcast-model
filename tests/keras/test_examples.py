@@ -536,6 +536,28 @@ def test_the_image_pipeline_requires_a_dataset_and_names_the_ones_it_knows() -> 
         DATA.KerasImageData(dataset="synthetic")
 
 
+@pytest.mark.parametrize(("backend", "hidden"), [("jax", True), ("tensorflow", False)])
+def test_the_image_pipeline_hides_the_gpus_from_tensorflow_unless_it_is_the_backend(
+    monkeypatch: pytest.MonkeyPatch, backend: str, hidden: bool
+) -> None:
+    """The `tf.data` pipeline must leave the GPUs to the backend, and on `tensorflow` that is TensorFlow.
+
+    On `jax` or `torch`, a TensorFlow that sees the GPUs reserves their memory at its first op and
+    starves the backend that trains. On `tensorflow` the same call would take the backend's own
+    GPUs away and move the whole run to the CPU without a word, so it must not happen there. The
+    recorder stands in for the real call, which would blind this test process for good.
+    """
+    calls: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(keras.backend, "backend", lambda: backend)
+    monkeypatch.setattr(
+        tf.config, "set_visible_devices", lambda devices, device_type=None: calls.append((devices, device_type))
+    )
+
+    _pipeline()
+
+    assert calls == ([([], "GPU")] if hidden else [])
+
+
 def test_the_shipped_dataset_template_refuses_to_render_without_a_dataset() -> None:
     """`scm format` must fail on the missing parameter, not render `{{dataset}}` into the pattern.
 

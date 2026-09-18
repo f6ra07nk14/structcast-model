@@ -42,8 +42,23 @@ from typing import Any
 from pydantic import BaseModel, DirectoryPath
 import tensorflow as tf
 
+import keras
+
 EXTENSIONS = frozenset({".bmp", ".jpeg", ".jpg", ".png", ".webp"})
 """Suffixes read as images, lowercased. The horse2zebra tree is JPEG; the others cost nothing."""
+
+
+def hide_gpus_from_tensorflow() -> None:
+    """Take the GPUs from the pipeline's TensorFlow, unless TensorFlow is the Keras backend and trains on them.
+
+    The twin of `examples/keras/data.py`: a file loaded by path cannot import its neighbour.
+    """
+    if keras.backend.backend() == "tensorflow":
+        return
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except RuntimeError:
+        pass
 
 
 def rank_and_world() -> tuple[int, int]:
@@ -113,6 +128,10 @@ class UnpairedImageLoader(BaseModel):
 
     seed: int = 42
     """Seed of the two shuffles and of the per-item augmentation draws, so a run is reproducible."""
+
+    def model_post_init(self, context: Any, /) -> None:
+        """Hide the GPUs from TensorFlow, now that something in the run is about to read data."""
+        hide_gpus_from_tensorflow()
 
     @cached_property
     def sources(self) -> tuple[tf.data.Dataset, tf.data.Dataset]:

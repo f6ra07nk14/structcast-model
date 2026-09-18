@@ -18,8 +18,10 @@ import mlflow
 import numpy as np
 from PIL import Image
 import pytest
+import tensorflow as tf
 from typer.testing import CliRunner
 
+import keras
 from structcast_model.builders.keras import KerasBuilder, KerasLearnerBuilder
 from structcast_model.commands.cmd_keras import app
 from tests import CFG_DIR
@@ -171,6 +173,27 @@ def test_each_rank_owns_a_disjoint_share_of_both_domains(tmp_path: Path, monkeyp
     assert (shares["0"][0], shares["1"][0]) == (3, 3)  # max(6, 4) // 2
     assert not set(shares["0"][1]) & set(shares["1"][1])
     assert not set(shares["0"][2]) & set(shares["1"][2])
+
+
+@pytest.mark.parametrize(("backend", "hidden"), [("jax", True), ("tensorflow", False)])
+def test_the_loader_hides_the_gpus_from_tensorflow_unless_it_is_the_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, hidden: bool
+) -> None:
+    """A 256-pixel CycleGAN needs every byte of its GPUs, and only the `tensorflow` backend is TensorFlow.
+
+    On `jax` or `torch`, a pipeline TensorFlow that sees the GPUs reserves their memory at its first
+    op and starves the backend that trains; on `tensorflow` hiding them would move the run to the
+    CPU without a word. The recorder stands in for the real call, which would blind this process.
+    """
+    calls: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(keras.backend, "backend", lambda: backend)
+    monkeypatch.setattr(
+        tf.config, "set_visible_devices", lambda devices, device_type=None: calls.append((devices, device_type))
+    )
+
+    UnpairedImageLoader(root_A=tmp_path, root_B=tmp_path)
+
+    assert calls == ([([], "GPU")] if hidden else [])
 
 
 @pytest.fixture(scope="module")

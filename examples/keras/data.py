@@ -65,6 +65,16 @@ EXTENSIONS = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png"})
 """Suffixes read as images, lowercased: the set `keras.utils.image_dataset_from_directory` lists."""
 
 
+def hide_gpus_from_tensorflow() -> None:
+    """Take the GPUs from the pipeline's TensorFlow, unless TensorFlow is the Keras backend and trains on them."""
+    if keras.backend.backend() == "tensorflow":
+        return
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except RuntimeError:
+        pass
+
+
 def list_labelled_images(root: Path) -> tuple[list[str], list[int]]:
     """The images under *root* and their class indices, from a tree laid out one folder per class.
 
@@ -248,6 +258,10 @@ class KerasImageData(BaseModel):
 
     label_key: str = "label"
     """The batch key the labels are stored under."""
+
+    def model_post_init(self, context: Any, /) -> None:
+        """Hide the GPUs from TensorFlow, now that something in the run is about to read data."""
+        hide_gpus_from_tensorflow()
 
     @cached_property
     def source(self) -> tf.data.Dataset:
