@@ -90,7 +90,7 @@ class FlaxLayerIntermediate(LayerIntermediate):
         base, attributes, forward = "flax.nnx.Module", "", "__call__"
         if self.gradient_checkpointing is not None:
             # The base owns `__call__` and rematerializes the body it finds under `_forward`.
-            base, forward = "GradientCheckpointingModule", "_forward"
+            base, forward = "structcast_model.flax.layers.GradientCheckpointingModule", "_forward"
             lines = ["gradient_checkpointing = True"]
             if self.gradient_checkpointing:
                 keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
@@ -261,7 +261,7 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
                 f'GRADIENT_CHECKPOINTING option "{unknown[0]}" is not a keyword argument of '
                 f"flax.nnx.remat, which accepts {sorted(_REMAT_OPTIONS)}."
             )
-        imports["structcast_model.flax.layers"].add("GradientCheckpointingModule")
+        imports["structcast_model.flax.layers"].add(None)
         resolved: dict[str, str] = {}
         for key, value in options.items():
             if key == "policy" and isinstance(value, str):
@@ -466,9 +466,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         "jax": {None},
         "jax.numpy": {None},
         "flax.nnx": {None, "Param"},
-        "structcast_model.flax.optimizers": {"get_learning_rate", "gradient_steps"},
+        "structcast_model.flax": {None},
     }
-    """Default imports for Flax learners; the generated steps and properties call these directly."""
+    """Default imports for Flax learners; the generated steps and properties call these qualified off the package."""
 
     _learner_members: ClassVar[frozenset[str]] = frozenset(
         {
@@ -640,17 +640,21 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                 if index == 0:
                     step += clock
                 target = "_has_updated" if index == 0 else "_"
-                update = f"update_with_loss_scale({_owned(owned)}, {segment.optimizer}, _grads, {segment.scale}{extra})"
+                update = (
+                    f"structcast_model.flax.update_with_loss_scale("
+                    f"{_owned(owned)}, {segment.optimizer}, _grads, {segment.scale}{extra})"
+                )
                 step.append(f"{target}, {segment.scale} = {update}")
             else:
                 if index == 0:
-                    step += [*clock, f"_before = gradient_steps({segment.optimizer})"]
+                    step += [*clock, f"_before = structcast_model.flax.gradient_steps({segment.optimizer})"]
                 step.append(f"{segment.optimizer}.update({_owned(owned)}, _grads{extra})")
                 if index == 0:
                     step.append(
-                        f"_has_updated = True if _before is None else gradient_steps({segment.optimizer}) > _before"
+                        "_has_updated = True if _before is None else "
+                        f"structcast_model.flax.gradient_steps({segment.optimizer}) > _before"
                     )
-        rates = ", ".join(f"{name!r}: get_learning_rate({name})" for name in self.optimizers)
+        rates = ", ".join(f"{name!r}: structcast_model.flax.get_learning_rate({name})" for name in self.optimizers)
         carried = "".join(f", {name}" for name in self.mixed_precision_scales)
         step += [
             "# Read at trace time: the walk compiles to a reference to the injected rate rather than to",
@@ -665,8 +669,24 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         return self._training_flow_parts[0]
 
     def _get_forward_inference_flow(self) -> list[str]:
-        """Get the body of the `_inference_step` function."""
+        """Get the body of the `_inference_step` function.
+
+        The step is one function, so every name its flow stores is local to the whole step, exactly
+        as in a training segment: a read before the store is rejected here, unless the name is a
+        parameter of the step -- a batch entry, say -- which the read sees and the later store rebinds.
+        """
         lines = [self._get_regular_step(i, o, L) for i, o, L in self.inference_flow]
+        parameters = {*self.models, *[f"ema_{name}" for name in self._inference_shadows], *self.inputs, "kwargs"}
+        deferred = {name for _, output, _ in self.inference_flow for name in stored_names(output)} - parameters
+        for line in lines:
+            loads, stored = statement_names(line)
+            if shadowed := sorted(loads & deferred):
+                raise SpecError(
+                    f'INFERENCE_FLOW reads "{shadowed[0]}" before it stores it. The Flax inference step is one '
+                    "function, so a name its flow stores is local to the whole step: compute the value before it "
+                    "is read, or give one of the two another name."
+                )
+            deferred -= stored
         return [*lines, f"return {self._forward_outputs}"]
 
     def _reject_reserved_names(self) -> None:
@@ -676,7 +696,9 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         the batch entries are their keyword-only parameters. A name shared with `self`, with
         `kwargs`, with a member of the class or with a view attribute emits a step that fails to
         import -- or, worse, an `__init__` that silently overwrites what the trainer reads off the
-        learner afterwards.
+        learner afterwards. The flow layers are read by name too, as the locals of `__init__` -- or,
+        for a layer that is an import itself, the module global -- the steps close over, so a batch
+        entry named like one would be the value the flows call in its place.
 
         What a flow stores is bound in the enclosing step too, next to the names the step binds for
         itself: an output named like one of them would return the learning rates as a criterion, and
@@ -701,6 +723,7 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             *shadows,
             *[f"_ema_state_{name}" for name in self.ema],
             *[f"_view_ema_{name}" for name in self.ema],
+            *self.layers,
         }
         if shared := sorted(set(state) & set(self.inputs)):
             raise SpecError(
@@ -713,15 +736,16 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                 raise SpecError(
                     f'Name "{name}" is reserved by the generated Flax learner, so it cannot name a model, an '
                     "optimizer or an input: the learner takes each of them as a parameter of its steps and keeps "
-                    "its models and optimizers under attributes of its own. Rename it."
+                    "its models and optimizers under attributes of its own and its flow layers under names the "
+                    "steps read. Rename it."
                 )
         stored = unique([n for flow in (self.flow, self.inference_flow) for u in flow for n in _stores(u)])
         for name in [*stored, *self.outputs]:
-            if name in {*state, *shadows, *self._step_locals}:
+            if name in {*state, *shadows, *self._step_locals, *self.layers}:
                 raise SpecError(
                     f'A FLOW of the learner stores "{name}", which the generated training step already binds for '
-                    "a model, an average of one, an optimizer or a value of its own: the store would overwrite it "
-                    "before the step reads it. Rename the output."
+                    "a model, an average of one, an optimizer, a flow layer or a value of its own: the store would "
+                    "overwrite it before the step reads it. Rename the output."
                 )
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
@@ -935,11 +959,9 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             return None
         if (name := naming(f"{opt_name}_dynamic_scale")) in layers or name in others:
             raise SpecError(f'Duplicate variable name "{name}" for the loss scale found in the learner flow.')
-        imports["structcast_model.flax.optimizers"].add("loss_scale")
-        imports["structcast_model.flax.optimizers"].add("update_with_loss_scale")
         options = {} if isinstance(mixed_precision, bool) else mixed_precision
         keywords = ", ".join(f"{key}={resolve_getter(imports, value)}" for key, value in options.items())
-        others[name] = f"loss_scale({keywords})"
+        others[name] = f"structcast_model.flax.loss_scale({keywords})"
         return name
 
     def _register_shadow_models(

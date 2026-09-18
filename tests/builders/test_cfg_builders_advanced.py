@@ -1,10 +1,12 @@
 """Advanced builder tests using real cfg templates."""
 
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from re import findall
 from typing import Any
 
 import pytest
+from structcast.core.exceptions import SpecError
 from timm.utils.clip_grad import dispatch_clip_grad
 
 from structcast_model.builders.torch import TorchLearnerBuilder
@@ -139,11 +141,48 @@ def test_learner_bfloat16_script_has_no_grad_scaler() -> None:
 def test_learner_script_gates_model_invocations() -> None:
     """Every model call is wrapped in a sync gate so distributed reducers arm exactly once."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
-    assert "sync_gate(model, __need_update__)" in script
+    assert "        sync_gate(model, __need_update__)" in script
     assert script.index("sync_gate(model, __need_update__)") < script.index("cls = model(image)")
     assert "def _sync_gate(module, armed):" not in script  # the package helper, never an inline copy
-    assert 'restore_requires_grad(model, self._requires_grad_defaults["model"])' in script
+    assert ('structcast_model.torch.restore_requires_grad(model, self._requires_grad_defaults["model"])') in script
     assert "def _restore" not in script  # the package helper, never an inline copy
+
+
+def test_learner_flow_calls_the_sync_gate_where_torch_compile_can_trace_it(tmp_path: Path) -> None:
+    """The gate is the one helper a compiled flow calls, so it is the one name the script imports bare.
+
+    Reached as `structcast_model.torch.distributed.sync_gate`, dynamo would have to walk the lazy-import
+    shims `structcast_model` and `structcast_model.torch`, and it raises `InternalTorchDynamoError` on
+    them: every `--compile` run of a generated learner would fail at its first step.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["loss"],
+        "LEARNERS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": [
+                    "_obj_",
+                    {"_addr_": "structcast_model.torch.create_opt"},
+                    {"_bind_": {"opt": "torch.optim.SGD", "lr": 0.01}},
+                ],
+                "FLOW": [
+                    ["x", "y", "model"],
+                    [["y", "x"], "loss", ["_obj_", {"_addr_": "torch.nn.MSELoss"}, "_call_"]],
+                ],
+            }
+        ],
+    }
+    TorchLearnerBuilder(raw=raw)()(path := tmp_path / "learner.py")
+    spec = spec_from_file_location("compiled_learner", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    learner = module.Learner(model=torch.nn.Linear(2, 2))
+    flow = torch.compile(learner.flow_functions["_flow_create_opt"], fullgraph=True, backend="eager")
+    assert torch.isfinite(flow(True, torch.randn(3, 2)))
 
 
 def test_learner_script_bind_arguments_are_deterministic(tmp_path: Path) -> None:
@@ -381,8 +420,8 @@ def test_learner_collected_imports_include_torch_and_amp() -> None:
     """Collected imports include torch always, the sync gate always, and torch.amp only for fp16."""
     imports = TorchLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
     assert "torch" in imports
-    assert "sync_gate" in imports["structcast_model.torch.distributed"]
-    assert "get_decays" in imports["structcast_model.torch.optimizers"]
+    assert imports["structcast_model.torch.distributed"] == {"sync_gate"}
+    assert imports["structcast_model.torch"] == {None}
     assert "contextlib" not in imports
     assert "torch.amp" not in imports
     fp16_imports = fp16_builder()().collected_imports
@@ -397,12 +436,15 @@ def test_learner_script_calls_the_optimizer_referenced_by_file_path(tmp_path: Pa
     """
     built = TorchLearnerBuilder.from_path(LEARNER_YAML)()
     # The module is imported for `get_decays`, but the file-referenced class must not ride along.
-    assert "AdamWWithCosine" not in built.collected_imports["structcast_model.torch.optimizers"]
+    assert "AdamWWithCosine" not in built.collected_imports["structcast_model.torch"]
     code = rendered_module(built, tmp_path)
     assert "AdamWWithCosine(" in code
     resolved = str(Path("examples/torch/optimizers.py").resolve())
-    assert f"AdamWWithCosine = import_from_address('AdamWWithCosine', module_file={resolved!r})" in code
-    assert "from structcast.utils.base import import_from_address" in code
+    assert (
+        f"AdamWWithCosine = structcast.utils.base.import_from_address('AdamWWithCosine', module_file={resolved!r})"
+    ) in code
+    assert "import structcast.utils.base\n" in code
+    assert "from structcast.utils" not in code
 
 
 # ---------------------------------------------------------------------------
@@ -498,3 +540,36 @@ def test_learner_without_ema_is_emitted_as_it_was_before_the_field_existed() -> 
     assert built.ema == ()
     assert "ema_" not in built.scripts[0]
     assert "torch.optim.swa_utils" not in built.collected_imports
+
+
+# ---------------------------------------------------------------------------
+# TorchLearnerBuilder: reserved names
+# ---------------------------------------------------------------------------
+
+
+def test_learner_rejects_an_input_named_like_a_flow_layer() -> None:
+    """The flow functions read their layers by name, so a batch entry cannot share one.
+
+    The input becomes a parameter of the flow function, which would then call the batch tensor in the
+    loss's place -- a failure only on the first batch of a run.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["FLOW"][1]["NAME"] = "label"
+    raw["LEARNERS"][0]["INFERENCE_FLOW"][1][2] = "label"
+
+    with pytest.raises(SpecError, match='Name "label" is reserved by the generated PyTorch learner'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+def test_learner_rejects_a_flow_storing_a_value_named_like_a_model() -> None:
+    """The flow functions read the models by name, so a value the flow stores cannot share one.
+
+    The store rebinds the model inside the flow function: the sync gate and the forward call would
+    receive the batch tensor instead of the module the optimizer owns.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["FLOW"].insert(0, ["image", "model"])
+
+    with pytest.raises(SpecError, match='A FLOW of the learner stores "model"'):
+        _ = TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts

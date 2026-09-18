@@ -88,7 +88,7 @@ class _Intermediate(Serializable):
         imported_code = "\n".join(
             [f"from {p} import {', '.join(sorted(m for m in i if m))}" for p, i in from_imports.items() if i]
             + [f"import {p}" for p, i in module_imports.items() if None in i]
-            + (["from structcast.utils.base import import_from_address"] if file_imports else [])
+            + (["import structcast.utils.base"] if file_imports else [])
         ).strip()
         module_names = {name for names in from_imports.values() for name in names}
         bound: dict[str, str] = {}
@@ -110,7 +110,9 @@ class _Intermediate(Serializable):
                 # Resolve the config-relative path while it is resolvable, so the generated script
                 # imports the same file regardless of the directory it is later run from.
                 rendered_file = str(Path(file).resolve()) if Path(file).exists() else file
-                binding_lines.append(f"{leaf} = import_from_address({address!r}, module_file={rendered_file!r})")
+                binding_lines.append(
+                    f"{leaf} = structcast.utils.base.import_from_address({address!r}, module_file={rendered_file!r})"
+                )
         file_bindings = "\n".join(binding_lines)
         # Module level, so every instance of every generated class shares one bound callable object.
         hoisted = "\n".join(

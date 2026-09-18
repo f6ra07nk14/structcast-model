@@ -116,12 +116,37 @@ class SimpleLearner:
                 keyword here and nothing below has to know about it.
         """
         self.model = model
-        self.loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        criterion = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+        def _flow_optimizer(*, x: Any, y: Any) -> tuple[Any, dict[str, Any]]:
+            """Compute the loss to differentiate and the criteria of one training batch.
+
+            Keyword-only, as every generated flow is: the adapters and the distributed strategies pass
+            the batch by name, and a positional batch would bind the entries in declaration order.
+            """
+            logits = model(x, training=True)
+            loss = criterion(y_true=y, y_pred=logits)
+            accuracy = keras.ops.mean(keras.metrics.sparse_categorical_accuracy(y_true=y, y_pred=logits))
+            return loss, {"loss": loss, "accuracy": accuracy}
+
+        def _flow_inference(*, x: Any, y: Any) -> dict[str, Any]:
+            """Compute the same criteria with the model in inference mode, differentiating nothing."""
+            logits = model(x, training=False)
+            return {
+                "loss": criterion(y_true=y, y_pred=logits),
+                "accuracy": keras.ops.mean(keras.metrics.sparse_categorical_accuracy(y_true=y, y_pred=logits)),
+            }
+
+        # Closures bound as attributes, exactly as a generated learner writes its flows: they read the
+        # model and the loss by name, never `self`, and the loss stays a local because nothing reads
+        # it off the learner.
+        self._flow_optimizer = _flow_optimizer
+        self._flow_inference = _flow_inference
         # One segment: this optimizer, these variables, this flow. A learner training two models
         # under two optimizers -- a GAN, say -- hands the adapter one segment per optimizer.
         self._segment = AdapterSegment(
             name="optimizer",
-            flow=self._flow_optimizer,
+            flow=_flow_optimizer,
             optimizer=keras.optimizers.SGD(
                 learning_rate=learning_rate, gradient_accumulation_steps=gradient_accumulation_steps
             ),
@@ -134,7 +159,7 @@ class SimpleLearner:
         # inside a jitted one.
         adapter.prepare([self._segment])
         self._training_step = adapter.build_train_step([self._segment])
-        self._inference_step = adapter.build_inference_step(self._flow_inference, models=[model])
+        self._inference_step = adapter.build_inference_step(_flow_inference, models=[model])
         # The criteria both steps return. The CLI reads them off the learner to build the tracker
         # and the progress-bar rows, unless `--learner-outputs` overrides them.
         self.outputs = ["loss", "accuracy"]
@@ -142,25 +167,6 @@ class SimpleLearner:
         self._steps = 0
         self._last_updates = 0
         self._has_updated = False
-
-    def _flow_optimizer(self, *, x: Any, y: Any) -> tuple[Any, dict[str, Any]]:
-        """Compute the loss to differentiate and the criteria of one training batch.
-
-        Keyword-only, as every generated flow is: the adapters and the distributed strategies pass
-        the batch by name, and a positional batch would bind the entries in declaration order.
-        """
-        logits = self.model(x, training=True)
-        loss = self.loss(y_true=y, y_pred=logits)
-        accuracy = keras.ops.mean(keras.metrics.sparse_categorical_accuracy(y_true=y, y_pred=logits))
-        return loss, {"loss": loss, "accuracy": accuracy}
-
-    def _flow_inference(self, *, x: Any, y: Any) -> dict[str, Any]:
-        """Compute the same criteria with the model in inference mode, differentiating nothing."""
-        logits = self.model(x, training=False)
-        return {
-            "loss": self.loss(y_true=y, y_pred=logits),
-            "accuracy": keras.ops.mean(keras.metrics.sparse_categorical_accuracy(y_true=y, y_pred=logits)),
-        }
 
     @property
     def models(self) -> dict[str, keras.Model]:

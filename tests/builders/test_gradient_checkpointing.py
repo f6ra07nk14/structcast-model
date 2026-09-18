@@ -123,7 +123,7 @@ def test_a_layer_that_does_not_ask_for_checkpointing_is_emitted_unchanged(
 def test_a_checkpointed_torch_layer_inherits_the_runtime_base() -> None:
     """The options land as class attributes of the layer itself, so no wrapper module is inserted."""
     script = _script(TorchBuilder, TORCH_RAW, {"use_reentrant": False, "determinism_check": "constant:none"})
-    assert script.startswith("class Model(GradientCheckpointingLayer):")
+    assert script.startswith("class Model(structcast_model.torch.layers.GradientCheckpointingLayer):")
     assert "    gradient_checkpointing = True\n" in script
     assert "    _checkpoint_kwargs = {'use_reentrant': False, 'determinism_check': 'none'}\n" in script
     # The forward body is untouched: the base intercepts `__call__`, which reaches `forward` anyway.
@@ -144,7 +144,7 @@ def test_the_non_reentrant_checkpoint_is_filled_in_for_torch() -> None:
 def test_a_checkpointed_flax_module_emits_its_body_as_forward() -> None:
     """`nnx.remat` needs the body under a name of its own, and a policy named as a string is JAX's."""
     script = _script(FlaxBuilder, FLAX_RAW, {"policy": "dots_saveable", "prevent_cse": False})
-    assert script.startswith("class Model(GradientCheckpointingModule):")
+    assert script.startswith("class Model(structcast_model.flax.layers.GradientCheckpointingModule):")
     assert "    _remat_kwargs = {'policy': jax.checkpoint_policies.dots_saveable, 'prevent_cse': False}\n" in script
     assert "    def _forward(self, x, *, training = None, **kwargs):\n" in script
     assert "def __call__" not in script
@@ -175,27 +175,28 @@ def test_a_checkpointed_keras_layer_disables_flash_attention_before_its_sublayer
     backend that kernel raises instead of falling back (`REFERENCE.md`, "GRADIENT_CHECKPOINTING").
     """
     script = _script(KerasBuilder, KERAS_RAW, True)
-    assert "        super().__init__(**kwargs)\n        disable_flash_attention_for_remat()\n" in script
-    assert script.index("disable_flash_attention_for_remat()") < script.index("self.fc = Dense")
+    guard = "structcast_model.keras.layers.disable_flash_attention_for_remat()"
+    assert f"        super().__init__(**kwargs)\n        {guard}\n" in script
+    assert script.index(guard) < script.index("self.fc = Dense")
     checkpointed = KerasBuilder(raw={**KERAS_RAW, "GRADIENT_CHECKPOINTING": True})(classname="Model")
-    assert checkpointed.collected_imports["structcast_model.keras.layers"] == {"disable_flash_attention_for_remat"}
+    assert checkpointed.collected_imports["structcast_model.keras.layers"] == {None}
     assert "structcast_model.keras.layers" not in KerasBuilder(raw=KERAS_RAW)(classname="Model").collected_imports
 
 
 @pytest.mark.parametrize(
-    ("builder", "raw", "module", "name"),
+    ("builder", "raw", "module"),
     [
-        (TorchBuilder, TORCH_RAW, "structcast_model.torch.layers", "GradientCheckpointingLayer"),
-        (FlaxBuilder, FLAX_RAW, "structcast_model.flax.layers", "GradientCheckpointingModule"),
+        (TorchBuilder, TORCH_RAW, "structcast_model.torch.layers"),
+        (FlaxBuilder, FLAX_RAW, "structcast_model.flax.layers"),
     ],
     ids=["torch", "flax"],
 )
 def test_the_runtime_base_is_imported_only_by_the_modules_that_use_it(
-    builder: Any, raw: dict[str, Any], module: str, name: str
+    builder: Any, raw: dict[str, Any], module: str
 ) -> None:
     """A per-instance import, not a default one: an unchecked model must import nothing new."""
     assert module not in builder(raw=raw)(classname="Model").collected_imports
-    assert builder(raw={**raw, "GRADIENT_CHECKPOINTING": True})(classname="Model").collected_imports[module] == {name}
+    assert builder(raw={**raw, "GRADIENT_CHECKPOINTING": True})(classname="Model").collected_imports[module] == {None}
 
 
 def test_a_flax_policy_name_pulls_jax_into_the_generated_module() -> None:
@@ -280,6 +281,46 @@ def test_keras_allows_a_nested_dropout_parametrized_down_to_zero() -> None:
     assert "keras.remat" in "\n".join(KerasBuilder(raw=_with_drop_path(0.0))().scripts)
 
 
+def _with_sublayer(address: str, call: dict[str, Any]) -> dict[str, Any]:
+    """A layer whose flow also builds `address` from the `call` keywords."""
+    return {
+        **KERAS_RAW,
+        "FLOW": [*KERAS_RAW["FLOW"], ["y", "y", "extra", {"_obj_": [["_addr_", address], {"_call_": call}]}]],
+    }
+
+
+@pytest.mark.parametrize(
+    ("address", "call"),
+    [
+        ("keras.layers.MultiHeadAttention", {"num_heads": 2, "key_dim": 8, "dropout": 0.1}),
+        ("keras.layers.LSTM", {"units": 4, "dropout": 0.0, "recurrent_dropout": 0.2}),
+    ],
+    ids=["attention_dropout", "one_of_two_recurrent_dropouts"],
+)
+def test_keras_refuses_a_layer_whose_dropout_keyword_draws(address: str, call: dict[str, Any]) -> None:
+    """Attention and recurrent layers draw a dropout mask of their own, so one rate above zero is a second draw.
+
+    An RNN draws for its input and its recurrent state separately: a zero on one keyword says nothing
+    about the other.
+    """
+    with pytest.raises(SpecError, match=f'builds "{address.rsplit(".", 1)[1]}"'):
+        _script(KerasBuilder, _with_sublayer(address, call), True)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [{"num_heads": 2, "key_dim": 8, "dropout": 0.0}, {"num_heads": 2, "key_dim": 8}],
+    ids=["dropout_zero", "dropout_omitted"],
+)
+def test_keras_checkpoints_attention_that_draws_no_dropout(call: dict[str, Any]) -> None:
+    """Unlike `Dropout`'s required rate, attention dropout defaults to 0, so leaving it out draws nothing.
+
+    Refusing it would take checkpointing away from the shipped Vision Transformer, whose
+    `MultiHeadAttention` is written without the keyword.
+    """
+    assert "keras.remat" in _script(KerasBuilder, _with_sublayer("keras.layers.MultiHeadAttention", call), True)
+
+
 def test_the_torch_selective_checkpoint_context_resolves_like_any_other_value() -> None:
     """`context_fn` is torch's counterpart of the flax policy, so a pattern has to survive to the script."""
     context = {
@@ -330,7 +371,9 @@ def test_layers_differing_only_in_checkpointing_stay_separate_classes() -> None:
     }
     scripts = "\n".join(TorchBuilder(raw=raw)(classname="Model").scripts)
     assert scripts.count("(torch.nn.Module):") == 2  # the unchecked Unit and the root model
-    assert scripts.count("(GradientCheckpointingLayer):") == 2  # `true` reused by "again", plus the mapping
+    assert (
+        scripts.count("(structcast_model.torch.layers.GradientCheckpointingLayer):") == 2
+    )  # `true` reused by "again", plus the mapping
 
 
 def test_the_field_configures_the_layer_and_never_becomes_a_sublayer() -> None:

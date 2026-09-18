@@ -21,11 +21,14 @@ __all__ = [
     "get_jax_device",
     "get_jax_devices",
     "get_learning_rate",
+    "gradient_steps",
     "layers",
+    "loss_scale",
     "no_weight_decay_mask",
     "resolve_input_shapes",
     "restore_training_state",
     "unwrap_variables",
+    "update_with_loss_scale",
 ]
 
 if TYPE_CHECKING:
@@ -38,7 +41,14 @@ if TYPE_CHECKING:
         TP_PRESETS,
         FlaxDistributedStrategy,
     )
-    from structcast_model.flax.optimizers import get_learning_rate, no_weight_decay_mask, unwrap_variables
+    from structcast_model.flax.optimizers import (
+        get_learning_rate,
+        gradient_steps,
+        loss_scale,
+        no_weight_decay_mask,
+        unwrap_variables,
+        update_with_loss_scale,
+    )
     from structcast_model.flax.trainer import (
         FlaxBestCriterion,
         FlaxTracker,
@@ -63,7 +73,14 @@ else:
     import_structure = {
         "distributed": ["AXIS", "MODEL_AXIS", "PRESET_RULES", "TACTICS", "TP_PRESETS", "FlaxDistributedStrategy"],
         "layers": [],
-        "optimizers": ["get_learning_rate", "no_weight_decay_mask", "unwrap_variables"],
+        "optimizers": [
+            "get_learning_rate",
+            "gradient_steps",
+            "loss_scale",
+            "no_weight_decay_mask",
+            "unwrap_variables",
+            "update_with_loss_scale",
+        ],
         "trainer": [
             "FlaxBestCriterion",
             "FlaxTracker",

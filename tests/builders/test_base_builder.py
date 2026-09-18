@@ -1,8 +1,12 @@
 """API-level tests for base builder utilities."""
 
+import ast
 from collections import defaultdict
+from functools import reduce
+from importlib import import_module
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from re import findall
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -218,6 +222,90 @@ def test_builder_deduplicates_sublayers_sharing_input_shapes(tmp_path: Path) -> 
     assert module_path.read_text(encoding="utf-8").count("class Unit(") == 1
     model = _import_module(module_path).TinyNet()
     assert model.first is not model.second
+
+
+def test_builder_imports_a_project_address_as_its_module_and_calls_it_qualified(tmp_path: Path) -> None:
+    """A generated script reaches `structcast_model` only qualified off an imported package, never a from-import.
+
+    A from-import would put the leaf name into the script's globals, where a flow name or a
+    generated class of the same name silently replaces it; the layer is still named after the leaf.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [["x", "y", {"_obj_": [["_addr_", "structcast_model.torch.layers.ToChannelLast"], {"_call_": {}}]}]],
+    }
+    module_path = tmp_path / "tiny_net.py"
+    TorchBuilder(raw=raw)(classname="TinyNet")(module_path)
+    code = module_path.read_text(encoding="utf-8")
+    assert "import structcast_model.torch.layers\n" in code
+    assert "self.to_channel_last = structcast_model.torch.layers.ToChannelLast()" in code
+    assert "from structcast_model" not in code
+    assert _import_module(module_path).TinyNet().to_channel_last.__class__.__name__ == "ToChannelLast"
+
+
+def test_builder_imports_a_package_address_as_the_package_and_calls_it_qualified(tmp_path: Path) -> None:
+    """A helper a framework package re-exports is addressed off the package, the one spelling it serves.
+
+    The twin of the `layers` subpackage case: `structcast_model.torch` lists symbols, not the `.py`
+    modules defining them, so the address is emitted as written and has to resolve when the script runs.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [["x", "y", {"_obj_": [["_addr_", "structcast_model.torch.get_torch_device"], {"_call_": {}}]}]],
+    }
+    module_path = tmp_path / "tiny_net.py"
+    TorchBuilder(raw=raw)(classname="TinyNet")(module_path)
+    code = module_path.read_text(encoding="utf-8")
+    assert "import structcast_model.torch\n" in code
+    assert "self.get_torch_device = structcast_model.torch.get_torch_device()" in code
+    assert "from structcast_model" not in code
+    assert _import_module(module_path).TinyNet().get_torch_device in {"cpu", "cuda"}
+
+
+def test_every_project_name_the_builders_emit_resolves_where_the_script_reaches_it() -> None:
+    """A helper the builders emit but its package never re-exported renders a script that fails when it runs.
+
+    A framework package serves only its `__all__`: symbols and its `layers` subpackage, never a `.py`
+    module. The emitted names are read off the builder sources, so a helper added later is checked
+    without a list to update. Bare string statements are docstrings, which name modules on purpose,
+    and dict keys and subscripts are the import table, whose named leaves are checked on their module.
+    """
+    import_module("structcast_model.builders.flax")
+    import_module("structcast_model.builders.keras")
+    emitted: set[str] = set()
+    for source in Path(str(import_module("structcast_model.builders.base").__file__)).parent.glob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        skipped = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Expr)}
+        skipped |= {id(key) for node in ast.walk(tree) if isinstance(node, ast.Dict) for key in node.keys}
+        skipped |= {id(node.slice) for node in ast.walk(tree) if isinstance(node, ast.Subscript)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skipped:
+                emitted.update(findall(r"\bstructcast_model(?:\.\w+)+", node.value))
+    assert {name.split(".")[1] for name in emitted} >= {"torch", "keras", "flax"}
+    unresolved = []
+    for name in sorted(emitted):
+        import_module(name.rpartition(".")[0])  # the `import` line the script carries
+        try:
+            reduce(getattr, name.split(".")[1:], import_module("structcast_model"))
+        except AttributeError:
+            unresolved.append(name)
+    assert unresolved == []
+
+    classes = [_Intermediate]
+    for cls in classes:
+        classes += cls.__subclasses__()
+    named = {
+        (module, leaf)
+        for cls in classes
+        if cls.__module__.startswith("structcast_model.")
+        for module, leaves in cls.default_imports.items()
+        for leaf in leaves
+        if leaf
+    }
+    assert ("structcast_model.torch.distributed", "sync_gate") in named
+    assert [pair for pair in sorted(named) if not hasattr(import_module(pair[0]), pair[1])] == []
 
 
 def test_layer_intermediate_default_methods_raise_not_implemented() -> None:

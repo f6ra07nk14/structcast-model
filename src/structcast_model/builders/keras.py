@@ -41,6 +41,13 @@ Matched by the name a layer is constructed under, so a user-defined class doing 
 including one reached through `_file_` -- is invisible here and documented in `REFERENCE.md` instead.
 """
 
+_DROPOUT_KEYWORD_KERAS_LAYERS = frozenset({"Attention", "GRU", "LSTM", "MultiHeadAttention", "SimpleRNN"})
+"""Keras layers that draw from a seed only through a `dropout` or `recurrent_dropout` keyword defaulting to 0.
+
+Kept apart from `_STATEFUL_KERAS_LAYERS` because leaving the keyword out is itself a rate of 0, where
+leaving out a `Dropout` rate only means it was passed some other way.
+"""
+
 
 def _stateful_sublayer(expression: str) -> str | None:
     """Return the blocklisted Keras layer one emitted constructor expression builds, if it builds one.
@@ -48,6 +55,11 @@ def _stateful_sublayer(expression: str) -> str | None:
     A `rate=0` member of the Dropout family is let through: `Dropout.call` is guarded by `self.rate > 0`,
     so it returns its input untouched and draws nothing, and the recomputation matches the first pass.
     That is the shape a stochastic-depth section takes when its rate is parametrized down to zero.
+
+    The attention and recurrent layers draw under the same guard, once per rate keyword, so every one
+    written has to be a literal 0 -- an `LSTM` with `recurrent_dropout=0.2` still draws -- and writing
+    none is 0 too. They are judged by those keywords alone: a rate passed positionally or through a
+    `**` expansion is not seen.
     """
     try:
         node = ast.parse(expression, mode="eval").body
@@ -58,10 +70,12 @@ def _stateful_sublayer(expression: str) -> str | None:
         return None
     called = node.func
     name = called.attr if isinstance(called, ast.Attribute) else getattr(called, "id", "")
-    if not (name in _STATEFUL_KERAS_LAYERS or name.startswith("Random")):
+    if not (name in _STATEFUL_KERAS_LAYERS or name in _DROPOUT_KEYWORD_KERAS_LAYERS or name.startswith("Random")):
         return None
-    rates = [k.value for k in node.keywords if k.arg == "rate"]
-    if rates and all(isinstance(rate, ast.Constant) and rate.value == 0 for rate in rates):
+    rates = [k.value for k in node.keywords if k.arg in ("rate", "dropout", "recurrent_dropout")]
+    if (rates or name in _DROPOUT_KEYWORD_KERAS_LAYERS) and all(
+        isinstance(rate, ast.Constant) and rate.value == 0 for rate in rates
+    ):
         return None
     return name
 
@@ -153,7 +167,7 @@ class KerasLayerIntermediate(LayerIntermediate):
         if self.gradient_checkpointing is not None:
             # Before the sub-layers are built, not at training time: `keras.layers.MultiHeadAttention`
             # caches the flash attention decision in its own `__init__`, so a later flip misses it.
-            prologue += f"{sep}disable_flash_attention_for_remat()"
+            prologue += f"{sep}structcast_model.keras.layers.disable_flash_attention_for_remat()"
             # No base class: Keras reads the `call` signature to decide whether it forwards
             # `training` and how it maps a batch passed by name, and a `*args` base would erase both.
             # Not `_call_impl`: on the torch backend a Keras layer inherits `torch.nn.Module`, which
@@ -216,8 +230,8 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
         The sub-layers recomputation would run twice are rejected by
         `KerasLayerIntermediate._reject_stateful_sublayers`, which sees the whole subtree.
 
-        The one import a checkpointed layer gains is the JAX flash attention guard its `__init__`
-        calls, which no other layer imports (`REFERENCE.md`, "GRADIENT_CHECKPOINTING").
+        What checkpointing adds to a layer is the JAX flash attention guard its `__init__` calls, qualified
+        through `structcast_model.keras.layers` (`REFERENCE.md`, "GRADIENT_CHECKPOINTING").
         """
         if config is False:
             return None
@@ -226,7 +240,7 @@ class KerasBuilder(BaseModelBuilder[KerasLayerIntermediate]):
                 f"GRADIENT_CHECKPOINTING keyword arguments {sorted(config)} have no Keras equivalent: "
                 "keras.remat takes the function alone, so set GRADIENT_CHECKPOINTING to true and drop them."
             )
-        imports["structcast_model.keras.layers"].add("disable_flash_attention_for_remat")
+        imports["structcast_model.keras.layers"].add(None)
         return {}
 
 
@@ -348,9 +362,9 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     Every backend-specific mechanic -- how the loss is differentiated, how the optimizer is applied,
     how the step is compiled -- lives in the backend adapter the generated learner selects once,
     so the emitted script imports no framework beyond `keras` and branches on no
-    backend. Each optimizer segment becomes one `_flow_<optimizer>` method written in `keras.ops`,
-    handed to the adapter as the `flow` of a `_segment_<optimizer>` attribute; the adapter turns
-    them into the training step, compiled when `scm keras train --compile` asked for it.
+    backend. Each optimizer segment becomes one `_flow_<optimizer>` closure of `__init__` written in
+    `keras.ops`, handed to the adapter as the `flow` of a `_segment_<optimizer>` attribute; the adapter
+    turns them into the training step, compiled when `scm keras train --compile` asked for it.
 
     The emitted module holds imports and the class alone, and the class keeps no anonymous
     collection: the constants are class attributes, every segment is a named attribute, the batch
@@ -368,9 +382,9 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "keras": {None},
-        "structcast_model.keras.adapters": {"AdapterSegment", "select_backend_adapter"},
+        "structcast_model.keras": {None},
     }
-    """Default imports for Keras learners; the generated learner calls these directly."""
+    """Default imports for Keras learners; the generated learner calls these fully qualified, off the package."""
 
     @cached_property
     def _segments(self) -> list[tuple[list[tuple[str, str, str | None]], KerasOptimizerSegment]]:
@@ -397,7 +411,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         for units, segment in self._segments:
             if segment.optimizer == "inference":
                 raise SpecError(
-                    'An optimizer named "inference" emits a _flow_inference method that collides with the '
+                    'An optimizer named "inference" emits a _flow_inference closure that collides with the '
                     "learner's own inference flow, so one of the two definitions would silently replace the "
                     "other: rename the optimizer."
                 )
@@ -438,13 +452,13 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
 
     @property
     def _flow_parameters(self) -> str:
-        """The batch parameters of a flow method: one keyword-only parameter per input name.
+        """The batch parameters of a flow: one keyword-only parameter per input name.
 
         Keyword-only because every caller of a flow -- the adapters, the distributed strategy --
         passes the batch by name, and a positional batch would silently take the entries in
         declaration order.
         """
-        return f", *, {self._forward_inputs}" if self.inputs else ""
+        return f"*, {self._forward_inputs}" if self.inputs else ""
 
     def _flow_step(self, inputs: str, output: str, layer: str | None, *, training: bool) -> str:
         """Emit one flow step, running a model in the mode this flow needs it in.
@@ -455,10 +469,10 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         if layer is None:
             return f"{output} = {inputs}"
         arguments = ", ".join(p for p in (inputs, f"training={training}" if layer in self.models else "") if p)
-        return f"{output} = self.{layer}({arguments})"
+        return f"{output} = {layer}({arguments})"
 
     def _get_forward_training_flow(self) -> list[str]:
-        """Get the `_flow_<optimizer>` method of every segment, indented one level into the class body."""
+        """Get the `_flow_<optimizer>` closure of every segment and its binding, as lines of the `__init__` body."""
         indent = " " * 4
         # A segment is one function the adapter calls with the batch alone, so a value another
         # segment computed is simply not in scope there.
@@ -479,34 +493,54 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
                 bound |= stores
             criteria = ", ".join(f"{name!r}: {name}" for name in self._criteria[segment.optimizer])
             body.append(f"return {segment.loss}, {{{criteria}}}")
-            lines.append(f"def _flow_{segment.optimizer}(self{self._flow_parameters}):")
+            lines.append(f"def _flow_{segment.optimizer}({self._flow_parameters}):")
             lines += [f"{indent}{line}" for line in body]
-            lines.append("")
+            lines.append(f"self._flow_{segment.optimizer} = _flow_{segment.optimizer}")
         return lines
 
     def _get_forward_inference_flow(self) -> list[str]:
-        """Get the body of the `_flow_inference` method, which runs every model in inference mode."""
+        """Get the body of the `_flow_inference` closure, which runs every model in inference mode."""
         lines = [self._flow_step(i, o, L, training=False) for i, o, L in self.inference_flow]
         return [*lines, f"return {self._forward_outputs}"]
 
+    def _reject_reserved_names(self) -> None:
+        """Reject a batch entry or a stored value named like a model or a flow layer.
+
+        The flows are closures of `__init__` reading the models and flow layers by name, so a batch
+        parameter or a local a flow stores under one of those names is what the flow would read.
+        """
+        closed = {*self.models, *self.layers}
+        units = [u for u in (*self.flow, *self.inference_flow) if not isinstance(u, OptimizerSegment)]
+        for name in unique([*self.inputs, *[n for _, output, _ in units for n in stored_names(output)]]):
+            if name in closed:
+                raise SpecError(
+                    f'Name "{name}" is both a model or flow layer of the learner and an input or a value its FLOW '
+                    "stores: the generated flows are closures of __init__ reading the models and flow layers by "
+                    "name, so the flow would call the batch entry or the stored value in its place. Rename one."
+                )
+
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner: one class whose backend half is the adapter's."""
+        self._reject_reserved_names()
         indent = " " * 4
         sep2 = "\n" + indent * 2
         sep3 = "\n" + indent * 3
         inputs = self._forward_inputs
         inputs += ", " if inputs else ""
         named = ", ".join(f"{name}={name}" for name in self.inputs)
-        every_model = ", ".join(f"self.{name}" for name in self.models)
-        flows = "\n".join(indent + line if line else "" for line in self._forward_training_flow)
+        every_model = ", ".join(self.models)
         attributes = [f"self._segment_{segment.optimizer}" for _, segment in self._segments]
         listed = f"[{', '.join(attributes)}]"
         tupled = f"({', '.join(attributes)},)"
         body = [f"self.{name} = {name}" for name in self.models]
-        body += [f"self.{k} = {v}" for k, v in initialized_layers.items()]
+        body += [f"{k} = {v}" for k, v in initialized_layers.items() if k != v]
         body += [f"{k} = {v}" for k, v in self.others.items() if k != v]
+        body += self._forward_training_flow
+        body.append(f"def _flow_inference({self._flow_parameters}):")
+        body += [f"{indent}{line}" for line in self._forward_inference_flow]
+        body.append("self._flow_inference = _flow_inference")
         for _, segment in self._segments:
-            owned = ", ".join(f"self.{name}" for name in segment.trainable_layers)
+            owned = ", ".join(segment.trainable_layers)
             variables = (
                 f"list({owned}.trainable_variables)"
                 if len(segment.trainable_layers) == 1
@@ -514,13 +548,16 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             )
             fields = [
                 f"name={segment.optimizer!r},",
-                f"flow=self._flow_{segment.optimizer},",
+                f"flow=_flow_{segment.optimizer},",
                 f"optimizer={segment.optimizer},",
                 f"variables={variables},",
                 f"models=[{owned}],",
             ]
-            body.append(f"self._segment_{segment.optimizer} = AdapterSegment({sep3}{sep3.join(fields)}{sep2})")
-        body.append("adapter = select_backend_adapter()")
+            body.append(
+                f"self._segment_{segment.optimizer} = "
+                f"structcast_model.keras.AdapterSegment({sep3}{sep3.join(fields)}{sep2})"
+            )
+        body.append("adapter = structcast_model.keras.select_backend_adapter()")
         body.append(
             f"adapter.prepare({listed}, mixed_precision={self.mixed_precision!r}, "
             f"mixed_precision_type={self.mixed_precision_type!r})"
@@ -544,9 +581,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         body.append("self._last_updates = 0")
         body.append("self._has_updated = False")
         body.append(f"self._training_step = adapter.build_train_step({listed})")
-        body.append(
-            f"self._inference_step = adapter.build_inference_step(self._flow_inference, models=[{every_model}])"
-        )
+        body.append(f"self._inference_step = adapter.build_inference_step(_flow_inference, models=[{every_model}])")
         body.append(f"self.inputs = {self.inputs}")
         body.append(f"self.outputs = {self.outputs}")
         # The first segment is the learner's clock, read through the segment because `prepare`
@@ -564,11 +599,11 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
                 "# beside the variables and only writes it back when training ends, so the flow",
                 "# would otherwise read the raw weights. The `finally` is what keeps a flow that",
                 "# raises from leaving the average in the model.",
-                "swap_ema_weights(self._ema_optimizers)",
+                "structcast_model.keras.swap_ema_weights(self._ema_optimizers)",
                 "try:",
                 f"{indent}return self._inference_step({named})",
                 "finally:",
-                f"{indent}swap_ema_weights(self._ema_optimizers)",
+                f"{indent}structcast_model.keras.swap_ema_weights(self._ema_optimizers)",
             ]
             ema_doc = """
     An optimizer of this learner averages its weights (`use_ema`), so `inference_step` swaps that
@@ -603,9 +638,10 @@ class {self.classname}:
 
     A model runs with `training=True` only inside the segment that owns it, and with
     `training=False` everywhere else, so a frozen model updates no normalization statistics.
-    Learner-level flow layers -- the losses and metrics of the FLOW -- must be stateless: only the
-    models' variables are threaded through a compiled step, so a variable held by such a layer would
-    freeze at its first value on the JAX backend.
+    Learner-level flow layers -- the losses and metrics of the FLOW -- are locals of `__init__` the
+    flows close over, so they must be stateless: only the models' variables are threaded through a
+    compiled step, and a variable held by such a layer would freeze at its first value on the JAX
+    backend.
 
     Gradient accumulation is the optimizer's (`gradient_accumulation_steps` in the OPTIMIZER
     pattern). The learner owns the training counters: `steps` counts every `training_step` call on
@@ -626,10 +662,6 @@ class {self.classname}:
 
     def __init__(self, {self._learner_models}, **kwargs):
         {sep2.join(body)}
-
-{flows}
-    def _flow_inference(self{self._flow_parameters}):
-        {sep2.join(self._forward_inference_flow)}
 
     def training_step(self, {inputs}**kwargs):
         self._steps += 1
@@ -720,10 +752,7 @@ class KerasLearnerBuilder(BaseLearnerBuilder[KerasLearnerIntermediate]):
         # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
         # discarded one, so `super()` raises here, exactly as in the Flax builder.
         base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
-        # The one import an averaging learner gains is the swap its `inference_step` runs, which no
-        # other learner imports (`REFERENCE.md`, "EMA").
-        if uses_ema := _declares_ema(learner.OPTIMIZER.model_dump(by_alias=True)):
-            imports["structcast_model.keras.adapters"].add("swap_ema_weights")
+        uses_ema = _declares_ema(learner.OPTIMIZER.model_dump(by_alias=True))
         return KerasOptimizerSegment(
             loss=base.loss,
             optimizer=base.optimizer,

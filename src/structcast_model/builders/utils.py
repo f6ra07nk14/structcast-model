@@ -126,7 +126,14 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
                 # special key so the script renderer emits an import_from_address binding instead.
                 imports[f"{FILE_IMPORT_PREFIX}{first.file}"].add(first.address)
             elif module:
-                imports[module].add(res)
+                # The project's own packages are imported as modules and reached fully qualified, so
+                # none of their members becomes a global of the generated script. The address is emitted
+                # as written: a framework package re-exports symbols and its `layers` subpackage only, so
+                # `structcast_model.torch.create_opt` resolves while the module path
+                # `structcast_model.torch.optimizers.create_opt` fails when the script runs, by design.
+                project = module.split(".")[0] in ("structcast", "structcast_model")
+                imports[module].add(None if project else res)
+                res = f"{module}.{res}" if project else res
         elif isinstance(first, ObjectPattern):
             res = _resolve(first)
         else:

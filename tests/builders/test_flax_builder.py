@@ -392,7 +392,7 @@ def test_flax_learner_emits_the_steps_as_functions_over_named_state() -> None:
     assert "def _training_step(model, optimizer, *, x, y, **kwargs):" in script
     assert "def _inference_step(model, *, x, y, **kwargs):" in script
     assert "(_, (loss,)), _grads = flax.nnx.value_and_grad(_flow_optimizer, has_aux=True)(model, x=x, y=y)" in script
-    assert "lrs = {'optimizer': get_learning_rate(optimizer)}" in script
+    assert "lrs = {'optimizer': structcast_model.flax.get_learning_rate(optimizer)}" in script
     assert "return {'loss': loss}, lrs, _has_updated\n" in script
     # The keys are attribute names: a trainer compiles a step by rebinding the attribute it names.
     assert 'return {"_training_step": self._training_step, "_inference_step": self._inference_step}' in script
@@ -462,10 +462,10 @@ def test_flax_learner_never_reads_a_variable_value_or_an_update_result() -> None
 
 
 def test_flax_learner_imports_the_helpers_its_steps_call() -> None:
-    """The generated steps call `get_learning_rate` and `gradient_steps` directly."""
+    """The generated steps call `get_learning_rate` and `gradient_steps` fully qualified, off the package."""
     imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
 
-    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
+    assert imports["structcast_model.flax"] == {None}
     assert imports["flax.nnx"] == {None, "Param", "Optimizer"}
     assert imports["jax"] == {None}
     assert imports["jax.numpy"] == {None}
@@ -481,8 +481,11 @@ def test_flax_learner_detects_its_updates_inside_the_step() -> None:
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"accumulate_gradients": 3}})
 
     assert "MultiSteps(" in script
-    assert "_before = gradient_steps(optimizer)" in script
-    assert "_has_updated = True if _before is None else gradient_steps(optimizer) > _before" in script
+    assert "_before = structcast_model.flax.gradient_steps(optimizer)" in script
+    assert (
+        "_has_updated = True if _before is None else "
+        "structcast_model.flax.gradient_steps(optimizer) > _before" in script
+    )
     assert "self._steps += 1" in script
     assert "self._has_updated = bool(has_updated)" in script
     assert "self._updates += int(self._has_updated)" in script
@@ -505,13 +508,13 @@ def test_flax_learner_scales_the_loss_it_differentiates_and_carries_the_scale_th
     """
     script = _learner_script(LEARNER_YAML, {"DEFAULT": {"mixed_precision": {"growth_interval": 100}}})
 
-    assert "self.optimizer_dynamic_scale = loss_scale(growth_interval=100)" in script
+    assert "self.optimizer_dynamic_scale = structcast_model.flax.loss_scale(growth_interval=100)" in script
     assert "def _flow_optimizer(model, x, y, _loss_scale):" in script
     assert "return loss * _loss_scale, (loss,)" in script
     assert "def _training_step(model, optimizer, optimizer_dynamic_scale, *, x, y, **kwargs):" in script
     assert "_loss_scale=optimizer_dynamic_scale.scale)" in script
     assert (
-        "_has_updated, optimizer_dynamic_scale = update_with_loss_scale("
+        "_has_updated, optimizer_dynamic_scale = structcast_model.flax.update_with_loss_scale("
         "model, optimizer, _grads, optimizer_dynamic_scale)"
     ) in script
     assert "return {'loss': loss}, lrs, _has_updated, optimizer_dynamic_scale\n" in script
@@ -528,7 +531,8 @@ def test_flax_learner_without_mixed_precision_emits_no_scale_at_all() -> None:
     """The field defaults to off, and off has to mean the code a learner emitted before it existed.
 
     Every learner in the repository is unscaled, so anything the scaled path emits unconditionally
-    -- an import, a step parameter, a helper call -- would change every generated file at once.
+    -- a step parameter, a helper call -- would change every generated file at once. The package
+    import is not one of them: every Flax learner imports `structcast_model.flax`, scaled or not.
     """
     script = _learner_script(LEARNER_YAML)
     imports = FlaxLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
@@ -537,7 +541,7 @@ def test_flax_learner_without_mixed_precision_emits_no_scale_at_all() -> None:
     assert "_loss_scale" not in script
     assert "dynamic_scale" not in script
     assert "grad_scalers" not in script
-    assert imports["structcast_model.flax.optimizers"] == {"get_learning_rate", "gradient_steps"}
+    assert imports["structcast_model.flax"] == {None}
 
 
 def test_flax_learner_scales_every_segment_on_its_own_scale() -> None:
@@ -551,11 +555,13 @@ def test_flax_learner_scales_every_segment_on_its_own_scale() -> None:
 
     script = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts[-1]
 
-    assert "self.optimizer_ab_dynamic_scale = loss_scale()" in script
-    assert "self.optimizer_c_dynamic_scale = loss_scale()" in script
+    assert "self.optimizer_ab_dynamic_scale = structcast_model.flax.loss_scale()" in script
+    assert "self.optimizer_c_dynamic_scale = structcast_model.flax.loss_scale()" in script
     # The clock is still the first segment alone: the later ones report no update of their own.
-    assert "_has_updated, optimizer_ab_dynamic_scale = update_with_loss_scale((a, b), optimizer_ab," in script
-    assert "_, optimizer_c_dynamic_scale = update_with_loss_scale(c, optimizer_c," in script
+    assert (
+        "_has_updated, optimizer_ab_dynamic_scale = structcast_model.flax.update_with_loss_scale((a, b), optimizer_ab,"
+    ) in script
+    assert "_, optimizer_c_dynamic_scale = structcast_model.flax.update_with_loss_scale(c, optimizer_c," in script
     assert "lrs, _has_updated, optimizer_ab_dynamic_scale, optimizer_c_dynamic_scale\n" in script
 
 
@@ -567,7 +573,7 @@ def test_flax_learner_detects_on_the_first_optimizer_alone() -> None:
     """
     script = _learner_script(SEGMENTS_YAML)
 
-    assert "_before = gradient_steps(optimizer_ab)" in script
+    assert "_before = structcast_model.flax.gradient_steps(optimizer_ab)" in script
     assert "gradient_steps(optimizer_c)" not in script
 
 
@@ -716,16 +722,21 @@ def test_flax_convnext_learner_cfg_keeps_its_rate_readable_and_its_norms_undecay
     Its rate has to survive the rewrite as an injected hyperparameter while every other keyword --
     including the mask callable, which `inject_hyperparams` would otherwise try to arrayify --
     stays static, and the structured model output has to be unpacked before the criteria read it.
+    The defaults are the torch and Keras twins' recipe: a warmup-cosine schedule peaking at 4e-3 is
+    the rate that gets injected, and no clipping stage is built, because the twins clip only on
+    request.
     """
     script = _learner_script(CFG_DIR / "flax" / "learners" / "ConvNeXtV2.yaml")
 
     assert "cls = model_output['cls']" in script
     assert (
-        "tx=chain(clip_by_global_norm(max_norm=1.0), "
-        "inject_hyperparams(inner_factory=adamw, static_args=['weight_decay', 'b1', 'b2', 'mask'])"
-        "(learning_rate=0.001, weight_decay=0.05, b1=0.9, b2=0.999, "
-        "mask=no_weight_decay_mask('^(?:\\\\w+\\\\.)*bias$', '^(?:\\\\w+\\\\.)*scale$'))"
+        "tx=chain(inject_hyperparams(inner_factory=adamw, static_args=['weight_decay', 'b1', 'b2', 'mask'])"
+        "(learning_rate=warmup_cosine_decay_schedule(init_value=1e-05, peak_value=0.004, warmup_steps=1000, "
+        "decay_steps=300000, end_value=1e-06), weight_decay=0.05, b1=0.9, b2=0.999, "
+        "mask=structcast_model.flax.no_weight_decay_mask("
+        "'^(?:\\\\w+\\\\.)*bias$', '^(?:\\\\w+\\\\.)*scale$'))"
     ) in script
+    assert "clip_by_global_norm" not in script
 
 
 @pytest.mark.parametrize("name", ["ImageClassifier", "SmallLanguageModel"])
@@ -797,6 +808,26 @@ def test_flax_learner_rejects_a_segment_that_reads_a_name_it_stores_later() -> N
         _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
 
 
+def test_flax_learner_rejects_an_inference_flow_that_reads_a_name_it_stores_later() -> None:
+    """The inference step is one function as well, so a name its flow stores is local to all of it.
+
+    Reading it first fails only on the first evaluation batch, as `UnboundLocalError`. A batch entry
+    the flow rebinds later is different: it is a parameter of the step, so reading it first reads the
+    batch, and refusing that order would refuse a step that runs.
+    """
+    raw = load_any(SEGMENTS_YAML)
+    raw["LEARNERS"][0]["INFERENCE_FLOW"].insert(0, ["eval: out_b * 2.0", "doubled", None])
+
+    with pytest.raises(SpecError, match='INFERENCE_FLOW reads "out_b" before it stores it'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = FlaxLearnerBuilder(raw=raw, current_path=str(SEGMENTS_YAML))().scripts
+
+    rebound = load_any(SEGMENTS_YAML)
+    rebound["LEARNERS"][1]["INFERENCE_FLOW"].append(["eval: y * 2.0", "y", None])
+
+    assert "y = y * 2.0" in FlaxLearnerBuilder(raw=rebound, current_path=str(SEGMENTS_YAML))().scripts[-1]
+
+
 def _rename_model(raw: dict[str, Any], name: str) -> None:
     """Rename the single model of the linear fixture everywhere its learner names it."""
     raw["LEARNERS"][0]["TRAINABLE_LAYERS"] = [name]
@@ -828,6 +859,8 @@ def _build(raw: dict[str, Any]) -> None:
         # soon as one segment does, and a batch entry of that name would shadow it for every learner.
         (lambda raw: _rename_input(raw, "grad_scalers"), 'Name "grad_scalers" is reserved'),
         (lambda raw: raw["LEARNERS"][0].update(NAME="self"), 'Name "self" is reserved'),
+        # The steps call the flow layers by name, so a batch entry of that name is the one they call.
+        (lambda raw: _rename_input(raw, "mse"), 'Name "mse" is reserved'),
     ],
     ids=[
         "optimizer-named-like-an-input",
@@ -836,6 +869,7 @@ def _build(raw: dict[str, Any]) -> None:
         "input-kwargs",
         "input-grad-scalers",
         "self",
+        "input-named-like-a-flow-layer",
     ],
 )
 def test_flax_learner_rejects_a_name_the_generated_class_cannot_carry(
@@ -881,8 +915,9 @@ def test_flax_learner_rejects_a_model_named_like_the_view_of_another() -> None:
         # uniform, so an output that would shadow it cannot slip through on the unscaled path and
         # then break when the template turns `MIXED_PRECISION` on.
         lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "_loss_scale", None]),
+        lambda raw: raw["LEARNERS"][0]["FLOW"].insert(0, ["eval: 1.0", "mse", None]),
     ],
-    ids=["learning-rates", "gradients", "model", "loss-scale"],
+    ids=["learning-rates", "gradients", "model", "loss-scale", "flow-layer"],
 )
 def test_flax_learner_rejects_a_flow_output_the_step_already_binds(mutate: Callable[[dict[str, Any]], Any]) -> None:
     """The step binds the flow results next to the names it computes itself, so the two may not meet.

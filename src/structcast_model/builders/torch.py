@@ -18,7 +18,7 @@ from structcast_model.builders.base import (
     OptimizerSegment,
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
-from structcast_model.builders.utils import resolve_getter, resolve_object, statement_names
+from structcast_model.builders.utils import resolve_getter, resolve_object, statement_names, stored_names
 from structcast_model.utils.base import to_snake, unique
 
 _CHECKPOINT_OPTIONS = frozenset(
@@ -59,7 +59,7 @@ class TorchLayerIntermediate(LayerIntermediate):
         sep = "\n" + indent * 2
         base, attributes = "torch.nn.Module", ""
         if self.gradient_checkpointing is not None:
-            base = "GradientCheckpointingLayer"
+            base = "structcast_model.torch.layers.GradientCheckpointingLayer"
             lines = ["gradient_checkpointing = True"]
             if self.gradient_checkpointing:
                 keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
@@ -118,7 +118,7 @@ class TorchBuilder(BaseModelBuilder[TorchLayerIntermediate]):
                 f'GRADIENT_CHECKPOINTING option "{unknown[0]}" is not a keyword argument of '
                 f"torch.utils.checkpoint.checkpoint, which accepts {sorted(_CHECKPOINT_OPTIONS)}."
             )
-        imports["structcast_model.torch.layers"].add("GradientCheckpointingLayer")
+        imports["structcast_model.torch.layers"].add(None)
         return {key: resolve_getter(imports, value) for key, value in {"use_reentrant": False, **options}.items()}
 
 
@@ -206,16 +206,17 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
 
     default_imports: ClassVar[dict[str, set[str | None]]] = {
         "torch": {None},
-        "structcast_model.torch.optimizers": {
-            "get_decays",
-            "get_learning_rate",
-            "get_named_parameters",
-            "get_param_groups",
-            "restore_requires_grad",
-        },
+        "structcast_model.torch": {None},
         "structcast_model.torch.distributed": {"sync_gate"},
     }
-    """Default imports for PyTorch learners; the generated steps and properties call these directly."""
+    """Default imports for PyTorch learners; the generated steps and properties call these fully qualified.
+
+    A helper is reached through its package re-export, `structcast_model.torch.<name>`, never through the `.py`
+    module defining it: the package lists only its symbols and the `layers` subpackage, so a module path fails.
+
+    Except `sync_gate`, imported by name: the flow functions call it inside `torch.compile`, and dynamo raises
+    `InternalTorchDynamoError` walking `structcast_model` and `structcast_model.torch`, which are lazy-import
+    shims, where it traces a plain function global cleanly."""
 
     @cached_property
     def mixed_precision_scales(self) -> list[str]:
@@ -339,7 +340,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
             )
             step += [f"{m}.{'train' if m in trainable_layers else 'eval'}()" for m in self.models]
             step += [
-                f'restore_requires_grad({m}, self._requires_grad_defaults["{m}"])'
+                f'structcast_model.torch.restore_requires_grad({m}, self._requires_grad_defaults["{m}"])'
                 if m in trainable_layers
                 else f"{m}.requires_grad_(False)"
                 for m in self.models
@@ -433,9 +434,45 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                     "Read it from INFERENCE_FLOW instead."
                 )
 
+    def _reject_reserved_names(self) -> None:
+        """Reject a batch entry or a stored value named like a name the generated learner binds itself.
+
+        The flow functions are closures of `__init__` reading the models, their averages and the flow
+        layers by name, and the training step binds the models, optimizers, clippers and gradient
+        scalers as locals of its own next to `__need_update__`. A batch parameter or a value a flow
+        stores under one of those names is what the flow or the step would read in its place.
+        """
+        reserved = {
+            "self",
+            "kwargs",
+            "__need_update__",
+            "device_type",
+            *self.others,
+            *self.layers,
+            *[f"_flow_{name}" for name in self.optimizers],
+            "_flow_inference",
+        }
+        for name in self.inputs:
+            if name in reserved:
+                raise SpecError(
+                    f'Name "{name}" is reserved by the generated PyTorch learner, so it cannot name an input: the '
+                    "learner binds it for a model, an average of one, an optimizer, a gradient clipper or scaler, a "
+                    "flow layer or a value of its own, and the input, a parameter of the flow functions and steps, "
+                    "would stand in for it. Rename the input."
+                )
+        units = [u for u in (*self.flow, *self.inference_flow) if not isinstance(u, OptimizerSegment)]
+        for name in unique([n for _, output, _ in units for n in stored_names(output)]):
+            if name in reserved:
+                raise SpecError(
+                    f'A FLOW of the learner stores "{name}", which the generated learner already binds for a model, '
+                    "an average of one, an optimizer, a gradient clipper or scaler, a flow layer or a value of its "
+                    "own: the store would overwrite it before the flow or the step reads it. Rename the output."
+                )
+
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
         """Get the script for the learner."""
         self._reject_ema_in_training_flow()
+        self._reject_reserved_names()
         indent = " " * 4
         sep = "\n" + indent * 2
         shadows = [f"ema_{m}" for m in self.ema]
@@ -531,15 +568,15 @@ class {self.classname}:
 
     @property
     def learning_rates(self):
-        return {{k: get_learning_rate(v) for k, v in self.optimizers.items()}}
+        return {{k: structcast_model.torch.get_learning_rate(v) for k, v in self.optimizers.items()}}
 
     @property
     def weight_decays(self):
-        return get_decays(self.optimizers)
+        return structcast_model.torch.get_decays(self.optimizers)
 
     @property
     def param_group_names(self):
-        return {{k: get_param_groups(v) for k, v in self.optimizers.items()}}
+        return {{k: structcast_model.torch.get_param_groups(v) for k, v in self.optimizers.items()}}
 """
 
 
@@ -646,7 +683,10 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         trainable_layers: list[str],
     ) -> tuple[str, str]:
         opt_inst, opt_cls = resolve_object(imports, optimizer)
-        return f"{opt_inst}(get_named_parameters([{', '.join(trainable_layers)}]))", opt_cls
+        return (
+            f"{opt_inst}(structcast_model.torch.get_named_parameters([{', '.join(trainable_layers)}]))",
+            opt_cls,
+        )
 
 
 __all__ = [

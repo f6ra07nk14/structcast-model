@@ -198,24 +198,27 @@ def _built(raw: dict[str, Any], path: Path = LEARNER_YAML) -> str:
     return KerasLearnerBuilder(raw=raw, current_path=str(path))().scripts[-1]
 
 
-def test_keras_learner_emits_one_flow_method_per_segment() -> None:
+def test_keras_learner_emits_one_flow_closure_per_segment() -> None:
     """Each segment is one `keras.ops` function the adapter calls with the batch entries by name.
 
     The batch parameters are keyword-only, so a caller that handed the entries over positionally --
     the strategy replicating a step, a hand-written trainer -- fails instead of binding them in
     declaration order; nothing unpacks a mapping any more. Nothing in a flow may name a backend
-    either: the same method has to differentiate under `tf.GradientTape`, under
-    `jax.value_and_grad` and under torch autograd.
+    either: the same function has to differentiate under `tf.GradientTape`, under
+    `jax.value_and_grad` and under torch autograd. The flows are closures of `__init__` bound as
+    attributes, as on torch, so they read the models and flow layers by name and never `self`.
     """
     script = _learner_script(SEGMENTS_YAML)
 
-    assert "def _flow_optimizer_ab(self, *, x, y):" in script
-    assert "        out_a = self.a(x, training=True)" in script
-    assert "        return loss_ab, {'loss_ab': loss_ab}" in script
-    assert "def _flow_optimizer_c(self, *, x, y):" in script
-    assert "        return loss_c, {'loss_c': loss_c}" in script
-    assert "def _flow_inference(self, *, x, y):" in script
-    assert "        out_c = self.c(x, training=False)" in script
+    assert "        def _flow_optimizer_ab(*, x, y):" in script
+    assert "            out_a = a(x, training=True)" in script
+    assert "            return loss_ab, {'loss_ab': loss_ab}" in script
+    assert "        self._flow_optimizer_ab = _flow_optimizer_ab" in script
+    assert "        def _flow_optimizer_c(*, x, y):" in script
+    assert "            return loss_c, {'loss_c': loss_c}" in script
+    assert "        def _flow_inference(*, x, y):" in script
+    assert "            out_c = c(x, training=False)" in script
+    assert "        self._flow_inference = _flow_inference" in script
     assert "batch[" not in script
     for backend in ("import tensorflow", "import jax", "import torch", "keras.backend.backend()"):
         assert backend not in script
@@ -233,9 +236,9 @@ def test_keras_learner_prepares_the_segments_before_it_builds_the_steps() -> Non
     script = _learner_script(LEARNER_YAML)
 
     prepare = script.index("adapter.prepare([self._segment_optimizer]")
-    assert script.index("adapter = select_backend_adapter()") < prepare
+    assert script.index("adapter = structcast_model.keras.select_backend_adapter()") < prepare
     assert prepare < script.index("adapter.build_train_step([self._segment_optimizer])")
-    assert "self._inference_step = adapter.build_inference_step(self._flow_inference, models=[self.model])" in script
+    assert "self._inference_step = adapter.build_inference_step(_flow_inference, models=[model])" in script
     assert "return {'optimizer': self._segment_optimizer.optimizer}" in script
 
 
@@ -247,9 +250,10 @@ def test_keras_learner_hands_each_segment_the_variables_of_the_models_it_owns() 
     """
     script = _learner_script(SEGMENTS_YAML)
 
-    assert "variables=[v for m in (self.a, self.b,) for v in m.trainable_variables]," in script
-    assert "variables=list(self.c.trainable_variables)," in script
-    assert "models=[self.a, self.b]," in script
+    assert "flow=_flow_optimizer_ab," in script
+    assert "variables=[v for m in (a, b,) for v in m.trainable_variables]," in script
+    assert "variables=list(c.trainable_variables)," in script
+    assert "models=[a, b]," in script
     assert "return {'optimizer_ab': ['a', 'b'], 'optimizer_c': ['c']}" in script
 
 
@@ -264,8 +268,8 @@ def test_keras_learner_runs_a_model_another_segment_owns_in_inference_mode() -> 
 
     script = _built(raw, SEGMENTS_YAML)
 
-    assert "        read_a = self.a(x, training=False)" in script
-    assert "        out_c = self.c(x, training=True)" in script
+    assert "            read_a = a(x, training=False)" in script
+    assert "            out_c = c(x, training=True)" in script
 
 
 def test_keras_learner_counts_updates_from_the_optimizers_own_counter() -> None:
@@ -540,13 +544,13 @@ def test_keras_learner_imports_only_keras_and_the_adapter_helpers() -> None:
     imports = KerasLearnerBuilder.from_path(LEARNER_YAML)().collected_imports
 
     assert imports["keras"] == {None}
-    assert imports["structcast_model.keras.adapters"] == {"AdapterSegment", "select_backend_adapter"}
+    assert imports["structcast_model.keras"] == {None}
 
 
 def test_keras_learner_swaps_an_average_into_inference_only_when_one_is_declared() -> None:
     """The swap wrapper is emitted off the OPTIMIZER pattern, so a learner without an EMA is untouched.
 
-    Emitting it unconditionally would put an import, a `try`/`finally` and two swap calls into every
+    Emitting it unconditionally would put a `try`/`finally` and two swap calls into every
     generated learner, iterating a list that is always empty. The generated file is what a reader
     checks a run against, and a step announcing that it evaluates an average where none exists costs
     more than the branch it saves.
@@ -562,13 +566,8 @@ def test_keras_learner_swaps_an_average_into_inference_only_when_one_is_declared
 
     assert "swap_ema_weights" not in plain
     assert "_ema_optimizers" not in plain
-    # Both directions of the loan, and the import that carries them, only here.
-    assert built.scripts[-1].count("swap_ema_weights(self._ema_optimizers)") == 2
-    assert built.collected_imports["structcast_model.keras.adapters"] == {
-        "AdapterSegment",
-        "select_backend_adapter",
-        "swap_ema_weights",
-    }
+    # Both directions of the loan, only here.
+    assert built.scripts[-1].count("structcast_model.keras.swap_ema_weights(self._ema_optimizers)") == 2
 
 
 def test_keras_learner_rejects_two_optimizers_averaging_the_same_model() -> None:
@@ -622,8 +621,38 @@ def test_every_shipped_keras_learner_template_renders_one_flow_per_segment(
     assert script.startswith("class Learner:")
     assert f"self.inputs = {inputs!r}" in script
     for segment in segments:
-        assert f"def _flow_{segment}(self, *, {', '.join(inputs)}):" in script
-    assert f"def _flow_inference(self, *, {', '.join(inputs)}):" in script
+        assert f"def _flow_{segment}(*, {', '.join(inputs)}):" in script
+    assert f"def _flow_inference(*, {', '.join(inputs)}):" in script
+
+
+def test_the_keras_learner_keeps_its_flow_layers_as_locals_of_init() -> None:
+    """The learner is a plain class nothing tracks, so its losses and metrics need no attribute.
+
+    Checkpoints and the trainer reach the learner's state through `models` and `optimizers` alone,
+    and the flows close over the flow layers the way the torch and flax learners do. An attribute
+    would hand every reader of the learner a second, unused route to the layers.
+    """
+    script = _learner_script(CFG_DIR / "keras" / "learners" / "CycleGAN.yaml")
+
+    assert "\n        criterion_identity = " in script
+    assert "self.criterion_" not in script
+
+
+@pytest.mark.parametrize("name", ["y", "errors"], ids=["input", "store"])
+def test_keras_learner_rejects_a_flow_layer_named_like_an_input_or_a_stored_value(name: str) -> None:
+    """The flows read their layers by name, so a batch entry or a stored value cannot share one.
+
+    Inside the closure the parameter or the local would be what the flow calls in the layer's place:
+    `errors = errors(...)` is an `UnboundLocalError`, and a batch tensor is no loss, both only on the
+    first batch of a run.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["LEARNERS"][0]["FLOW"][1]["NAME"] = name
+    raw["LEARNERS"][0]["INFERENCE_FLOW"][1][2] = name
+
+    with pytest.raises(SpecError, match=f'Name "{name}" is both a model or flow layer'):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
 
 
 @pytest.mark.parametrize("name", ["ConvNeXtV2", "ImageClassifier", "SmallLanguageModel"])

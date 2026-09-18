@@ -200,8 +200,10 @@ def test_create_learner_writes_an_importable_class(tmp_path: Path, cli_runner: C
     # and the step detects the updates it applies by reading the count back across its own update.
     text = out.read_text()
     assert "MultiSteps" in text
-    assert "_before = gradient_steps(optimizer)" in text
-    assert "_has_updated = True if _before is None else gradient_steps(optimizer) > _before" in text
+    assert "_before = structcast_model.flax.gradient_steps(optimizer)" in text
+    assert (
+        "_has_updated = True if _before is None else structcast_model.flax.gradient_steps(optimizer) > _before"
+    ) in text
 
 
 # ---------------------------------------------------------------------------

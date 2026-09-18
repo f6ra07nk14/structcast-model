@@ -815,7 +815,11 @@ def _typed_layers(script: str) -> list[tuple[str, bool]]:
     return [
         (match.group(1), bool(re_search(r"\bdtype=(?!dtype\b)", line)))
         for line in script.splitlines()
-        if (match := re_search(r"= (Conv|LayerNorm|Linear|GlobalResponseNorm)\(", line))
+        if (
+            match := re_search(
+                r"= (?:structcast_model\.flax\.layers\.)?(Conv|LayerNorm|Linear|GlobalResponseNorm)\(", line
+            )
+        )
     ]
 
 
