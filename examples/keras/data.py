@@ -478,9 +478,8 @@ class KerasImageData(BaseModel):
             if self.hflip:
                 layers.append(keras.layers.RandomFlip("horizontal", seed=self.seed))
             if self.crop_padding:
-                # A seed of its own where a flip precedes it, so the crop offset is not perfectly
-                # correlated with that flip; the plain seed where there is no flip to decorrelate from.
-                layers.append(keras.layers.RandomCrop(*self.image_size, seed=self.seed + int(self.hflip)))
+                # A seed of its own, so the crop offset is not perfectly correlated with the flip.
+                layers.append(keras.layers.RandomCrop(*self.image_size, seed=self.seed + 1))
         layers.append(keras.layers.Resizing(*self.image_size))
         layers.append(keras.layers.Rescaling(scale=1.0 / 255))
         return layers

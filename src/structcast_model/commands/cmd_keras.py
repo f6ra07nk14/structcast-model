@@ -494,16 +494,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
         # -- the models above all, and the optimizers the learner builds against their variables.
         with strategy.activate():
-            # Seeded from the strategy's data coordinates rather than the bare seed, as `scm torch
-            # train` is: the ranks of a torch-backend run each take their own slice of the batch, and
-            # a shared seed would have them draw the same dropout masks over it. Inside the activation
-            # because that is what joins the process group the coordinates are read from -- before it
-            # every rank still reports 0 -- and still before the models are built, which is all the
-            # call needs: it only sets the Python, NumPy and backend seeds and drops the global
-            # `SeedGenerator`, creating no variable the activation would place. `sync_initial_weights`
-            # copies rank 0's weights over theirs afterwards, so the offset moves what a step draws
-            # alone. Outside torch the run is single-controller and the coordinate is 0, which leaves
-            # the seed exactly as it was.
+            # Inside the activation: data_rank reads 0 until the process group is joined, and each rank
+            # needs its own seed so replicas draw different dropout masks, as `scm torch train` does.
             keras.utils.set_random_seed(seed + strategy.data_rank)
             for raw in model_patterns:
                 if len(raw) != 1:
