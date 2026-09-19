@@ -936,6 +936,41 @@ def test_splitting_makes_the_mixed_group_uniform_and_keeps_its_hyperparameters(s
     _stepped(model, optimizer)  # the crash the split exists for
 
 
+def test_splitting_gives_each_subgroup_the_param_names_of_its_own_parameters(single_process_gloo: None) -> None:
+    """`param_groups.yaml` is the only place a run says which parameter got which decay or LR scale.
+
+    ``create_opt`` appends to ``params`` and ``param_names`` in lockstep, so the two lists are index
+    aligned and the split has to cut them together. Handing both subgroups the whole original list
+    reports every parameter as sitting in both of them -- wrong exactly under tensor parallelism,
+    which is the configuration the file is read for.
+    """
+    model, optimizer = _mixed_optimizer(foreach=True)
+    optimizer.param_groups[0]["param_names"] = list(_MIXED_PARAMETERS)
+
+    split_mixed_param_groups(optimizer)
+
+    names = [group["param_names"] for group in optimizer.param_groups]
+    for group in optimizer.param_groups:
+        assert len(group["param_names"]) == len(group["params"])
+        assert [id(p) for p in group["params"]] == [id(model.get_parameter(n)) for n in group["param_names"]]
+    assert not set(names[0]) & set(names[1])
+    assert sorted(names[0] + names[1]) == sorted(_MIXED_PARAMETERS)
+
+
+def test_splitting_a_group_without_param_names_does_not_invent_them(single_process_gloo: None) -> None:
+    """An optimizer built straight from ``model.parameters()`` carries no names, and gains none here.
+
+    That is every learner without layer-wise decay, and a synthesized key would put a name list into
+    `param_groups.yaml` for a run that never declared one.
+    """
+    _, optimizer = _mixed_optimizer(foreach=True)
+
+    split_mixed_param_groups(optimizer)
+
+    assert len(optimizer.param_groups) == 2
+    assert not any("param_names" in group for group in optimizer.param_groups)
+
+
 def test_splitting_leaves_an_already_uniform_optimizer_exactly_as_it_was() -> None:
     """Every run calls this, tensor-parallel or not, so anywhere it is not needed it must do nothing.
 

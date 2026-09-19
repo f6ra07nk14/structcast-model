@@ -153,10 +153,13 @@ def split_mixed_param_groups(optimizer: Any) -> None:
     ``optimizer.step()`` with ``aten._foreach_lerp_.Scalar got mixed torch.Tensor and DTensor``.
 
     A mixed group becomes one subgroup per kind, carrying the same hyperparameters and the same
-    parameters in the same order. A group that is already uniform is left as the very object it was,
-    which makes this an identity for every run with no ``DTensor`` in it -- which is why it runs for
-    every optimizer rather than under the tensor-parallel strategies alone: a hand-written strategy,
-    or a wrapper added later, produces the same mixture and needs the same protection.
+    parameters in the same order. ``create_opt`` builds ``params`` and ``param_names`` in lockstep,
+    so the names are cut along with the parameters: each subgroup's ``param_names`` names exactly its
+    own parameters, and a group carrying no names produces subgroups carrying none either. A group
+    that is already uniform is left as the very object it was, which makes this an identity for every
+    run with no ``DTensor`` in it -- which is why it runs for every optimizer rather than under the
+    tensor-parallel strategies alone: a hand-written strategy, or a wrapper added later, produces the
+    same mixture and needs the same protection.
 
     Splitting is the fix that changes no arithmetic: an optimizer's update is independent per
     parameter, and the grouping decides only which of them are fused into one kernel call. Passing
@@ -176,17 +179,21 @@ def split_mixed_param_groups(optimizer: Any) -> None:
     """
     groups: list[dict[str, Any]] = []
     for group in optimizer.param_groups:
-        kinds: dict[bool, list[Any]] = {}
-        for parameter in group["params"]:
+        kinds: dict[bool, list[int]] = {}
+        for index, parameter in enumerate(group["params"]):
             # Plain by exact type rather than ``isinstance(parameter, DTensor)``: the public DTensor
             # path only exists from torch 2.5, while the tensor-parallel API that produces the
             # mixture ships in 2.4 -- and a plain parameter is always exactly a Tensor or a Parameter.
             plain = type(parameter) in (torch.Tensor, torch.nn.Parameter)
-            kinds.setdefault(plain, []).append(parameter)
+            kinds.setdefault(plain, []).append(index)
         if len(kinds) < 2:
             groups.append(group)
         else:
-            groups.extend({**group, "params": params} for params in kinds.values())
+            for indices in kinds.values():
+                subgroup = {**group, "params": [group["params"][i] for i in indices]}
+                if "param_names" in group:
+                    subgroup["param_names"] = [group["param_names"][i] for i in indices]
+                groups.append(subgroup)
     if len(groups) == len(optimizer.param_groups):
         return
     logger.info(
@@ -894,7 +901,6 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
     sync_batchnorm: bool = True
     """Whether to convert ``BatchNorm`` layers to ``SyncBatchNorm`` before sharding; a no-op on CPU."""
 
-    _broadcast_on_load = True
     _mesh: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -952,7 +958,10 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         return OrderedDict(models)
 
     def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
-        """Compile the sharded submodules in place, so compile units follow the shard boundaries.
+        """Compile the submodules the shard globs name, so compile units follow the shard boundaries.
+
+        Named, not yet sharded: compile runs before wrap (ADR-0024), so this walks the plain modules
+        the patterns match and :meth:`wrap` shards exactly those afterwards.
 
         Compiling the root instead would bury the per-block all-gather/reduce-scatter hooks inside one
         graph. A module none of the patterns match keeps the default root compile: matching
