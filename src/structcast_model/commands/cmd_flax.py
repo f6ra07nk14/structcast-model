@@ -334,7 +334,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         extra = {key: value for key, value in compile_kw.items() if key not in fixed}
         for flow_name in list(learner.flow_functions):
             # The generated learner names its steps after the contract they follow: only the training
-            # one rewrites state, so only its parameters are donated (`docs/adr/0015`). The inference
+            # one rewrites state, so only its parameters are donated (`docs/adr/0019`, amended by
+            # `docs/adr/0023`: a scaled step's loss scales are donated along with them). The inference
             # step runs against views sharing the models' arrays and donates nothing.
             step = getattr(learner, flow_name)
             donated = {"donate_argnames": scm_flax.donate_argnames(step)} if flow_name == "_training_step" else {}

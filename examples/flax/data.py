@@ -308,9 +308,8 @@ class TFDataLoader(BaseModel):
         The listing is what `num_examples` counts. A tfds name is loaded through `tfds.load`
         instead, which hands over decoded uint8 images and int64 labels where a directory hands over
         a path and an int32 label; `_decode` and `_preprocess` are what make the batch contract
-        identical either way. A file is decoded at `resize_size`, not at `image_size`: the crop that
-        `crop_pct` exists for happens in `_preprocess`, and an item that had already been resized to
-        the final size would leave it nothing to crop.
+        identical either way. A file is decoded at its stored size, never resized on the way in, so
+        `_preprocess` is the only resample of either source and the two agree pixel for pixel.
 
         Raises:
             ImportError: If `tensorflow_datasets` is not installed and a tfds name was asked for.
@@ -350,10 +349,12 @@ class TFDataLoader(BaseModel):
 
     @tf.autograph.experimental.do_not_convert
     def _decode(self, path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Read one listed file, resizing it to a square unless a crop is going to read the source.
+        """Read one listed file and hand the image on at its stored size.
 
-        On the small-image path this is what `image_dataset_from_directory` did. On the ImageNet path
-        nothing is resized: `_preprocess` cuts its crop out of the source image, as the torch
+        Nothing is resized here, on either path: `_preprocess` is the only place an image is
+        resampled, so a file and a tfds item -- which arrives decoded and never passes through this
+        map -- come out of the same recipe as the same pixels. On the ImageNet path a resize here
+        would be wrong as well: `_preprocess` cuts its crop out of the source image, as the torch
         example's `RandomResizedCrop` does, and a file already squashed to one square size would
         leave that crop no scale and no aspect ratio to draw. The items therefore stay ragged until
         `_preprocess` makes each of them `image_size` square, which is still before anything batches
@@ -364,12 +365,9 @@ class TFDataLoader(BaseModel):
             label (tf.Tensor): Its class index, carried through untouched so the pair stays paired.
 
         Returns:
-            tuple[tf.Tensor, tf.Tensor]: The image, at `resize_size` or at its stored size, and its
-                label.
+            tuple[tf.Tensor, tf.Tensor]: The image at its stored size and its label.
         """
-        size = self.resize_size
-        image = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
-        return (image if self.crop_pct is not None else tf.image.resize(image, (size, size))), label
+        return tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False), label
 
     @tf.autograph.experimental.do_not_convert
     def _random_resized_crop(self, image: tf.Tensor, seed: tf.Tensor) -> tf.Tensor:

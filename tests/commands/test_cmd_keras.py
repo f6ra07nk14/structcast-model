@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 import inspect
@@ -394,12 +395,18 @@ class NonMainStrategy(KerasDistributedStrategy):
     collection the saver drives stays the real strategy's, which is what makes the run reach the
     callbacks at all. Reaching a real second process would need a launcher, which a unit test has
     no business starting.
+
+    It is taken at the moment the real one takes it -- `_activate_torch` reads `dist.get_rank()`
+    inside `activate`, and the rank is 0 until then -- so a caller reading a coordinate too early
+    sees the 0 it would see under torchrun.
     """
 
-    def __post_init__(self) -> None:
-        """Validate the preset as the real strategy does, then take a worker's rank."""
-        super().__post_init__()
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        """Take a worker's rank on the way in, as the real strategy's torch activation does."""
         self._rank = 1
+        with super().activate():
+            yield
 
 
 @pytest.fixture(scope="module")
@@ -985,6 +992,37 @@ def test_train_leaves_the_run_and_the_display_to_the_main_rank(
     assert mlflow.get_experiment_by_name("keras-worker") is None
     assert "Registered callbacks:" not in result.output
     assert "Training dataset size:" not in result.output
+
+
+def test_train_seeds_each_rank_by_its_data_coordinate(
+    tmp_path: Path, cli_runner: CliRunner, patterns: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker must not draw what the first rank draws, or the replicas would share their noise.
+
+    A data-parallel run gives each rank its own slice of the batch and averages what they produce;
+    ranks seeded alike drop the same units of every layer on their own slice, which is not the
+    independent noise the recipe assumes, and is not what `scm torch train` does with the same seed.
+    The weights are unaffected: they are broadcast from rank 0 once they are built.
+    """
+    seeded: list[int] = []
+    set_random_seed = keras.utils.set_random_seed
+
+    def _record(seed: int) -> None:
+        seeded.append(seed)
+        set_random_seed(seed)
+
+    monkeypatch.setattr(keras.utils, "set_random_seed", _record)
+
+    _train(
+        cli_runner,
+        patterns,
+        tmp_path,
+        experiment="keras-seed",
+        epochs=1,
+        extra=["--seed", "7", "--strategy", f"[_obj_, {{_addr_: {__name__}.NonMainStrategy}}]"],
+    )
+
+    assert seeded == [8]
 
 
 @pytest.mark.skipif(BACKEND == "jax", reason="fsdp is supported on the jax backend.")

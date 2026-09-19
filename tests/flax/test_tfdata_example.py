@@ -17,6 +17,9 @@ import numpy as np
 import pytest
 
 from structcast_model.base_trainer import SimpleDataProvider
+from structcast_model.builders import schema
+from structcast_model.commands.utils import instantiate_object
+from tests import CFG_DIR
 
 # Before the module is loaded: importing the example imports TensorFlow, which the flax floor
 # environment does not install. The pipeline is an example integration rather than a floor concern,
@@ -133,6 +136,26 @@ def test_the_crop_ratio_decides_how_much_of_the_image_survives() -> None:
     """
     assert TFDataLoader(name="cifar10", image_size=224, crop_pct=0.875).resize_size == 256
     assert TFDataLoader(name="cifar10", image_size=16, crop_pct=1.0).resize_size == 16
+
+
+def test_the_shipped_template_selects_the_imagenet_transform() -> None:
+    """`cfg/flax/others/default_tfdata.yaml` renders the recipe `default_timm.yaml` ships, 0.875.
+
+    That is the whole point of the pair: a flax run and a torch run pointed at one tree have to be
+    drawn from the same distributions, and `crop_pct` is the single parameter deciding it. A revert
+    to null would be silent -- the keys, the shapes and the dtypes of every batch stay identical,
+    and the run trains on a squashed square instead of an ImageNet crop -- so the shipped value is
+    pinned here, against the loader it renders into rather than against the file's text. A small
+    set asks for the other transform by name, which is the second render: nothing refuses the ratio
+    on a 32-pixel source, it just upsamples nine-pixel windows.
+    """
+    template: Any = schema.Template.from_path(CFG_DIR / "flax" / "others" / "default_tfdata.yaml")
+
+    def _render_loader(**parameters: Any) -> Any:
+        return instantiate_object(template({"DEFAULT": {"dataset": "cifar10", **parameters}}).model_dump(mode="json"))
+
+    assert _render_loader().crop_pct == 0.875
+    assert _render_loader(crop_pct=None).crop_pct is None
 
 
 def _one_picture(loader: Any, picture: Any) -> Any:
@@ -332,6 +355,32 @@ def test_a_directory_source_yields_the_same_batch_contract_as_a_dataset_name(tmp
     assert (data.num_examples, len(data)) == (8, 4)
 
 
+def test_a_directory_item_and_a_tfds_item_leave_the_small_transform_identical(tmp_path: Path) -> None:
+    """One recipe over one image has to give one result, whichever source that image arrived from.
+
+    The small-image path is where the two can silently part: a file passes through `_decode` and a
+    tfds item does not, so a bilinear resize left in the decode lands a file at exactly the size the
+    bicubic resize in `_resize_then_crop` targets, which leaves that bicubic pass returning the
+    image untouched -- a file arrives bilinear-resampled where a tfds item arrives
+    bicubic-resampled. Nothing downstream notices: the keys, the shapes and the dtypes all still
+    match, and a run that swapped a directory tree for the tfds copy of the same set would simply
+    train on different pixels, which is the one comparison this example exists to make. The source
+    is a gradient because every filter agrees on a flat colour, and both loaders are given the same
+    stored size so only the resampling can differ.
+    """
+    picture = tf.cast(tf.reshape(tf.range(6 * 6 * 3), (6, 6, 3)) % 256, tf.uint8)
+    folder = tmp_path / "class0"
+    folder.mkdir()
+    for index in range(2):
+        tf.io.write_file(str(folder / f"{index}.png"), tf.io.encode_png(picture))
+    bare: Any = {"image_size": 4, "mean": (0.0,) * 3, "std": (1.0,) * 3}
+
+    from_files = next(iter(_directory_loader(tmp_path, crop_pct=None, **bare)()))["image"]
+    from_tfds = next(iter(_one_picture(_loader(batch_size=2, **bare), picture)()))["image"]
+
+    assert np.array_equal(from_files, from_tfds)
+
+
 def test_a_directory_source_decodes_as_the_pipeline_pulls(tmp_path: Path) -> None:
     """The listing is what is read up front; the pixels are not, or ImageNet would not fit.
 
@@ -448,7 +497,7 @@ def _graph_parallelism(dataset: Any) -> tuple[list[int], list[int]]:
 
 
 def test_the_parallelism_knobs_reach_the_ops_that_take_them(tmp_path: Path) -> None:
-    """AUTOTUNE is a floor, not a budget, and the timm example is handed `num_workers: 32`.
+    """AUTOTUNE is a floor, not a budget, and the timm example is handed `workers: 16`.
 
     On a host whose cores are shared with a busy JAX process AUTOTUNE settles well under what the
     machine has, and a starved input pipeline shows up as a slower run rather than as an error -- so

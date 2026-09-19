@@ -571,6 +571,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
                 }
             )
             logger.log_dict(arguments, "arguments.yaml")
+            # Guarded because ``param_group_names`` is a torch-only extension the generated learner
+            # adds, not a member of the ``Learner`` protocol every learner here satisfies.
             if hasattr(learner, "param_group_names"):
                 logger.log_dict(learner.param_group_names, "param_groups.yaml")
             for artifact in log_artifacts or []:

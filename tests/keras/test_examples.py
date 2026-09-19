@@ -276,7 +276,7 @@ def _graph_parallelism(dataset: Any) -> tuple[list[int], list[int]]:
 
 
 def test_the_parallelism_knobs_reach_the_ops_that_take_them(tmp_path: Path) -> None:
-    """AUTOTUNE is a floor, not a budget, and the timm example is handed `num_workers: 32`.
+    """AUTOTUNE is a floor, not a budget, and the timm example is handed `workers: 16`.
 
     On a host whose cores are shared with a busy training process AUTOTUNE settles well under what
     the machine has, and a starved input pipeline shows up as a slower run rather than as an error --
@@ -536,6 +536,20 @@ def test_the_image_pipeline_requires_a_dataset_and_names_the_ones_it_knows() -> 
         DATA.KerasImageData(dataset="synthetic")
 
 
+def test_the_image_pipeline_refuses_the_imagenet_recipe_on_a_single_channel_set() -> None:
+    """`crop_pct` reads three channels everywhere and mnist has one, so the pair cannot train at all.
+
+    Nothing in the ImageNet path is shaped by the data: the jitter blends towards a greyscale, and
+    the mean and std are three numbers, so an mnist item only fails once the graph is built -- long
+    after the configuration that asked for it was accepted, and with an error naming a shape rather
+    than the two fields that disagree.
+    """
+    with pytest.raises(ValueError, match="crop_pct"):
+        DATA.KerasImageData(dataset="mnist", crop_pct=0.875)
+
+    assert DATA.KerasImageData(dataset="mnist").crop_pct is None
+
+
 @pytest.mark.parametrize(("backend", "hidden"), [("jax", True), ("tensorflow", False)])
 def test_the_image_pipeline_hides_the_gpus_from_tensorflow_unless_it_is_the_backend(
     monkeypatch: pytest.MonkeyPatch, backend: str, hidden: bool
@@ -578,6 +592,27 @@ def test_the_shipped_dataset_template_refuses_to_render_without_a_dataset() -> N
     assert arguments["dataset"] == "cifar100"
     assert arguments["batch_size"] == 8
     assert (arguments["image_key"], arguments["label_key"]) == ("image", "label")
+
+
+def test_the_shipped_dataset_template_defaults_to_the_imagenet_recipe_and_takes_a_null_override() -> None:
+    """`crop_pct` is the switch between the two recipes, so its default decides what a bare render trains under.
+
+    That default has to be the ratio `cfg/torch/others/default_timm.yaml` ships, or the same dataset
+    directory is drawn from two distributions depending on which framework reads it, and the Keras
+    numbers stop being comparable to the torch ones for a reason nothing in either file states. The
+    small-image recipe is still reachable, but only by spelling `crop_pct: null` out -- which is also
+    what a single-channel set needs, since the loader refuses "mnist" with a ratio set rather than
+    let the graph fail on the missing channels. Rendered and inspected, never built, for the reason
+    the test above gives.
+    """
+    template: Template[Any] = Template.from_path(CFG_DIR / "keras" / "others" / "default_keras.yaml")
+
+    shipped = template({"DEFAULT": {"dataset": "cifar100"}}).model_dump(mode="json")["_obj_"][-1][-1]
+    assert (shipped["crop_pct"], shipped["image_size"], shipped["batch_size"]) == (0.875, [224, 224], 128)
+
+    override = {"dataset": "mnist", "crop_pct": None, "image_size": [32, 32], "batch_size": 32}
+    small = template({"DEFAULT": override}).model_dump(mode="json")["_obj_"][-1][-1]
+    assert (small["crop_pct"], small["image_size"], small["batch_size"]) == (None, [32, 32], 32)
 
 
 def test_the_corpus_yields_the_shifted_pair_the_language_learner_reads(tmp_path: Path) -> None:

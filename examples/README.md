@@ -88,10 +88,11 @@ protocol — nothing is subclassed, nothing is registered:
 - **`outputs`** — the criterion names the steps return. The CLI reads them off the learner to build
   the tracker and the progress-bar rows, unless `--learner-outputs` overrides them.
 
-The flow function takes `__need_update__` first, as every generated one does: it arms the gradient
-synchronization of a DDP- or FSDP2-wrapped model on the last backward of an update, and does nothing
-on a plain module. A generated learner emits one `_flow_<optimizer>` per optimizer segment plus a
-`_flow_inference`; one flow covers both steps here because they compute the same thing.
+The flow function takes `__need_update__` first, as every generated `_flow_<optimizer>` does: it
+arms the gradient synchronization of a DDP- or FSDP2-wrapped model on the last backward of an
+update, and does nothing on a plain module. A generated learner emits one `_flow_<optimizer>` per
+optimizer segment plus a `_flow_inference` that takes no gate, having no backward to arm; one flow
+covers both steps here because they compute the same thing.
 
 The optimizer lives on the learner, together with its schedule. `SimpleLearner` also defines
 `on_epoch_end`, which advances the schedule after each epoch. The trainer finds that method by
@@ -174,8 +175,9 @@ scm torch create learner cfg/torch/learners/ConvNeXtV2.yaml -p 'DEFAULT: {epochs
 ```
 
 `learner.py` holds a `Learner` class with exactly the members the tutorial writes by hand — `models`,
-`update`, `training_step`, `inference_step`, plus `flow_functions`, `optimizers`, `optimizer_models`,
-`grad_scalers`, `learning_rates`, `weight_decays`, and `param_group_names`.
+`steps`, `updates`, `has_updated`, `restore_counters`, `training_step`, `inference_step`, plus
+`flow_functions`, `optimizers`, `optimizer_models`, `grad_scalers`, `learning_rates`,
+`weight_decays`, and `param_group_names`.
 
 Then render the dataset configurations and train:
 
@@ -380,10 +382,14 @@ result is not the same curve as the torch `LambdaLR`, only the same envelope: to
 epoch and holds one rate for all of it, an optax schedule is read on every update and falls
 continuously, so the two agree exactly at epoch boundaries and drift inside an epoch.
 
-[`flax/data.py`](flax/data.py) is a `tf.data` pipeline: resize, then a random crop and flip while
-training or a central crop while evaluating, then normalization — all on CPU threads. Constructing
-a loader takes every GPU out of TensorFlow's sight so it never reserves the memory JAX needs;
-importing the module does not, because importing is something a test collector may do incidentally.
+[`flax/data.py`](flax/data.py) is a `tf.data` pipeline, and `crop_pct` is the switch between its two
+transforms — `default_tfdata.yaml` ships `crop_pct: 0.875`, so a default render trains under
+ImageNet's: a random resized crop, a flip and brightness/contrast/saturation jitter while training,
+a shortest-edge resize and a central crop while evaluating, then normalization. A small-image run
+overrides it back to `crop_pct: null`, for a square resize, then a random crop and flip while
+training or a central crop while evaluating — all on CPU threads. Constructing a loader takes every
+GPU out of TensorFlow's sight so it never reserves the memory JAX needs; importing the module does
+not, because importing is something a test collector may do incidentally.
 The draws are stateless and keyed by each item's position in the shuffled stream, so epochs differ
 while a seed still replays a whole run. There is no epoch hook and no rank sharding: `tf.data`
 reshuffles by itself, and the strategy is the only thing that splits a batch.
@@ -467,16 +473,20 @@ list of paths and never an array — and it is what `data_dir` renders in
 [`cfg/keras/others/default_keras.yaml`](../cfg/keras/others/default_keras.yaml), joined with
 `train_split` / `validation_split`. Both sources leave one batch contract — `{image: float32 in
 [0, 1], label: int64}` as NumPy, keyed by `image_key` and `label_key` — and shard identically per
-rank, before the decode. `RandomFlip`, `RandomCrop`, `Resizing` and `Rescaling` apply inside the
-`tf.data` pipeline and never inside the model: Keras' image preprocessing layers fall back to
-TensorFlow operations when a `tf.data` pipeline traces them, so one pipeline feeds a run on any
-backend, while a layer built into the model would augment whatever loads that model afterwards.
-Building the pipeline therefore needs `tensorflow` installed even for a `jax` or `torch` run.
+rank, before the decode. On the small-image recipe, `RandomFlip`, `RandomCrop`, `Resizing` and
+`Rescaling` apply inside the `tf.data` pipeline and never inside the model: Keras' image
+preprocessing layers fall back to TensorFlow operations when a `tf.data` pipeline traces them, so
+one pipeline feeds a run on any backend, while a layer built into the model would augment whatever
+loads that model afterwards. Building the pipeline therefore needs `tensorflow` installed even for a
+`jax` or `torch` run.
 `shuffle_buffer` bounds the training shuffle of a `keras.datasets` set, whose buffer would be a
 second copy of an array already in memory; a directory is shuffled by its file list instead, after
 the shard and before the decode, so a tree listed class by class is mixed whole rather than through
-a window of it. Pad-then-crop is the small-image recipe rather than ImageNet's scale-and-aspect
-jitter — a run chasing a published number brings its own random resized crop.
+a window of it. Pad-then-crop is the small-image recipe, and `crop_pct` is the switch between it
+and ImageNet's scale-and-aspect jitter — `default_keras.yaml` ships `crop_pct: 0.875`, so a
+default render trains under the ImageNet one, and a small-image run overrides it back to
+`crop_pct: null`. An `mnist` render has no choice about that: the ImageNet path reads three
+channels throughout, and the loader refuses that pair at construction, not at the first batch.
 
 [`keras/optimizers.py`](keras/optimizers.py) exists for one knob: weight-decay exemptions are
 configured by `optimizer.exclude_from_weight_decay(...)` after construction and before the optimizer

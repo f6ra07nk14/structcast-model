@@ -172,7 +172,8 @@ def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Ite
             'The "torch" Keras backend builds no compiled step, so --compile cannot be honored: the '
             "learner's steps assign to Keras variables and run a Keras optimizer, which torch.compile "
             "graph-breaks on, and the adapter builds no other kind of step. Drop --compile, or run on the "
-            "tensorflow or jax backend."
+            "tensorflow or jax backend: --backend under train, KERAS_BACKEND under time, which has no "
+            "--backend of its own."
         )
     adapter = scm_keras.select_backend_adapter()
     adapter.compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
@@ -476,7 +477,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     _activate_backend(backend)
     _cap_torch_gpu_memory(backend, gpu_memory_fraction)
     device = scm_keras.get_keras_device(device)
-    keras.utils.set_random_seed(seed)
     # Spanning everything that builds or traces a step: the learner's constructor, and `wrap_steps`.
     with _compile_choice(backend, compile_pattern):
         # Resolved before the models: the class itself is what carries the policy the models are built
@@ -494,6 +494,17 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
         # -- the models above all, and the optimizers the learner builds against their variables.
         with strategy.activate():
+            # Seeded from the strategy's data coordinates rather than the bare seed, as `scm torch
+            # train` is: the ranks of a torch-backend run each take their own slice of the batch, and
+            # a shared seed would have them draw the same dropout masks over it. Inside the activation
+            # because that is what joins the process group the coordinates are read from -- before it
+            # every rank still reports 0 -- and still before the models are built, which is all the
+            # call needs: it only sets the Python, NumPy and backend seeds and drops the global
+            # `SeedGenerator`, creating no variable the activation would place. `sync_initial_weights`
+            # copies rank 0's weights over theirs afterwards, so the offset moves what a step draws
+            # alone. Outside torch the run is single-controller and the coordinate is 0, which leaves
+            # the seed exactly as it was.
+            keras.utils.set_random_seed(seed + strategy.data_rank)
             for raw in model_patterns:
                 if len(raw) != 1:
                     raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")

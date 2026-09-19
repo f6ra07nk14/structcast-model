@@ -50,10 +50,10 @@ from functools import cached_property
 from math import floor, log
 import os
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import numpy as np
-from pydantic import BaseModel, DirectoryPath, Field
+from pydantic import BaseModel, DirectoryPath, Field, model_validator
 import tensorflow as tf
 
 import keras
@@ -258,6 +258,18 @@ class KerasImageData(BaseModel):
 
     label_key: str = "label"
     """The batch key the labels are stored under."""
+
+    @model_validator(mode="after")
+    def _reject_a_single_channel_set_on_the_imagenet_recipe(self) -> Self:
+        """Refuse mnist with `crop_pct` here rather than let the graph fail on the missing channels."""
+        if self.crop_pct is not None and self.dataset == "mnist":
+            raise ValueError(
+                "crop_pct selects the ImageNet recipe, which reads three channels throughout -- the greyscale "
+                'blends of the jitter, the three-element mean and std -- and "mnist" arrives with one, so the '
+                "pipeline would only fail once a batch was built. Leave crop_pct unset to train mnist under the "
+                "small-image recipe, or name a three-channel set."
+            )
+        return self
 
     def model_post_init(self, context: Any, /) -> None:
         """Hide the GPUs from TensorFlow, now that something in the run is about to read data."""
@@ -466,7 +478,9 @@ class KerasImageData(BaseModel):
             if self.hflip:
                 layers.append(keras.layers.RandomFlip("horizontal", seed=self.seed))
             if self.crop_padding:
-                layers.append(keras.layers.RandomCrop(*self.image_size, seed=self.seed))
+                # A seed of its own where a flip precedes it, so the crop offset is not perfectly
+                # correlated with that flip; the plain seed where there is no flip to decorrelate from.
+                layers.append(keras.layers.RandomCrop(*self.image_size, seed=self.seed + int(self.hflip)))
         layers.append(keras.layers.Resizing(*self.image_size))
         layers.append(keras.layers.Rescaling(scale=1.0 / 255))
         return layers
