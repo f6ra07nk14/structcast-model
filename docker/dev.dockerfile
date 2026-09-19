@@ -27,13 +27,14 @@ RUN uv python install $PYTHON_VERSIONS --preview
 # The venv created in /app/.venv will be reused in CI via PATH
 # One sync per interpreter warms the uv cache with the cp311/cp312/cp313 wheels the py{311,312,313}
 # tox legs need (a single sync would leave two of them downloading at test time), and the wandb
-# extra matches the tox default env. 3.11 runs last so /app/.venv keeps the image's default
-# interpreter. Keep the list in step with PYTHON_VERSIONS above.
+# extra matches the tox default env. The loop reverses the list order, not the version numbers, so
+# PYTHON_VERSIONS has to name the version PY_VERSION pins the base image to first: only then does
+# the reverse walk sync it last and /app/.venv keeps the image's default interpreter.
 RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=README.md,target=README.md \
     --mount=type=bind,source=tox.ini,target=tox.ini \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    for version in 3.13 3.12 3.11; do \
+    for version in $(printf '%s\n' $PYTHON_VERSIONS | tac); do \
     uv sync --frozen --no-install-project --python $version \
     --dev --group tox --extra all-cpu --extra mlflow --extra flops --extra wandb \
     || exit 1; \
