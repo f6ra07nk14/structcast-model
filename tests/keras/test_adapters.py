@@ -332,6 +332,31 @@ def test_swap_ema_weights_leaves_an_unstarted_average_alone() -> None:
     assert all(not np.any(_value(a)) for a in optimizer._model_variables_moving_average)
 
 
+def test_swap_ema_weights_steps_over_a_variable_with_no_average() -> None:
+    """A variable its own gradient overwrites has no average, and the swap has to leave it alone.
+
+    `add_optimizer_variables` puts `None` in place of the average of an `overwrite_with_gradient`
+    variable -- a float8 scale is one -- so a swap that trusted the list to hold variables would
+    raise inside the assignment at the first validation of a run that had trained fine until then.
+    The pair beside it is what says this is a skip and not a swap that quietly did nothing.
+    """
+    model = _model()
+    # Three applies, so the average has moved away from the weights and a trade is visible: after a
+    # single one Keras seeds it to them.
+    optimizer = _averaging(model, applies=3)
+    weights = [_value(variable) for variable in model.trainable_variables]
+    averages = [_value(average) for average in optimizer._model_variables_moving_average]
+    assert not np.array_equal(weights[1], averages[1])
+    # What Keras leaves behind for such a variable, without the model kind that declares one: the
+    # swap only ever sees this list.
+    optimizer._model_variables_moving_average[0] = None
+
+    swap_ema_weights([optimizer])
+
+    assert np.array_equal(_value(model.trainable_variables[0]), weights[0])
+    assert np.array_equal(_value(model.trainable_variables[1]), averages[1])
+
+
 def test_swap_ema_weights_trades_a_shared_variable_once() -> None:
     """Two optimizers averaging one model must not trade the same variable twice.
 

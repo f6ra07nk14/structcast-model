@@ -678,6 +678,10 @@ class Recorder(KerasTrainer):
         variables = {
             "model": type(self.learner.models["model"].variables[0].value).__name__,
             "optimizer": type(optimizer.variables[0].value).__name__,
+            # Reported because the configuration above is guarded: a MirroredStrategy on one device
+            # still hands back MirroredVariable, so this count is the only thing saying the run
+            # under test was the two-device one.
+            "cpus": len(tf.config.list_logical_devices("CPU")),
         }
         with open(os.environ["PROBE_OUT"], "w") as handle:
             json.dump(variables, handle)
@@ -726,7 +730,7 @@ def test_the_training_command_builds_the_learner_under_the_mirrored_scope(tmp_pa
 
     result = _run(TENSORFLOW_CLI_SCRIPT, tmp_path, str(generated), str(output), backend="tensorflow")
 
-    assert result == {"model": "MirroredVariable", "optimizer": "MirroredVariable"}
+    assert result == {"model": "MirroredVariable", "optimizer": "MirroredVariable", "cpus": 2}
 
 
 @pytest.mark.skipif(BACKEND != "tensorflow", reason="Only the tensorflow path traces the replicated call.")
