@@ -18,6 +18,26 @@ PARAMETERS:
     norm_eps: 1.0e-5
     mlp_ratio: 4
     rope_base: 10000.0 # the standard RoPE frequency base
+    # Compute precision of every parameterized layer below, off by default so nothing changes for a
+    # run that does not ask for it. Turn it on by overriding it on the *selected size group*, which
+    # is the whole incantation:
+    #   -p "tiny: {dtype: bfloat16}"
+    # One override reaches every layer because the flows below select a size group with
+    # "_jinja_group_" and hand that group's value down to each section as a parameter of its own, as
+    # "VisionTransformer.yaml" does. Overriding "SHARED" is what does not work: a command-line
+    # "SHARED" is merged onto the default group, and it reaches a size group only when the same
+    # invocation names that group too -- so the shared form still works alongside the group one, and
+    # on its own it is a no-op rather than a model with narrowed blocks and a float32 head.
+    # This is *mixed* precision, not pure bf16: it sets the "dtype" of each layer and leaves
+    # "param_dtype" at its float32 default, so the weights, the gradients and the optimizer moments
+    # stay fp32 while the matmuls and the normalizations run in bf16 -- the Flax spelling of what
+    # "cfg/torch/learners/SmallLanguageModel.yaml" gets from its "MIXED_PRECISION_TYPE: bfloat16"
+    # autocast over fp32 master weights, which is what makes the two backends' bf16 runs comparable.
+    # Pure bf16 storage would be a "param_dtype" too, and is deliberately not offered: an fp32
+    # master copy is what keeps a long run's small updates from rounding away.
+    # There is no batch-side counterpart to set here, unlike the image templates: the input is
+    # integer tokens, so the token embedding's own "dtype" is the first precision in the model.
+    dtype: null
   # model size parameters
   tiny:
     dim: 256
@@ -36,6 +56,7 @@ _jinja_yaml_: |-
   {% raw %}
   _jinja_yaml_: |-
     INPUT_SHAPES:
+      # int32 where the torch and Keras twins use int64: jax runs with x64 off, which demotes int64 anyway.
       tokens: {_SHAPE_: [{{max_seq_len}}], _DTYPE_: int32}
   {% endraw %}
 OUTPUTS: [logits]
@@ -45,11 +66,12 @@ FLOW:
       - _jinja_group_: {{size}}
       {% raw %}
         _jinja_yaml_: |-
-          - [tokens, feature, token_embedding, [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: {{vocab_size}}, features: {{dim}}, rngs: "eval: rngs"}}]]
+          {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+          - [tokens, feature, token_embedding, [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: {{vocab_size}}, features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
           - [feature, feature, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{dropout}}, rngs: "eval: rngs"}}]]
           - [feature, feature, backbone, {TYPE: Backbone}]
-          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-          - [feature, logits, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{vocab_size}}, use_bias: false, rngs: "eval: rngs"}}]]
+          - [feature, feature, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
+          - [feature, logits, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{vocab_size}}, use_bias: false, rngs: "eval: rngs"{{dt}}}}]]
       {% endraw %}
 Backbone:
   OUTPUTS: [feature]
@@ -59,24 +81,25 @@ Backbone:
       {% raw %}
         _jinja_yaml_: |-
           {% for i in range(depth) %}
-          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dropout: {{dropout}}}}}]
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dropout: {{dropout}}, dtype: {{dtype | tojson}}}}}]
           {% endfor %}
       {% endraw %}
 Block:
   OUTPUTS: [out]
   _jinja_yaml_: |-
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     FLOW:
-      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-      - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}}}}]
+      - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
+      - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dtype: {{dtype | tojson}}}}}]
       - ["eval: inp + attended", residual]
-      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"}}]]
+      - [residual, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: "eval: {{dim}} * {{mlp_ratio}}", rngs: "eval: rngs"{{dt}}}}]]
       # "approximate=False" is the exact erf GELU the torch and Keras twins use; the jax default is
       # the tanh approximation, and the two agree to no more than about three decimals. Every value
       # bound here is a literal, which is what lets the builder hoist the bound callable to a
       # module-level constant, so two instances of this class still share one graphdef and one trace.
       - [_, _, [_obj_, {_addr_: flax.nnx.gelu}, {_bind_: {approximate: false}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: "eval: {{dim}} * {{mlp_ratio}}", out_features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, projected, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{dropout}}, rngs: "eval: rngs"}}]]
       - ["eval: residual + projected", out]
 CausalSelfAttention:
@@ -91,12 +114,13 @@ CausalSelfAttention:
   _jinja_yaml_: |-
     {% set head_dim = dim // heads %}
     {% set half_dim = head_dim // 2 %}
+    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
     FLOW:
       # (batch, seq, dim) -> (batch, seq, 3 * dim) -> (batch, seq, 3, heads, {{head_dim}}).
       # The fused projection is laid out as q, k, v each of "dim" contiguous features, heads-major
       # within each, so one reshape performs both the qkv split and the head split; the fused
       # kernel below reads (batch, seq, heads, head_dim) directly, so nothing is transposed.
-      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"}}]]
+      - [inp, qkv, qkv_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{3 * dim}}, rngs: "eval: rngs"{{dt}}}}]]
       - ["eval: qkv.reshape(qkv.shape[0], qkv.shape[1], 3, {{heads}}, {{head_dim}})", fused]
       - ["eval: fused[:, :, 0]", query]
       - ["eval: fused[:, :, 1]", key]
@@ -116,4 +140,4 @@ CausalSelfAttention:
       - ["eval: jax.nn.dot_product_attention(query, key, value, is_causal=True)", attended]
       # (batch, seq, heads, {{head_dim}}) -> (batch, seq, dim).
       - ["eval: attended.reshape(attended.shape[0], attended.shape[1], {{dim}})", attended]
-      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"}}]]
+      - [attended, out, out_proj, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dim}}, out_features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]

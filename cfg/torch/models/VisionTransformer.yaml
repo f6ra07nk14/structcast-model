@@ -96,7 +96,7 @@ Backbone:
       {% raw %}
         _jinja_yaml_: |-
           {% for i in range(depth) %}
-          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1)}}}}}]
+          - [feature, feature, "block{{i}}", {TYPE: Block, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, drop_path: {{drop_path_rate * i / (depth - 1) if depth > 1 else 0.0}}}}}]
           {% endfor %}
       {% endraw %}
 Block:

@@ -313,6 +313,30 @@ def test_small_language_model_learner_lowers_the_loss_it_reports(small_language_
     assert _moved(before, learner.models["model"])
 
 
+def test_small_language_model_narrows_every_layer_from_the_one_size_group_override(tmp_path: Path) -> None:
+    """`-p "tiny: {dtype: bfloat16}"` is what lets this row run at its torch twin's precision.
+
+    `cfg/torch/learners/SmallLanguageModel.yaml` trains under `MIXED_PRECISION_TYPE: bfloat16`, and
+    Flax carries precision on the model rather than the learner, so without this knob there is no
+    way to run the two rows at the same precision at all. Mixed, not pure: only `dtype` is threaded,
+    so `param_dtype` stays float32 and the weights -- and with them the gradients and the optax
+    moments -- keep an fp32 master copy while the matmuls and the normalizations run in bf16. Every
+    layer that takes the keyword is read back rather than a sample, since the template reaches them
+    through three nested sections and a knob threaded into two of the three would narrow most of the
+    model, train, converge and be a different model from the one that was asked for: the embedding,
+    the final norm and the head, then two norms, two projections and the attention's two projections
+    in each of the two blocks.
+    """
+    parameters = {"tiny": {"dim": 16, "heads": 2, "depth": 2, "vocab_size": 11, "dtype": "bfloat16"}}
+    model = _model_type(tmp_path, "SmallLanguageModel", parameters)(rngs=nnx.Rngs(0))
+    layers = [node for _, node in nnx.iter_graph(model) if isinstance(node, (nnx.Embed, nnx.LayerNorm, nnx.Linear))]
+
+    assert len(layers) == 3 + 2 * 6
+    assert {layer.dtype for layer in layers} == {"bfloat16"}
+    assert {str(leaf.dtype) for leaf in jax.tree.leaves(nnx.state(model, nnx.Param))} == {"float32"}
+    assert model(jnp.arange(8, dtype=jnp.int32).reshape(2, 4) % 11)["logits"].dtype == jnp.bfloat16
+
+
 # ---------------------------------------------------------------------------
 # Vision Transformer and the image classifier learner
 # ---------------------------------------------------------------------------

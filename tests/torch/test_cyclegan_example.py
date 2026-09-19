@@ -197,6 +197,26 @@ def test_a_pool_of_no_images_hands_every_image_straight_back() -> None:
     assert pool.images == []
 
 
+def test_the_generator_pads_for_its_kernel_and_not_for_its_channel_count(tmp_path: Path) -> None:
+    """A one-channel run has to keep the resolution, which only the kernel decides.
+
+    `ReflectionPad2d` before a kernel of size k has to reflect k // 2 pixels per side, which is what
+    keeps the resolution -- the pad of the two 7x7 convolutions is therefore 3 whatever the images
+    carry. It was read off `channels`, which happens to be 3 for RGB; a grayscale run would have lost
+    two pixels per side at the stem and grown them back nowhere, so the template only ever worked for
+    the default it shipped with.
+    """
+    generator = tmp_path / "generator.py"
+    TorchBuilder.from_path(MODELS / "CycleGAN_generator.yaml")(
+        parameters={"DEFAULT": {"channels": 1, "n_residual_blocks": 1, "init_features": 4}}
+    )(generator)
+
+    source = generator.read_text()
+
+    assert source.count("ReflectionPad2d(padding=3)") == 2  # the stem and the output 7x7 convolutions
+    assert source.count("ReflectionPad2d(padding=1)") == 2  # the residual block's two 3x3 convolutions
+
+
 @pytest.fixture(scope="module")
 def generated(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Generate the two shipped model templates and the learner once, shrunk to a few channels."""

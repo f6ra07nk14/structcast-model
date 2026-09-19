@@ -30,7 +30,7 @@ PARAMETERS:
     clip_grad_norm: null # set to null or a positive float
     accumulate_gradients: 4 # null or a positive integer: this learner is the accumulating one
     ema: true # false drops both EMA keywords below -- see 4.
-    ema_momentum: 0.99
+    ema_decay: 0.999 # the twins' horizon; the momentum is derived to keep it at any window (REFERENCE.md, "EMA")
 IMPORTS: {}
 # 2. Mixed precision: "MIXED_PRECISION" selects the "keras.mixed_precision" global policy the
 #    training CLI sets before it builds the models, and "MIXED_PRECISION_TYPE" names its element
@@ -54,10 +54,13 @@ LEARNERS:
     #    silently (REFERENCE.md, "ACCUMULATE_GRADIENTS").
     #
     # 4. EMA is "use_ema"/"ema_momentum" on the optimizer, with two limitations this template does
-    #    not work around and does not hide (REFERENCE.md, "EMA"):
+    #    not hide (REFERENCE.md, "EMA"):
     #      - the average is updated on every "apply" call, including the accumulation no-ops of the
-    #        window above, so its effective horizon is "accumulate_gradients" times shorter than the
-    #        momentum suggests -- unlike the torch and flax "EMA" fields, which blend once per Update;
+    #        window above, where the torch and flax "EMA" fields blend once per Update, so the
+    #        momentum emitted below is not "ema_decay" itself but "ema_decay ** (1 / k)" over that
+    #        window -- which restores the averaging horizon and not the exact sequence: the first
+    #        "k - 1" blends of a window see the weights the previous Update left, so the two are
+    #        identical only at "k = 1" and close for the small windows a recipe uses;
     #      - it belongs on the inner optimizer, which is what this pattern builds: under a float16
     #        policy the adapter wraps this optimizer in a "LossScaleOptimizer", and "use_ema" set on
     #        that wrapper instead would do nothing.
@@ -84,7 +87,7 @@ LEARNERS:
             learning_rate: {{lr}}
             weight_decay: {{weight_decay}}
             {% if ema %}
-            ema_momentum: {{ema_momentum}}
+            ema_momentum: {{ema_decay ** (1 / (accumulate_gradients or 1))}}
             {% endif %}
             {% if accumulate_gradients is not none %}
             gradient_accumulation_steps: {{accumulate_gradients}}

@@ -2,39 +2,66 @@
 # "scm keras train --training-dataset" / "--validation-dataset".
 # The source is given one of two ways, and one of them must be:
 #   - "data_dir": the root of a dataset laid out one directory per split and one folder per class
-#     inside it, which is the tree the timm loader reads too, so one dataset directory on the host
-#     serves both frameworks. The images are decoded a batch at a time, so this is the form a run at
-#     ImageNet's size uses; "train_split" and "validation_split" name the two directories under the
-#     root, and "training" picks between them.
+#     inside it, which is the tree the timm loader and "cfg/flax/others/default_tfdata.yaml" read
+#     too, so one dataset directory on the host serves all three frameworks. The images are decoded
+#     a batch at a time, so this is the form a run at ImageNet's size uses; "train_split" and
+#     "validation_split" name the two directories under the root, and "training" picks between them.
 #   - "dataset": the name of a "keras.datasets" set ("mnist", "cifar10" or "cifar100"), downloaded
 #     once into the Keras cache directory and held in memory. Small sets only.
 # "training" also selects everything that follows from the split -- the training split is shuffled
 # and augmented, the validation split is neither, and only the training split drops a short final
 # batch, so a validation epoch is measured over the whole split.
-# "crop_pct" picks the augmentation recipe. Left null it is the small-image one (a horizontal flip
-# and a pad-then-crop, as core Keras preprocessing layers inside the tf.data pipeline, pixels scaled
-# to 0..1), which is what a CIFAR-sized set trains under. Set, it is the recipe timm gives
-# "cfg/torch/others/default_timm.yaml" -- a random resized crop, a horizontal flip and colour jitter
-# while training, a shortest-edge resize and a central crop while evaluating, ImageNet channel
-# statistics either way -- so a Keras run and a torch run over the same tree are drawn from the same
+# "crop_pct" picks the augmentation recipe. Set -- and it is set below -- it is the recipe timm
+# gives "cfg/torch/others/default_timm.yaml": a random resized crop, a horizontal flip and colour
+# jitter while training, a shortest-edge resize and a central crop while evaluating, ImageNet channel
+# statistics either way, so a Keras run and a torch run over the same tree are drawn from the same
 # distributions rather than from two recipes. That is the recipe an ImageNet run wants, and 0.875 is
-# the ratio timm defaults to.
+# the ratio timm defaults to. Left null it is the small-image one instead (a horizontal flip and a
+# pad-then-crop, as core Keras preprocessing layers inside the tf.data pipeline, pixels scaled to
+# 0..1), which is what a CIFAR-sized set trains under.
+# The shipped "image_size" and "batch_size" are the ImageNet-sized pair the other two frameworks
+# ship -- 224 pixels and 128 items, as in "cfg/torch/others/default_timm.yaml" and
+# "cfg/flax/others/default_tfdata.yaml" -- so a run over one dataset directory starts at the same
+# shape and the same step size whichever framework reads it. With "crop_pct" set below they agree on
+# the recipe too: the defaults alone land on the ImageNet one at 224 pixels, and a CIFAR-sized run is
+# the render that overrides all three back to "crop_pct: null", "image_size: [32, 32]" and
+# "batch_size: 32", which is the second render below.
+# That "crop_pct: null" is what a small-image override has to spell out: the ImageNet recipe reads
+# three channels throughout, so a render naming "mnist" and inheriting the shipped ratio is refused
+# by the loader at construction, and a CIFAR-sized set that keeps it is upscaled to the crop instead
+# of trained at its own size.
+# There is no "image_dtype" here. "cfg/torch/others/default_timm.yaml" and
+# "cfg/flax/others/default_tfdata.yaml" carry one because those two loaders can be asked to deliver a
+# batch in a given element type -- timm takes an "img_dtype", and the flax pipeline casts on its way
+# out -- while this one always delivers float32 and leaves the casting to the global
+# "keras.mixed_precision" policy, which a layer's "__call__" applies to a float input. That is a
+# difference in delivery, not in where the precision of a run is picked: a Keras run picks it on the
+# learner pattern, by "mixed_precision_type", e.g. "cfg/keras/learners/ImageClassifier.yaml", exactly
+# as a torch run does.
 # Render it twice, once per split, e.g.
 #   scm format cfg/keras/others/default_keras.yaml -o dataset_train.yaml \
-#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true, image_size: [224, 224], crop_pct: 0.875}'
+#       -p 'DEFAULT: {data_dir: /data/imagenet, training: true}'
 #   scm format cfg/keras/others/default_keras.yaml -o dataset_valid.yaml \
-#       -p 'DEFAULT: {dataset: cifar100, training: false}'
+#       -p 'DEFAULT: {dataset: cifar100, training: false, crop_pct: null, image_size: [32, 32], batch_size: 32}'
 PARAMETERS:
   DEFAULT:
     training: false
     train_split: train # directory under "data_dir" holding the training split
     validation_split: validation # directory under "data_dir" holding the validation split
-    batch_size: 32
-    image_size: [32, 32]
-    crop_padding: 4 # small-image recipe: pixels padded on each side before the random crop
-    # null keeps the small-image recipe above; a ratio switches to the ImageNet one, where the
-    # shortest edge is resized to image_size / crop_pct before the evaluation crop.
-    crop_pct: null
+    batch_size: 128
+    image_size: [224, 224]
+    # Read only on the small-image recipe, which the shipped "crop_pct" does not select: pixels
+    # padded on each side before the random crop. Four is the number a 32-pixel image is cropped
+    # with, and the jitter it buys holds only while the padded image is larger than the crop, so a
+    # render that takes "crop_pct: null" and leaves "image_size" at 224 shifts the window by far less
+    # of the width, and a "keras.datasets" set -- 28 or 32 pixels, padded to 36 or 40 -- is upscaled
+    # by "keras.layers.RandomCrop" instead of cropped, for no jitter at all, which is a second reason
+    # the CIFAR render above drops "image_size" alongside the ratio. A run staying on the shipped
+    # recipe leaves this as it is; nothing reads it there.
+    crop_padding: 4
+    # The ImageNet recipe, where the shortest edge is resized to image_size / crop_pct before the
+    # evaluation crop; null switches to the small-image one above.
+    crop_pct: 0.875
     hflip: true # random horizontal flip, training split only, on either recipe
     # Items the training shuffle of a "keras.datasets" set holds at once, capped by the number of
     # items a rank owns: a full buffer there would be a second copy of an in-memory array. It does
@@ -42,7 +69,7 @@ PARAMETERS:
     shuffle_buffer: 1024
     seed: 42
     # Items decoded and augmented at once, and batches held ready ahead of the device; null is
-    # "tf.data.AUTOTUNE" for both. They are this pipeline's "num_workers: 32", the number
+    # "tf.data.AUTOTUNE" for both. They are this pipeline's "workers: 16", the number
     # "cfg/torch/others/default_timm.yaml" hands timm: AUTOTUNE sizes itself from what it is already
     # achieving, which on a host shared with a busy training process settles below what the CPU has,
     # and a starved input pipeline costs step time rather than raising anything. The file read is the
@@ -66,7 +93,7 @@ _obj_:
         {% elif dataset is defined %}
         dataset: {{dataset}}
         {% else %}
-        {{ 'A source is required and has no default: pass -p "DEFAULT: {data_dir: /path/to/dataset}" for a directory of class folders, or -p "DEFAULT: {dataset: cifar10}" for a keras.datasets set (mnist, cifar10, cifar100).' | raise_error }}
+        {{ 'A source is required and has no default: pass -p "DEFAULT: {data_dir: /path/to/dataset}" for a directory of class folders, or -p "DEFAULT: {dataset: cifar10, crop_pct: null, image_size: [32, 32], batch_size: 32}" for a keras.datasets set (mnist, cifar10, cifar100), which the shipped ImageNet recipe does not fit.' | raise_error }}
         {% endif %}
         training: {{training}}
         batch_size: {{batch_size}}

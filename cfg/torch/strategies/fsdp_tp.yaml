@@ -5,7 +5,7 @@
 # submesh. Every rank of one group must read the same slice of the dataset, which the CLI publishes
 # as DATA_RANK and DATA_WORLD_SIZE and derives the run's seed from. The pattern is called with
 # device=... and local_rank=...; parallel_modules is the plan tp.yaml documents, and every FSDP2 knob
-# (shard_modules, reshard_after_forward, mp_policy, sync_batchnorm) is bound here as in fsdp2.yaml.
+# (shard_modules, reshard_after_forward, sync_batchnorm) is bound here as in fsdp2.yaml.
 #
 # The plan below is written for cfg/torch/models/VisionTransformer.yaml and must be adapted to the
 # model it runs on: a pattern matching no module anywhere is refused at wrap time. See tp.yaml for

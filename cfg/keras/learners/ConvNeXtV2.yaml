@@ -34,11 +34,13 @@ IMPORTS: {}
 # builds the models, and needs "MIXED_PRECISION_TYPE" to name its element type: "float16", which
 # wraps every optimizer in a "keras.optimizers.LossScaleOptimizer" (a mapping here carries that
 # wrapper's keyword arguments), or "bfloat16", which shares float32's exponent range and stays
-# unscaled. Either field alone is refused, which is one difference in default precision from the
-# torch twin: there "MIXED_PRECISION: false" with "MIXED_PRECISION_TYPE: bfloat16" means unscaled
-# bfloat16 autocast, while the pairing rule here makes that combination a float32 run.
-MIXED_PRECISION: false
-MIXED_PRECISION_TYPE: null
+# unscaled. Either field alone is refused, which is why the pair below and the torch twin's, both
+# unscaled bfloat16, are spelled differently: there "MIXED_PRECISION: false" with
+# "MIXED_PRECISION_TYPE: bfloat16" means exactly that, since the flag is the float16 gradient scaler,
+# while the pairing rule here refuses that combination and the same intent needs
+# "MIXED_PRECISION: true".
+MIXED_PRECISION: true
+MIXED_PRECISION_TYPE: bfloat16
 INPUTS: [image, label]
 OUTPUTS: [ce_loss, acc1, acc5]
 LEARNERS:
@@ -80,12 +82,12 @@ LEARNERS:
     # "keras.losses.SparseCategoricalCrossentropy" has no label smoothing, so the integer labels are
     # one-hot encoded against the width of the logits and the categorical loss carries the smoothing.
     # At "label_smoothing: 0.0" the two are the same loss.
-    # The cast is the one the two image classifier learners spell: it is an identity under the float32
-    # policy above, and the reason it is here anyway is that the accuracies want float32 --
-    # "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy", refuses a bfloat16
-    # prediction outright on the tensorflow backend (jax and torch compute it, and the
-    # "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). So turning
-    # MIXED_PRECISION on here is a two-line edit rather than a broken run.
+    # The cast is the one the two image classifier learners spell, and it is what makes the policy
+    # above a run rather than a crash: under it the head emits bfloat16, and the accuracies want
+    # float32 -- "tf.math.in_top_k", behind "keras.metrics.sparse_top_k_categorical_accuracy",
+    # refuses a bfloat16 prediction outright on the tensorflow backend (jax and torch compute it, and
+    # the "SparseTopKCategoricalAccuracy" class is no way around it: it calls the same kernel). It
+    # stays an identity when the two fields above are edited back to a float32 run.
     FLOW:
       - INPUTS: image
         OUTPUTS: {cls: cls}

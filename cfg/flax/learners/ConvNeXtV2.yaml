@@ -17,7 +17,14 @@ PARAMETERS:
     # optimizer applies, not epochs -- under "optax.MultiSteps" only the steps that apply the
     # accumulated gradients count -- so this is what turns the epoch counts above into the step
     # counts "optax.warmup_cosine_decay_schedule" takes. Set it to len(training_dataset), or to
-    # len(training_dataset) // accumulate_gradients when "accumulate_gradients" is set.
+    # len(training_dataset) // accumulate_gradients when "accumulate_gradients" is set. The 1000
+    # below is a placeholder standing in for that count, not a value read off any loader: leave it
+    # as it is and the warmup and decay horizons are simply wrong, with nothing to say so -- the
+    # schedule runs either way: with fewer real updates per epoch than the placeholder the run ends
+    # short of "min_lr", and with more -- ImageNet at batch 1024 is about 1250 -- optax clamps the
+    # cosine at "decay_steps", so the rate bottoms out at "min_lr" well before the last epoch and
+    # the tail of training runs flat there. The Keras twin ships the same placeholder for the same
+    # reason.
     steps_per_epoch: 1000
     lr: 4.0e-3
     warmup_lr: 1.0e-5

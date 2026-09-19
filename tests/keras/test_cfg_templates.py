@@ -328,7 +328,9 @@ def test_the_showcase_pair_runs_every_feature_this_backend_has_in_one_step(
     assert (learner.MIXED_PRECISION, learner.MIXED_PRECISION_TYPE) == (True, "bfloat16")
     assert keras.backend.standardize_dtype(models[True](IMAGE_BATCH["image"])["cls"].dtype) == "bfloat16"
     assert all(v.dtype == "float32" for v in models[True].trainable_variables)
-    assert (optimizer.gradient_accumulation_steps, optimizer.use_ema, optimizer.ema_momentum) == (2, True, 0.99)
+    # The momentum is the `ema_decay` parameter taken to the 1/k power, which is what keeps the
+    # averaging horizon the twins' when the blend runs on the window's no-ops too.
+    assert (optimizer.gradient_accumulation_steps, optimizer.use_ema, optimizer.ema_momentum) == (2, True, 0.999**0.5)
 
     flags = [(learner.training_step(**IMAGE_BATCH), learner.has_updated)[1] for _ in range(4)]
 
@@ -395,7 +397,9 @@ def test_the_showcase_window_can_be_taken_off_by_parameter(tmp_path: Path) -> No
     *string* `None`, which Keras compares against 2 and rejects -- so the showcase could not express
     "train without a window" at all. Off, the keyword has to be absent rather than passed as
     anything: Keras reads a missing one as no accumulation, and the learner's own window read
-    (`... or 1`) would take any non-empty string for a real window.
+    (`... or 1`) would take any non-empty string for a real window. Without a window the derived
+    momentum has nothing to compensate for, so it must come out as the `ema_decay` parameter itself:
+    the `1/k` power is only correct if it degrades to the identity here.
     """
     model = _model(tmp_path, "VisionTransformer", SHOWCASE_PARAMETERS, None)
     learner = _learner(tmp_path, "ImageClassifierShowcase", {"DEFAULT": {"accumulate_gradients": None}}, model=model)
@@ -405,6 +409,7 @@ def test_the_showcase_window_can_be_taken_off_by_parameter(tmp_path: Path) -> No
 
     assert "gradient_accumulation_steps=" not in source  # the keyword is absent, not passed as anything
     assert learner.optimizers["optimizer"].gradient_accumulation_steps is None
+    assert learner.optimizers["optimizer"].ema_momentum == 0.999  # the parameter itself, undivided
     assert flags == [True, True]  # without a window every step applies
     assert learner.updates == 2
 
@@ -414,17 +419,37 @@ def test_the_image_classifier_learner_derives_both_precision_fields_from_one_par
 
     Both fields are required together on this backend -- either one alone is refused at build time --
     so one parameter carries the pair rather than exposing two a `-p` could set into a refusal. The
-    default arm is the float32 one this template has always emitted.
+    default arm is the unscaled bfloat16 one the torch twin also defaults to; the float32 arm is
+    reached by setting the parameter to `null`, which is the only spelling that clears both fields.
     """
     policies = {}
-    for name, parameters in (("default", {}), ("mixed", {"SHARED": {"mixed_precision_type": "bfloat16"}})):
+    for name, parameters in (("default", {}), ("float32", {"SHARED": {"mixed_precision_type": None}})):
         path = tmp_path / f"{name}.py"
         KerasLearnerBuilder.from_path(LEARNERS / "ImageClassifier.yaml")(parameters=parameters)(path)
         learner_type = _load(path, f"precision_{name}").Learner
         policies[name] = (learner_type.MIXED_PRECISION, learner_type.MIXED_PRECISION_TYPE)
 
-    assert policies["default"] == (False, None)
-    assert policies["mixed"] == (True, "bfloat16")
+    assert policies["default"] == (True, "bfloat16")
+    assert policies["float32"] == (False, None)
+
+
+@pytest.mark.parametrize("name", ["ConvNeXtV2", "ImageClassifier", "ImageClassifierShowcase", "SmallLanguageModel"])
+def test_every_shipped_recipe_learner_defaults_to_the_unscaled_bfloat16_policy(name: str, tmp_path: Path) -> None:
+    """The four recipe templates are read against their torch twins, which all default to bfloat16.
+
+    The CLI sets the process-wide `keras.mixed_precision` policy from these two class attributes
+    before it builds anything, so they are the precision a shipped recipe trains at, not a
+    suggestion. A template that drifted back to float32 would still train and still look healthy --
+    it would only make every comparison against the torch twin measure precision instead of the
+    thing being compared. The flag is asserted with the type because `_validate_mixed_precision`
+    refuses either field alone: the only float32 spelling that builds is both of them moving
+    together, which is the drift these two assertions catch.
+    """
+    path = tmp_path / f"{name}.py"
+    KerasLearnerBuilder.from_path(LEARNERS / f"{name}.yaml")(parameters={})(path)
+    learner_type = _load(path, f"policy_{name}").Learner
+
+    assert (learner_type.MIXED_PRECISION, learner_type.MIXED_PRECISION_TYPE) == (True, "bfloat16")
 
 
 IMAGE_CLASSIFIERS: dict[str, dict[str, Any]] = {
@@ -434,7 +459,9 @@ IMAGE_CLASSIFIERS: dict[str, dict[str, Any]] = {
 """The two templates of one image-classification recipe, each in the parametrization of its mixed arm.
 
 The showcase declares the policy in the file; the base learner reaches the same one through the
-parameter that carries both precision fields.
+parameter that carries both precision fields. That override now names the base learner's own
+default, and is kept because it is what exercises the parameter path -- the arm a float32
+comparison passes `null` to -- which the showcase's literal fields never reach.
 """
 
 
@@ -470,14 +497,13 @@ def test_both_image_classifiers_evaluate_their_top_k_under_a_bfloat16_policy(
 def test_no_top_k_learner_hands_its_criteria_the_uncast_head_output(case: str, tmp_path: Path) -> None:
     """Every template calling `sparse_top_k_categorical_accuracy` must route it through the cast.
 
-    The behavioral form of this is the bfloat16 run above, and it is the better check -- but it can
-    only be written for the two learners that can reach a policy at all. `ConvNeXtV2` declares
-    `MIXED_PRECISION: false` as a literal, and the CLI reads the policy off that class attribute
-    alone, so no parameter and no flag turns it on: the only way to reach the crash is to edit the
-    two fields, and a test cannot run what the shipped file cannot express. What is left is the
-    structural half, asserted on the rendered source, and it is the half that stops the next copy of
-    this recipe from shipping a flow whose accuracies read the head directly. Both flows are counted
-    because each spells the cast on its own.
+    The behavioral form of this is the bfloat16 run above, and it is the better check -- but it
+    builds a model and takes a step per case, so it is written for the two templates of the one
+    recipe it compares. This is the structural half, asserted on the rendered source and cheap
+    enough to run over every template that calls the metric, `ConvNeXtV2` included. All three ship
+    the bfloat16 pair, so the crash sits on each of their default paths rather than behind an edit,
+    and this is what stops the next copy of this recipe from shipping a flow whose accuracies read
+    the head directly. Both flows are counted because each spells the cast on its own.
     """
     path = tmp_path / f"{case}.py"
     KerasLearnerBuilder.from_path(LEARNERS / f"{case}.yaml")(parameters={})(path)

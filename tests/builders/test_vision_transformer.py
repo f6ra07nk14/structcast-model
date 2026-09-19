@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import pytest
 import timm
+from timm.layers import DropPath
 from torch.distributed.fsdp import fully_shard
 
 from structcast_model.builders.torch import TorchBuilder, TorchLearnerBuilder
@@ -225,6 +226,36 @@ def test_image_classifier_learner_trains_both_models(
     assert torch.isfinite(trained["ce_loss"])
     assert sorted(trained) == ["acc1", "acc5", "ce_loss"]
     assert sorted(inferred) == ["acc1", "acc5", "ce_loss"]
+
+
+@pytest.mark.parametrize(
+    ("cfg_path", "parameters"),
+    [
+        (MODEL_YAML, {"base": {"dim": 32, "heads": 2, "depth": 1}, "SHARED": {"image_size": 32, "num_classes": 10}}),
+        (CONVNEXT_YAML, {"atto": {"depths": [1, 0, 0, 0]}, "SHARED": {"drop_path_rate": 0.1, "num_classes": 10}}),
+    ],
+    ids=["vision_transformer", "convnext_v2"],
+)
+def test_a_one_block_preset_renders_without_stochastic_depth(
+    tmp_path_factory: pytest.TempPathFactory, cfg_path: Any, parameters: dict[str, Any]
+) -> None:
+    """A single block must render, and it must drop nothing.
+
+    The ramp spreads `drop_path_rate` over the blocks by dividing by the span between the first and
+    the last, which is zero when there is only one -- unguarded that is a `ZeroDivisionError` at
+    render time, so the one shape a smoke run or an ablation reaches for first could not be built at
+    all. The first block of the full ramp draws 0.0, so the only block of a one-block preset draws
+    the same; the flax and keras twins carry the same guard.
+    """
+    module_path = tmp_path_factory.mktemp("one_block") / "model.py"
+    TorchBuilder.from_path(cfg_path)(parameters=parameters)(module_path)
+    torch.manual_seed(0)
+    model = _load(module_path).Model()
+
+    rates = [module.drop_prob for module in model.modules() if isinstance(module, DropPath)]
+
+    assert rates
+    assert set(rates) == {0.0}
 
 
 def test_image_classifier_learner_lowers_the_loss_on_a_fixed_batch(
