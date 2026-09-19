@@ -214,6 +214,21 @@ def test_bool_or_path_or_dict_parser_file_path_loads_content(tmp_path: Path) -> 
         unregister_dir(tmp_path)
 
 
+def test_bool_or_path_or_dict_parser_yaml_null_returns_none() -> None:
+    """YAML's own spelling of off must not be the one spelling that crashes."""
+    assert bool_or_path_or_dict_parser("null") is None
+    assert bool_or_path_or_dict_parser("~") is None
+
+
+def test_bool_or_path_or_dict_parser_none_string_is_not_off() -> None:
+    """The string "none" is a YAML string, not null, so it stays a path that fails to resolve.
+
+    Reading it as off would be a second spelling of off that no other YAML consumer here shares.
+    """
+    with pytest.raises(FileNotFoundError):
+        bool_or_path_or_dict_parser("none")
+
+
 def test_path_or_any_parser_file_path_loads_content(tmp_path: Path) -> None:
     """A path string pointing to a YAML file loads its content."""
     cfg = tmp_path / "data.yaml"

@@ -1,0 +1,94 @@
+# The Flax mirror of "cfg/torch/models/CycleGAN_generator.yaml": a Johnson-style residual generator,
+# written against the NHWC layout Flax convolutions read and against explicit input feature counts,
+# since "flax.nnx.Conv" has no lazy form.
+# Two torch layers have no nnx twin and are folded into the layer that followed them:
+# "torch.nn.ReflectionPad2d" becomes "padding: REFLECT" on the convolution -- a kernel of size k
+# reflects exactly k // 2 pixels per side, which is what keeps the resolution -- and
+# "torch.nn.Upsample(scale_factor=2)" becomes a repeat of every row and column, which is nearest
+# neighbour upsampling written out.
+# A third fold is not exact: the stride-2 downsampling convolutions ask for "padding: SAME", which
+# on an even input pads (0, 1) where the torch template's "padding=1" pads (1, 1). The output grid
+# is the same size, shifted by one pixel; training from scratch this is a different but equally
+# valid alignment, and it is only worth knowing when weights are transplanted from a torch run.
+# "flax.nnx.InstanceNorm" is built without scale or bias, matching the "affine=False" default of
+# "torch.nn.InstanceNorm2d" the torch template relies on, and with the "eps=1e-5" of that layer
+# rather than the 1e-6 flax defaults to.
+PARAMETERS:
+  DEFAULT:
+    channels: 3
+    n_residual_blocks: 9
+    init_features: 64
+IMPORTS: {}
+INPUTS: [image]
+OUTPUTS: [out]
+STRUCTURED_OUTPUT: true
+_jinja_yaml_: |-
+  FLOW:
+    # Initial convolution block
+    - INPUTS: image
+      OUTPUTS: _
+      NAME: stem
+      LAYER:
+        - _obj_
+        - _addr_: flax.nnx.Conv
+        - _call_:
+            in_features: {{channels}}
+            out_features: {{init_features}}
+            kernel_size: [7, 7]
+            padding: REFLECT
+            rngs: "eval: rngs"
+    - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{init_features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+    - [_, _, [_obj_, {_addr_: flax.nnx.relu}]]
+    # Downsampling
+    - [_, _, down0, {TYPE: DownBlock, PARAM: {DEFAULT: {fin: {{init_features}}, fout: {{init_features * 2}}}}}]
+    - [_, _, down1, {TYPE: DownBlock, PARAM: {DEFAULT: {fin: {{init_features * 2}}, fout: {{init_features * 4}}}}}]
+    # Residual blocks
+    {% for i in range(n_residual_blocks) %}
+    - [_, _, "res_block{{i}}", {TYPE: ResidualBlock, PARAM: {DEFAULT: {features: {{init_features * 4}}}}}]
+    {% endfor %}
+    # Upsampling
+    - [_, _, up0, {TYPE: UpBlock, PARAM: {DEFAULT: {fin: {{init_features * 4}}, fout: {{init_features * 2}}}}}]
+    - [_, _, up1, {TYPE: UpBlock, PARAM: {DEFAULT: {fin: {{init_features * 2}}, fout: {{init_features}}}}}]
+    # Output layer
+    - INPUTS: _
+      OUTPUTS: _
+      NAME: head
+      LAYER:
+        - _obj_
+        - _addr_: flax.nnx.Conv
+        - _call_:
+            in_features: {{init_features}}
+            out_features: {{channels}}
+            kernel_size: [7, 7]
+            padding: REFLECT
+            rngs: "eval: rngs"
+    - [_, out, [_obj_, {_addr_: flax.nnx.tanh}]]
+ResidualBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.relu}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs"}}]]
+      - [_, feat, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - ["eval: inp + feat", out, null]
+DownBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [2, 2], padding: SAME, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [_, out, [_obj_, {_addr_: flax.nnx.relu}]]
+UpBlock:
+  OUTPUTS: [out]
+  _jinja_yaml_: |-
+    FLOW:
+      # A rename, so that a flow line names "inp": the builder reads a sublayer's inputs off its
+      # flow, and an expression line names none of the values it reads.
+      - [inp, feat]
+      # Nearest neighbour upsampling by 2: every row and every column repeated once.
+      - ["eval: feat.repeat(2, axis=1).repeat(2, axis=2)", upsampled]
+      - [upsampled, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [1, 1], padding: SAME, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [_, out, [_obj_, {_addr_: flax.nnx.relu}]]

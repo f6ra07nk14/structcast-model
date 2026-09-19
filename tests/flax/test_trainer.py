@@ -3,13 +3,163 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Iterator
+from functools import partial, wraps
 import logging
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from structcast_model.flax.trainer import create_jax_inputs, get_jax_device, get_jax_devices
+from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider
+from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer, ShardedDataset, create_jax_inputs
+from structcast_model.flax.utils import donate_argnames, get_jax_device, get_jax_devices
+from tests.fakes import CountingLearner
+
+
+class _StubLearner(CountingLearner):
+    """A minimal Learner reporting one criterion, so the loop can run without a generated learner."""
+
+    def __init__(self, loss: float = 1.0) -> None:
+        """Report *loss* from every step."""
+        super().__init__()
+        self.loss = loss
+
+    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Count the Step as one Update and report the fixed loss as a device array."""
+        self.count_step()
+        return {"loss": jnp.asarray(self.loss)}
+
+    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Report twice the fixed loss, so a validation average cannot be confused with a training one."""
+        return {"loss": jnp.asarray(2 * self.loss)}
+
+
+class _Recorder:
+    """Records the events it receives, implementing exactly the protocols it is asked to."""
+
+    def __init__(self, log: list[str]) -> None:
+        """Attach a recording method for every lifecycle event."""
+        self.log = log
+        for event in EVENTS:
+            setattr(self, event, partial(self._record, event))
+
+    def _record(self, event: str, info: BaseInfo) -> None:
+        """Append the event name to the shared log."""
+        self.log.append(event)
+
+
+class _BatchPlacement:
+    """Record the batches a sharded dataset places."""
+
+    def __init__(self) -> None:
+        """Start with no placed batches."""
+        self.placed: list[int] = []
+
+    def shard_batch(self, batch: dict[str, int]) -> dict[str, int]:
+        """Record and return one batch without changing it."""
+        self.placed.append(batch["x"])
+        return batch
+
+
+def _trainer(tracker: Any, **kwargs: Any) -> FlaxTrainer:
+    """Build a trainer over one training and one validation batch."""
+    return FlaxTrainer(
+        learner=_StubLearner(),
+        tracker=tracker,
+        data=SimpleDataProvider(training_dataset=[{"x": 1}], validation_dataset=[{"x": 2}]),
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FlaxTracker
+# ---------------------------------------------------------------------------
+
+
+def test_flax_tracker_reports_the_running_mean_as_floats() -> None:
+    """The trainer writes what the tracker returns into the history the loggers read.
+
+    Floats, not arrays: `BaseTrainer.tracker` is typed to return them, `BestCriterion` compares
+    them against a float infinity, and the loggers take `float` metric values.
+    """
+    tracker = FlaxTracker.from_criteria(["loss"])
+
+    means = [tracker(loss=jnp.asarray(value)) for value in (1.0, 2.0, 6.0)]
+
+    assert means == [{"loss": 1.0}, {"loss": 1.5}, {"loss": 3.0}]
+    assert all(type(value) is float for mean in means for value in mean.values())
+
+
+def test_flax_tracker_logs_are_empty_before_the_first_step() -> None:
+    """A split that ran no step has no average to report, and reporting 0.0 would be a lie."""
+    assert FlaxTracker.from_criteria(["loss"]).logs() == {}
+
+
+def test_flax_tracker_resets_between_the_splits_of_one_epoch() -> None:
+    """Without the reset, the validation average of an epoch would carry its training values.
+
+    The tracker is routed by protocol, so this drives the real loop: the reset only happens if
+    `on_training_begin` and `on_validation_begin` are the names the trainer dispatches.
+    """
+    tracker = FlaxTracker.from_criteria(["loss"])
+    trainer = _trainer(tracker)
+
+    trainer.fit(epochs=2)
+
+    # The stub reports 1.0 while training and 2.0 while validating, one step each: a tracker that
+    # never reset would report 1.5 for the validation split and 1.0 again for the second epoch.
+    for epoch in (1, 2):
+        assert trainer.logs(epoch)["loss"] == pytest.approx(1.0)
+        assert trainer.logs(epoch)["val_loss"] == pytest.approx(2.0)
+
+
+def test_flax_tracker_is_routed_into_the_two_reset_events_only() -> None:
+    """The tracker takes part in the loop by protocol alone, exactly as the torch tracker does."""
+    assert _trainer(FlaxTracker.from_criteria(["loss"])).describe() == {
+        "on_training_begin": ["FlaxTracker"],
+        "on_validation_begin": ["FlaxTracker"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# FlaxTrainer
+# ---------------------------------------------------------------------------
+
+
+def test_flax_trainer_dispatches_the_documented_event_order() -> None:
+    """The Flax trainer inherits the loop, so its lifecycle must be the base trainer's, unchanged."""
+    log: list[str] = []
+
+    _trainer(FlaxTracker.from_criteria(["loss"]), callbacks=[_Recorder(log)]).fit(epochs=1)
+
+    assert log == [
+        "on_epoch_begin",
+        "on_training_begin",
+        "on_training_step_begin",
+        "on_update",
+        "on_training_step_end",
+        "on_training_end",
+        "on_validation_begin",
+        "on_validation_step_begin",
+        "on_validation_step_end",
+        "on_validation_end",
+        "on_epoch_end",
+    ]
+
+
+def test_sharded_dataset_prefetches_two_batches_before_the_first_step() -> None:
+    """Device placement must be queued ahead of the step to overlap input transfer with compute."""
+    placement = _BatchPlacement()
+    dataset = ShardedDataset([{"x": index} for index in range(3)], placement)
+    iterator = iter(dataset)
+
+    assert next(iterator) == {"x": 0}
+    assert placement.placed == [0, 1]
+
+    assert next(iterator) == {"x": 1}
+    assert placement.placed == [0, 1, 2]
 
 
 def test_create_jax_inputs_from_int_tuple_returns_array() -> None:
@@ -113,3 +263,88 @@ def test_get_jax_device_invalid_raises() -> None:
     """get_jax_device raises ValueError for a non-existent device string."""
     with pytest.raises(ValueError, match="not available"):
         get_jax_device("nonexistent:99")
+
+
+# ---------------------------------------------------------------------------
+# donate_argnames
+# ---------------------------------------------------------------------------
+
+
+def test_donate_argnames_reads_the_state_parameters_a_step_declares() -> None:
+    """The step signature is the donation contract, and nothing else decides what is donated.
+
+    Reading it back is what extends donation to a hand-written step following the convention, and
+    what keeps the batch -- whose arrays the caller still holds afterwards -- out of the donation.
+    A step another layer already wrapped has to report the parameters underneath, or a compiled run
+    would donate nothing at all.
+    """
+
+    def _training_step(model: Any, optimizer: Any, *, x: Any, y: Any, **kwargs: Any) -> None:
+        """A generated training step: state positionally, batch keyword-only."""
+
+    @wraps(_training_step)
+    def wrapped(*args: Any, **kwargs: Any) -> None:
+        """The same step behind a wrapper, as a strategy or a profiler hands it over."""
+
+    assert donate_argnames(_training_step) == ("model", "optimizer")
+    assert donate_argnames(wrapped) == ("model", "optimizer")
+
+
+# ---------------------------------------------------------------------------
+# ShardedDataset
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStrategy:
+    """A strategy stub whose `shard_batch` records what it placed and hands the batch back."""
+
+    def __init__(self) -> None:
+        """Start with nothing placed."""
+        self.placed: list[dict[str, Any]] = []
+
+    def shard_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Record *batch* as placed and return it unchanged."""
+        self.placed.append(batch)
+        return batch
+
+
+class _EpochDataset:
+    """A list-backed dataset that also reacts to `on_epoch_begin`, as a reshuffling sampler does."""
+
+    def __init__(self, batches: list[dict[str, Any]]) -> None:
+        """Yield *batches*, recording every epoch it is told about."""
+        self.batches = batches
+        self.epochs: list[int] = []
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """Yield every batch of one epoch."""
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        """Return the number of batches in one epoch."""
+        return len(self.batches)
+
+    def on_epoch_begin(self, info: BaseInfo[Any]) -> None:
+        """Record the epoch that is about to start."""
+        self.epochs.append(info.epoch)
+
+
+def test_sharded_dataset_places_every_epoch_and_keeps_the_dataset_visible_to_the_trainer() -> None:
+    """The wrapper sits between the loader and the trainer, so it must stay invisible to both.
+
+    A run reads it once per epoch, so an iterator consumed by the first epoch would starve every
+    later one; the size is the provider's step count, which must stay the wrapped dataset's; and the
+    trainer picks an event's participants with `isinstance` against a runtime-checkable protocol,
+    which looks attributes up statically -- a `__getattr__` forward would hide the dataset's hooks.
+    """
+    strategy = _RecordingStrategy()
+    dataset = _EpochDataset([{"x": 1}, {"x": 2}])
+
+    sharded = ShardedDataset(dataset, strategy)
+
+    assert len(sharded) == 2
+    assert [batch for _ in range(2) for batch in sharded] == [{"x": 1}, {"x": 2}, {"x": 1}, {"x": 2}]
+    assert strategy.placed == [{"x": 1}, {"x": 2}, {"x": 1}, {"x": 2}]
+    assert isinstance(sharded, OnEpochBegin)
+    sharded.on_epoch_begin(BaseInfo(epoch=3))
+    assert dataset.epochs == [3]

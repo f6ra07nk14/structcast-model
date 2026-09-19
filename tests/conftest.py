@@ -12,13 +12,21 @@ from typer.testing import CliRunner
 
 import torch.distributed as dist
 
-WANDB_LOGGER = "structcast_model.torch.wandb_logger"
+WANDB_LOGGER = "structcast_model.loggers.wandb"
 
 # MLflow 3.15 put the filesystem tracking backend into maintenance mode and refuses it unless this
 # opt-out is set. The MLflow tests point at a temporary file store on purpose, so they exercise the
 # real client without a server; production callers pick their own backend URI and are unaffected.
 # Set here rather than in a fixture because the distributed tests spawn workers that inherit it.
 os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+
+# Keras resolves its backend once, while it is first imported, and never switches afterwards, so the
+# choice has to be made before any keras import reaches the interpreter -- hence in the root conftest,
+# which pytest loads before collecting any test module, rather than in `tests/keras/`: a bare `pytest`
+# run imports `tests/commands/test_cmd_keras.py` first, and by then the backend would already be
+# whatever ~/.keras/keras.json names on the machine. `setdefault` leaves an explicitly requested
+# backend alone, so the same tests can be run against jax or torch by exporting KERAS_BACKEND.
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
 
 @pytest.fixture
@@ -44,17 +52,33 @@ def single_process_gloo(tmp_path: pathlib.Path) -> Generator[None, None, None]:
 def wandb_logger_with(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[Any], Any], None, None]:
     """Return a factory publishing a fake `wandb` and handing back the logger module that sees it.
 
-    `structcast_model.torch.wandb_logger` records the missing-wandb import failure once, while it is
+    `structcast_model.loggers.wandb` records the missing-wandb import failure once, while it is
     imported, so a fake injected into `sys.modules` later stays invisible until the module is
     reloaded. The teardown reloads it again without the fake, restoring the recorded failure for the
     tests that assert on it.
     """
 
+    def _reload() -> Any:
+        """Reload the logger module and re-point its package shim at the reloaded object.
+
+        `structcast_model.loggers` is a `LazySelectedImporter`, which caches every attribute it first
+        resolved, while `importlib.reload` leaves a *new* module object -- holding new class objects
+        -- in `sys.modules`. Without the re-point, the flat `loggers.WandbLogger` -- the attribute
+        the CLI reaches the logger through -- would keep serving what was resolved before the
+        reload, for the rest of the session.
+        """
+        reloaded = importlib.reload(importlib.import_module(WANDB_LOGGER))
+        package, _, attribute = WANDB_LOGGER.rpartition(".")
+        shim = importlib.import_module(package)
+        for symbol in shim._imported_structure[attribute]:
+            setattr(shim, symbol, getattr(reloaded, symbol))
+        return reloaded
+
     def _reload_with(fake: Any) -> Any:
         monkeypatch.setitem(sys.modules, "wandb", fake)
-        return importlib.reload(importlib.import_module(WANDB_LOGGER))
+        return _reload()
 
     yield _reload_with
     monkeypatch.undo()
     if WANDB_LOGGER in sys.modules:
-        importlib.reload(sys.modules[WANDB_LOGGER])
+        _reload()

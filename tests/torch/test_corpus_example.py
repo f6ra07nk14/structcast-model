@@ -6,6 +6,8 @@ import importlib.util
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import torch
 
 
@@ -75,3 +77,38 @@ def test_loader_batches_land_on_the_resolved_device(tmp_path: Path) -> None:
     assert batches[0]["tokens"].shape == (8, 4)
     assert batches[0]["tokens"].device.type == device.type
     assert batches[0]["targets"].dtype == torch.int64
+
+
+def _distributed_loader(data_path: Path) -> Any:
+    """A loader that believes it is running distributed, so it builds a sampler to inspect."""
+    loader = TinyShakespeareLoader(block_size=4, data_path=data_path, batch_size=2)
+    loader.__dict__["distributed_results"] = {"device": "cpu", "distributed": True}
+    return loader
+
+
+def test_loader_shards_on_the_data_coordinates_rather_than_the_global_rank(
+    tmp_path: Path, single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`scm torch train` publishes the data coordinates, and the shard must follow them.
+
+    Under a tensor-parallel strategy the ranks of one group split a single model and must be fed
+    the identical batch: sharding on the global rank there hands each of them a different slice,
+    which trains a mismatched model rather than failing. Without the variables -- a standalone run,
+    or a plain `torchrun` -- the process group stays the source, which is what DDP needs.
+    """
+    path = tmp_path / "corpus.txt"
+    path.write_text("abcdefghij" * 10, encoding="utf-8")
+    monkeypatch.setenv("DATA_RANK", "1")
+    monkeypatch.setenv("DATA_WORLD_SIZE", "2")
+    published = _distributed_loader(path).dataloader.sampler
+
+    # The process group is rank 0 of 1; the published coordinates are what the sampler must use.
+    assert (published.rank, published.num_replicas) == (1, 2)
+    assert len(published) == 11  # half of the 22 items of the split
+
+    monkeypatch.delenv("DATA_RANK")
+    monkeypatch.delenv("DATA_WORLD_SIZE")
+    fallback = _distributed_loader(path).dataloader.sampler
+
+    assert (fallback.rank, fallback.num_replicas) == (0, 1)
+    assert len(fallback) == 22

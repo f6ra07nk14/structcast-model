@@ -1,0 +1,136 @@
+# Supervised image classification for the Flax model "cfg/flax/models/ConvNeXtV2.yaml", which reads
+# "image" and emits a structured output whose only key is "cls".
+# The recipe mirrors the torch and Keras twins: a warmup-cosine schedule peaking at "lr", and no
+# clipping unless "clip_grad_norm" is set.
+# The schedule is one difference from the torch twin: timm's cosine steps once per epoch and times
+# its decay from epoch 0 ("warmup_prefix: false"), while "optax.warmup_cosine_decay_schedule", like
+# the Keras twin's schedule, moves on every update and starts its decay once the warmup ends.
+# The Flax side ships no "create_opt": an optax chain already carries clipping, weight decay and the
+# learning rate, and "flax.nnx.Optimizer" only binds that chain to the module.
+# The builder wraps the factory carrying "learning_rate" in "optax.inject_hyperparams" so the rate
+# stays readable at run time; writing that wrapper here by hand is equally valid.
+PARAMETERS:
+  DEFAULT:
+    epochs: 300
+    warmup_epochs: 1
+    # The number of optimizer updates in one epoch. An optax schedule counts the updates the
+    # optimizer applies -- under "optax.MultiSteps" only the applying steps -- so this turns the
+    # epoch counts above into the step counts "optax.warmup_cosine_decay_schedule" takes. 1000 is a
+    # placeholder: set it to len(training_dataset) // (accumulate_gradients or 1), or the warmup and
+    # decay horizons are silently wrong.
+    steps_per_epoch: 1000
+    lr: 4.0e-3
+    warmup_lr: 1.0e-5
+    min_lr: 1.0e-6
+    weight_decay: 0.05
+    clip_grad_norm: null # set to null or a positive float
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+INPUTS: [image, label]
+OUTPUTS: [ce_loss, acc1, acc5]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: ce_loss
+    TRAINABLE_LAYERS: [model]
+    # Clipping comes first in the chain, so it applies once per update to the accumulated gradients.
+    # "no_weight_decay_mask" exempts every bias and normalization scale -- the "kernel" arrays of the
+    # convolutions and the two projections of each block are all that is left to decay.
+    # "accumulate_gradients", when set, wraps the whole chain in "optax.MultiSteps": accumulation
+    # gates on the device, and the generated step reads the applied count back off the outermost
+    # optimizer state across its own update, so the wrapper has to stay outermost to be seen.
+    OPTIMIZER:
+      - _obj_
+      - _addr_: flax.nnx.Optimizer
+      - _jinja_yaml_: |-
+          {% if accumulate_gradients is none %}
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.chain
+                - _call_:
+                    {% if clip_grad_norm is not none %}
+                    - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                    {% endif %}
+                    - - _obj_
+                      - _addr_: optax.adamw
+                      - _call_:
+                          learning_rate:
+                            - _obj_
+                            - _addr_: optax.warmup_cosine_decay_schedule
+                            - _call_:
+                                init_value: {{warmup_lr}}
+                                peak_value: {{lr}}
+                                warmup_steps: {{warmup_epochs * steps_per_epoch}}
+                                decay_steps: {{epochs * steps_per_epoch}}
+                                end_value: {{min_lr}}
+                          weight_decay: {{weight_decay}}
+                          b1: 0.9
+                          b2: 0.999
+                          mask:
+                            - _obj_
+                            - _addr_: structcast_model.flax.no_weight_decay_mask
+                            - _call_:
+                                - ^(?:\w+\.)*bias$
+                                - ^(?:\w+\.)*scale$
+          {% else %}
+          - _bind_:
+              tx:
+                - _obj_
+                - _addr_: optax.MultiSteps
+                - _call_:
+                    opt:
+                      - _obj_
+                      - _addr_: optax.chain
+                      - _call_:
+                          {% if clip_grad_norm is not none %}
+                          - [_obj_, {_addr_: optax.clip_by_global_norm}, {_call_: {max_norm: {{clip_grad_norm}}}}]
+                          {% endif %}
+                          - - _obj_
+                            - _addr_: optax.adamw
+                            - _call_:
+                                learning_rate:
+                                  - _obj_
+                                  - _addr_: optax.warmup_cosine_decay_schedule
+                                  - _call_:
+                                      init_value: {{warmup_lr}}
+                                      peak_value: {{lr}}
+                                      warmup_steps: {{warmup_epochs * steps_per_epoch}}
+                                      decay_steps: {{epochs * steps_per_epoch}}
+                                      end_value: {{min_lr}}
+                                weight_decay: {{weight_decay}}
+                                b1: 0.9
+                                b2: 0.999
+                                mask:
+                                  - _obj_
+                                  - _addr_: structcast_model.flax.no_weight_decay_mask
+                                  - _call_:
+                                      - ^(?:\w+\.)*bias$
+                                      - ^(?:\w+\.)*scale$
+                    every_k_schedule: {{accumulate_gradients}}
+          {% endif %}
+    EXTRA: {}
+    FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - INPUTS: {logits: cls, labels: label}
+        OUTPUTS: sample_losses
+        NAME: cross_entropy_loss
+        LAYER: [_obj_, {_addr_: optax.softmax_cross_entropy_with_integer_labels}]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+    INFERENCE_FLOW:
+      - INPUTS: image
+        OUTPUTS: {cls: cls}
+        NAME: model
+      - [{logits: cls, labels: label}, sample_losses, cross_entropy_loss]
+      - ["eval: sample_losses.mean()", ce_loss, null]
+      - ["eval: (cls.argmax(axis=-1) == label).mean()", acc1, null]
+      - ["eval: (cls.argsort(axis=-1)[:, -5:] == label[:, None]).any(axis=-1).mean()", acc5, null]
+# "LOSSES" and "MODELS" can be set to lists of loss and model configurations, respectively,
+# to specify the losses and models to be used during training.
+# These will be automatically aggregated from the "LEARNERS" configurations,
+# but can also be manually specified here if needed.
+LOSSES: []
+MODELS: []
