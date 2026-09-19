@@ -155,6 +155,32 @@ def test_keras_builder_cfg_convnext_sublayer_builds_backbone(backbone: str) -> N
     assert len(built.scripts) > 0
 
 
+@pytest.mark.parametrize(
+    ("rate", "checkpointed"),
+    [(0, True), (0.0, True), (0.1, False)],
+    ids=["zero_int", "zero_float", "stochastic_depth"],
+)
+def test_keras_reads_a_positionally_written_dropout_rate_when_it_judges_remat(rate: float, checkpointed: bool) -> None:
+    """`Dropout(0.0)` is the same layer as `Dropout(rate=0.0)`, so checkpointing has to judge it the same.
+
+    The refusal tells the user to parametrize the Dropout down to a literal rate of 0; refusing a
+    template that has done exactly that, only positionally, leaves them nowhere to go. A rate above
+    zero still draws on the recomputation pass and stays refused whichever way it was written.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "GRADIENT_CHECKPOINTING": True,
+        "FLOW": [["x", "y", {"_obj_": [["_addr_", "keras.layers.Dropout"], ["_call_", rate]]}]],
+    }
+
+    if not checkpointed:
+        with pytest.raises(SpecError, match='builds "Dropout"'):
+            KerasBuilder(raw=raw)(classname="Model")
+        return
+    assert "keras.remat" in KerasBuilder(raw=raw)(classname="Model").scripts[0]
+
+
 MODEL_TEMPLATES = {
     "ConvNeXtV2": ({"SHARED": {"num_classes": 10}, "atto": {"dims": [4, 8, 8, 16], "depths": [1, 1, 1, 1]}}, ["cls"]),
     "CycleGAN_generator": ({"DEFAULT": {"n_residual_blocks": 1, "init_features": 4}}, ["out"]),
@@ -650,8 +676,27 @@ def test_keras_learner_rejects_a_flow_layer_named_like_an_input_or_a_stored_valu
     raw["LEARNERS"][0]["FLOW"][1]["NAME"] = name
     raw["LEARNERS"][0]["INFERENCE_FLOW"][1][2] = name
 
-    with pytest.raises(SpecError, match=f'Name "{name}" is both a model or flow layer'):
+    with pytest.raises(SpecError, match=f'Name "{name}" is reserved by the generated Keras learner'):
         # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+@pytest.mark.parametrize("name", ["optimizer", "self", "kwargs"], ids=["optimizer", "self", "kwargs"])
+def test_keras_learner_rejects_an_input_named_like_a_name_init_or_the_step_binds(name: str) -> None:
+    """A flow layer is not the only name the learner binds: the optimizers and the steps bind their own.
+
+    The Keras learner has no EMA shadow, so its `others` beyond the models are the optimizer
+    instances, locals of `__init__` a flow unit may name as its layer -- an input taking that name
+    inside the closure is what such a step would call. `self` and `kwargs` are worse: the step is
+    emitted as `def training_step(self, <inputs>, **kwargs)`, so either one is a duplicate parameter
+    the generated module cannot even be imported with.
+    """
+    raw = load_any(LEARNER_YAML)
+    raw["INPUTS"][0] = name
+    raw["LEARNERS"][0]["FLOW"][0][0] = name
+    raw["LEARNERS"][0]["INFERENCE_FLOW"][0][0] = name
+
+    with pytest.raises(SpecError, match=f'Name "{name}" is reserved by the generated Keras learner'):
         _ = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
 
 

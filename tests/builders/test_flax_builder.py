@@ -343,6 +343,32 @@ def test_inject_learning_rate_leaves_an_already_injected_pattern_alone() -> None
     assert injected is True
 
 
+def test_inject_learning_rate_ignores_a_module_file_named_after_inject(tmp_path: Path) -> None:
+    """A `_file_` is the module path an address is imported from, never an address.
+
+    A file path ending in the name would otherwise read as a hand-written injection and suppress the
+    rewrite, costing the run both its readable learning rate and the warning that says so.
+    """
+    module = tmp_path / "inject_hyperparams"
+    module.touch()
+    pattern = ObjectPattern.model_validate(
+        {
+            "_obj_": [
+                ["_addr_", "optax.chain"],
+                {
+                    "_call_": [
+                        {"_obj_": [{"_addr_": "my_transforms.clip", "_file_": str(module)}, {"_call_": {}}]},
+                        {"_obj_": [["_addr_", "optax.sgd"], {"_call_": {"learning_rate": 0.01}}]},
+                    ]
+                },
+            ]
+        }
+    )
+    rewritten, injected = inject_learning_rate(pattern)
+    assert injected is True
+    assert _render(rewritten)[0] == "chain(clip(), inject_hyperparams(inner_factory=sgd)(learning_rate=0.01))"
+
+
 def test_inject_learning_rate_reports_a_pattern_without_a_learning_rate_keyword() -> None:
     """A positional rate cannot be identified, so the pattern is left alone and flagged as unreported."""
     pattern = ObjectPattern.model_validate({"_obj_": [["_addr_", "optax.sgd"], ["_call_", 0.1]]})

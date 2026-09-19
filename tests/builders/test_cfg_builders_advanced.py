@@ -217,6 +217,19 @@ def test_learner_script_defines_steps_as_methods() -> None:
     assert "forward_inference_step" not in script
 
 
+def test_inference_flow_function_takes_no_update_gate() -> None:
+    """Only the training flows gate their model calls, so only they take `__need_update__`.
+
+    `_gated_body` runs over the training segments alone; the inference flow reads the flag nowhere,
+    and a parameter every caller has to fill with a constant is one more way a trainer rebinding the
+    compiled flow function can get the call wrong.
+    """
+    script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
+    assert "def _flow_inference(image, label):" in script
+    assert "self._flow_inference(image, label)" in script
+    assert "def _flow_optimizer(__need_update__, image, label):" in script
+
+
 def test_learner_script_exposes_properties() -> None:
     """Exposes models, optimizers, optimizer_models, grad_scalers, learning_rates, weight_decays, param_group_names."""
     script = TorchLearnerBuilder.from_path(LEARNER_YAML)().scripts[0]
@@ -573,3 +586,36 @@ def test_learner_rejects_a_flow_storing_a_value_named_like_a_model() -> None:
 
     with pytest.raises(SpecError, match='A FLOW of the learner stores "model"'):
         _ = TorchLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
+
+
+# ---------------------------------------------------------------------------
+# TorchLearnerBuilder: flow rejections
+# ---------------------------------------------------------------------------
+
+
+def test_learner_rejects_a_flow_segment_no_later_code_reads() -> None:
+    """A segment whose stores nothing later needs is a rejected template, not a broken builder.
+
+    Every other rejection in the torch builder raises `SpecError`, and that is what tells a caller --
+    and the user reading the failure -- that the learner configuration is what has to change.
+    """
+    optimizer = ["_obj_", {"_addr_": "torch.optim.SGD"}, {"_bind_": {"lr": 0.01}}]
+    mse = ["_obj_", {"_addr_": "torch.nn.MSELoss"}, "_call_"]
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["loss"],
+        "LEARNERS": [
+            {
+                "LOSS": "loss",
+                "TRAINABLE_LAYERS": ["model"],
+                "OPTIMIZER": optimizer,
+                "FLOW": [["x", "y", "model"], [["y", "x"], "loss", mse]],
+            },
+            # The second segment stores `z`, which neither its own backward nor the outputs read.
+            {"LOSS": "loss", "TRAINABLE_LAYERS": ["model"], "OPTIMIZER": optimizer, "FLOW": [["x", "z", "model"]]},
+        ],
+    }
+
+    with pytest.raises(SpecError, match="produces no value any later code needs"):
+        # `scripts` is a cached property: binding it is what runs the emission being rejected here.
+        _ = TorchLearnerBuilder(raw=raw)().scripts

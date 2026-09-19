@@ -60,10 +60,10 @@ class TorchLayerIntermediate(LayerIntermediate):
         base, attributes = "torch.nn.Module", ""
         if self.gradient_checkpointing is not None:
             base = "structcast_model.torch.layers.GradientCheckpointingLayer"
-            lines = ["gradient_checkpointing = True"]
-            if self.gradient_checkpointing:
-                keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
-                lines.append(f"_checkpoint_kwargs = {{{keywords}}}")
+            # Always keyworded: `_resolve_gradient_checkpointing` fills `use_reentrant` in, so a
+            # checkpointed layer never carries an empty mapping.
+            keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
+            lines = ["gradient_checkpointing = True", f"_checkpoint_kwargs = {{{keywords}}}"]
             attributes = "".join(f"{indent}{line}\n" for line in lines) + "\n"
         if self._forward_inference_flow:
             codes = [
@@ -142,9 +142,9 @@ class TorchUserDefinedLearner(UserDefinedLearner[TorchLearnerBehavior]):
     """
 
     MIXED_PRECISION: bool | dict[str, Any] = False
-    """Whether to use mixed precision during backward pass.
+    """Whether to enable float16 gradient scaling (`torch.amp.GradScaler`).
 
-    If the value is a dictionary, it will be used as the keyword arguments for configuring mixed precision context.
+    If the value is a dictionary, it will be used as the keyword arguments for the gradient scaler.
     """
 
     MIXED_PRECISION_TYPE: Literal["bfloat16", "float16"] | None = None
@@ -232,9 +232,9 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
     def _flow_function(self, name: str, params: list[str], body: list[str], returns: list[str]) -> list[str]:
         """Emit one pure flow function plus the self-assignment that makes it rebindable (compilable)."""
         if not returns:
-            raise ValueError(f"Flow function {name} produces no value any later code needs; check the learner FLOW.")
+            raise SpecError(f"Flow function {name} produces no value any later code needs; check the learner FLOW.")
         indent = " " * 4
-        header = f"def {name}(__need_update__{''.join(f', {p}' for p in params)}):"
+        header = f"def {name}({', '.join(params)}):"
         tail = [f"{indent}return {', '.join(returns)}", f"self.{name} = {name}"]
         return [header, *[f"{indent}{line}" for line in body], *tail]
 
@@ -279,7 +279,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         params = [n for n in info["external"] if n in self.inputs]
         body = self._with_autocast([line for line, _ in info["lines"]])
         defs = self._flow_function("_flow_inference", params, body, self.outputs)
-        call = f"{', '.join(self.outputs)} = self._flow_inference(False{''.join(f', {p}' for p in params)})"
+        call = f"{', '.join(self.outputs)} = self._flow_inference({', '.join(params)})"
         return defs, [call]
 
     def _get_forward_training_flow(self) -> list[str]:
@@ -330,7 +330,9 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 if mixed_precision_name is None
                 else f"{mixed_precision_name}.scale({scaled}).backward({backward_kwargs})"
             )
-            params = [n for n in info["external"] if n in available]
+            # The gate leads the parameters of a training flow function: `_gated_body` reads it, and
+            # the inference flow, which gates nothing, takes no such parameter.
+            params = ["__need_update__", *[n for n in info["external"] if n in available]]
             needed = {loss} | set(self.outputs) | statement_names(backward_line)[0]
             needed |= {n for later in infos[i + 1 :] for n in later["external"]}
             returns = [n for n in info["stores"] if n in needed]
@@ -345,8 +347,7 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 else f"{m}.requires_grad_(False)"
                 for m in self.models
             ]
-            arguments = "__need_update__" + "".join(f", {p}" for p in params)
-            step.append(f"{', '.join(returns)} = self.{function_name}({arguments})")
+            step.append(f"{', '.join(returns)} = self.{function_name}({', '.join(params)})")
             step.append(backward_line)
             if self.accumulate_gradients:
                 step.append("if __need_update__:")
@@ -509,7 +510,7 @@ class {self.classname}:
     def __init__(self, {self._learner_models}, **kwargs):
         device_type = next({self.models[0]}.parameters()).device.type
         {sep.join([f"{m}.zero_grad()" for m in self.models])}
-        {sep.join([f"{k} = {v}" for k, v in initialized_layers.items()])}
+        {sep.join([f"{k} = {v}" for k, v in initialized_layers.items() if k != v])}
         {sep.join(instances)}
         {sep.join(self._forward_training_flow)}
         {sep.join(self._forward_inference_flow)}
@@ -601,7 +602,7 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         """Build the optimizer segment, registering the gradient clipper and scaler it needs."""
         # `learner` arrives through the base hook signature; `template_type` guarantees the torch schema.
         clip = cast(TorchLearnerBehavior, learner).CLIP
-        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION, module.MIXED_PRECISION_TYPE)
+        amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
         clip_name: str | None = None
         if clip:
             clip_inst, clip_cls = resolve_object(imports, clip)
@@ -661,14 +662,10 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         self,
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
-        mixed_precision_type: str | None,
     ) -> tuple[str, str | None]:
+        # The precision type is not read here: `_validate_mixed_precision` already refuses an enabled
+        # MIXED_PRECISION with anything but float16, so a scaler is built only where one is wanted.
         if isinstance(mixed_precision, bool) and not mixed_precision:
-            return "", None
-        if mixed_precision_type != "float16":
-            # bfloat16 shares float32's exponent range: gradients cannot underflow, so a scaler
-            # is pure overhead. The schema rejects this pairing; returning nothing keeps the
-            # builder safe regardless.
             return "", None
         if isinstance(mixed_precision, bool):
             mixed_precision = {}

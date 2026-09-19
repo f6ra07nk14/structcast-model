@@ -24,9 +24,7 @@ from structcast_model.builders.base import (
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import (
-    # Framework-neutral and shared with the Keras builder, re-exported here because a caller reading
-    # a learner's `OPTIMIZER_HASHES` reaches for it next to the builder that emitted them.
-    optimizer_hash,
+    optimizer_hash,  # re-exported here, next to the builder that emits a learner's `OPTIMIZER_HASHES`
     resolve_getter,
     resolve_object,
     statement_names,
@@ -285,7 +283,7 @@ def _keywords(part: Any) -> dict[str, Any] | None:
 
 def _is_inject(key: Any, value: Any) -> bool:
     """Report whether one serialized entry is an address naming `inject_hyperparams`."""
-    return key in ("_addr_", "_file_") and isinstance(value, str) and value.endswith("inject_hyperparams")
+    return key == "_addr_" and isinstance(value, str) and value.endswith("inject_hyperparams")
 
 
 def _references_inject(node: Any) -> bool:

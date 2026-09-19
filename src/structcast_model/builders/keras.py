@@ -52,14 +52,17 @@ leaving out a `Dropout` rate only means it was passed some other way.
 def _stateful_sublayer(expression: str) -> str | None:
     """Return the blocklisted Keras layer one emitted constructor expression builds, if it builds one.
 
-    A `rate=0` member of the Dropout family is let through: `Dropout.call` is guarded by `self.rate > 0`,
-    so it returns its input untouched and draws nothing, and the recomputation matches the first pass.
-    That is the shape a stochastic-depth section takes when its rate is parametrized down to zero.
+    A member of the Dropout family whose rate is a literal 0 is let through: `Dropout.call` is guarded
+    by `self.rate > 0`, so it returns its input untouched and draws nothing, and the recomputation
+    matches the first pass. That is the shape a stochastic-depth section takes when its rate is
+    parametrized down to zero. The family takes its rate first, so `Dropout(0.0)` counts as much as
+    `Dropout(rate=0.0)`; nothing else on the blocklist reads its first argument as a rate, and
+    `BatchNormalization(0)` names an axis.
 
     The attention and recurrent layers draw under the same guard, once per rate keyword, so every one
     written has to be a literal 0 -- an `LSTM` with `recurrent_dropout=0.2` still draws -- and writing
-    none is 0 too. They are judged by those keywords alone: a rate passed positionally or through a
-    `**` expansion is not seen.
+    none is 0 too. They are judged by those keywords alone: their rates are never the first argument,
+    so one passed positionally or through a `**` expansion is not seen.
     """
     try:
         node = ast.parse(expression, mode="eval").body
@@ -73,6 +76,8 @@ def _stateful_sublayer(expression: str) -> str | None:
     if not (name in _STATEFUL_KERAS_LAYERS or name in _DROPOUT_KEYWORD_KERAS_LAYERS or name.startswith("Random")):
         return None
     rates = [k.value for k in node.keywords if k.arg in ("rate", "dropout", "recurrent_dropout")]
+    if "Dropout" in name:
+        rates += node.args[:1]
     if (rates or name in _DROPOUT_KEYWORD_KERAS_LAYERS) and all(
         isinstance(rate, ast.Constant) and rate.value == 0 for rate in rates
     ):
@@ -130,12 +135,17 @@ class KerasLayerIntermediate(LayerIntermediate):
         """
         if self.gradient_checkpointing is None or not (stateful := _stateful_sublayers(self)):
             return self
+        rate = "a literal rate of 0"
+        if "Dropout" in stateful[0]:
+            # The family takes its rate first and is the only one whose first argument is read as one,
+            # so the positional spelling is offered to it alone.
+            rate += ", keyword or first positional"
         raise SpecError(
             f'GRADIENT_CHECKPOINTING cannot be applied to a layer whose FLOW builds "{stateful[0]}", here or in '
             "one of its sublayers: keras.remat runs the wrapped body a second time in the backward pass, and a "
             "layer that draws from a seed or updates its own variables does it twice -- different gradients on "
             "the TensorFlow and PyTorch backends, a tracer error on JAX. Checkpoint a layer that holds no such "
-            f"state, or parametrize {stateful[0]} down to a rate of 0, which draws nothing."
+            f"state, or parametrize {stateful[0]} down to {rate}, which draws nothing."
         )
 
     def _get_layer(self, layername: str) -> str:
@@ -504,19 +514,24 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         return [*lines, f"return {self._forward_outputs}"]
 
     def _reject_reserved_names(self) -> None:
-        """Reject a batch entry or a stored value named like a model or a flow layer.
+        """Reject a batch entry or a stored value named like a name the generated learner binds itself.
 
-        The flows are closures of `__init__` reading the models and flow layers by name, so a batch
-        parameter or a local a flow stores under one of those names is what the flow would read.
+        The flows are closures of `__init__` reading the models, the optimizers and the flow layers by
+        name, and the steps take the batch beside `self` and `**kwargs`, so a batch parameter or a local
+        a flow stores under one of those names is what the flow would read, or a parameter the step
+        cannot even declare twice.
         """
-        closed = {*self.models, *self.layers}
+        # `_flow_<optimizer>` and `_flow_inference` are left out: only `__init__` reads them, and a
+        # batch parameter or a flow's local never lands in that scope.
+        closed = {"self", "kwargs", *self.models, *self.others, *self.layers}
         units = [u for u in (*self.flow, *self.inference_flow) if not isinstance(u, OptimizerSegment)]
         for name in unique([*self.inputs, *[n for _, output, _ in units for n in stored_names(output)]]):
             if name in closed:
                 raise SpecError(
-                    f'Name "{name}" is both a model or flow layer of the learner and an input or a value its FLOW '
-                    "stores: the generated flows are closures of __init__ reading the models and flow layers by "
-                    "name, so the flow would call the batch entry or the stored value in its place. Rename one."
+                    f'Name "{name}" is reserved by the generated Keras learner, so it cannot name an input or a '
+                    "value its FLOW stores: the learner binds it for itself, a model, an optimizer or a flow "
+                    "layer, and the flows are closures of __init__ reading those names while the steps take the "
+                    "batch beside self and **kwargs. Rename one."
                 )
 
     def _get_learner_script(self, initialized_layers: dict[str, str]) -> str:
