@@ -513,6 +513,9 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         lines = [self._flow_step(i, o, L, training=False) for i, o, L in self.inference_flow]
         return [*lines, f"return {self._forward_outputs}"]
 
+    _init_locals: ClassVar[frozenset[str]] = frozenset({"adapter", "inners", "windows"})
+    """Locals `__init__` binds for the adapter bookkeeping, after the models and flow layers."""
+
     def _reject_reserved_names(self) -> None:
         """Reject a batch entry or a stored value named like a name the generated learner binds itself.
 
@@ -525,7 +528,17 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         # batch parameter or a flow's local never lands in that scope.
         closed = {"self", "kwargs", *self.models, *self.others, *self.layers}
         units = [u for u in (*self.flow, *self.inference_flow) if not isinstance(u, OptimizerSegment)]
-        for name in unique([*self.inputs, *[n for _, output, _ in units for n in stored_names(output)]]):
+        stored = [n for _, output, _ in units for n in stored_names(output)]
+        # `__init__` binds these after the models and layers, so a model or layer under one of them
+        # is rebound before any flow runs.
+        for name in unique([*self.models, *self.others, *self.layers, *self.inputs, *stored]):
+            if name in self._init_locals:
+                raise SpecError(
+                    f'Name "{name}" is reserved by the generated Keras learner: its __init__ binds it for the '
+                    "backend adapter bookkeeping after the models and flow layers, so a model, layer, input or "
+                    "stored value under it would be read as that bookkeeping by every flow. Rename it."
+                )
+        for name in unique([*self.inputs, *stored]):
             if name in closed:
                 raise SpecError(
                     f'Name "{name}" is reserved by the generated Keras learner, so it cannot name an input or a '

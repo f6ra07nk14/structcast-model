@@ -715,3 +715,24 @@ def test_the_keras_learner_templates_put_clipping_and_accumulation_in_the_optimi
     assert "global_clipnorm=1.5" in script
     assert "gradient_accumulation_steps=4" in script
     assert "CLIP" not in script
+
+
+@pytest.mark.parametrize("name", ["adapter", "windows"], ids=["layer", "input"])
+def test_keras_learner_rejects_a_layer_or_input_named_like_an_init_local(name: str) -> None:
+    """`__init__` binds `adapter`, `inners` and `windows` after the models and flow layers.
+
+    A flow layer or model under one of those names is rebound to the adapter bookkeeping before any
+    flow runs, so the closure calls a `TorchAdapter` or a list where it meant the layer; an input under
+    it shadows the bookkeeping inside the flow instead. Both surface only on the first batch.
+    """
+    raw = load_any(LEARNER_YAML)
+    if name == "adapter":
+        raw["LEARNERS"][0]["FLOW"][1]["NAME"] = name
+        raw["LEARNERS"][0]["INFERENCE_FLOW"][1][2] = name
+    else:
+        raw["INPUTS"][0] = name
+        raw["LEARNERS"][0]["FLOW"][0][0] = name
+        raw["LEARNERS"][0]["INFERENCE_FLOW"][0][0] = name
+
+    with pytest.raises(SpecError, match=f'Name "{name}" is reserved by the generated Keras learner'):
+        _ = KerasLearnerBuilder(raw=raw, current_path=str(LEARNER_YAML))().scripts
