@@ -5,7 +5,9 @@ from functools import partial
 import os
 from pathlib import Path
 import random
+import sys
 from time import time
+import traceback
 from typing import TYPE_CHECKING, Any, Literal
 
 from structcast.utils.base import dump_yaml_to_string
@@ -240,6 +242,21 @@ def call_calflops(
     print(f"FLOPs: {flops}")
     print(f"MACs: {macs}")
     print(f"Parameters: {params}")
+
+
+def _tear_down_failed_rank() -> None:
+    """Print the in-flight exception, then abort the process group without waiting on the other ranks.
+
+    `destroy_process_group` drains the group, and under NCCL that blocks while a peer still sits in a
+    collective waiting for this rank. The failing rank then never exits, its traceback is never printed,
+    and the job only dies on the NCCL watchdog timeout, naming a healthy collective. The traceback is
+    printed first so it survives any teardown; `_abort_process_group` (torch>=2.6) then returns at once,
+    and torch releases without it fall back to destroying the group.
+    """
+    traceback.print_exc()
+    sys.stderr.flush()
+    abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+    (abort or torch.distributed.destroy_process_group)()
 
 
 def _cap_gpu_memory(device: str, fraction: float | None) -> None:
@@ -547,9 +564,12 @@ def train(  # noqa: PLR0913, PLR0917
             if is_main:
                 print(f"Registered callbacks:\n{dump_yaml_to_string(trainer.describe())}")
             trainer.fit(epochs=epochs, start_epoch=start_epoch, validation_frequency=validation_frequency)
-    finally:
+    except BaseException:
         if distributed:
-            torch.distributed.destroy_process_group()
+            _tear_down_failed_rank()
+        raise
+    if distributed:
+        torch.distributed.destroy_process_group()
 
 
 __all__ = ["app"]
