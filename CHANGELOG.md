@@ -1,3 +1,20 @@
+## [6.0.1](https://github.com/f6ra07nk14/structcast-model/compare/v6.0.0...v6.0.1) (2026-09-25)
+
+
+### 📔 Docs
+
+* **agents:** point the issue tracker at structcast-model [skip ci] ([5c6415c](https://github.com/f6ra07nk14/structcast-model/commit/5c6415c8dcac4a3eca02b25daceb123d42bb1ac7))
+
+
+### 🔧 Fixes
+
+* **torch:** print a failing rank's traceback and abort its process group ([5880169](https://github.com/f6ra07nk14/structcast-model/commit/588016961354b1ce6fe0779c467f195a80e056d7)), closes [#34](https://github.com/f6ra07nk14/structcast-model/issues/34)
+
+
+### 🚨 Tests
+
+* **flax:** reject a non-callable tensor initializer ([59b564d](https://github.com/f6ra07nk14/structcast-model/commit/59b564d7b190610fe183624133e5b83652cb60c9)), closes [#22](https://github.com/f6ra07nk14/structcast-model/issues/22)
+
 ## [6.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v5.0.0...v6.0.0) (2026-09-25)
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "structcast-model"
-version = "6.0.0"
+version = "6.0.1"
 description = "Construct neural network models and training workflows by structcast package."
 readme = "README.md"
 requires-python = ">=3.11"
