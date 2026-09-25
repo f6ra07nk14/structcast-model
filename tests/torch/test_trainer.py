@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 from typing import Any
 
@@ -10,8 +9,8 @@ import pytest
 from torch.nn import Module
 
 from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
+from structcast_model.loggers.base import NullLogger
 from structcast_model.torch.distributed import SingleDeviceStrategy
-from structcast_model.torch.logger import NullLogger
 from structcast_model.torch.trainer import (
     TorchBestCriterion,
     TorchTracker,
@@ -23,6 +22,7 @@ from structcast_model.torch.trainer import (
     initial_distributed_env,
     initial_model,
 )
+from tests.fakes import CountingLearner, SteppedInfo
 import torch
 
 # ---------------------------------------------------------------------------
@@ -44,20 +44,7 @@ class _LossModule(Module):
         return {"loss": torch.tensor(0.5)}
 
 
-@dataclass(kw_only=True)
-class _InfoWithModels(BaseInfo[torch.nn.Module]):
-    """Info carrying models without a trainer, for callbacks tested outside a training loop."""
-
-    named_models: dict[str, torch.nn.Module] = field(default_factory=dict)
-    """The models the property hands out."""
-
-    @property
-    def models(self) -> dict[str, torch.nn.Module]:
-        """Return the models this info was built with."""
-        return self.named_models
-
-
-class _StubLearner:
+class _StubLearner(CountingLearner):
     """A minimal stub implementing the Learner protocol for tests that don't exercise a real step."""
 
     def __init__(
@@ -67,9 +54,10 @@ class _StubLearner:
         optimizers: dict[str, Any] | None = None,
     ) -> None:
         """Initialize with optional models, optimizers, and the learning rates a real learner would report."""
+        super().__init__()
         self._models = models or {}
         self._optimizers = optimizers or {}
-        self.learning_rates = learning_rates or {}
+        self._learning_rates = learning_rates or {}
 
     @property
     def models(self) -> dict[str, Any]:
@@ -86,17 +74,10 @@ class _StubLearner:
         """Pair every optimizer with every model, which is the pairing a single-model learner reports."""
         return {name: list(self._models) for name in self._optimizers}
 
-    def update(self, step: int) -> bool:
-        """Always signal that an update should occur."""
-        return True
-
-    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op training step."""
-        return {}
-
-    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op inference step."""
-        return {}
+    @property
+    def learning_rates(self) -> dict[str, float]:
+        """Return the learning rates a real learner would report."""
+        return self._learning_rates
 
 
 class _MetricModule(Module):
@@ -557,13 +538,15 @@ def test_training_state_saver_records_everything_needed_to_resume() -> None:
     """A run is resumed from the weights, the optimizer state, and the loop counters together."""
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    learner = _StubLearner(models={"model": model}, optimizers={"opt": optimizer})
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(models={"model": model}, optimizers={"opt": optimizer}),
+        learner=learner,
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=SimpleDataProvider(training_dataset=[]),
     )
-    trainer.epoch, trainer.step, trainer.update = 3, 7, 2
+    trainer.epoch = 3
+    learner.restore_counters(steps=7, updates=2)
     recorder = _RecordingLogger()
     TrainingStateSaver(logger=recorder, strategy=SingleDeviceStrategy(device="cpu")).on_epoch_end(trainer)
     states, name = recorder.states[0]
@@ -648,8 +631,8 @@ def test_from_criteria_monitor_logs_the_best_value_each_epoch() -> None:
     """The best value must land in the run as a metric: that is what makes a run comparable afterwards."""
     logger = _BestRecordingLogger()
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], [], logger, SingleDeviceStrategy(device="cpu"))
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert logger.metrics == [("best_val_loss", 0.3, 1)]
@@ -663,8 +646,8 @@ def test_from_criteria_saves_the_state_only_for_save_criteria(save_criteria: lis
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], save_criteria, logger, SingleDeviceStrategy(device="cpu")
     )
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert logger.states == expected
@@ -676,11 +659,11 @@ def test_from_criteria_does_not_save_a_stale_best() -> None:
     (monitor,) = TorchBestCriterion.from_criteria(
         [], ["val_loss"], ["val_loss"], logger, SingleDeviceStrategy(device="cpu")
     )
-    info = _InfoWithModels(named_models={"model": torch.nn.Linear(4, 2)})
-    info.epoch, info.step = 1, 5
+    info = SteppedInfo(named_models={"model": torch.nn.Linear(4, 2)})
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
-    info.epoch, info.step = 2, 9
+    info.epoch, info.current_step = 2, 9
     info.history[2] = {"val_loss": 0.9}
     monitor.on_epoch_end(info)
     assert logger.states == ["best_val_loss"]
@@ -696,8 +679,8 @@ def test_from_criteria_saves_the_states_the_strategy_produced() -> None:
     strategy = _RecordingStrategy()
     model = torch.nn.Linear(4, 2)
     (monitor,) = TorchBestCriterion.from_criteria([], ["val_loss"], ["val_loss"], logger, strategy)
-    info = _InfoWithModels(named_models={"model": model})
-    info.epoch, info.step = 1, 5
+    info = SteppedInfo(named_models={"model": model})
+    info.epoch, info.current_step = 1, 5
     info.history[1] = {"val_loss": 0.3}
     monitor.on_epoch_end(info)
     assert strategy.calls == [{"model": model}]

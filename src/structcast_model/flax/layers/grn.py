@@ -21,7 +21,7 @@ class GlobalResponseNorm(Module):
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
         bias_init: Initializer = initializers.zeros_init(),  # noqa: B008
-        scale_init: Initializer = initializers.ones_init(),  # noqa: B008
+        scale_init: Initializer = initializers.zeros_init(),  # noqa: B008
         reduction_axes: Axes = (1, 2),
         feature_axes: Axes = -1,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
@@ -44,6 +44,9 @@ class GlobalResponseNorm(Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """Applies Global Response Normalization to the input."""
         x, scale, bias = self.promote_dtype((x, self.scale, self.bias), dtype=self.dtype)
-        x_g = jnp.sqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
+        norm = jnp.sqrt((x * x).sum(axis=self.reduction_axes, keepdims=True))
+        masked = jnp.where(norm <= 0, jnp.ones_like(x), x)
+        masked_norm = jnp.sqrt((masked * masked).sum(axis=self.reduction_axes, keepdims=True))
+        x_g = jnp.where(norm <= 0, 0, masked_norm)
         x_n = x_g / (x_g.mean(axis=self.feature_axes, keepdims=True) + self.epsilon)
         return x + (x * x_n) * scale + bias

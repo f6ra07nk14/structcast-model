@@ -14,6 +14,7 @@ from timm.data import AugMixDataset, FastCollateMixup, ImageDataset, Mixup
 
 from structcast_model.base_trainer import BaseInfo, DataProvider, SimpleDataProvider
 from structcast_model.torch.trainer import TorchTracker, TorchTrainer
+from tests.fakes import CountingLearner
 import torch
 
 
@@ -32,27 +33,6 @@ _EXAMPLE = _load_example_module()
 TimmDatasetWrapper = _EXAMPLE.TimmDatasetWrapper
 TimmDataLoaderWrapper = _EXAMPLE.TimmDataLoaderWrapper
 TimmDataProvider = _EXAMPLE.TimmDataProvider
-
-
-class _StubLearner:
-    """A minimal stub implementing the Learner protocol, for the trainer routing test."""
-
-    models: dict[str, Any] = {}
-    optimizers: dict[str, Any] = {}
-    optimizer_models: dict[str, list[str]] = {}
-    learning_rates: dict[str, float] = {}
-
-    def update(self, step: int) -> bool:
-        """Always signal that an update should occur."""
-        return True
-
-    def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op training step."""
-        return {}
-
-    def inference_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """No-op inference step."""
-        return {}
 
 
 def _populate_image_folder(root: Path, *, num_classes: int = 2, images_per_class: int = 4) -> Path:
@@ -273,7 +253,7 @@ def test_timm_dataloader_is_routed_into_the_epoch_events_by_the_trainer() -> Non
     """The renamed hooks are what let the trainer pick the dataset up from the provider scan."""
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(),
+        learner=CountingLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=SimpleDataProvider(training_dataset=_training_wrapper()),
     )
@@ -340,6 +320,42 @@ def test_timm_dataloader_wrapper_dataloader_with_aug_splits(image_folder: Path) 
         **_LOADER_BASE_KWARGS,
     )
     assert isinstance(wrapper.dataset_wrapper, AugMixDataset)
+
+
+def _distributed_wrapper(image_folder: Path) -> Any:
+    """A wrapper that believes it is running distributed, so timm builds a sharding sampler."""
+    wrapper = TimmDataLoaderWrapper(
+        dataset=TimmDatasetWrapper(name="", root=str(image_folder), batch_size=2),
+        **_LOADER_BASE_KWARGS,
+    )
+    wrapper.__dict__["distributed"] = True
+    return wrapper
+
+
+def test_timm_dataloader_shards_on_the_data_coordinates_rather_than_the_global_rank(
+    image_folder: Path, single_process_gloo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`create_loader` shards on the global rank, which `scm torch train`'s coordinates override.
+
+    Under a tensor-parallel strategy the ranks of one group split a single model and must be fed
+    the identical batch: the sampler timm builds hands each of them a different slice instead,
+    which trains a mismatched model rather than failing. Without the variables -- a standalone run,
+    or a plain `torchrun` -- timm's own sampler is left alone, which is what DDP needs.
+    """
+    monkeypatch.setenv("DATA_RANK", "1")
+    monkeypatch.setenv("DATA_WORLD_SIZE", "2")
+    published = _distributed_wrapper(image_folder).dataloader.sampler
+
+    # The process group is rank 0 of 1; the published coordinates are what the sampler must use.
+    assert (published.rank, published.num_replicas) == (1, 2)
+    assert len(published) == 4  # half of the 8 images
+
+    monkeypatch.delenv("DATA_RANK")
+    monkeypatch.delenv("DATA_WORLD_SIZE")
+    fallback = _distributed_wrapper(image_folder).dataloader.sampler
+
+    assert (fallback.rank, fallback.num_replicas) == (0, 1)
+    assert len(fallback) == 8
 
 
 def test_timm_dataloader_wrapper_len(image_folder: Path) -> None:
@@ -491,7 +507,7 @@ def test_timm_data_provider_wrappers_are_routed_into_the_epoch_events_by_the_tra
     """
     trainer = TorchTrainer(
         device="cpu",
-        learner=_StubLearner(),
+        learner=CountingLearner(),
         tracker=TorchTracker.from_criteria(["loss"], distributed=False),
         data=TimmDataProvider(training=_training_wrapper(), validation=TimmDataLoaderWrapper()),
     )

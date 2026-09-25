@@ -9,8 +9,9 @@ OUTPUTS: [out]
 STRUCTURED_OUTPUT: false
 _jinja_yaml_: |-
   FLOW:
-    # Initial convolution block
-    - [image, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: {{channels}}}}]]
+    # Initial convolution block. The pad follows the convolution below, not the channel count: a
+    # kernel of size k reflects exactly k // 2 pixels per side, which is what keeps the resolution.
+    - [image, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: 3}}]]
     - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{init_features}}, kernel_size: 7}}]]
     - [_, _, [_obj_, {_addr_: torch.nn.InstanceNorm2d}, {_call_: {num_features: {{init_features}}}}]]
     - [_, _, [_obj_, {_addr_: torch.nn.ReLU}, {_call_: {inplace: true}}]]
@@ -24,8 +25,8 @@ _jinja_yaml_: |-
     # Upsampling
     - [_, _, up0, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features * 2}}}}}]
     - [_, _, up1, {TYPE: UpBlock, PARAM: {DEFAULT: {fout: {{init_features}}}}}]
-    # Output layer
-    - [_, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: {{channels}}}}]]
+    # Output layer, reflecting 7 // 2 pixels per side for its own 7x7 convolution as the stem does
+    - [_, _, [_obj_, {_addr_: torch.nn.ReflectionPad2d}, {_call_: {padding: 3}}]]
     - [_, _, [_obj_, {_addr_: torch.nn.LazyConv2d}, {_call_: {out_channels: {{channels}}, kernel_size: 7}}]]
     - [_, out, [_obj_, {_addr_: torch.nn.Tanh}, _call_]]
 ResidualBlock:

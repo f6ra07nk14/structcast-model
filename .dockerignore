@@ -8,3 +8,4 @@ coverage_html/
 *.pyc
 .coverage*
 coverage.xml
+.tox/

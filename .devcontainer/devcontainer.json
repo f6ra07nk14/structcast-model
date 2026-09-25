@@ -23,7 +23,7 @@
             "version": "20"
         }
     },
-    "initializeCommand": "bash -lc 'mkdir -p \"$HOME/.codex\" \"$HOME/.claude\" && if [ ! -e \"$HOME/.claude.json\" ]; then printf \"{}\\n\" > \"$HOME/.claude.json\" && chmod 600 \"$HOME/.claude.json\"; fi'",
+    "initializeCommand": "bash -lc 'mkdir -p \"$HOME/.codex\" \"$HOME/.claude\" \"$HOME/.gemini/antigravity-cli\" \"$HOME/.gemini/config\" \"$HOME/.config/herdr\" \"$HOME/.local/state/herdr\" && if [ ! -e \"$HOME/.claude.json\" ]; then printf \"{}\\n\" > \"$HOME/.claude.json\" && chmod 600 \"$HOME/.claude.json\"; fi'",
     "runArgs": [
         // GPUs for this container itself. Sibling containers started through
         // the forwarded Docker socket are created by the host daemon, so they
@@ -58,6 +58,14 @@
         // container unless the host home layout matches.
         "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind",
         "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
+        // Persist Antigravity CLI settings and workspace conversation indexes.
+        "source=${localEnv:HOME}/.gemini/antigravity-cli,target=/home/vscode/.gemini/antigravity-cli,type=bind",
+        // Persist Antigravity CLI global customizations, including Herdr hooks.
+        "source=${localEnv:HOME}/.gemini/config,target=/home/vscode/.gemini/config,type=bind",
+        // Persist Herdr sessions, configuration, and client/plugin state.
+        // Host directories must be writable by UID 1000 (remoteUser vscode).
+        "source=${localEnv:HOME}/.config/herdr,target=/home/vscode/.config/herdr,type=bind",
+        "source=${localEnv:HOME}/.local/state/herdr,target=/home/vscode/.local/state/herdr,type=bind",
         // Use a stable project volume so shell history survives container rebuilds.
         "source=commandhistory,target=/commandhistory,type=volume"
     ],

@@ -1,11 +1,119 @@
 """Unit tests for structcast_model.commands.main."""
 
+from collections.abc import Callable, Iterator
+import inspect
+import logging
+import subprocess
+import sys
 from typing import Any
 
+import pytest
 from structcast.utils.base import register_dir, unregister_dir
+from typer import Typer
+from typer.models import ArgumentInfo, OptionInfo
 from typer.testing import CliRunner
 
 from structcast_model.commands.main import app
+from structcast_model.commands.utils import bool_or_path_or_dict_parser
+
+
+def _iter_commands(typer_app: Typer, path: tuple[str, ...] = ()) -> Iterator[tuple[str, Callable[..., Any]]]:
+    """Yield ``(command path, callback)`` for every command registered under `typer_app`, recursively."""
+    if typer_app.registered_callback is not None and typer_app.registered_callback.callback is not None:
+        yield " ".join((*path, "(callback)")), typer_app.registered_callback.callback
+    for command in typer_app.registered_commands:
+        assert command.callback is not None
+        yield " ".join((*path, command.name or command.callback.__name__)), command.callback
+    for group in typer_app.registered_groups:
+        assert group.typer_instance is not None
+        yield from _iter_commands(group.typer_instance, (*path, group.name or ""))
+
+
+def test_every_cli_parameter_has_help() -> None:
+    """Every option and argument of every command must document itself, or `--help` shows a blank description."""
+    missing = [
+        f"{command_path} / {param_name}"
+        for command_path, callback in _iter_commands(app)
+        for param_name, param in inspect.signature(callback).parameters.items()
+        if isinstance(param.default, OptionInfo | ArgumentInfo) and not (param.default.help or "").strip()
+    ]
+    assert not missing, f"CLI parameters without help text: {missing}"
+
+
+def test_every_compile_option_comes_from_one_factory() -> None:
+    """`--compile` means one thing on all six commands (`docs/adr/0024`), so one factory declares all six.
+
+    Written per command, the flag came to carry four meanings and no two texts agreed on the value
+    grammar. Pinning the parser identity and the shared sentence catches the way that comes back: a
+    command hand-rolling its own `Option` again, or editing its copy of the prose in place. The
+    per-command fragments are the other half -- a factory ignoring its `tail` would pass the rest.
+    """
+    options = {
+        command_path: param.default
+        for command_path, callback in _iter_commands(app)
+        for param in inspect.signature(callback).parameters.values()
+        if isinstance(param.default, OptionInfo) and "--compile" in (param.default.param_decls or ())
+    }
+
+    assert set(options) == {"torch time", "torch train", "flax time", "flax train", "keras time", "keras train"}
+    shared = 'Omitted, "null" or "false" runs them eagerly; "true" compiles with default options.'
+    for command_path, option in options.items():
+        assert shared in (option.help or ""), command_path
+        assert option.parser is bool_or_path_or_dict_parser, command_path
+    for command_path, fragment in (
+        ("torch time", 'with "torch.compile"'),
+        ("flax time", 'with "nnx.jit"'),
+        ("flax train", 'with "nnx.jit"'),
+        ("flax train", "what is static and what is donated"),
+        ("keras time", "builds no compiled step"),
+        ("keras time", "stateless scope"),
+        ("keras train", "builds no compiled step"),
+    ):
+        assert fragment in (options[command_path].help or ""), command_path
+
+
+def test_short_flags_are_globally_unique() -> None:
+    """One letter, one meaning: a short flag reused for a different long option would silently change meaning."""
+    meanings: dict[str, str] = {}
+    collisions: list[str] = []
+    for command_path, callback in _iter_commands(app):
+        for param_name, param in inspect.signature(callback).parameters.items():
+            if not isinstance(param.default, OptionInfo):
+                continue
+            decls = list(param.default.param_decls or ())
+            long = next((decl for decl in decls if decl.startswith("--")), param_name)
+            shorts = [decl for decl in decls if decl.startswith("-") and not decl.startswith("--")]
+            for short in shorts:
+                if meanings.setdefault(short, long) != long:
+                    collisions.append(f"{short}: {meanings[short]} vs {long} (at {command_path} / {param_name})")
+    assert not collisions, f"Short flags meaning more than one long option: {collisions}"
+
+
+@pytest.mark.parametrize("module", ["cmd_flax", "cmd_keras", "cmd_torch"])
+def test_importing_a_command_module_imports_no_framework(module: str) -> None:
+    """Building the CLI must cost no framework: `main` imports all three command modules at once.
+
+    Every framework a command drives is reached through a lazy router or a `LazyModuleImporter`, so
+    that `--help` and the framework-free commands stay fast and a run pays only for the framework it
+    asked for. A single eager import -- a plain `from structcast_model.torch import ...` here, or one
+    added to a shim on the way -- would silently make every invocation import torch, JAX and Keras.
+    A subprocess is the only honest check: the test session has all three imported long before this
+    runs.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import structcast_model.commands.{module}; import sys; "
+            "leaked = [name for name in ('torch', 'tensorflow', 'jax', 'keras', 'flax') if name in sys.modules]; "
+            "raise SystemExit(f'imported: {leaked}' if leaked else 0)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_app_no_args_is_help(cli_runner: CliRunner) -> None:
@@ -20,6 +128,58 @@ def test_app_help(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "torch" in result.output
+
+
+@pytest.mark.parametrize(("flags", "expected"), [([], logging.INFO), (["--log-level", "DEBUG"], logging.DEBUG)])
+def test_log_level_is_applied_before_a_group_runs(cli_runner: CliRunner, flags: list[str], expected: int) -> None:
+    """The commands report progress through `logging`, which the root level decides the visibility of.
+
+    The default has to stay INFO, or notices such as the resume "Ignoring --start-epoch" line are dropped
+    by the root logger's WARNING default and a run silently looks like it obeyed an ignored option.
+
+    The root starts at WARNING here on purpose: `log_level = "INFO"` in `pyproject.toml` already leaves
+    it at INFO, so asserting against that default would pass with the callback deleted entirely.
+    """
+    root = logging.getLogger()
+    original = root.level
+    try:
+        root.setLevel(logging.WARNING)
+        result = cli_runner.invoke(app, [*flags, "torch", "--help"])
+        assert result.exit_code == 0, result.output
+        assert root.level == expected
+    finally:
+        root.setLevel(original)
+
+
+LOG_PROBE = """
+import logging, sys
+from structcast_model.commands.main import app
+
+@app.command(name="probe")
+def probe() -> None:
+    logging.getLogger("structcast_model.torch.trainer").info("INFO-MARKER")
+    logging.getLogger("structcast_model.torch.trainer").debug("DEBUG-MARKER")
+
+app([*sys.argv[1:], "probe"], standalone_mode=False)
+"""
+
+
+@pytest.mark.parametrize(
+    ("flags", "printed"),
+    [([], {"INFO"}), (["--log-level", "DEBUG"], {"INFO", "DEBUG"}), (["--log-level", "WARNING"], set())],
+)
+def test_log_level_decides_which_records_a_real_run_prints(flags: list[str], printed: set[str]) -> None:
+    """Setting the root level is only half of it: a run with no handler prints nothing whatever the level is.
+
+    `basicConfig` installs the stderr handler as well as setting the level. Without it the records reach
+    `logging.lastResort`, which drops everything below WARNING, so `--log-level DEBUG` would be accepted
+    and then print nothing. A subprocess is the only honest check: `log_level = "INFO"` in
+    `pyproject.toml` has pytest configure the root logger long before this runs.
+    """
+    result = subprocess.run([sys.executable, "-c", LOG_PROBE, *flags], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {level for level in ("INFO", "DEBUG") if f"{level}-MARKER" in result.stderr} == printed, result.stderr
 
 
 def test_app_torch_help(cli_runner: CliRunner) -> None:

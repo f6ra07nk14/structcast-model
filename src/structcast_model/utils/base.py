@@ -4,15 +4,21 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from logging import getLogger
 import re
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from pydantic_core import from_json
 from structcast.utils.base import find_path, import_from_address, load_yaml
 from structcast.utils.types import PathLike
 
+from structcast_model.base_trainer import TensorInitializer
+
 logger = getLogger(__name__)
 
 T = TypeVar("T")
+
+DTypeT = TypeVar("DTypeT")
+
+TensorT = TypeVar("TensorT")
 
 
 def load_json(path: PathLike) -> Any:
@@ -80,13 +86,9 @@ def to_snake(value: str) -> str:
     Returns:
         The converted string in snake_case.
     """
-    # Handle the sequence of uppercase letters followed by a lowercase letter
     value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
-    # Insert an underscore between a lowercase letter and an uppercase letter
     value = re.sub(r"([a-z])([A-Z])", r"\1_\2", value)
-    # Insert an underscore between a digit and an uppercase letter
     value = re.sub(r"([0-9])([A-Z])", r"\1_\2", value)
-    # Insert an underscore between a lowercase letter and a digit
     value = re.sub(r"([a-z])([0-9])", r"\1_\2", value)
     value = re.sub(r"(\W+)", "_", value)
     value = re.sub("__([A-Z])", r"_\1", value)
@@ -122,47 +124,46 @@ def resolve_tensor_initializer(
     init: str | None,
     dtype: str,
     *,
-    float_default: Any,
-    int_default: Any,
-    protocol: Any,
-) -> Any:
+    float_default: TensorInitializer[DTypeT, TensorT],
+    int_default: TensorInitializer[DTypeT, TensorT],
+) -> TensorInitializer[DTypeT, TensorT]:
     """Resolve the callable creating a dummy tensor for a tensor specification.
 
     Args:
         init (str | None): The address of the initializer to use,
             or `None` to select a default based on `dtype`.
         dtype (str): The name of the element type of the tensor, e.g. `"bfloat16"` or `"int64"`.
-        float_default (Any): The initializer to use for floating point element types.
-        int_default (Any): The initializer to use for integer element types,
+        float_default (TensorInitializer[DTypeT, TensorT]): The initializer to use for floating point element types.
+        int_default (TensorInitializer[DTypeT, TensorT]): The initializer to use for integer element types,
             since the floating point default cannot produce integer values.
-        protocol (Any): The runtime-checkable protocol the resolved initializer must satisfy.
 
     Returns:
-        Any: The initializer, to be called as `initializer(size, dtype=...)`.
+        TensorInitializer[DTypeT, TensorT]: The initializer, to be called as `initializer(size, dtype=...)`.
 
     Raises:
-        TypeError: If the initializer resolved from `init` does not satisfy `protocol`.
+        TypeError: If the initializer resolved from `init` does not satisfy `TensorInitializer`.
 
     Note:
         A runtime-checkable protocol only verifies that `__call__` exists, which makes this check
         equivalent to `callable(...)`. A mismatched signature is only detected when the initializer is called.
+        The element and tensor types of an imported initializer are therefore taken on trust from the defaults.
     """
     if init is not None:
         initializer = import_from_address(init)
-        if not isinstance(initializer, protocol):
+        if not isinstance(initializer, TensorInitializer):
             raise TypeError(f"Initializer is not callable as a tensor initializer: {init!r}")
-        return initializer
+        return cast("TensorInitializer[DTypeT, TensorT]", initializer)
     if dtype.startswith("int"):
         logger.warning('No initializer specified for dtype "%s". Falling back to zeros.', dtype)
         return int_default
     return float_default
 
 
-def resolve_input_shapes(model: Any, shapes: Any = None) -> Any:
+def resolve_input_shapes(model: object, shapes: Any = None) -> Any:
     """Resolve the input shapes to create dummy inputs from, preferring the explicitly requested ones.
 
     Args:
-        model (Any): The built model, or a mapping or sequence of models. The `input_shapes` attribute
+        model (object): The built model, or a mapping or sequence of models. The `input_shapes` attribute
             emitted by the builders is used when no shapes are requested; for a collection of models,
             the attributes of its members are merged.
         shapes (Any): The explicitly requested shapes, which take precedence when they are not empty.

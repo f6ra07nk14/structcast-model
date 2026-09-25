@@ -16,7 +16,7 @@ class ChannelLastShuffle(Module):
         super().__init__()
         self.groups = groups
 
-    def forward(self, input: Tensor) -> Tensor:  # pylint: disable=redefined-builtin
+    def forward(self, input: Tensor) -> Tensor:
         """Rearrange the last channels in a tensor."""
         prefix = input.shape[:-1]
         dim = input.shape[-1]

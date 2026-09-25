@@ -8,17 +8,17 @@ from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, Learner
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
+from structcast_model.loggers.base import Logger
 from structcast_model.torch.distributed import DistributedStrategy, initial_distributed_env
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
-from structcast_model.torch.logger import Logger
-from structcast_model.torch.types import Tensor, TensorInitializer
+from structcast_model.torch.types import Tensor
 from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
 
-logger = getLogger(__name__)
+_logger = getLogger(__name__)
 
 DTYPES = {
     "float32": torch.float32,
@@ -57,7 +57,6 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
             node.DTYPE,
             float_default=torch.rand,
             int_default=torch.zeros,
-            protocol=TensorInitializer,
         )
         return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
     if isinstance(node, Mapping):
@@ -176,7 +175,6 @@ class TorchTracker:
         """
         tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            # torch.compile returns an OptimizedModule proxying the tracker, typed as a plain Module.
             tracker = cast("CriteriaTracker", compile_fn(tracker))
         if distributed is None:
             distributed = torch.distributed.is_initialized()
@@ -244,8 +242,6 @@ class _BestLogger:
         name = f"best_{best.target}"
         self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
-            # Producing the states is a collective, so every rank must reach it. That the ranks agree
-            # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
             self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
 
 
@@ -262,12 +258,53 @@ class TrainingStateSaver:
     def on_epoch_end(self, info: BaseInfo[torch.nn.Module]) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
-        # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
         states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
         states["meta"] = {"epoch": info.epoch, "step": info.step, "update": info.update}
         self.logger.log_state_dict(states, "training_state")
+
+
+def restore_training_state(
+    *,
+    resume: str,
+    strategy: DistributedStrategy,
+    models: Mapping[str, torch.nn.Module],
+    learner: Learner[torch.nn.Module],
+    start_epoch: int,
+    logger: Logger,
+    is_main: bool = True,
+) -> int:
+    """Load the resumed state into the models, optimizers and gradient scalers, and return the epoch to continue at.
+
+    The saved epoch wins over *start_epoch*. The logger owns the reference format
+    and only rank 0 holds a real one: the `NullLogger` ranks fetch nothing and take the state from
+    the strategy's broadcast.
+
+    Args:
+        resume (str): The training state reference, in whatever form *logger* accepts.
+        strategy (DistributedStrategy): The strategy loading the state into the live modules.
+        models (Mapping[str, torch.nn.Module]): The live models to restore into.
+        learner (Learner[torch.nn.Module]): The learner owning the optimizers and gradient scalers to restore into.
+        start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
+        logger (Logger): The logger the state is fetched through.
+        is_main (bool): Whether this process logs the override message.
+
+    Returns:
+        int: The epoch to continue at: the saved one plus one.
+    """
+    state = strategy.load_state_dict(
+        models, learner.optimizers, learner.optimizer_models, logger.fetch_training_state(resume)
+    )
+    for scaler_name, scaler in getattr(learner, "grad_scalers", {}).items():
+        if state.get("grad_scalers", {}).get(scaler_name):
+            scaler.load_state_dict(state["grad_scalers"][scaler_name])
+    meta = state["meta"]
+    learner.restore_counters(int(meta["step"]), int(meta["update"]))
+    resumed_epoch = int(meta["epoch"]) + 1
+    if start_epoch != 1 and is_main:
+        _logger.info("Ignoring --start-epoch %s: the resumed state continues at epoch %s.", start_epoch, resumed_epoch)
+    return resumed_epoch
 
 
 __all__ = [
@@ -283,6 +320,7 @@ __all__ = [
     "initial_distributed_env",
     "initial_model",
     "resolve_input_shapes",
+    "restore_training_state",
 ]
 
 

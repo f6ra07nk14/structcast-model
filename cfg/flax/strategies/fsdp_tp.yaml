@@ -1,0 +1,24 @@
+# Distributed strategy pattern: fully sharded data parallel and tensor parallelism on one
+# two-dimensional mesh. model_devices says how many devices the "model" axis spans and is required
+# here; the rest become the "data" axis, along which the batch is split and the parameters no
+# column/row rule claimed are sharded. The rule table is read in order and the first match wins, so
+# the tensor-parallel rules come before the catch-all "fsdp" one: a parameter is sharded on one axis
+# or the other, never both. The pattern is called with device=..., which this preset ignores: it
+# spans the devices itself. See tp.yaml for the tactics and for model_axis_mode.
+#
+# The rules below are written for cfg/flax/models/VisionTransformer.yaml and must be adapted to the
+# model they run on: a rule matching no parameter is refused at wrap time. See tp.yaml for the
+# SmallLanguageModel variant.
+- _obj_
+- _addr_: structcast_model.flax.distributed.FlaxDistributedStrategy
+- _bind_:
+    preset: fsdp_tp
+    model_devices: 2
+    min_size: 1048576 # 1 MiB, the cutoff of the "fsdp" tactic alone
+    # devices: 8
+    rules:
+      - ["\\.self_attention\\.qkv_proj\\.", column]
+      - ["\\.self_attention\\.out_proj\\.", row]
+      - ["\\.linear\\.", column]
+      - ["\\.linear_1\\.", row]
+      - [".*", fsdp]

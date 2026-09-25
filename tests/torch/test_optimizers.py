@@ -10,7 +10,15 @@ import pytest
 from torch.nn import Linear
 
 from structcast_model.base_trainer import BaseInfo
-from structcast_model.torch.optimizers import create_opt, get_decays, set_lr_scale
+from structcast_model.torch.optimizers import (
+    create_opt,
+    get_decays,
+    get_learning_rate,
+    get_named_parameters,
+    get_param_groups,
+    restore_requires_grad,
+    set_lr_scale,
+)
 import torch
 
 # Access private helpers via the exported function's __globals__
@@ -194,6 +202,80 @@ def test_param_groups_weight_decay_excludes_frozen_params() -> None:
     )
     all_params = [p for g in groups for p in g["params"]]
     assert not any(p is model.weight for p in all_params)
+
+
+# ---------------------------------------------------------------------------
+# get_named_parameters
+# ---------------------------------------------------------------------------
+
+
+def test_get_named_parameters_from_module() -> None:
+    """Named parameters exist so optimizer state is keyed by name per the repo's Pairing concept."""
+    model = Linear(4, 2)
+    result = get_named_parameters([model])
+    names = [n for n, _ in result]
+    assert "weight" in names
+    assert "bias" in names
+
+
+def test_get_named_parameters_from_pre_named_iterable() -> None:
+    """Pre-named iterables are spliced as-is, so custom parameter sources bypass named_parameters()."""
+    pre_named = [("custom.weight", torch.nn.Parameter(torch.zeros(3)))]
+    result = get_named_parameters([pre_named])
+    assert result == pre_named
+
+
+def test_get_named_parameters_mixed_sources() -> None:
+    """Both modules and pre-named iterables can appear in the same call."""
+    model = Linear(4, 2)
+    pre_named = [("extra.bias", torch.nn.Parameter(torch.zeros(1)))]
+    result = get_named_parameters([model, pre_named])
+    names = [n for n, _ in result]
+    assert "weight" in names
+    assert "extra.bias" in names
+
+
+# ---------------------------------------------------------------------------
+# restore_requires_grad
+# ---------------------------------------------------------------------------
+
+
+def test_restoring_requires_grad_defaults() -> None:
+    """Partially frozen models must stay frozen through training steps; this helper is the mechanism."""
+    model = Linear(4, 2)
+    model.weight.requires_grad_(False)
+    defaults = [p.requires_grad for p in model.parameters()]
+    # Blanket unfreeze, then restore
+    for p in model.parameters():
+        p.requires_grad_(True)
+    restore_requires_grad(model, defaults)
+    assert model.weight.requires_grad is False
+    assert model.bias.requires_grad is True
+
+
+# ---------------------------------------------------------------------------
+# get_learning_rate
+# ---------------------------------------------------------------------------
+
+
+def test_get_learning_rate_returns_first_group_lr() -> None:
+    """The base learning rate lives in group 0; surfacing it keeps generated scripts free of index magic."""
+    optimizer = torch.optim.SGD(Linear(4, 2).parameters(), lr=0.42)
+    assert get_learning_rate(optimizer) == pytest.approx(0.42)
+
+
+# ---------------------------------------------------------------------------
+# get_param_groups
+# ---------------------------------------------------------------------------
+
+
+def test_param_groups_getter_strips_params_key() -> None:
+    """The params tensor list is redundant for reporting and breaks serialization; it must be stripped."""
+    optimizer = torch.optim.SGD(Linear(4, 2).parameters(), lr=0.01)
+    groups = get_param_groups(optimizer)
+    assert len(groups) == 1
+    assert "params" not in groups[0]
+    assert "lr" in groups[0]
 
 
 # ---------------------------------------------------------------------------

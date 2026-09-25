@@ -30,7 +30,7 @@ class GlobalResponseNormalization(keras.layers.Layer):
         feature_axes: int | tuple[int, ...] = -1,
         epsilon: float = 1e-6,
         beta_initializer: Any = "zeros",
-        gamma_initializer: Any = "ones",
+        gamma_initializer: Any = "zeros",
         beta_regularizer: Any | None = None,
         gamma_regularizer: Any | None = None,
         beta_constraint: Any | None = None,
@@ -76,6 +76,9 @@ class GlobalResponseNormalization(keras.layers.Layer):
 
     def call(self, inputs: keras.KerasTensor) -> keras.KerasTensor:
         """Applies Global Response Normalization to the input."""
-        x_g = ops.sqrt(ops.sum(ops.square(inputs), axis=self.reduction_axes, keepdims=True))
+        norm = ops.sqrt(ops.sum(ops.square(inputs), axis=self.reduction_axes, keepdims=True))
+        masked = ops.where(ops.less_equal(norm, 0.0), ops.ones_like(inputs), inputs)
+        masked_norm = ops.sqrt(ops.sum(ops.square(masked), axis=self.reduction_axes, keepdims=True))
+        x_g = ops.where(ops.less_equal(norm, 0.0), 0.0, masked_norm)
         x_n = x_g / (ops.mean(x_g, axis=self.feature_axes, keepdims=True) + self.epsilon)
         return inputs + (inputs * x_n) * self.scale + self.bias

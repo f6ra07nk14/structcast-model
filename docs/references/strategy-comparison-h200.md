@@ -103,10 +103,10 @@ The practical consequences:
   without replicates.
 
 This also settles a false lead. An apparent 9 pp single-device regression under `torch.compile`
-did not reproduce: with the flow-function compile at `cmd_torch.py:401` disabled the run reached
-43.96%, and with it enabled 43.65%, both matching the uncompiled baseline. ConvNeXt V2-B is
-numerically unaffected by compilation as well (epoch-10 top-1 0.668063 uncompiled vs 0.668058
-compiled). Compilation changes speed, not what these models learn.
+did not reproduce: with the flow-function compile in `_assemble_learner` (`commands/cmd_torch.py`)
+disabled the run reached 43.96%, and with it enabled 43.65%, both matching the uncompiled baseline.
+ConvNeXt V2-B is numerically unaffected by compilation as well (epoch-10 top-1 0.668063 uncompiled
+vs 0.668058 compiled). Compilation changes speed, not what these models learn.
 
 ### Recipe
 
@@ -159,7 +159,7 @@ The single-device language-model arms reported `ce_loss` 0.2866 against 1.1649 f
 at the same global batch size — exactly the factor `accumulate_gradients: 4`. The generated
 training step rebound the tracked loss to the accumulation-scaled value before `backward()`, so
 every reported loss metric was divided by the accumulation count. Fixed in
-`builders/torch_builder.py` by scaling inside the backward expression only; gradients were never
+`builders/torch.py` by scaling inside the backward expression only; gradients were never
 affected, and `val_ce_loss` (no accumulation in validation) needs no correction.
 
 ## Per-rank data verification

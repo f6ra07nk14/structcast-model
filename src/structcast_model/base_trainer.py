@@ -8,9 +8,6 @@ from operator import gt, lt
 from time import time
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
 
-# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
-# inspect.getattr_static on Python 3.11 as well (backported from 3.12): probing a protocol member
-# must not execute a property getter, which for a data provider may build a real data loader.
 from typing_extensions import Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -23,6 +20,10 @@ else:
 logger = getLogger(__name__)
 
 ModelT = TypeVar("ModelT")
+
+DTypeT_contra = TypeVar("DTypeT_contra", contravariant=True)
+
+TensorT_co = TypeVar("TensorT_co", covariant=True)
 
 DatasetLike: TypeAlias = Iterable[dict[str, Any]]
 """Dataset-like object."""
@@ -49,11 +50,29 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
 
 
 @runtime_checkable
+class TensorInitializer(Protocol[DTypeT_contra, TensorT_co]):
+    """Callable creating a dummy tensor of the given size and element type, called as `initializer(size, dtype=...)`.
+
+    Shared by every framework, each binding its own element and tensor types: `torch.rand` is a
+    `TensorInitializer[torch.dtype, torch.Tensor]`, `jax.numpy.zeros` a `TensorInitializer[DTypeLike, jax.Array]`,
+    and `numpy.zeros` a `TensorInitializer[DTypeLike, numpy.ndarray]`.
+
+    Note:
+        Being runtime-checkable, `isinstance` only verifies that `__call__` exists;
+        a mismatched signature is only detected when the initializer is called.
+    """
+
+    def __call__(self, size: tuple[int, ...], /, *, dtype: DTypeT_contra) -> TensorT_co:
+        """Create a tensor of the given size and element type."""
+        ...
+
+
+@runtime_checkable
 class Learner(Protocol, Generic[ModelT]):
     """Protocol for the object that owns the models and defines how they learn.
 
-    A learner decides when an update should happen, how a training step runs, and how an
-    inference step runs.
+    A learner owns the training counters, defines how a training step runs and
+    how an inference step runs, and reports after each step whether an Update landed.
     """
 
     @property
@@ -73,11 +92,32 @@ class Learner(Protocol, Generic[ModelT]):
         """
 
     @property
+    def flow_functions(self) -> dict[str, Callable[..., Any]]:
+        """The named flow callables a strategy or trainer may compile or rebind (attribute name -> callable).
+
+        A caller that compiles or replicates one rebinds the attribute the key names to its wrapper,
+        which leaves the public steps eager and their host-owned counters running in Python. Empty
+        when the learner has no separable flows, which the keras `MirroredStrategy` path refuses.
+        """
+
+    @property
     def learning_rates(self) -> dict[str, float]:
         """The current learning rate of each optimizer, for display and logging."""
 
-    def update(self, step: int) -> bool:
-        """Determine whether to update the model based on the current step and any internal state."""
+    @property
+    def steps(self) -> int:
+        """The number of completed training Steps (batch iterations)."""
+
+    @property
+    def updates(self) -> int:
+        """The number of completed Updates (optimizer applies)."""
+
+    @property
+    def has_updated(self) -> bool:
+        """Whether the just-finished Step landed an Update."""
+
+    def restore_counters(self, steps: int, updates: int) -> None:
+        """Seed the host-owned counters after a checkpoint restore."""
 
     def training_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Perform the training step for the given criteria."""
@@ -159,24 +199,34 @@ class SimpleDataProvider:
 class BaseInfo(Generic[ModelT]):
     """Base information for building a model."""
 
-    step: int = 0
-    """The current training step."""
-
-    update: int = 0
-    """The number of times the model has been updated."""
-
     epoch: int = 0
     """The current epoch."""
 
-    history: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history: dict[int, dict[str, float]] = field(default_factory=dict)
     """History of training and validation logs."""
+
+    @property
+    def step(self) -> int:
+        """The number of completed training Steps; a bare info counts none, a trainer reads its learner's.
+
+        Read-only: the learner owns the counters.
+        """
+        return 0
+
+    @property
+    def update(self) -> int:
+        """The number of completed Updates; a bare info counts none, a trainer reads its learner's.
+
+        Read-only: the learner owns the counters.
+        """
+        return 0
 
     @property
     def models(self) -> dict[str, ModelT]:
         """The models by name; a bare info holds none, a trainer delegates to its learner."""
         return {}
 
-    def logs(self, epoch: int | None = None) -> dict[str, Any]:
+    def logs(self, epoch: int | None = None) -> dict[str, float]:
         """Get the log for the given epoch."""
         if epoch is None:
             return self.history.setdefault(self.epoch, {})
@@ -323,7 +373,7 @@ class BaseTrainer(BaseInfo[ModelT]):
     data: DataProvider
     """The provider of the training and validation datasets."""
 
-    callbacks: Sequence[Any] = ()
+    callbacks: Sequence[object] = ()
     """Objects routed into the events whose protocol they implement."""
 
     training_prefix: str = ""
@@ -332,13 +382,23 @@ class BaseTrainer(BaseInfo[ModelT]):
     validation_prefix: str = "val_"
     """ Prefix for validation logs. """
 
-    history: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history: dict[int, dict[str, float]] = field(default_factory=dict)
     """History of training and validation logs."""
 
     _events: dict[str, list[tuple[str, Callable[..., None]]]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Extension hook kept for subclasses; the participant scan runs lazily via ``_scan``."""
+
+    @property
+    def step(self) -> int:
+        """The learner's count of completed training Steps, read on every access."""
+        return self.learner.steps
+
+    @property
+    def update(self) -> int:
+        """The learner's count of completed Updates, read on every access."""
+        return self.learner.updates
 
     @property
     def models(self) -> dict[str, ModelT]:
@@ -351,7 +411,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         The datasets join the scan so hooks such as a distributed sampler's set_epoch fire on
         every rank without explicit registration.
         """
-        candidates: list[Any] = [
+        candidates: list[object] = [
             self.learner,
             *self.learner.optimizers.values(),
             self.tracker,
@@ -377,8 +437,6 @@ class BaseTrainer(BaseInfo[ModelT]):
         dead-callback warning also fires here.
         """
         self._events = self._routed_events()
-        # The learner/tracker/data participants legitimately may implement no event, but an entry of
-        # the explicit callbacks sequence that matches nothing is almost certainly a typo'd hook name.
         for callback in self.callbacks:
             if not any(isinstance(callback, protocol) for protocol in EVENT_PROTOCOLS.values()):
                 logger.warning(
@@ -409,19 +467,21 @@ class BaseTrainer(BaseInfo[ModelT]):
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
 
-    def update_models(self, __inputs__: Any) -> tuple[bool, dict[str, Any]]:
+    def update_models(self, __inputs__: Mapping[str, Any]) -> dict[str, Any]:
         """Perform a training step and update the models.
 
+        Whether the step landed an update is not returned here: the learner owns the training
+        counters, so the loop reads ``learner.has_updated`` after this call.
+
         Args:
-            __inputs__ (Any): The inputs for the training step.
+            __inputs__ (Mapping[str, Any]): The inputs for the training step.
 
         Returns:
-            tuple[bool, dict[str, Any]]: A tuple containing a boolean indicating whether the model was updated and
-                a dictionary of criteria for tracking.
+            dict[str, Any]: The criteria for tracking.
         """
-        return self.learner.update(self.step), self.learner.training_step(**__inputs__)
+        return self.learner.training_step(**__inputs__)
 
-    def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
+    def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, float]:
         """Train the model on the given dataset.
 
         Args:
@@ -429,15 +489,15 @@ class BaseTrainer(BaseInfo[ModelT]):
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
 
         Returns:
-            Mapping[str, Any]: The logs from training, which may include metrics and other information.
+            Mapping[str, float]: The logs from training, which may include metrics and other information.
         """
         self._dispatch("on_training_begin")
         elapsed_time = 0.0
         for index, inputs in enumerate(get_dataset(dataset), start=1):
-            self.step += 1
             self._dispatch("on_training_step_begin")
             elapsed_time -= time()
-            updated, criteria = self.update_models(inputs)
+            criteria = self.update_models(inputs)
+            updated = self.learner.has_updated
             logs = self.tracker(**criteria)
             self.sync()
             elapsed_time += time()
@@ -446,13 +506,12 @@ class BaseTrainer(BaseInfo[ModelT]):
                 logs = {f"{self.training_prefix}{k}": v for k, v in logs.items()}
             self.logs().update(logs)
             if updated:
-                self.update += 1
                 self._dispatch("on_update")
             self._dispatch("on_training_step_end")
         self._dispatch("on_training_end")
         return logs
 
-    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
+    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, float]:
         """Evaluate the model on the given dataset.
 
         Args:
@@ -460,7 +519,7 @@ class BaseTrainer(BaseInfo[ModelT]):
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
 
         Returns:
-            Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
+            Mapping[str, float]: The logs from evaluation, which may include metrics and other information.
         """
         self._dispatch("on_validation_begin")
         elapsed_time = 0.0
@@ -483,7 +542,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         epochs: int,
         start_epoch: int = 1,
         validation_frequency: int = 1,
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, dict[str, float]]:
         """Fit the model on the datasets of the data provider.
 
         Args:
@@ -572,7 +631,7 @@ def _format_criteria(info: BaseInfo) -> str:
 
     Trainers dispatch themselves as *info*, so the learner's learning rates are read directly.
     """
-    values: dict[str, Any] = dict(cast("BaseTrainer[Any]", info).learner.learning_rates)
+    values: dict[str, float] = dict(cast("BaseTrainer[Any]", info).learner.learning_rates)
     values.update(info.logs())
     return "\n".join([f"epoch: {info.epoch}", *(f"  {key}: {value}" for key, value in values.items())])
 
@@ -673,6 +732,7 @@ __all__ = [
     "Printer",
     "ProgressBar",
     "SimpleDataProvider",
+    "TensorInitializer",
     "get_dataset",
     "get_dataset_size",
 ]

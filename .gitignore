@@ -223,3 +223,6 @@ __marimo__/
 .devcontainer/devcontainer-lock.json
 # Downloaded example datasets (the corpus loader in examples/torch/corpus.py fetches into data/)
 data/
+
+# Git worktrees for task branches (AGENTS.md)
+.worktrees/

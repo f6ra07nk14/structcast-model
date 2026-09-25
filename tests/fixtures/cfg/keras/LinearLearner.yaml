@@ -1,0 +1,34 @@
+# Minimal single-segment Keras learner over "tests/fixtures/cfg/keras/Linear.yaml": a squared error
+# whose optimum is analytic, so a runtime test can assert the loss actually falls.
+PARAMETERS:
+  DEFAULT:
+    accumulate_gradients: null # set to null or a positive integer
+IMPORTS: {}
+INPUTS: [x, y]
+OUTPUTS: [loss]
+LEARNERS:
+  - NAME: optimizer
+    LOSS: loss
+    TRAINABLE_LAYERS: [model]
+    OPTIMIZER:
+      - _obj_
+      - _addr_: keras.optimizers.SGD
+      - _call_:
+          learning_rate: 0.1
+          _jinja_yaml_: |-
+            {% if accumulate_gradients is none %}
+            {}
+            {% else %}
+            gradient_accumulation_steps: {{accumulate_gradients}}
+            {% endif %}
+    FLOW:
+      - [x, prediction, model]
+      - INPUTS: {y_true: y, y_pred: prediction}
+        OUTPUTS: errors
+        NAME: mse
+        LAYER: [_obj_, {_addr_: keras.losses.mean_squared_error}]
+      - ["eval: keras.ops.mean(errors)", loss, null]
+    INFERENCE_FLOW:
+      - [x, prediction, model]
+      - [{y_true: y, y_pred: prediction}, errors, mse]
+      - ["eval: keras.ops.mean(errors)", loss, null]

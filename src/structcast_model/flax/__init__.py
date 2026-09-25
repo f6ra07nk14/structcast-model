@@ -1,1 +1,90 @@
 """Flax module for StructCast-Model."""
+
+from typing import TYPE_CHECKING
+
+__all__ = [
+    "AXIS",
+    "MODEL_AXIS",
+    "PRESET_RULES",
+    "TACTICS",
+    "TP_PRESETS",
+    "FlaxBestCriterion",
+    "FlaxDistributedStrategy",
+    "FlaxTracker",
+    "FlaxTrainer",
+    "FlaxTrainingStateSaver",
+    "ShardedDataset",
+    "create_jax_inputs",
+    "donate_argnames",
+    "dot_general_out",
+    "get_jax_device",
+    "get_jax_devices",
+    "get_learning_rate",
+    "gradient_steps",
+    "layers",
+    "loss_scale",
+    "no_weight_decay_mask",
+    "resolve_input_shapes",
+    "restore_training_state",
+    "unwrap_variables",
+    "update_with_loss_scale",
+]
+
+if TYPE_CHECKING:
+    from structcast_model.flax import layers
+    from structcast_model.flax.distributed import (
+        AXIS,
+        MODEL_AXIS,
+        PRESET_RULES,
+        TACTICS,
+        TP_PRESETS,
+        FlaxDistributedStrategy,
+    )
+    from structcast_model.flax.optimizers import (
+        get_learning_rate,
+        gradient_steps,
+        loss_scale,
+        no_weight_decay_mask,
+        unwrap_variables,
+        update_with_loss_scale,
+    )
+    from structcast_model.flax.trainer import (
+        FlaxBestCriterion,
+        FlaxTracker,
+        FlaxTrainer,
+        FlaxTrainingStateSaver,
+        ShardedDataset,
+        create_jax_inputs,
+        resolve_input_shapes,
+        restore_training_state,
+    )
+    from structcast_model.flax.utils import donate_argnames, dot_general_out, get_jax_device, get_jax_devices
+else:
+    import sys
+
+    from structcast.utils.lazy_import import LazySelectedImporter
+
+    import_structure = {
+        "distributed": ["AXIS", "MODEL_AXIS", "PRESET_RULES", "TACTICS", "TP_PRESETS", "FlaxDistributedStrategy"],
+        "layers": [],
+        "optimizers": [
+            "get_learning_rate",
+            "gradient_steps",
+            "loss_scale",
+            "no_weight_decay_mask",
+            "unwrap_variables",
+            "update_with_loss_scale",
+        ],
+        "trainer": [
+            "FlaxBestCriterion",
+            "FlaxTracker",
+            "FlaxTrainer",
+            "FlaxTrainingStateSaver",
+            "ShardedDataset",
+            "create_jax_inputs",
+            "resolve_input_shapes",
+            "restore_training_state",
+        ],
+        "utils": ["donate_argnames", "dot_general_out", "get_jax_device", "get_jax_devices"],
+    }
+    sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

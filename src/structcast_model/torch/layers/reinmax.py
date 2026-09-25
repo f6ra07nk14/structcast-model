@@ -30,7 +30,6 @@ class ReinMaxCore(Function):
     @staticmethod
     def backward(ctx: BackwardCFunction, grad_at_sample: Tensor, grad_at_p: Tensor) -> Any:
         """Backward method."""
-        # `torch._C._FunctionBase.saved_tensors` is typed as a 1-tuple upstream, but it holds every saved tensor.
         one_hot_sample, logits, y_soft, tau = cast("tuple[Tensor, Tensor, Tensor, Tensor]", ctx.saved_tensors)
 
         shifted_y_soft = 0.5 * ((logits / tau).softmax(dim=-1) + one_hot_sample)

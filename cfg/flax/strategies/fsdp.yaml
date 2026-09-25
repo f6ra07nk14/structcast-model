@@ -1,0 +1,14 @@
+# Distributed strategy pattern: fully sharded data parallel. The batch is split as under "dp" and the
+# parameters are sharded along their leading dimension too, so each device stores a slice of them.
+# A parameter under min_size bytes, or one whose leading dimension the device count does not divide,
+# stays replicated. The pattern is called with device=..., which this preset ignores: it spans the
+# devices itself. Bind rules to replace the preset's (parameter-path regex, tactic) table.
+- _obj_
+- _addr_: structcast_model.flax.distributed.FlaxDistributedStrategy
+- _bind_:
+    preset: fsdp
+    min_size: 1048576 # 1 MiB
+    # devices: 4
+    # rules:
+    #   - ["^embedding\\.", replicate]
+    #   - [".*", fsdp]
