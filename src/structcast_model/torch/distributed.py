@@ -12,13 +12,14 @@ Every ``state_dict``/``load_state_dict`` implementation routes through
 """
 
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
 from logging import getLogger
 import os
 import re
-from typing import Any, Literal, overload
+from types import ModuleType
+from typing import Any, Literal, ParamSpec, TypeGuard, TypeVar, overload
 
 from structcast.utils.lazy_import import try_import
 from timm.layers import convert_sync_batchnorm
@@ -36,15 +37,27 @@ with try_import() as _fsdp_imports:  # torch >= 2.6 ships the stable per-paramet
 
 with try_import() as _dcp_imports:  # torch >= 2.2; older builds admitted by the torch-cpu extra floor lack both.
     from torch.distributed.checkpoint import state_dict as _dcp_state_dict
-    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 with try_import() as _tp_imports:  # torch >= 2.4 ships the DTensor tensor-parallel styles at this path.
     from torch.distributed.tensor.parallel import (
         ColwiseParallel,
+        ParallelStyle,
         RowwiseParallel,
         SequenceParallel,
         parallelize_module,
     )
+
+_ModuleT = TypeVar("_ModuleT", bound=torch.nn.Module)
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+class _HasParamGroups(Protocol):
+    """Anything exposing torch's mutable ``param_groups`` list: an optimizer or a proxy delegating to one."""
+
+    param_groups: list[dict[str, Any]]
+
 
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
@@ -121,7 +134,7 @@ def initial_distributed_env(
     return result["device"], result["global_rank"], result["local_rank"], result["world_size"], result["distributed"]
 
 
-def sync_gate(module: Any, armed: bool) -> None:
+def sync_gate(module: object, armed: bool) -> None:
     """Arm or disarm *module*'s next gradient synchronization; a no-op for plain modules.
 
     Generated training steps call this immediately before every model invocation. ``armed`` is
@@ -142,7 +155,7 @@ def sync_gate(module: Any, armed: bool) -> None:
         module.set_requires_gradient_sync(armed)
 
 
-def split_mixed_param_groups(optimizer: Any) -> None:
+def split_mixed_param_groups(optimizer: _HasParamGroups) -> None:
     """Rewrite *optimizer*'s parameter groups so none of them mixes ``DTensor``s with plain tensors.
 
     Tensor parallelism converts only the parameters its ``parallel_modules`` globs name into
@@ -173,7 +186,7 @@ def split_mixed_param_groups(optimizer: Any) -> None:
     when it is constructed.
 
     Args:
-        optimizer (Any): The optimizer whose ``param_groups`` are rewritten in place. Duck-typed,
+        optimizer (_HasParamGroups): The optimizer whose ``param_groups`` are rewritten in place. Duck-typed,
             because an optimizer proxy delegates ``param_groups`` to the optimizer it wraps, and that
             is the list that has to change.
     """
@@ -237,7 +250,13 @@ class DistributedStrategy(Protocol):
     def wrap(self, models: "OrderedDict[str, torch.nn.Module]") -> "OrderedDict[str, torch.nn.Module]":
         """Wrap the models for this strategy and return the wrapped mapping."""
 
-    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+    @overload
+    def compile(self, module: _ModuleT, compile_kw: Mapping[str, Any] | None) -> _ModuleT: ...
+
+    @overload
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]: ...
+
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]:
         """Compile *module* where this strategy wants its compile units, and return what to use.
 
         ``compile_kw`` of ``None`` returns *module* unchanged. Modules are compiled in place, so the
@@ -415,7 +434,7 @@ class _StateDictMixin:
                 optimizer.load_state_dict(optimizer_states[name])
         return state
 
-    def _dcp_handles(self, optimizer: Any, action: str) -> bool:
+    def _dcp_handles(self, optimizer: object, action: str) -> TypeGuard[torch.optim.Optimizer]:
         """Whether DCP can key this optimizer's state by parameter FQNs.
 
         Optimizer proxies (e.g. the example ``AdamWWithCosine``) are not ``torch.optim.Optimizer``
@@ -424,7 +443,9 @@ class _StateDictMixin:
         """
         return isinstance(optimizer, torch.optim.Optimizer)
 
-    def _set_optimizer_state(self, api: Any, container: torch.nn.Module, optimizer: Any, osd: dict[str, Any]) -> None:
+    def _set_optimizer_state(
+        self, api: ModuleType, container: torch.nn.Module, optimizer: torch.optim.Optimizer, osd: dict[str, Any]
+    ) -> None:
         """Load one optimizer's saved state, which arrives in full on every rank.
 
         Optimizer states load without the broadcast option: torch's ``set_optimizer_state_dict``
@@ -473,7 +494,13 @@ class _StateDictMixin:
 class _CompileMixin:
     """Default compilation placement: the model root itself is the compile unit."""
 
-    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+    @overload
+    def compile(self, module: _ModuleT, compile_kw: Mapping[str, Any] | None) -> _ModuleT: ...
+
+    @overload
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]: ...
+
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]:
         """Compile in place when *module* is an ``nn.Module``, else wrap with ``torch.compile``.
 
         In-place compilation (``nn.Module.compile``) keeps the object identity: no ``OptimizedModule``
@@ -734,7 +761,7 @@ def _check_tied_parameters(model: torch.nn.Module, paths: Sequence[str], option:
             )
 
 
-def _device_mesh(device: str, **dims: int) -> Any:
+def _device_mesh(device: str, **dims: int) -> "DeviceMesh":
     """Build a named device mesh over the process group's ranks, on *device*'s own device type.
 
     Without an explicit mesh, ``fully_shard`` follows the accelerator, which reports CUDA on
@@ -746,7 +773,7 @@ def _device_mesh(device: str, **dims: int) -> Any:
     return init_device_mesh(device_type, tuple(dims.values()), mesh_dim_names=tuple(dims))
 
 
-def _parallel_style(style: Any) -> Any:
+def _parallel_style(style: "str | ParallelStyle") -> "ParallelStyle":
     """Return the ``ParallelStyle`` a plan entry names, or *style* itself when it is not a name.
 
     The vocabulary covers the four shapes a transformer needs; anything else -- ``PrepareModuleInput``,
@@ -773,8 +800,8 @@ def _parallel_style(style: Any) -> Any:
 
 def _parallelize_models(
     models: Mapping[str, torch.nn.Module],
-    mesh: Any,
-    parallel_modules: Sequence[tuple[str, Any]],
+    mesh: "DeviceMesh",
+    parallel_modules: "Sequence[tuple[str, str | ParallelStyle]]",
 ) -> None:
     """Apply *parallel_modules* to every model in place, over the one-dimensional *mesh*.
 
@@ -787,7 +814,7 @@ def _parallelize_models(
     for name, model in models.items():
         _check_tied_parameters(model, [path for path, _ in matched[name]], "parallel_modules")
     for model in models.values():
-        plan: dict[str, Any] = {}
+        plan: dict[str, ParallelStyle] = {}
         for pattern, style in parallel_modules:
             instance = _parallel_style(style)
             for path, _ in _matched_in_model(model, [pattern])[0]:
@@ -957,7 +984,13 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
             fully_shard(model, **kwargs)
         return OrderedDict(models)
 
-    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+    @overload
+    def compile(self, module: _ModuleT, compile_kw: Mapping[str, Any] | None) -> _ModuleT: ...
+
+    @overload
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]: ...
+
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]:
         """Compile the submodules the shard globs name, so compile units follow the shard boundaries.
 
         Named, not yet sharded: compile runs before wrap (ADR-0024), so this walks the plain modules
@@ -984,7 +1017,7 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
             "only be resolved through parameter FQNs."
         )
 
-    def _dcp_handles(self, optimizer: Any, action: str) -> bool:
+    def _dcp_handles(self, optimizer: object, action: str) -> TypeGuard[torch.optim.Optimizer]:
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise ValueError(
                 f"{action.capitalize()} optimizer state under FSDP2 requires torch.optim.Optimizer "

@@ -589,9 +589,13 @@ def test_fsdp2_sync_gate_on_the_root_reaches_the_block_groups(single_process_glo
     assert _param_group(wrapped.block0).reduce_grads is False
 
 
-def _is_compiled(module: torch.nn.Module) -> bool:
-    """Whether ``.compile()`` ran on *module* itself; the compiled call impl is the only marker it leaves."""
-    return module._compiled_call_impl is not None
+def _is_compiled(module: object) -> bool:
+    """Whether ``.compile()`` ran on *module* itself; the compiled call impl is the only marker it leaves.
+
+    Takes ``object`` because ``nn.Module.__getattr__`` types submodules such as ``model.block0`` as
+    ``Tensor | Module``.
+    """
+    return getattr(module, "_compiled_call_impl", None) is not None
 
 
 def test_fsdp2_compile_compiles_the_matched_blocks_and_not_the_root() -> None:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, Learner
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.loggers.base import Logger
 from structcast_model.torch.distributed import DistributedStrategy, initial_distributed_env
@@ -275,7 +275,7 @@ def restore_training_state(
     resume: str,
     strategy: DistributedStrategy,
     models: Mapping[str, torch.nn.Module],
-    learner: Any,
+    learner: Learner[torch.nn.Module],
     start_epoch: int,
     logger: Logger,
     is_main: bool = True,
@@ -290,7 +290,7 @@ def restore_training_state(
         resume (str): The training state reference, in whatever form *logger* accepts.
         strategy (DistributedStrategy): The strategy loading the state into the live modules.
         models (Mapping[str, torch.nn.Module]): The live models to restore into.
-        learner (Any): The learner owning the optimizers and gradient scalers to restore into.
+        learner (Learner[torch.nn.Module]): The learner owning the optimizers and gradient scalers to restore into.
         start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
         logger (Logger): The logger the state is fetched through.
         is_main (bool): Whether this process logs the override message.
