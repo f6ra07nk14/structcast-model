@@ -30,9 +30,9 @@ RUN uv python install $PYTHON_VERSIONS --preview
 # extra matches the tox default env. The loop reverses the list order, not the version numbers, so
 # PYTHON_VERSIONS has to name the version PY_VERSION pins the base image to first: only then does
 # the reverse walk sync it last and /app/.venv keeps the image's default interpreter.
+# Only the files uv reads are mounted: a bind-mounted file's content is part of this layer's cache key,
+# so mounting README.md or tox.ini rebuilt the whole dependency layer on every edit to either.
 RUN --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=README.md,target=README.md \
-    --mount=type=bind,source=tox.ini,target=tox.ini \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     for version in $(printf '%s\n' $PYTHON_VERSIONS | tac); do \
     uv sync --frozen --no-install-project --python $version \

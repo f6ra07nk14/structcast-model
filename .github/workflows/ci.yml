@@ -147,8 +147,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             PY_VERSION=3.11
-          cache-from: type=gha,scope=dev-image
-          cache-to: type=gha,mode=max,scope=dev-image
+          # The pushed image carries its own cache metadata (inline), so a rebuild no longer uploads a second
+          # copy of the dependency layer to the GitHub Actions cache; the gha source stays read-only for the
+          # images built before this change
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-ci:${{ steps.branch-name.outputs.sanitized }}-latest
+            type=registry,ref=ghcr.io/${{ github.repository }}-ci:dev-latest
+            type=gha,scope=dev-image
+          cache-to: type=inline
 
       - name: Log build summary
         run: |
