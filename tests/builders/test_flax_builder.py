@@ -1142,148 +1142,73 @@ def test_flax_learner_without_ema_is_emitted_as_it_was_before_the_field_existed(
     assert "ema_" not in built.scripts[-1]
 
 
-class ComputeOnlyLayer:
-    """A layer naming `dtype` and not `param_dtype`, which no shipped `flax.nnx` layer does.
-
-    Addressed by the test below so the forwarding is proven per keyword rather than as a pair: every
-    parameterized `flax.nnx` layer names both, so a builder that treated them as one would pass on
-    the whole shipped catalogue and hand a user's own layer an argument it cannot take.
-    """
-
-    def __init__(self, *, dtype: Any = None) -> None:
-        """Take the compute type and nothing else; the builder only ever reads this signature."""
-        self.dtype = dtype
-
-
 def _flow_layer(address: str, **keywords: Any) -> dict[str, Any]:
     """One `LAYER` pattern calling *address* with *keywords*."""
     return {"_obj_": [["_addr_", address], {"_call_": keywords}]}
 
 
-def test_flax_forwards_each_precision_keyword_only_to_the_layers_that_name_it() -> None:
-    """The constructor pair reaches a layer through its own signature, not through the template.
+def test_building_a_flax_model_never_imports_its_layer_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The builder only emits code, so the model framework stays out of the build.
 
-    Which is what makes every generated Flax model a precision knob, the templates that thread
-    `dtype` themselves included. Read per keyword and per layer, because the alternatives all
-    generate code that imports: a pair forwarded together breaks the layer naming one, a pair
-    forwarded to everything breaks `flax.nnx.Dropout`, and a bare address is a function the flow
-    calls, not a constructor with arguments to add.
+    A script may be rendered where the layers it addresses are not installed, and importing a
+    `_file_` address would execute user code at build time. An address naming no module must
+    therefore build, emitted exactly as written, and no address may be imported along the way.
     """
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise AssertionError(f"imported {args} while building")
+
+    monkeypatch.setattr("structcast.utils.base.import_from_address", refuse)
     raw = {
         "INPUTS": ["x"],
         "OUTPUTS": ["y"],
         "FLOW": [
             ["x", "x", "fc", _flow_layer("flax.nnx.Linear", in_features=4, out_features=4, rngs="eval: rngs")],
-            ["x", "x", "drop", _flow_layer("flax.nnx.Dropout", rate=0.5, rngs="eval: rngs")],
-            ["x", "x", "act", {"_obj_": [["_addr_", "flax.nnx.relu"]]}],
-            ["x", "y", "half", _flow_layer("tests.builders.test_flax_builder.ComputeOnlyLayer")],
+            ["x", "y", "odd", _flow_layer("no_such_module.NoSuchLayer", units=2)],
         ],
     }
 
     script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
 
-    assert (
-        "self.fc = Linear(in_features=4, out_features=4, rngs=rngs, dtype=dtype, param_dtype=param_dtype)\n"
-    ) in script
-    assert "self.drop = Dropout(rate=0.5, rngs=rngs)\n" in script
-    assert "self.act = relu\n" in script
-    assert "self.half = ComputeOnlyLayer(dtype=dtype)\n" in script
+    assert "self.fc = Linear(in_features=4, out_features=4, rngs=rngs)\n" in script
+    assert "self.odd = NoSuchLayer(units=2)\n" in script
 
 
-def test_a_precision_keyword_written_on_a_layer_wins_over_the_constructor_argument() -> None:
-    """A value the configuration chose for one layer is the one that layer keeps.
+def test_nested_generated_classes_still_receive_the_precision_pair() -> None:
+    """One constructor argument must still narrow a whole model of nested generated classes.
 
-    The templates that already thread `dtype` through their own parameters are the reason: their
-    per-layer value has to survive a model built with the constructor argument, or a size group's
-    `bfloat16` would become whatever the caller passed. The other keyword is still forwarded, so the
-    precedence is per keyword too.
+    The builder owns the signature of every generated `__init__`, so it is the one place that can
+    hand the pair down; a nested class that missed it would silently stay at its defaults.
+    """
+    raw = {
+        "INPUTS": ["x"],
+        "OUTPUTS": ["y"],
+        "FLOW": [["x", "y", "unit", {"TYPE": "Unit"}]],
+        "Unit": {"INPUTS": ["a"], "OUTPUTS": ["b"], "FLOW": [["a", "b", {"_obj_": [["_addr_", "flax.nnx.relu"]]}]]},
+    }
+
+    script = FlaxBuilder(raw=raw)(classname="Model").scripts[-1]
+
+    assert "self.unit = Unit(rngs=rngs, training=training, dtype=dtype, param_dtype=param_dtype)\n" in script
+
+
+def test_a_precision_keyword_written_on_a_layer_is_emitted_exactly_as_written() -> None:
+    """Precision reaches a third-party layer only through what the template writes.
+
+    `eval: dtype`/`eval: param_dtype` wire the layer to the generated constructor, as `rngs` is
+    wired; a concrete value is that layer's own and must not be replaced. The builder adds neither,
+    which is why a layer the template leaves alone keeps its own default.
     """
     raw = {
         "INPUTS": ["x"],
         "OUTPUTS": ["y"],
         "FLOW": [
-            [
-                "x",
-                "y",
-                "fc",
-                _flow_layer(
-                    "flax.nnx.Linear",
-                    in_features=4,
-                    out_features=2,
-                    rngs="eval: rngs",
-                    dtype="eval: jax.numpy.bfloat16",
-                ),
-            ]
+            ["x", "x", "wired", _flow_layer("flax.nnx.Linear", dtype="eval: dtype", param_dtype="eval: param_dtype")],
+            ["x", "y", "fixed", _flow_layer("flax.nnx.Linear", dtype="eval: jax.numpy.bfloat16")],
         ],
     }
 
     script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
 
-    assert (
-        "self.fc = Linear(in_features=4, out_features=2, rngs=rngs, "
-        "dtype=jax.numpy.bfloat16, param_dtype=param_dtype)\n"
-    ) in script
-
-
-def test_a_layer_the_builder_cannot_read_is_left_unforwarded_and_said_so(caplog: pytest.LogCaptureFixture) -> None:
-    """Forwarding nothing is the safe fallback, and a silent one is the dangerous kind.
-
-    The commands import no framework, so a script can be rendered where the layers it addresses are
-    not installed. Failing the build there would break that; forwarding nothing quietly is worse --
-    the same configuration would emit a narrowed model in one environment and a float32 one in
-    another, and the generated script carries no trace of which. So the fallback logs the address it
-    could not read.
-    """
-    raw = {
-        "INPUTS": ["x"],
-        "OUTPUTS": ["y"],
-        "FLOW": [["x", "y", "fc", _flow_layer("no_such_module.NoSuchLayer", units=2)]],
-    }
-
-    with caplog.at_level(logging.WARNING, logger="structcast_model.builders.flax"):
-        script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
-
-    assert "self.fc = NoSuchLayer(units=2)\n" in script
-    assert [r.message for r in caplog.records if "no_such_module.NoSuchLayer" in r.message]
-
-
-def test_no_precision_keyword_is_added_to_a_call_an_attribute_walked_to() -> None:
-    """The signature read is the address's; an `_attr_` moves the call somewhere else.
-
-    `flax.nnx.Linear.from_config(...)` would be given the `dtype` that `Linear.__init__` names and
-    that the classmethod does not, which is a `TypeError` the moment the model is built. The address
-    and the callable have to be the same object for the read to mean anything, so a pattern that
-    walks away from it is left exactly as the configuration wrote it.
-    """
-    pattern = {"_obj_": [["_addr_", "flax.nnx.Linear"], {"_attr_": "from_config"}, {"_call_": {"config": 2}}]}
-    raw = {"INPUTS": ["x"], "OUTPUTS": ["y"], "FLOW": [["x", "y", "fc", pattern]]}
-
-    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
-
-    assert "self.fc = Linear.from_config(config=2)\n" in script
-
-
-def test_a_layer_that_declares_its_own_default_is_not_handed_the_builders() -> None:
-    """A keyword is forwarded only where forwarding this builder's default changes nothing.
-
-    `flax.nnx.SimpleCell` is the counterexample the rule exists for: alone in the zoo it computes in
-    float32 rather than in the input's type, so handing it `dtype=None` would silently make it
-    input-inferred -- the one layer where the pair would not be inert at its defaults. Its
-    `param_dtype` does default to float32, so that half is still forwarded, which is what keeps the
-    rule per keyword rather than per layer. The mask builders fall out of the same rule for a
-    different reason: their `dtype` is the element type of the mask they return, and it defaults to
-    float32 too, so a compute type must never reach it.
-    """
-    raw = {
-        "INPUTS": ["x"],
-        "OUTPUTS": ["y"],
-        "FLOW": [
-            ["x", "x", "cell", _flow_layer("flax.nnx.SimpleCell", in_features=4, hidden_features=4, rngs="eval: rngs")],
-            ["x", "y", "mask", _flow_layer("flax.nnx.make_causal_mask", x="eval: x")],
-        ],
-    }
-
-    script = FlaxBuilder(raw=raw)(classname="Model").scripts[0]
-
-    assert "self.cell = SimpleCell(in_features=4, hidden_features=4, rngs=rngs, param_dtype=param_dtype)\n" in script
-    assert "self.mask = make_causal_mask(x=x)\n" in script
+    assert "self.wired = Linear(dtype=dtype, param_dtype=param_dtype)\n" in script
+    assert "self.fixed = Linear(dtype=jax.numpy.bfloat16)\n" in script

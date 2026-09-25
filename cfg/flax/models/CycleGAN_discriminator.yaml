@@ -38,6 +38,8 @@ _jinja_yaml_: |-
             # Tuples, not lists: "flax.nnx.Conv" only accepts a pair of ints per spatial dimension.
             padding: "eval: ((2, 1), (2, 1))"
             rngs: "eval: rngs"
+            dtype: "eval: dtype"
+            param_dtype: "eval: param_dtype"
 DiscriminatorBlock:
   OUTPUTS: [out]
   _jinja_yaml_: |-
@@ -54,7 +56,9 @@ DiscriminatorBlock:
               strides: [2, 2]
               padding: 1
               rngs: "eval: rngs"
+              dtype: "eval: dtype"
+              param_dtype: "eval: param_dtype"
       {% if normalize %}
-      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
       {% endif %}
       - [_, out, [_obj_, {_addr_: flax.nnx.leaky_relu}, {_bind_: {negative_slope: 0.2}}]]

@@ -861,7 +861,7 @@ _obj_:
 
 - uses channel-last tensor layout (*H × W × C*)
 - constructor accepts a `rngs: flax.nnx.Rngs` argument for parameter initialization, and a
-  `dtype`/`param_dtype` pair forwarded to every layer that takes one (see REFERENCE.md, *Precision (Flax)*)
+  `dtype`/`param_dtype` pair the template wires onto every parameterized layer (see REFERENCE.md, *Precision (Flax)*)
 - `__call__` propagates a `training` flag to sub-modules
 - layer APIs differ (e.g., `flax.nnx.Conv` instead of `torch.nn.LazyConv2d`)
 

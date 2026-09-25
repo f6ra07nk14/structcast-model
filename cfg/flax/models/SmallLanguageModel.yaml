@@ -37,6 +37,8 @@ PARAMETERS:
     # master copy is what keeps a long run's small updates from rounding away.
     # There is no batch-side counterpart to set here, unlike the image templates: the input is
     # integer tokens, so the token embedding's own "dtype" is the first precision in the model.
+    # Left null, each layer instead takes the "dtype"/"param_dtype" constructor arguments of the
+    # generated model, wired below as "eval: dtype"/"eval: param_dtype" (the builder adds neither).
     dtype: null
   # model size parameters
   tiny:
@@ -66,7 +68,7 @@ FLOW:
       - _jinja_group_: {{size}}
       {% raw %}
         _jinja_yaml_: |-
-          {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+          {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
           - [tokens, feature, token_embedding, [_obj_, {_addr_: flax.nnx.Embed}, {_call_: {num_embeddings: {{vocab_size}}, features: {{dim}}, rngs: "eval: rngs"{{dt}}}}]]
           - [feature, feature, [_obj_, {_addr_: flax.nnx.Dropout}, {_call_: {rate: {{dropout}}, rngs: "eval: rngs"}}]]
           - [feature, feature, backbone, {TYPE: Backbone}]
@@ -87,7 +89,7 @@ Backbone:
 Block:
   OUTPUTS: [out]
   _jinja_yaml_: |-
-    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+    {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
     FLOW:
       - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dim}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - [_, attended, {TYPE: CausalSelfAttention, PARAM: {DEFAULT: {dim: {{dim}}, heads: {{heads}}, dtype: {{dtype | tojson}}}}}]
@@ -114,7 +116,7 @@ CausalSelfAttention:
   _jinja_yaml_: |-
     {% set head_dim = dim // heads %}
     {% set half_dim = head_dim // 2 %}
-    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+    {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
     FLOW:
       # (batch, seq, dim) -> (batch, seq, 3 * dim) -> (batch, seq, 3, heads, {{head_dim}}).
       # The fused projection is laid out as q, k, v each of "dim" contiguous features, heads-major

@@ -775,7 +775,7 @@ def test_vision_transformer_emits_the_same_module_until_a_dtype_is_asked_for(tmp
     assert checkpointed == checkpointed_none
     # Layer constructions only, and only a dtype the template chose: the class-token index is a
     # "jax.numpy.zeros(..., dtype=...)" expression that has always been there, and every layer now
-    # carries the builder's own "dtype=dtype" forwarding, so a bare "dtype=" would not mean what it
+    # carries the template's own "dtype=dtype" wiring, so a bare "dtype=" would not mean what it
     # looks like. What must stay absent is a value the knob picked, which is what the template
     # threads and what would move the module a run trains.
     assert not [

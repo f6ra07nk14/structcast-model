@@ -644,8 +644,8 @@ def test_restore_counters_seeds_both_counts_from_the_checkpoint(tmp_path: Path) 
 def test_a_half_precision_model_trains_under_the_scale_the_learner_owns(tmp_path: Path, compiled: bool) -> None:
     """The two halves of a Flax float16 run are configured apart and have to meet here.
 
-    Precision is the model's -- the `dtype` its generated `__init__` now takes, whatever its template
-    threads -- and the loss scale is the learner's `MIXED_PRECISION`, so nothing pairs them at build
+    Precision is the model's -- the `dtype` its generated `__init__` takes, which its template wires
+    onto its layers -- and the loss scale is the learner's `MIXED_PRECISION`, so nothing pairs them at build
     time. What this asserts is that they compose: the activations are float16 over the fp32 master
     weights, the scaled step still brings the loss down, and the counters still report the applies.
 

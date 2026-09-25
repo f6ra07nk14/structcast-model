@@ -37,7 +37,9 @@ _jinja_yaml_: |-
             kernel_size: [7, 7]
             padding: REFLECT
             rngs: "eval: rngs"
-    - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{init_features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+            dtype: "eval: dtype"
+            param_dtype: "eval: param_dtype"
+    - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{init_features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
     - [_, _, [_obj_, {_addr_: flax.nnx.relu}]]
     # Downsampling
     - [_, _, down0, {TYPE: DownBlock, PARAM: {DEFAULT: {fin: {{init_features}}, fout: {{init_features * 2}}}}}]
@@ -62,23 +64,25 @@ _jinja_yaml_: |-
             kernel_size: [7, 7]
             padding: REFLECT
             rngs: "eval: rngs"
+            dtype: "eval: dtype"
+            param_dtype: "eval: param_dtype"
     - [_, out, [_obj_, {_addr_: flax.nnx.tanh}]]
 ResidualBlock:
   OUTPUTS: [out]
   _jinja_yaml_: |-
     FLOW:
-      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs"}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
       - [_, _, [_obj_, {_addr_: flax.nnx.relu}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs"}}]]
-      - [_, feat, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{features}}, out_features: {{features}}, kernel_size: [3, 3], padding: REFLECT, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
+      - [_, feat, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{features}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
       - ["eval: inp + feat", out, null]
 DownBlock:
   OUTPUTS: [out]
   _jinja_yaml_: |-
     FLOW:
-      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [2, 2], padding: SAME, rngs: "eval: rngs"}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [inp, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [2, 2], padding: SAME, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
       - [_, out, [_obj_, {_addr_: flax.nnx.relu}]]
 UpBlock:
   OUTPUTS: [out]
@@ -89,6 +93,6 @@ UpBlock:
       - [inp, feat]
       # Nearest neighbour upsampling by 2: every row and every column repeated once.
       - ["eval: feat.repeat(2, axis=1).repeat(2, axis=2)", upsampled]
-      - [upsampled, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [1, 1], padding: SAME, rngs: "eval: rngs"}}]]
-      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs"}}]]
+      - [upsampled, _, [_obj_, {_addr_: flax.nnx.Conv}, {_call_: {in_features: {{fin}}, out_features: {{fout}}, kernel_size: [3, 3], strides: [1, 1], padding: SAME, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
+      - [_, _, [_obj_, {_addr_: flax.nnx.InstanceNorm}, {_call_: {num_features: {{fout}}, epsilon: 1.0e-5, use_bias: false, use_scale: false, rngs: "eval: rngs", dtype: "eval: dtype", param_dtype: "eval: param_dtype"}}]]
       - [_, out, [_obj_, {_addr_: flax.nnx.relu}]]

@@ -64,7 +64,7 @@ FLAX_DISABLED = (
     "        self.input_shapes = {}\n"
     "        self.outputs = ['y']\n"
     "        self.training = training\n"
-    "        self.fc = Linear(in_features=4, out_features=2, rngs=rngs, dtype=dtype, param_dtype=param_dtype)\n"
+    "        self.fc = Linear(in_features=4, out_features=2, rngs=rngs)\n"
     "\n"
     "    def __call__(self, x, *, training = None, **kwargs):\n"
     "        training = self.training if training is None else training\n"

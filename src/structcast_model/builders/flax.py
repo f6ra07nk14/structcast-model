@@ -1,18 +1,15 @@
 """Builder for Flax (nnx) models."""
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import cache, cached_property
-from inspect import signature
+from functools import cached_property
 from logging import getLogger
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import Field, ValidationError
 from structcast.core.exceptions import SpecError
-from structcast.core.instantiator import AddressPattern, AttributePattern, ObjectPattern
-from structcast.utils.base import import_from_address
+from structcast.core.instantiator import ObjectPattern
 
 from structcast_model.builders.auto_name import AutoName
 from structcast_model.builders.base import (
@@ -45,10 +42,11 @@ class FlaxLayerIntermediate(LayerIntermediate):
     ``__init__`` also carries the precision pair every ``flax.nnx`` layer is parameterized by --
     ``dtype`` (compute, defaulting to ``None``, which is each layer's own default) and ``param_dtype``
     (storage, defaulting to ``jax.numpy.float32``, which is the ``flax.nnx`` default) -- and the
-    builder forwards them to every nested generated class and to every sub-layer that declares the
-    same default, per keyword, so that a model built at the defaults is unchanged. A ``dtype`` or
-    ``param_dtype`` the template wrote on a layer itself wins: the builder only adds what the
-    pattern does not already set.
+    builder forwards them to every nested generated class, and to nothing else. A third-party
+    sub-layer follows them only when the template wires them itself, as ``dtype: "eval: dtype"`` and
+    ``param_dtype: "eval: param_dtype"`` in its ``_call_`` (the same mechanism as ``rngs``), or sets
+    a concrete value there, which then wins for that sub-layer. The builder never imports a layer
+    address to decide this: it only emits code, so the model framework stays out of the build.
 
     Example:
         >>> from structcast_model.builders.flax import FlaxLayerIntermediate
@@ -130,89 +128,6 @@ dtype: flax.typing.Dtype | None = None, param_dtype: flax.typing.Dtype = jax.num
 _REMAT_OPTIONS = frozenset({"graph", "graph_updates", "policy", "prevent_cse", "static_argnums"})
 """The keyword arguments `flax.nnx.remat` accepts, which `GRADIENT_CHECKPOINTING` carries."""
 
-_DTYPE_ARGUMENTS: dict[str, Callable[[Any], bool]] = {
-    "dtype": lambda default: default is None,
-    # Matched by name rather than by identity: the builder imports no array library of its own, and
-    # `jax.numpy.float32` is not `numpy.float32` anyway.
-    "param_dtype": lambda default: getattr(default, "__name__", None) == "float32",
-}
-"""The precision keywords the generated `__init__` carries, each against the default that makes it inert.
-
-`dtype=None` and `param_dtype=jax.numpy.float32` are what that `__init__` defaults to, so a keyword
-is forwarded only where the layer declares the same default and handing it the builder's value
-therefore changes nothing. `flax.nnx.SimpleCell` is the one layer of the zoo that computes in
-float32 by default rather than in the input's type, and the mask builders (`make_causal_mask` and
-its two neighbours) take a `dtype` that is the element type of the mask they return: both are
-excluded by this rule rather than by a list naming them.
-"""
-
-
-@cache
-def _accepted_dtypes(address: str, file: Path | None) -> tuple[str, ...]:
-    """Return which of the precision keywords the addressed layer takes at the builder's own default.
-
-    Read off the signature, and per keyword rather than as a pair, because the layers do not agree
-    on both: `flax.nnx.Conv` names `dtype` and `param_dtype` at the inert defaults, `SimpleCell`
-    names both but defaults `dtype` to float32, and `flax.nnx.Dropout` names neither. A `**kwargs`
-    does not count -- it says nothing about what the layer would do with the value -- and neither
-    does a parameter with no default, which the configuration has to supply itself.
-
-    An address that cannot be imported or read here forwards nothing rather than failing the build,
-    because a script may be rendered where the framework it targets is not installed -- but it says
-    so: the same configuration would otherwise emit a silently float32 model in a thin environment
-    and a narrowed one where flax is present, and nothing downstream can tell the two apart.
-    """
-    try:
-        target = import_from_address(address, module_file=file)
-        # A class keeps its arguments on `__init__`: every `flax.nnx` layer answers `(*args, **kwargs)`
-        # for the class itself, which would report the whole catalogue as naming neither keyword.
-        constructor: Any = target
-        if isinstance(target, type):
-            constructor = constructor.__init__
-        parameters = signature(constructor).parameters
-    except Exception as error:  # Any import or introspection failure leaves the layer unforwarded.
-        logger.warning(
-            "Cannot read %s to forward dtype/param_dtype; the generated layer will not carry them: %s",
-            address,
-            error,
-        )
-        return ()
-    return tuple(
-        name for name, inert in _DTYPE_ARGUMENTS.items() if name in parameters and inert(parameters[name].default)
-    )
-
-
-def _with_dtypes(pattern: ObjectPattern) -> ObjectPattern:
-    """Add to one layer's pattern the precision keywords it accepts and does not already set.
-
-    The keywords are added as `eval:` values, so they resolve to the `dtype` and `param_dtype`
-    parameters of the generated `__init__` exactly as `rngs` resolves to its `rngs` parameter. What
-    the pattern already carries -- a template that threads its own `dtype` onto a layer, say -- is
-    left alone, so a per-layer value always wins over the constructor argument.
-
-    Only a pattern that ends in the call building the layer is rewritten: a bare address
-    (`flax.nnx.relu`) names a function the flow calls with its input, and a `_bind_` names a callable
-    whose arguments the configuration has already chosen. An `_attr_` anywhere after the address is
-    skipped too: the signature read here is the address's, while the call belongs to the attribute
-    it walked to, and handing that one a keyword the address happened to name is a `TypeError` when
-    the layer is built.
-    """
-    head = pattern.patterns[0]
-    if not isinstance(head, AddressPattern) or any(isinstance(p, AttributePattern) for p in pattern.patterns[1:]):
-        return pattern
-    # Serialized rather than validated: `ObjectPattern` takes the list form its validator accepts
-    # back, which is also where a call's keywords are plain data.
-    dumped = cast(list[Any], pattern.model_dump(by_alias=True))
-    # An argument-less call dumps to the bare key, which is still the call that builds the layer.
-    last = {"_call_": {}} if dumped[-1] == "_call_" else dumped[-1]
-    if not isinstance(keywords := (last.get("_call_") if isinstance(last, dict) else None), dict):
-        return pattern
-    missing = {name: f"eval: {name}" for name in _accepted_dtypes(head.address, head.file) if name not in keywords}
-    if not missing:
-        return pattern
-    dumped[-1] = {"_call_": {**keywords, **missing}}
-    return ObjectPattern.model_validate(dumped)
-
 
 @dataclass(kw_only=True, slots=True)
 class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
@@ -224,11 +139,9 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     Sub-modules that require a random-number generator should receive ``rngs: "eval: rngs"`` in
     their ``_call_`` arguments so that the builder emits ``rngs=rngs`` in the generated ``__init__`` body.
 
-    The ``dtype``/``param_dtype`` pair is not threaded that way: the builder reads each layer's
-    constructor and adds whichever of the two the layer takes at the same default the generated
-    ``__init__`` carries, so every generated model is a precision knob without its template saying
-    so and none of them is a different model until one is asked for. A value written on the layer in
-    the configuration wins.
+    The ``dtype``/``param_dtype`` pair of the generated ``__init__`` reaches a sub-module the same
+    way, through ``dtype: "eval: dtype"`` and ``param_dtype: "eval: param_dtype"``; the builder adds
+    them only to nested generated classes and never imports a layer address to find out what it takes.
 
     Example:
         >>> from structcast_model.builders.flax import FlaxBuilder
@@ -240,10 +153,6 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
     """
 
     user_defined_layer_type: ClassVar[type[FlaxLayerIntermediate]] = FlaxLayerIntermediate
-
-    def _resolve_layer(self, imports: defaultdict[str, set[str | None]], pattern: ObjectPattern) -> tuple[str, str]:
-        """Resolve one layer, handing it the precision keywords of the generated `__init__`."""
-        return resolve_object(imports, _with_dtypes(pattern))
 
     def _resolve_gradient_checkpointing(
         self,
@@ -272,7 +181,7 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
         return resolved
 
 
-def _keywords(part: Any) -> dict[str, Any] | None:
+def _keywords(part: object) -> dict[str, object] | None:
     """Return the keyword arguments of a serialized `_call_`/`_bind_` pattern part, if it has any."""
     if isinstance(part, dict):
         for key in ("_call_", "_bind_"):
@@ -281,12 +190,12 @@ def _keywords(part: Any) -> dict[str, Any] | None:
     return None
 
 
-def _is_inject(key: Any, value: Any) -> bool:
+def _is_inject(key: object, value: object) -> bool:
     """Report whether one serialized entry is an address naming `inject_hyperparams`."""
     return key == "_addr_" and isinstance(value, str) and value.endswith("inject_hyperparams")
 
 
-def _references_inject(node: Any) -> bool:
+def _references_inject(node: object) -> bool:
     """Report whether any address in the serialized pattern already names `inject_hyperparams`.
 
     Only addresses count. A plain string that happens to end in the name -- the label of a
@@ -305,18 +214,18 @@ def _references_inject(node: Any) -> bool:
     return False
 
 
-def _wrap_children(values: Iterable[Any]) -> tuple[list[Any], int]:
+def _wrap_children(values: Iterable[object]) -> tuple[list[object], int]:
     """Rewrite every child, returning the new children and how many factory calls were wrapped."""
     walked = [_wrap(value) for value in values]
     return [value for value, _ in walked], sum(count for _, count in walked)
 
 
-def _wrap(node: Any) -> tuple[Any, int]:
+def _wrap(node: object) -> tuple[object, int]:
     """Rewrite the rate-carrying factory calls nested anywhere under a serialized pattern node."""
     try:
         # `ObjectPattern` serializes to the `["_obj_", <part>, ...]` list its validator accepts back,
         # which the `model_dump` signature cannot express.
-        dumped = cast(list[Any], ObjectPattern.model_validate(node).model_dump(by_alias=True))
+        dumped = cast(list[object], ObjectPattern.model_validate(node).model_dump(by_alias=True))
     except ValidationError:
         if isinstance(node, dict):
             children, count = _wrap_children(node.values())
@@ -332,7 +241,7 @@ def _wrap(node: Any) -> tuple[Any, int]:
     # `static_args` is the safety valve: without it inject arrayifies every numeric keyword, and
     # `bool` is an `int` subclass, so a flag like `nesterov=True` would reach the factory as `Array(1)`.
     static_args = [key for key in _keywords(parts[index]) or {} if key != "learning_rate"]
-    arguments: dict[str, Any] = {"inner_factory": ["_obj_", *parts[:index]]}
+    arguments: dict[str, object] = {"inner_factory": ["_obj_", *parts[:index]]}
     if static_args:
         arguments["static_args"] = static_args
     return ["_obj_", ["_addr_", "optax.inject_hyperparams"], {"_call_": arguments}, *parts[index:]], count + 1
@@ -367,7 +276,7 @@ def inject_learning_rate(optimizer: ObjectPattern) -> tuple[ObjectPattern, bool]
     return ObjectPattern.model_validate(rewritten), True
 
 
-def _stores(unit: Any) -> list[str]:
+def _stores(unit: tuple[str, str, str | None] | OptimizerSegment) -> list[str]:
     """Return the names one flow unit assigns, nothing for the optimizer segment separating two."""
     return [] if isinstance(unit, OptimizerSegment) else stored_names(unit[1])
 
@@ -384,7 +293,7 @@ def _owned(trainable_layers: list[str]) -> str:
     return f"({', '.join(trainable_layers)})"
 
 
-_EMA_DEFAULTS: dict[str, Any] = {"decay": 0.999, "only": "eval: Param"}
+_EMA_DEFAULTS: dict[str, float | str] = {"decay": 0.999, "only": "eval: Param"}
 """What `flax.nnx.EMA` is given when nothing else is declared.
 
 Its own default tracks every Variable, which blends the RNG counters and the batch statistics along
@@ -992,7 +901,7 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
             keywords = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in {**_EMA_DEFAULTS, **options}.items())
             others[name] = f"flax.nnx.EMA({model}, {keywords})"
 
-    def _intermediate_fields(self, module: FlaxUserDefinedLearner) -> dict[str, Any]:
+    def _intermediate_fields(self, module: FlaxUserDefinedLearner) -> dict[str, list[str]]:
         """Get the framework-specific fields of the built learner intermediate."""
         return {"ema": list(module.EMA)}
 
@@ -1014,7 +923,7 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
         opt_inst, opt_cls = resolve_object(imports, pattern)
         # `nnx.Optimizer` requires `wrt`, and the parameters are the only sensible default.
         # `Param` and `flax.nnx` itself are default imports of the learner, so nothing is added here.
-        parts = cast(list[Any], pattern.model_dump(by_alias=True))[1:]
+        parts = cast(list[object], pattern.model_dump(by_alias=True))[1:]
         wrt = "" if any("wrt" in (_keywords(part) or {}) for part in parts) else ", wrt=Param"
         return f"{opt_inst}({_owned(trainable_layers)}{wrt})", opt_cls
 

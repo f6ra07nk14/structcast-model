@@ -32,6 +32,8 @@ PARAMETERS:
     # "flax.nnx" promotes an input against the layer's "dtype", so feeding bf16 batches
     # (-p "DEFAULT: {image_dtype: bfloat16}" on the dataset template) is neither necessary nor
     # sufficient on its own -- without this knob those batches are promoted back up to float32.
+    # Left null, each layer instead takes the "dtype"/"param_dtype" constructor arguments of the
+    # generated model, wired below as "eval: dtype"/"eval: param_dtype" (the builder adds neither).
     dtype: null
   # backbone model parameters
   atto:
@@ -73,7 +75,7 @@ FLOW:
       - _jinja_group_: {{backbone}}
       {% raw %}
         _jinja_yaml_: |-
-          {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+          {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
           - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{dims[-1]}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
           - [_, cls, head, [_obj_, {_addr_: flax.nnx.Linear}, {_call_: {in_features: {{dims[-1]}}, out_features: {{num_classes}}, rngs: "eval: rngs"{{dt}}}}]]
       {% endraw %}
@@ -108,7 +110,7 @@ Stem:
   OUTPUTS: [out]
   FLOW:
     - _jinja_yaml_: |-
-        {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+        {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
         - INPUTS: inp
           OUTPUTS: _
           LAYER:
@@ -121,16 +123,15 @@ Stem:
                 strides: [{{stem_kernel_size}}, {{stem_kernel_size}}]
                 padding: SAME
                 rngs: "eval: rngs"
-                # A line of its own, unlike the "{{dt}}" suffix the flow-style layers take: this
+                # Lines of their own, unlike the "{{dt}}" suffix the flow-style layers take: this
                 # "_call_" is a block mapping, where a trailing ", dtype: ..." is not a key.
-                {% if dtype is not none %}
-                dtype: {{dtype}}
-                {% endif %}
+                dtype: {{dtype if dtype is not none else '"eval: dtype"'}}
+                param_dtype: "eval: param_dtype"
         - [_, out, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
 DownSample:
   OUTPUTS: [out]
   _jinja_yaml_: |-
-    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+    {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
     FLOW:
       - [inp, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fin}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - INPUTS: _
@@ -145,13 +146,12 @@ DownSample:
               strides: [2, 2]
               padding: SAME
               rngs: "eval: rngs"
-              {% if dtype is not none %}
-              dtype: {{dtype}}
-              {% endif %}
+              dtype: {{dtype if dtype is not none else '"eval: dtype"'}}
+              param_dtype: "eval: param_dtype"
 Block:
   OUTPUTS: [out]
   _jinja_yaml_: |-
-    {% set dt = ", dtype: " ~ dtype if dtype is not none else "" %}
+    {% set dt = ", dtype: " ~ (dtype if dtype is not none else '"eval: dtype"') ~ ', param_dtype: "eval: param_dtype"' %}
     FLOW: 
       - INPUTS: inp
         OUTPUTS: _
@@ -166,9 +166,8 @@ Block:
               padding: SAME
               feature_group_count: {{fout}}
               rngs: "eval: rngs"
-              {% if dtype is not none %}
-              dtype: {{dtype}}
-              {% endif %}
+              dtype: {{dtype if dtype is not none else '"eval: dtype"'}}
+              param_dtype: "eval: param_dtype"
       - [_, _, [_obj_, {_addr_: flax.nnx.LayerNorm}, {_call_: {num_features: {{fout}}, epsilon: {{norm_eps}}, rngs: "eval: rngs"{{dt}}}}]]
       - INPUTS: _
         OUTPUTS: _
