@@ -164,8 +164,8 @@ class FlaxTracker:
     `jax.device_get` over all criteria at once, and it lands inside the region `BaseTrainer.train`
     times, where the torch loop blocks on `torch.cuda.synchronize()` for the same reason.
 
-    Unlike the torch tracker there is no all-reduce: JAX is single-controller, so a criterion
-    computed from a sharded batch is already the global value.
+    Unlike the torch tracker there is no all-reduce: this project runs JAX in one process, and GSPMD
+    under `nnx.jit` makes a criterion computed from a sharded batch already the global value.
 
     Example:
         >>> import jax.numpy as jnp

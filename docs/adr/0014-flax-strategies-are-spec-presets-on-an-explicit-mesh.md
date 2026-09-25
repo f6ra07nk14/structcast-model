@@ -19,7 +19,7 @@ JAX has no strategy zoo: one mechanism — a device mesh plus a `PartitionSpec` 
 single-device, data-parallel, and FSDP execution, with XLA inserting every collective. The Flax
 `DistributedStrategy` implementation is therefore **one class**, not a mirror of the three torch classes: on
 this side `wrap()` returns the models untouched (sharding is Variable metadata applied eagerly at
-construction), `sync_initial_weights()` is a no-op (single controller, one globally-addressable init),
+construction), `sync_initial_weights()` is a no-op (JAX runs in one process here, one globally-addressable init),
 the protocol carries no gradient-scaler seam at all (bf16 needs none, and there is no fp16 scaler here), and `compile()` is the `nnx.jit` seam. What
 distinguishes strategies is only a **preset**: the mesh to build and an ordered `(parameter-path regex, tactic)`
 rule table deciding each parameter's spec — the shape used by big_vision/scalax, first match wins, with a

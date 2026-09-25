@@ -260,7 +260,7 @@ class FlaxDistributedStrategy:
 
     @property
     def data_rank(self) -> int:
-        """0: a JAX run is single-controller, so its one process reads every batch whole."""
+        """0: this project runs JAX in one process, which reads every batch whole."""
         return 0
 
     @property
@@ -295,7 +295,7 @@ class FlaxDistributedStrategy:
         return models
 
     def sync_initial_weights(self, models: Mapping[str, nnx.Module]) -> None:
-        """Nothing to synchronize: JAX is single-controller, so one process initializes every device."""
+        """Nothing to synchronize: this project runs JAX in one process, which initializes every device."""
 
     def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]:
         """Return *module* compiled with `nnx.jit`, or unchanged when *compile_kw* is None.
