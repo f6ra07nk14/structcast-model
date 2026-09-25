@@ -8,14 +8,15 @@ models are built, because eager sharding reads it there.
 """
 
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from re import Pattern, compile as re_compile
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, ParamSpec, TypeVar
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.typing import ArrayLike
 import numpy as np
 
 from flax import nnx
@@ -45,13 +46,16 @@ split it along the model axis by its last dimension (`column`) or its first one 
 TP_PRESETS = ("tp", "fsdp_tp")
 """The presets whose mesh has a model axis, and whose unmatched parameters keep their own sharding."""
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
-def _axis_type(mode: str) -> Any:
+
+def _axis_type(mode: str) -> jax.sharding.AxisType:
     """The mesh axis type one of the `*_axis_mode` fields names."""
     return jax.sharding.AxisType.Explicit if mode == "explicit" else jax.sharding.AxisType.Auto
 
 
-def _to_host(value: Any) -> Any:
+def _to_host(value: ArrayLike) -> ArrayLike:
     """Copy one state leaf to host memory, typed RNG keys as their raw key data."""
     if not isinstance(value, jax.Array):
         return value
@@ -60,7 +64,7 @@ def _to_host(value: Any) -> Any:
     return np.asarray(value)
 
 
-def _from_host(live: Any, saved: Any) -> Any:
+def _from_host(live: ArrayLike, saved: ArrayLike) -> ArrayLike:
     """Restore one state leaf, placed on the sharding and dtype the live array currently has.
 
     Taking the placement from the live object is what makes a checkpoint topology-independent: the
@@ -78,7 +82,7 @@ def _from_host(live: Any, saved: Any) -> Any:
     return jax.device_put(jnp.asarray(saved, dtype=live.dtype), live.sharding)
 
 
-def _host_state(obj: Any) -> dict[str, Any]:
+def _host_state(obj: nnx.Module | nnx.Optimizer) -> dict[str, Any]:
     """Return the full state of an nnx object -- parameters, statistics and RNG state -- in host memory."""
     return jax.tree.map(_to_host, nnx.to_pure_dict(nnx.state(obj)))
 
@@ -96,7 +100,7 @@ def _missing_model_state(name: str) -> ValueError:
     )
 
 
-def _load_pure_state(obj: Any, saved: Mapping[str, Any]) -> None:
+def _load_pure_state(obj: nnx.Module | nnx.Optimizer, saved: Mapping[str, Any]) -> None:
     """Write a saved host state back into an nnx object in place, keeping its identity and metadata.
 
     The live state is read first so every leaf is restored against its current dtype and sharding.
@@ -163,7 +167,7 @@ class FlaxDistributedStrategy:
     The cutoff is the `fsdp` tactic's alone: a `column`/`row` rule names one layer of a plan whose other
     half is named too, and silently dropping one of the pair is worse than sharding a small kernel."""
 
-    _mesh: Any = field(default=None, init=False, repr=False)
+    _mesh: Mesh = field(init=False, repr=False)
     _rules: tuple[tuple[Pattern[str], str], ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -207,7 +211,7 @@ class FlaxDistributedStrategy:
         self._mesh = self._build_mesh(devices)
         jax.set_mesh(self._mesh)
 
-    def _build_mesh(self, devices: Sequence[Any]) -> Any:
+    def _build_mesh(self, devices: Sequence[Any]) -> Mesh:
         """Build the mesh of this preset over *devices*: one data axis, plus a model axis for `tp`.
 
         Each axis takes the type its own field names, :attr:`data_axis_mode` and
@@ -256,7 +260,7 @@ class FlaxDistributedStrategy:
         )
 
     @property
-    def mesh(self) -> Any:
+    def mesh(self) -> Mesh:
         """The mesh this strategy activated, e.g. for placing a batch or reading its size."""
         return self._mesh
 
@@ -299,7 +303,7 @@ class FlaxDistributedStrategy:
     def sync_initial_weights(self, models: Mapping[str, nnx.Module]) -> None:
         """Nothing to synchronize: JAX is single-controller, so one process initializes every device."""
 
-    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+    def compile(self, module: Callable[_P, _R], compile_kw: Mapping[str, Any] | None) -> Callable[_P, _R]:
         """Return *module* compiled with `nnx.jit`, or unchanged when *compile_kw* is None.
 
         The caller owns the compilation arguments, including which of a generated step's arguments
@@ -338,7 +342,7 @@ class FlaxDistributedStrategy:
     def state_dict(
         self,
         models: Mapping[str, nnx.Module],
-        optimizers: Mapping[str, Any] | None = None,
+        optimizers: Mapping[str, nnx.Optimizer] | None = None,
         optimizer_models: Mapping[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Produce `{"models": ..., "optimizers": ...}` in host memory, keyed by model and optimizer name.
@@ -355,7 +359,7 @@ class FlaxDistributedStrategy:
     def load_state_dict(
         self,
         models: Mapping[str, nnx.Module],
-        optimizers: Mapping[str, Any],
+        optimizers: Mapping[str, nnx.Optimizer],
         optimizer_models: Mapping[str, list[str]] | None,
         state: dict[str, Any] | None,
     ) -> dict[str, Any]:
@@ -387,7 +391,7 @@ class FlaxDistributedStrategy:
                 return tactic
         return None
 
-    def _check_rules_matched(self, models: Mapping[str, Any]) -> None:
+    def _check_rules_matched(self, models: Mapping[str, nnx.Module]) -> None:
         """Refuse a rule table holding a pattern no parameter of any model matches.
 
         A rule that matches nothing is a typo, and its cost is invisible: the parameters it meant to
@@ -410,7 +414,7 @@ class FlaxDistributedStrategy:
                 f"include {names[:10]}."
             )
 
-    def _check_row_hooks(self, name: str, model: Any, pure: Mapping[str, Any]) -> None:
+    def _check_row_hooks(self, name: str, model: nnx.Module, pure: Mapping[str, Any]) -> None:
         """Refuse a row-parallel layer that cannot name the sharding of its own output.
 
         A row-parallel layer contracts over the axis its kernel is split on, so its result is a
@@ -453,7 +457,7 @@ class FlaxDistributedStrategy:
                 "model_axis_mode: auto, which lets the compiler place the result itself."
             )
 
-    def _place(self, path: Any, array: Any) -> Any:
+    def _place(self, path: jax.tree_util.KeyPath, array: jax.Array) -> jax.Array:
         """Place one parameter on the sharding its first matching rule asks for.
 
         Under the `tp` presets an unmatched parameter is returned untouched, keeping whatever
@@ -464,7 +468,7 @@ class FlaxDistributedStrategy:
             return array
         return jax.device_put(array, NamedSharding(self._mesh, self._spec(tactic, array)))
 
-    def _spec(self, tactic: str | None, array: Any) -> PartitionSpec:
+    def _spec(self, tactic: str | None, array: jax.Array) -> PartitionSpec:
         """Return the spec one tactic asks for on one parameter."""
         if tactic == "fsdp":
             return self._fsdp_spec(array)
@@ -480,7 +484,7 @@ class FlaxDistributedStrategy:
             return PartitionSpec() if array.ndim < 2 else self._model_spec(array, 0)
         return PartitionSpec()
 
-    def _model_spec(self, array: Any, dim: int) -> PartitionSpec:
+    def _model_spec(self, array: jax.Array, dim: int) -> PartitionSpec:
         """Return the spec splitting *dim* of *array* across the model axis, or replicated.
 
         A dimension the model axis does not divide falls back to replication rather than failing the
@@ -490,7 +494,7 @@ class FlaxDistributedStrategy:
             return PartitionSpec()
         return PartitionSpec(*(MODEL_AXIS if d == dim else None for d in range(array.ndim)))
 
-    def _fsdp_spec(self, array: Any) -> PartitionSpec:
+    def _fsdp_spec(self, array: jax.Array) -> PartitionSpec:
         """Return the FSDP spec of one parameter: its leading dimension split, or replicated.
 
         Only the leading dimension of a parameter with at least two dimensions is a candidate.

@@ -77,7 +77,7 @@ def donate_argnames(function: Callable[..., Any]) -> tuple[str, ...]:
     return tuple(p.name for p in parameters if p.kind is Parameter.POSITIONAL_OR_KEYWORD)
 
 
-def dot_general_out(*spec: Any) -> Callable[..., Any]:
+def dot_general_out(*spec: str | tuple[str, ...] | None) -> Callable[..., jax.Array]:
     """Return a `jax.lax.dot_general` that places its result on `PartitionSpec(*spec)`.
 
     The hook a tensor-parallel layer needs when the model axis is Explicit and the compiler is
@@ -90,10 +90,10 @@ def dot_general_out(*spec: Any) -> Callable[..., Any]:
     keyword `partial` bound. The keyword is therefore overridden here instead.
 
     Args:
-        *spec (Any): The `PartitionSpec` entries of the output, e.g. `None, "model"`.
+        *spec (str | tuple[str, ...] | None): The `PartitionSpec` entries of the output, e.g. `None, "model"`.
 
     Returns:
-        Callable[..., Any]: A drop-in `dot_general` naming that sharding on every call.
+        Callable[..., jax.Array]: A drop-in `dot_general` naming that sharding on every call.
 
     Example:
         >>> import jax, jax.numpy as jnp
@@ -104,7 +104,7 @@ def dot_general_out(*spec: Any) -> Callable[..., Any]:
         "P(None, 'model')"
     """
 
-    def dot_general(*args: Any, **kwargs: Any) -> Any:
+    def dot_general(*args: Any, **kwargs: Any) -> jax.Array:
         """Run `jax.lax.dot_general` with the captured output sharding, whatever the caller asked for."""
         return jax.lax.dot_general(*args, **{**kwargs, "out_sharding": jax.sharding.PartitionSpec(*spec)})
 

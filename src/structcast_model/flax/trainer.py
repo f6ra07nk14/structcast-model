@@ -4,7 +4,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +19,7 @@ from structcast_model.base_trainer import (
     BaseTrainer,
     BestCriterion,
     DatasetLike,
+    Learner,
     TensorInitializer,
     get_dataset,
     get_dataset_size,
@@ -92,6 +93,13 @@ def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
     return [create_jax_inputs(value, batch_size=batch_size) for value in node]
 
 
+class _BatchSharder(Protocol):
+    """What :class:`ShardedDataset` needs of a strategy: placing one batch, as `FlaxDistributedStrategy` does."""
+
+    def shard_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Return *batch* placed on the devices."""
+
+
 @dataclass(frozen=True)
 class ShardedDataset:
     """A dataset whose batches are placed across the strategy's mesh as they are read.
@@ -105,7 +113,7 @@ class ShardedDataset:
     dataset: DatasetLike | Callable[[], DatasetLike]
     """The dataset producing the batches."""
 
-    strategy: Any
+    strategy: _BatchSharder
     """The strategy whose mesh the batches are placed on."""
 
     prefetch_size: int = 2
@@ -192,15 +200,15 @@ class FlaxTracker:
         self.sums = {criterion: jnp.zeros((), jnp.float32) for criterion in self.criteria}
         self.count = 0
 
-    def on_training_begin(self, info: BaseInfo[Any]) -> None:
+    def on_training_begin(self, info: BaseInfo[nnx.Module]) -> None:
         """Reset the tracker so an epoch's training averages start empty."""
         self.reset()
 
-    def on_validation_begin(self, info: BaseInfo[Any]) -> None:
+    def on_validation_begin(self, info: BaseInfo[nnx.Module]) -> None:
         """Reset the tracker so validation averages do not carry training values."""
         self.reset()
 
-    def __call__(self, **criteria: Any) -> dict[str, float]:
+    def __call__(self, **criteria: jax.Array | float) -> dict[str, float]:
         """Add one step's criteria to the sums and return the running means."""
         for criterion in self.criteria:
             self.sums[criterion] += criteria[criterion]
@@ -323,7 +331,7 @@ def restore_training_state(
     resume: str,
     strategy: FlaxDistributedStrategy,
     models: Mapping[str, nnx.Module],
-    learner: Any,
+    learner: Learner[nnx.Module],
     start_epoch: int,
     logger: Logger,
     optimizer_hashes: Mapping[str, str] | None = None,
@@ -342,7 +350,7 @@ def restore_training_state(
         resume (str): The training state reference, in whatever form *logger* accepts.
         strategy (FlaxDistributedStrategy): The strategy placing the restored arrays.
         models (Mapping[str, nnx.Module]): The live models to restore into.
-        learner (Any): The learner owning the optimizers and loss scales to restore into.
+        learner (Learner[nnx.Module]): The learner owning the optimizers and loss scales to restore into.
         start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.

@@ -38,7 +38,7 @@ def unwrap_variables(tree: Any) -> Any:
     )
 
 
-def get_learning_rate(optimizer: Any) -> jax.Array:
+def get_learning_rate(optimizer: nnx.Optimizer) -> jax.Array:
     """Return the learning rate the optimizer state currently reports.
 
     Optax stores no learning rate of its own: a constant lives in the update closure and a schedule
@@ -50,7 +50,7 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     compiles to a reference to the state array rather than to a host read.
 
     Args:
-        optimizer (Any): The `flax.nnx.Optimizer` whose state to read.
+        optimizer (nnx.Optimizer): The `flax.nnx.Optimizer` whose state to read.
 
     Returns:
         jax.Array: The reported rate as a float32 scalar, or NaN when the chain injects no rate at
@@ -71,7 +71,7 @@ def get_learning_rate(optimizer: Any) -> jax.Array:
     return jnp.asarray(jnp.nan if rate is None else rate, dtype=jnp.float32)
 
 
-def gradient_steps(optimizer: Any) -> jax.Array | None:
+def gradient_steps(optimizer: nnx.Optimizer) -> jax.Array | None:
     """Return the updates the optimizer's outermost `optax.MultiSteps` has applied, None without one.
 
     Accumulation gates on the device, so the generated training step detects an update by comparing
@@ -86,7 +86,7 @@ def gradient_steps(optimizer: Any) -> jax.Array | None:
     accumulation at all, which the step reports as an update on every call.
 
     Args:
-        optimizer (Any): The `flax.nnx.Optimizer` whose state to read.
+        optimizer (nnx.Optimizer): The `flax.nnx.Optimizer` whose state to read.
 
     Returns:
         jax.Array | None: The `gradient_step` of the outermost `MultiSteps`, or None when the
@@ -123,8 +123,13 @@ def loss_scale(**options: Any) -> DynamicScale:
 
 
 def update_with_loss_scale(
-    models: Any, optimizer: Any, grads: Any, dynamic_scale: DynamicScale, /, **extra: Any
-) -> tuple[Any, DynamicScale]:
+    models: nnx.Module | tuple[nnx.Module, ...],
+    optimizer: nnx.Optimizer,
+    grads: nnx.State,
+    dynamic_scale: DynamicScale,
+    /,
+    **extra: Any,
+) -> tuple[bool | jax.Array, DynamicScale]:
     """Apply one optimizer update against gradients a `DynamicScale` scaled, and advance the scale.
 
     The gradients arrive multiplied by `dynamic_scale.scale`, because the differentiated flow scaled
@@ -145,14 +150,14 @@ def update_with_loss_scale(
     scaler's does.
 
     Args:
-        models (Any): The modules the optimizer owns, one module or a tuple of them.
-        optimizer (Any): The `flax.nnx.Optimizer` to apply.
-        grads (Any): The scaled gradients of the segment's flow.
+        models (nnx.Module | tuple[nnx.Module, ...]): The modules the optimizer owns, one module or a tuple of them.
+        optimizer (nnx.Optimizer): The `flax.nnx.Optimizer` to apply.
+        grads (nnx.State): The scaled gradients of the segment's flow.
         dynamic_scale (DynamicScale): The scale the loss was multiplied by.
         **extra: Further keyword arguments for `flax.nnx.Optimizer.update`.
 
     Returns:
-        tuple[Any, DynamicScale]: Whether an update was attempted, and the advanced scale.
+        tuple[bool | jax.Array, DynamicScale]: Whether an update was attempted, and the advanced scale.
     """
     grads = jax.tree.map(lambda gradient: jnp.asarray(gradient, jnp.float32) / dynamic_scale.scale, grads)
     finite = jax.tree.reduce(lambda seen, g: seen & jnp.all(jnp.isfinite(g)), grads, jnp.asarray(True))
