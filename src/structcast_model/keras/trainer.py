@@ -7,14 +7,11 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import ml_dtypes
 import numpy as np
+from numpy.typing import DTypeLike, NDArray
 from pydantic import TypeAdapter, ValidationError
 
-# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
-# inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
-from typing_extensions import Protocol, runtime_checkable
-
 import keras
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, TensorInitializer
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.loggers.base import Logger
@@ -37,16 +34,7 @@ NumPy has no native `bfloat16`, so the type registered by `ml_dtypes`, a hard de
 """
 
 
-@runtime_checkable
-class TensorInitializer(Protocol):
-    """Callable creating a dummy NumPy array, called as `initializer(size, dtype=...)`."""
-
-    def __call__(self, size: tuple[int, ...], *, dtype: Any) -> Any:
-        """Create an array of the given size and element type."""
-        ...
-
-
-def random_array(size: tuple[int, ...], *, dtype: Any) -> Any:
+def random_array(size: tuple[int, ...], *, dtype: DTypeLike) -> NDArray[Any]:
     """Create a uniformly distributed random NumPy array, the default initializer for floating point types.
 
     `numpy.random.rand` cannot be used as an initializer directly,
@@ -54,10 +42,10 @@ def random_array(size: tuple[int, ...], *, dtype: Any) -> Any:
 
     Args:
         size (tuple[int, ...]): The size of the array, including the batch dimension.
-        dtype (Any): The element type of the array.
+        dtype (DTypeLike): The element type of the array.
 
     Returns:
-        Any: The created array.
+        NDArray[Any]: The created array.
     """
     return np.random.random(size).astype(dtype)
 
@@ -88,7 +76,6 @@ def create_numpy_inputs(shape: Any, *, batch_size: int = 1) -> Any:
             node.DTYPE,
             float_default=random_array,
             int_default=np.zeros,
-            protocol=TensorInitializer,
         )
         return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
     if isinstance(node, Mapping):

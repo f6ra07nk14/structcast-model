@@ -24,6 +24,10 @@ logger = getLogger(__name__)
 
 ModelT = TypeVar("ModelT")
 
+DTypeT_contra = TypeVar("DTypeT_contra", contravariant=True)
+
+TensorT_co = TypeVar("TensorT_co", covariant=True)
+
 DatasetLike: TypeAlias = Iterable[dict[str, Any]]
 """Dataset-like object."""
 
@@ -46,6 +50,24 @@ def get_dataset_size(dataset: DatasetLike | Callable[[], DatasetLike]) -> int:
     if hasattr(dataset, "__len__"):
         return dataset.__len__()
     return sum(1 for _ in dataset)
+
+
+@runtime_checkable
+class TensorInitializer(Protocol[DTypeT_contra, TensorT_co]):
+    """Callable creating a dummy tensor of the given size and element type, called as `initializer(size, dtype=...)`.
+
+    Shared by every framework, each binding its own element and tensor types: `torch.rand` is a
+    `TensorInitializer[torch.dtype, torch.Tensor]`, `jax.numpy.zeros` a `TensorInitializer[DTypeLike, jax.Array]`,
+    and `numpy.zeros` a `TensorInitializer[DTypeLike, numpy.ndarray]`.
+
+    Note:
+        Being runtime-checkable, `isinstance` only verifies that `__call__` exists;
+        a mismatched signature is only detected when the initializer is called.
+    """
+
+    def __call__(self, size: tuple[int, ...], /, *, dtype: DTypeT_contra) -> TensorT_co:
+        """Create a tensor of the given size and element type."""
+        ...
 
 
 @runtime_checkable
@@ -715,6 +737,7 @@ __all__ = [
     "Printer",
     "ProgressBar",
     "SimpleDataProvider",
+    "TensorInitializer",
     "get_dataset",
     "get_dataset_size",
 ]

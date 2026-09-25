@@ -8,12 +8,9 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import jax
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 import numpy as np
 from pydantic import TypeAdapter, ValidationError
-
-# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
-# inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
-from typing_extensions import Protocol, runtime_checkable
 
 from flax import nnx
 from structcast_model.base_trainer import (
@@ -22,6 +19,7 @@ from structcast_model.base_trainer import (
     BaseTrainer,
     BestCriterion,
     DatasetLike,
+    TensorInitializer,
     get_dataset,
     get_dataset_size,
 )
@@ -46,26 +44,17 @@ DTYPES = {
 """
 
 
-@runtime_checkable
-class TensorInitializer(Protocol):
-    """Callable creating a dummy JAX array, called as `initializer(size, dtype=...)`."""
-
-    def __call__(self, size: tuple[int, ...], *, dtype: Any) -> Any:
-        """Create an array of the given size and element type."""
-        ...
-
-
-def random_array(size: tuple[int, ...], *, dtype: Any) -> Any:
+def random_array(size: tuple[int, ...], *, dtype: DTypeLike) -> jax.Array:
     """Create a uniformly distributed random JAX array, the default initializer for floating point types.
 
     `jax.random` cannot be used as an initializer directly, since it requires an explicit key.
 
     Args:
         size (tuple[int, ...]): The size of the array, including the batch dimension.
-        dtype (Any): The element type of the array.
+        dtype (DTypeLike): The element type of the array.
 
     Returns:
-        Any: The created array.
+        jax.Array: The created array.
     """
     return jax.numpy.array(np.random.random(size), dtype=dtype)
 
@@ -96,7 +85,6 @@ def create_jax_inputs(shape: Any, *, batch_size: int = 1) -> Any:
             node.DTYPE,
             float_default=random_array,
             int_default=jax.numpy.zeros,
-            protocol=TensorInitializer,
         )
         return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
     if isinstance(node, Mapping):

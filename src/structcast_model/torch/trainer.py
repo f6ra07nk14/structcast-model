@@ -13,7 +13,7 @@ from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.loggers.base import Logger
 from structcast_model.torch.distributed import DistributedStrategy, initial_distributed_env
 from structcast_model.torch.layers.criteria_tracker import CriteriaTracker
-from structcast_model.torch.types import Tensor, TensorInitializer
+from structcast_model.torch.types import Tensor
 from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
@@ -58,7 +58,6 @@ def create_torch_inputs(shape: Any, *, batch_size: int = 1) -> Any:
             node.DTYPE,
             float_default=torch.rand,
             int_default=torch.zeros,
-            protocol=TensorInitializer,
         )
         return initializer((batch_size, *node.SHAPE), dtype=DTYPES[node.DTYPE])
     if isinstance(node, Mapping):

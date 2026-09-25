@@ -4,15 +4,21 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from logging import getLogger
 import re
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from pydantic_core import from_json
 from structcast.utils.base import find_path, import_from_address, load_yaml
 from structcast.utils.types import PathLike
 
+from structcast_model.base_trainer import TensorInitializer
+
 logger = getLogger(__name__)
 
 T = TypeVar("T")
+
+DTypeT = TypeVar("DTypeT")
+
+TensorT = TypeVar("TensorT")
 
 
 def load_json(path: PathLike) -> Any:
@@ -122,36 +128,35 @@ def resolve_tensor_initializer(
     init: str | None,
     dtype: str,
     *,
-    float_default: Any,
-    int_default: Any,
-    protocol: Any,
-) -> Any:
+    float_default: TensorInitializer[DTypeT, TensorT],
+    int_default: TensorInitializer[DTypeT, TensorT],
+) -> TensorInitializer[DTypeT, TensorT]:
     """Resolve the callable creating a dummy tensor for a tensor specification.
 
     Args:
         init (str | None): The address of the initializer to use,
             or `None` to select a default based on `dtype`.
         dtype (str): The name of the element type of the tensor, e.g. `"bfloat16"` or `"int64"`.
-        float_default (Any): The initializer to use for floating point element types.
-        int_default (Any): The initializer to use for integer element types,
+        float_default (TensorInitializer[DTypeT, TensorT]): The initializer to use for floating point element types.
+        int_default (TensorInitializer[DTypeT, TensorT]): The initializer to use for integer element types,
             since the floating point default cannot produce integer values.
-        protocol (Any): The runtime-checkable protocol the resolved initializer must satisfy.
 
     Returns:
-        Any: The initializer, to be called as `initializer(size, dtype=...)`.
+        TensorInitializer[DTypeT, TensorT]: The initializer, to be called as `initializer(size, dtype=...)`.
 
     Raises:
-        TypeError: If the initializer resolved from `init` does not satisfy `protocol`.
+        TypeError: If the initializer resolved from `init` does not satisfy `TensorInitializer`.
 
     Note:
         A runtime-checkable protocol only verifies that `__call__` exists, which makes this check
         equivalent to `callable(...)`. A mismatched signature is only detected when the initializer is called.
+        The element and tensor types of an imported initializer are therefore taken on trust from the defaults.
     """
     if init is not None:
         initializer = import_from_address(init)
-        if not isinstance(initializer, protocol):
+        if not isinstance(initializer, TensorInitializer):
             raise TypeError(f"Initializer is not callable as a tensor initializer: {init!r}")
-        return initializer
+        return cast("TensorInitializer[DTypeT, TensorT]", initializer)
     if dtype.startswith("int"):
         logger.warning('No initializer specified for dtype "%s". Falling back to zeros.', dtype)
         return int_default

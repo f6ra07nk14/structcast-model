@@ -8,8 +8,9 @@ from typing import Any
 import pytest
 from torch.nn import Module
 
-from structcast_model.base_trainer import BaseInfo, SimpleDataProvider
+from structcast_model.base_trainer import BaseInfo, SimpleDataProvider, TensorInitializer
 from structcast_model.loggers.base import NullLogger
+from structcast_model.torch import TensorInitializer as TorchTensorInitializer
 from structcast_model.torch.distributed import SingleDeviceStrategy
 from structcast_model.torch.trainer import (
     TorchBestCriterion,
@@ -144,6 +145,11 @@ def test_create_torch_inputs_rejects_non_callable_initializer() -> None:
     """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
     with pytest.raises(TypeError, match="not callable as a tensor initializer"):
         create_torch_inputs({"_SHAPE_": [4], "_INIT_": "torch.pi"})
+
+
+def test_torch_tensor_initializer_is_the_shared_protocol() -> None:
+    """The torch package re-exports the one `TensorInitializer` every framework resolves `_INIT_` against."""
+    assert TorchTensorInitializer is TensorInitializer
 
 
 # ---------------------------------------------------------------------------
