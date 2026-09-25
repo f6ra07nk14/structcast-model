@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"
 __all__ = [
     "EVENTS",
     "EVENT_PROTOCOLS",

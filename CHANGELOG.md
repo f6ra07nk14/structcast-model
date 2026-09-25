@@ -1,3 +1,346 @@
+## [6.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v5.0.0...v6.0.0) (2026-09-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* structcast_model.torch.TensorInitializer,
+structcast_model.torch.types.TensorInitializer,
+structcast_model.flax.TensorInitializer and
+structcast_model.keras.TensorInitializer are removed; import
+TensorInitializer from structcast_model.base_trainer instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015K4E7Ft7T57yLYon1je361
+* **builders:** templates relying on automatic dtype/param_dtype
+injection into third-party layers must now write it in the layer's
+_call_ (e.g. `dtype: "eval: dtype"`, `param_dtype: "eval: param_dtype"`).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015K4E7Ft7T57yLYon1je361
+* **cfg:** scm keras time -c cfg/keras/others/compile_default.yaml
+no longer resolves; pass --compile true or a backend-specific mapping.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+* **keras:** keras learners run their steps eagerly unless
+scm keras train --compile is given; the torch backend refuses the flag.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+* **flax:** scm flax train runs its steps eagerly unless --compile is
+given, and --compile none is no longer accepted.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+* **cfg:** `clip_grad_norm` on the torch learner templates previously
+selected the p-norm order with the clipping threshold fixed at 1.0. It is now the
+L2 threshold the global gradient norm is scaled down to, matching the Flax and
+Keras templates. Anyone who set it must re-read their value: `clip_grad_norm: 2.0`
+used to clip at 1.0 under an L2 norm and now clips at 2.0.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* DistributedStrategy gains data_rank/data_world_size,
+so external strategy implementations must add both properties before
+isinstance checks against the protocol accept them again.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **trainer:** Learner implementations must expose flow_functions;
+under MirroredStrategy an empty mapping is an error, not a fallback.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **trainer:** Learner implementations must replace update(step)
+with the steps/updates/has_updated properties and restore_counters.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **schema:** keras and flax templates carrying ACCUMULATE_GRADIENTS
+fail validation; declare the window on the optimizer instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **flax:** flax learners no longer honor ACCUMULATE_GRADIENTS;
+wrap the tx in optax.MultiSteps(every_k_schedule=k) instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **keras:** keras learners no longer honor ACCUMULATE_GRADIENTS;
+declare gradient_accumulation_steps on the optimizer instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **keras:** UserDefinedLearner no longer carries CLIP or the mixed
+precision fields, and LearnerIntermediate.flow carries OptimizerSegment
+instances instead of 6-tuples; torch consumers migrate to the
+TorchLearnerBuilder class family.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* feat(flax): generate NNX learners from the shared learner DSL
+
+FlaxLearnerBuilder and FlaxLearnerIntermediate emit a module-level
+training step with one nnx.value_and_grad per optimizer segment (the
+segment's owned modules as the differentiated container, other models
+as plain arguments), a manual gradient-accumulation State gated by the
+host-side update(step) flag, and nnx.view-based deterministic inference.
+The YAML OPTIMIZER pattern builds flax.nnx.Optimizer directly; the
+builder appends the owned-module container and a wrt=Param default, and
+rewrites the learning-rate-carrying factory with
+optax.inject_hyperparams(static_args=...) so the generated step reports
+the applied rate through an auxiliary output.
+structcast_model.flax.optimizers ships get_learning_rate (optax
+tree_get over the injected hyperparams, NaN when absent) and
+no_weight_decay_mask (path-regex mask for optax). Generation-time
+guards reject read-before-store segment flows and container-name
+collisions; the aux tuple carries only values that leave the closure,
+and flow_functions exposes the torch-compatible compile seam.
+Emitted torch learner code stays byte-identical (statement_names moved
+* **flax:** UserDefinedLearner no longer carries CLIP or the mixed
+precision fields, and LearnerIntermediate.flow carries OptimizerSegment
+instances instead of 6-tuples; torch consumers migrate to the
+TorchLearnerBuilder class family.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* feat(flax): generate NNX learners from the shared learner DSL
+
+FlaxLearnerBuilder and FlaxLearnerIntermediate emit a module-level
+training step with one nnx.value_and_grad per optimizer segment (the
+segment's owned modules as the differentiated container, other models
+as plain arguments), a manual gradient-accumulation State gated by the
+host-side update(step) flag, and nnx.view-based deterministic inference.
+The YAML OPTIMIZER pattern builds flax.nnx.Optimizer directly; the
+builder appends the owned-module container and a wrt=Param default, and
+rewrites the learning-rate-carrying factory with
+optax.inject_hyperparams(static_args=...) so the generated step reports
+the applied rate through an auxiliary output.
+structcast_model.flax.optimizers ships get_learning_rate (optax
+tree_get over the injected hyperparams, NaN when absent) and
+no_weight_decay_mask (path-regex mask for optax). Generation-time
+guards reject read-before-store segment flows and container-name
+collisions; the aux tuple carries only values that leave the closure,
+and flow_functions exposes the torch-compatible compile seam.
+Emitted torch learner code stays byte-identical (statement_names moved
+* **flax:** DistributedStrategy drops the grad_scaler_creator
+member; custom strategies relying on it construct their scaler inside
+wrap/compile instead, and generated learners no longer accept
+__grad_scaler_creator__.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* refactor(flax,builders): route contract warnings through logging
+
+The generation-time no-learning-rate notice and the resume drift
+notices move from warnings.warn to the house logger pattern
+(getLogger(__name__), lazy %-style args); flax/trainer names its
+module logger _logger because restore_training_state's public
+signature already takes a Logger parameter named logger. The tests pin
+the channel through caplog, keeping the quiet-path assertions scoped
+to structcast_model loggers, and the jax donation-warning checks stay
+on the warnings machinery they actually test.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* refactor(flax): publish ShardedDataset and flatten the flax CLI bindings
+
+The batch-sharding dataset adapter moves from a cmd_flax private into
+structcast_model.flax.trainer as public API (unit-tested for length
+passthrough, per-epoch re-iteration, and event-protocol visibility),
+the CLI consumes the flax package through one lazy scm_flax binding
+with all thirteen call sites flattened, and restore_training_state
+logs the --start-epoch override at INFO instead of printing.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **builders:** builder modules are now
+structcast_model.builders.{base,flax,keras,torch}.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **loggers:** the logger modules moved from
+structcast_model.torch.{logger,mlflow_logger,wandb_logger} to
+structcast_model.loggers.{base,mlflow,wandb}.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+* **commands:** `create model`/`create learner` no longer accept -c for
+--classname (use -n) and `create model` no longer accepts -s for
+--sublayer (use the long flag).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+### 💥 Breaking Changes
+
+* **builders:** drop the framework suffixes from the builder modules ([315031f](https://github.com/f6ra07nk14/structcast-model/commit/315031fa4892782973c2cb075e2359942e5080f7))
+* **builders:** pass flax learner state by name and empty the module scope ([3134bfc](https://github.com/f6ra07nk14/structcast-model/commit/3134bfc675097540546bc5de4e9991ef8e646384))
+* **cfg:** drop cfg/keras/others/compile_default.yaml ([a38bb14](https://github.com/f6ra07nk14/structcast-model/commit/a38bb14262e780373d13b767ab1e4196e064d51e))
+* **commands:** reserve -c and -s for --compile and --shape ([1a89254](https://github.com/f6ra07nk14/structcast-model/commit/1a8925438ae093b3ede14e4896605301d0e369e1))
+* **flax:** default --compile to off and drop the none spelling ([a7628e8](https://github.com/f6ra07nk14/structcast-model/commit/a7628e8e73b4b98fcb12489a7ff0c4a997353163))
+* **keras:** add --compile to train and stop compiling unconditionally ([920db62](https://github.com/f6ra07nk14/structcast-model/commit/920db6234650cb901723b5878019a1f6aa7d4a54))
+* **keras:** take the batch by name through the adapter boundary ([5f02922](https://github.com/f6ra07nk14/structcast-model/commit/5f0292291eddbc699b1b7251790d8f9dc86e180b))
+* **loggers:** move the torch loggers into a framework-agnostic package ([c7e6401](https://github.com/f6ra07nk14/structcast-model/commit/c7e6401642b4f8d8dd61ccc3a63ee921af3abf0a))
+* **schema:** move ACCUMULATE_GRADIENTS onto the torch learner schema ([52b0e28](https://github.com/f6ra07nk14/structcast-model/commit/52b0e28742e447368ed823cee71346134281d98e))
+* ship gradient checkpointing, EMA and tensor parallelism across the frameworks ([ad77f87](https://github.com/f6ra07nk14/structcast-model/commit/ad77f8763978e7d9070dea7968c561e962655114))
+* **trainer:** flow_functions joins the learner protocol ([43b2dce](https://github.com/f6ra07nk14/structcast-model/commit/43b2dcea9469a9e87dbaf6518bb2c7e88f3b79f9))
+* **trainer:** the learner owns the training counters ([8560d1b](https://github.com/f6ra07nk14/structcast-model/commit/8560d1b6138dc346e514c8d1d07f39291949706e))
+
+
+### 👷 Build
+
+* **docker:** derive the interpreter sync loop from PYTHON_VERSIONS ([8de646a](https://github.com/f6ra07nk14/structcast-model/commit/8de646a01520bc6cab11bc50e46b3f7593e94442))
+* **docker:** stop rebuilding the CI image for README and tox.ini edits ([b124bdf](https://github.com/f6ra07nk14/structcast-model/commit/b124bdf03e5446354e9b2deff16694fc483b9452))
+
+
+### 📦 Other
+
+* **devcontainer:** enhance setup for Antigravity CLI and Herdr integration ([2e51d4d](https://github.com/f6ra07nk14/structcast-model/commit/2e51d4d2e4afeef1edeb28a95d5ae796d3040846))
+* **devcontainer:** streamline Claude plugin setup by removing command check ([7c0befa](https://github.com/f6ra07nk14/structcast-model/commit/7c0befa074708c7931419bc51a226e4014b9047c))
+* **Dockerfile:** add python3-dev to the list of installed packages ([9291446](https://github.com/f6ra07nk14/structcast-model/commit/9291446c4c992d8fb3bbcd035aa844571a604327))
+* ignore .worktrees/ as AGENTS.md already assumes ([d93ec00](https://github.com/f6ra07nk14/structcast-model/commit/d93ec00c4057e4edcc18c2d4d526c40f61d62c08))
+* **plugins:** add new plugins for caveman and OpenAI Codex to the marketplace ([c13c702](https://github.com/f6ra07nk14/structcast-model/commit/c13c7024a7a892dbf412a5df435159dd66992b85))
+* tear down previous herdr crew before respawn ([7925dc9](https://github.com/f6ra07nk14/structcast-model/commit/7925dc91955a3bae47e440e1f281fb37c9d5eaff))
+
+
+### 🦊 CI/CD
+
+* run each tox environment as its own job and test dev through its pull request ([043a841](https://github.com/f6ra07nk14/structcast-model/commit/043a8414736685aef3ba77ab66a6219d9d888136))
+
+
+### 📔 Docs
+
+* **adr:** correct the recorded reason a sharded torch model refuses an EMA ([4c0af79](https://github.com/f6ra07nk14/structcast-model/commit/4c0af792d178004e5589c347e4026007a83c8030)), closes [#33](https://github.com/f6ra07nk14/structcast-model/issues/33)
+* **adr:** keep the keras time measurement inside ADR-0024 ([9289db8](https://github.com/f6ra07nk14/structcast-model/commit/9289db812830838bf1d346ed7d33660877352f06))
+* **adr:** record ADR-0024, one --compile definition on every command ([381ded6](https://github.com/f6ra07nk14/structcast-model/commit/381ded6bcad76c42eee8c282a5a25de7c301271a))
+* **adr:** record how flax drives DynamicScale from outside value_and_grad ([6928ca9](https://github.com/f6ra07nk14/structcast-model/commit/6928ca967009bde56c81143802dd6633fc14c939))
+* **adr:** record learner-owned training counters and the post-step protocol ([355aff9](https://github.com/f6ra07nk14/structcast-model/commit/355aff9a2f8113a0d03f9761f5d92028be76aba2))
+* **adr:** record per-backend native accumulation gating ([357704b](https://github.com/f6ra07nk14/structcast-model/commit/357704b1b19865dd5657e153e75e6b8acf41cc0c))
+* **adr:** record the checkpointing, EMA and tensor-parallel contracts ([9b64bae](https://github.com/f6ra07nk14/structcast-model/commit/9b64baead77ef98c3c30782b429c0d4a8db1c5ce))
+* **adr:** record the framework-agnostic loggers package and builders rename ([8d426d3](https://github.com/f6ra07nk14/structcast-model/commit/8d426d339dc72549ff0c446497229147ad1f0682))
+* **adr:** record the named-state generated learner contract ([f2a7dd3](https://github.com/f6ra07nk14/structcast-model/commit/f2a7dd39e5e5a978e38a1d5246c4075d00f7b4e2))
+* **adr:** record the shared CLI declaration layer and its placement rules ([b075273](https://github.com/f6ra07nk14/structcast-model/commit/b0752732e9870a5b2c8bb55ef0ba6b013189ac84))
+* **adr:** renumber the BatchNorm ADR to 0009 to resolve a number collision ([fde3728](https://github.com/f6ra07nk14/structcast-model/commit/fde37289b5f95bd4f7de64837bd131c9063eabc7))
+* **adr:** simplify the gradient_steps contract to an outermost check ([827049a](https://github.com/f6ra07nk14/structcast-model/commit/827049a85542774fa7de3f4b4578cc43e1b3ba17))
+* **agents:** point at .releaserc.json, the file that exists ([3303484](https://github.com/f6ra07nk14/structcast-model/commit/330348422bf8a5d9eb9b67518fbf9c16b514f6f7))
+* align CONTEXT and ADRs with the current code ([42a7ff8](https://github.com/f6ra07nk14/structcast-model/commit/42a7ff83eddbdf2b2941f479380b915b65d379c9))
+* bring the tutorials and agent guides in line with ADR-0024 ([13895a8](https://github.com/f6ra07nk14/structcast-model/commit/13895a84dd6645204c19784b196091059e207cc1))
+* **builders:** annotate the torch gate's intent semantics in generated code ([67ab470](https://github.com/f6ra07nk14/structcast-model/commit/67ab470e55d95a48e7e385c7d45b81f06ddf5e44))
+* **builders:** correct the keras counter-read cost comment ([8dde614](https://github.com/f6ra07nk14/structcast-model/commit/8dde6149b6f39f24838c1f73ca537f98c33a8cb4))
+* **cfg:** carry the ADR pointers' reasoning into the templates themselves ([3a94659](https://github.com/f6ra07nk14/structcast-model/commit/3a946591b5aa92bb6b0360609ba3a0ebe65dd290))
+* **commands:** make every CLI help string accurate and complete ([5f0779f](https://github.com/f6ra07nk14/structcast-model/commit/5f0779ffc37a3449d83bea38a68ee382601854d8))
+* **examples:** rebuild the README cf68eb0 triplicated ([1abfed8](https://github.com/f6ra07nk14/structcast-model/commit/1abfed8d0337ac1bc62a9826395ca86e98c6f1c9))
+* move source comments into a ledger under docs/ ([45b2e2b](https://github.com/f6ra07nk14/structcast-model/commit/45b2e2b69388b43c1e9b9206e1e0b963698a18b3))
+* **readme:** warn that a torch EMA is refused under FSDP2 and tensor parallel ([18b8d56](https://github.com/f6ra07nk14/structcast-model/commit/18b8d560dda6b1a62b3b86ededcb0e91da31ef40))
+* **reference:** correct the keras EMA parity claims and amend ADR-0021 ([c78ddb2](https://github.com/f6ra07nk14/structcast-model/commit/c78ddb2c058dc7f2929d8ea868a24943065eb203))
+* **reference:** document the flax loss scale and the slot it is saved in ([70d6176](https://github.com/f6ra07nk14/structcast-model/commit/70d61766a47e1b762b6b7faba241d89122a96de9))
+* **references:** report the H200 framework-parity and feature campaign ([ea1b85a](https://github.com/f6ra07nk14/structcast-model/commit/ea1b85aecaa58002583597733cf422d83630d0db)), closes [#32](https://github.com/f6ra07nk14/structcast-model/issues/32)
+* **reference:** state what the keras EMA is evaluated on and how its momentum converts ([1b17313](https://github.com/f6ra07nk14/structcast-model/commit/1b173133140b71522727b0e6bf59eb24a130084c))
+* **reference:** teach the learner-owned counter protocol ([90beb21](https://github.com/f6ra07nk14/structcast-model/commit/90beb2102a1ef4aeea1c4df0ab4488f8be28023d))
+* **reference:** teach the per-backend accumulation window forms ([17cfff7](https://github.com/f6ra07nk14/structcast-model/commit/17cfff753c8c7cd423ac7b6013170cbdd3e36564))
+* strip design-document references from docstrings ([c7cd569](https://github.com/f6ra07nk14/structcast-model/commit/c7cd5698e085b01a19a9c8ef0d2986516e0aa81a))
+* the keras average rides the resume checkpoint, not the best-model artifact ([cb4987a](https://github.com/f6ra07nk14/structcast-model/commit/cb4987a28773af582599910087e540dbeabc1769))
+
+
+### 📝 Examples
+
+* bring flax and keras cfg and examples to torch parity ([f90fa5b](https://github.com/f6ra07nk14/structcast-model/commit/f90fa5b2b45bcb3b1648161630c19946cd9d2251))
+* **cyclegan:** feed the shipped learners an unpaired loader and image pool ([08564a9](https://github.com/f6ra07nk14/structcast-model/commit/08564a9375807295c84b1538d54c62a7a4037ab4))
+* harden the data loaders and fold the flax schedules into the templates ([b730242](https://github.com/f6ra07nk14/structcast-model/commit/b73024245fdc94d97913adaf4f0a48d35fc30f2a))
+* stream ImageNet from directory trees and parameterize flax precision ([cf68eb0](https://github.com/f6ra07nk14/structcast-model/commit/cf68eb054918c8ebfbe6d7ddc58290ea817e17d7))
+* **torch:** align the hand-written learner with the CLI pipeline ([c54dd74](https://github.com/f6ra07nk14/structcast-model/commit/c54dd74c8e79d76c3f6a182bd69df5e1a02a155e))
+
+
+### 💎 Features
+
+* **api:** expose module-file public APIs flat on the package routers ([7bd634c](https://github.com/f6ra07nk14/structcast-model/commit/7bd634c94f53da6708c9e292c491a310ef70e5f7))
+* **builders:** qualified project imports, keras flow closures and reserved-name checks ([e14e419](https://github.com/f6ra07nk14/structcast-model/commit/e14e41927b82257911578ff83e66f13c1ab1de81))
+* **cfg:** parameterize dtype in the flax ConvNeXtV2 and VisionTransformer templates ([c4cc509](https://github.com/f6ra07nk14/structcast-model/commit/c4cc509db6926db8386657ec1cbdc8a59d2085f1))
+* **cfg:** parameterize the showcase average and the classifier precision ([84c77a6](https://github.com/f6ra07nk14/structcast-model/commit/84c77a64d1c40cc1fc2517547a191629e24837a3))
+* **commands:** cap GPU memory from the torch and flax CLIs ([3a6bc9b](https://github.com/f6ra07nk14/structcast-model/commit/3a6bc9b972b9af36972261e89f3ec08c3638dc3e))
+* **commands:** control the logging level from the root CLI ([631ce8d](https://github.com/f6ra07nk14/structcast-model/commit/631ce8d98d9ee3ef42e7b6a50f3b81d9fb94b853))
+* **flax:** carry dtype and param_dtype on every generated model ([e84a57a](https://github.com/f6ra07nk14/structcast-model/commit/e84a57aab55aead9abe0f2d25af8bd4c169a867e))
+* **flax:** learner generation and end-to-end training workflow ([#30](https://github.com/f6ra07nk14/structcast-model/issues/30)) ([14915c2](https://github.com/f6ra07nk14/structcast-model/commit/14915c22439e7deec66dcc8331e90972e4c86c75)), closes [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22)
+* **flax:** replace the manual accumulator with a parsed MultiSteps window ([dcad073](https://github.com/f6ra07nk14/structcast-model/commit/dcad07361ede2c965a1450d9a2fcf2205f0dc478))
+* **flax:** scale a learner segment's loss with a DynamicScale ([b4d25e7](https://github.com/f6ra07nk14/structcast-model/commit/b4d25e7dd3a2f3d5125f44efc74463f461b33469))
+* **flax:** type each mesh axis from its own flag ([c664576](https://github.com/f6ra07nk14/structcast-model/commit/c6645766549b29a250ad6bb7df7b1cf02fea6ab0))
+* **keras:** evaluate the optimizer's moving average in the inference step ([4759596](https://github.com/f6ra07nk14/structcast-model/commit/47595967720a1b7e6c008da97c1fbc5cdf5f734f))
+* **keras:** gate update() from the optimizer's own accumulation counter ([a501b86](https://github.com/f6ra07nk14/structcast-model/commit/a501b863e8ff44fd9d2b1691236781d54f9e7f1d))
+* **keras:** keras training workflow across the tensorflow, jax, and torch backends ([#31](https://github.com/f6ra07nk14/structcast-model/issues/31)) ([ac5432b](https://github.com/f6ra07nk14/structcast-model/commit/ac5432b3be951d732706bba360736a2a268b300e)), closes [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22) [#22](https://github.com/f6ra07nk14/structcast-model/issues/22)
+* **torch:** convert BatchNorm to SyncBatchNorm in the multi-rank strategies ([#28](https://github.com/f6ra07nk14/structcast-model/issues/28)) ([3e62685](https://github.com/f6ra07nk14/structcast-model/commit/3e6268512af8a14db06cad848057356bf0928ed9))
+* **torch:** expose the generated-learner helpers as public optimizer APIs ([49712f5](https://github.com/f6ra07nk14/structcast-model/commit/49712f576bd2fc6e498024c6405fa1e15c63efc7))
+* **trainer:** seed the learner counters on resume ([4d79833](https://github.com/f6ra07nk14/structcast-model/commit/4d798336745ce82662f0ed94c6ca31f115280d3f))
+
+
+### 🔧 Fixes
+
+* **builders:** hoist literal _bind_ callables to module-level constants ([f83d35a](https://github.com/f6ra07nk14/structcast-model/commit/f83d35a68d48f8c7e35dba802e88dfcbf91a73a1))
+* **builders:** make bind-lambda argument names deterministic ([1973cd0](https://github.com/f6ra07nk14/structcast-model/commit/1973cd045ada7c61f04f030192cfbc8a542b346c))
+* **builders:** reserve the keras learner's __init__ locals ([99297eb](https://github.com/f6ra07nk14/structcast-model/commit/99297eb1f40a3a7dcb95872b5503cdd22c106c6d))
+* **builders:** say why a sharded torch model cannot be averaged ([b02c1ef](https://github.com/f6ra07nk14/structcast-model/commit/b02c1efc01924ca018f6236402dae18cce0cfd95))
+* **builders:** short-circuit the idle keras gate and pin the MultiSteps match ([8042994](https://github.com/f6ra07nk14/structcast-model/commit/804299484a71a9b55f0128f33738f2105d8994ce))
+* **cfg:** align template defaults across the three frameworks ([b22ce12](https://github.com/f6ra07nk14/structcast-model/commit/b22ce12273571651936b67e6db460608ba939f9c))
+* **cfg:** align the flax ConvNeXtV2 learner with its twins and spell project addresses off the package ([d6efa89](https://github.com/f6ra07nk14/structcast-model/commit/d6efa89c610dfa383bd881f275ae71f079617e8d))
+* **cfg:** bind clip_grad_norm to the timm clipping threshold ([1d55e6a](https://github.com/f6ra07nk14/structcast-model/commit/1d55e6a54ef022f7d8987a441566e0a17e78945a))
+* **cfg:** call the exact erf GELU from the flax model templates ([dbf6404](https://github.com/f6ra07nk14/structcast-model/commit/dbf64049843178bef931484889a855d8486eb16b))
+* **cfg:** cast the keras image classifier logits to float32 before its criteria ([cf26bdc](https://github.com/f6ra07nk14/structcast-model/commit/cf26bdc54d712dd30a35383a237f35e3a5bd1f3e))
+* **cfg:** drop whole samples in the flax ConvNeXt V2 stochastic depth ([42e0d95](https://github.com/f6ra07nk14/structcast-model/commit/42e0d950ae82bd793b137e716b64885c93a10677))
+* **cfg:** give the keras ConvNeXt V2 learner the float32 cast its top-k needs ([2f56391](https://github.com/f6ra07nk14/structcast-model/commit/2f5639103515686a086a0ff0d0e13970651324b7))
+* **cfg:** give the keras SmallLanguageModel the torch/flax attention ([f6860cb](https://github.com/f6ra07nk14/structcast-model/commit/f6860cbbfbe76c16cb26ee4af24fb22f958c53f0))
+* **cfg:** guard the showcase accumulation window against a null parameter ([ca19a2f](https://github.com/f6ra07nk14/structcast-model/commit/ca19a2f954b3148cd90d4c857337ad682710e0e0))
+* **commands:** parse --training-mode-kwargs with the instantiator ([7961ba3](https://github.com/f6ra07nk14/structcast-model/commit/7961ba30b0b535753f5355ee42d0bec431870e4f))
+* **commands:** read a YAML null as off in bool_or_path_or_dict_parser ([2bf3122](https://github.com/f6ra07nk14/structcast-model/commit/2bf312280e81a4af8d5682b15736c93daa831012))
+* **crews:** add new worker and reviewer configurations with permission bypass ([9583c94](https://github.com/f6ra07nk14/structcast-model/commit/9583c943fff2a73c79e4262d5fb0239a68ce54db))
+* **docker:** put TensorFlow's CUDA wheel libraries on the loader path ([cf34e7b](https://github.com/f6ra07nk14/structcast-model/commit/cf34e7ba6f2db9b29afe7a0e570db875601a0bcd))
+* **examples:** align the flax and keras image pipelines with the torch recipe ([e340d9e](https://github.com/f6ra07nk14/structcast-model/commit/e340d9e205b4c621ecc4551346b95b6db757a9aa))
+* **examples:** hide GPUs from TensorFlow in the keras data pipelines ([f6b2f6d](https://github.com/f6ra07nk14/structcast-model/commit/f6b2f6de9f8c3c1972e4906751e0bfd7637a9cfa))
+* **examples:** seed keras ranks apart, resample flax images once, refuse single-channel crops ([35de419](https://github.com/f6ra07nk14/structcast-model/commit/35de419bb96590a86ba67f274f16fa4791531ca1))
+* **examples:** shuffle directory trees at the path level, not the pixels ([b888232](https://github.com/f6ra07nk14/structcast-model/commit/b88823236baa87bda68b5efe9743be80e41841c7))
+* **flax:** fire the update gate on the step MultiSteps actually applies ([587b772](https://github.com/f6ra07nk14/structcast-model/commit/587b77262901c8d5671c2a4e50c4ae92272ae017))
+* **flax:** forward a precision keyword only where it is inert at its default ([81dce92](https://github.com/f6ra07nk14/structcast-model/commit/81dce92463ebad709032a9ab9a186dd012a6a34d))
+* **flax:** refuse tensor-parallel presets without a column or row rule ([13e1c0f](https://github.com/f6ra07nk14/structcast-model/commit/13e1c0fe188dcee5ef93a2e8ddbb46319627b964))
+* **flax:** type every mesh axis Auto unless model_axis_mode opts into explicit ([0dff549](https://github.com/f6ra07nk14/structcast-model/commit/0dff54912a6ec7f8a14ba908f35b7fb62d8f83cb))
+* **keras:** disable flash attention when a layer checkpoints on jax ([43d1f32](https://github.com/f6ra07nk14/structcast-model/commit/43d1f328920945bb7d22933c9b697f895d8d81aa))
+* **keras:** make the EMA inference swap total, single-owner and unwindable ([90b41fd](https://github.com/f6ra07nk14/structcast-model/commit/90b41fd69768de9ee779cd75e5378cf83191a75c))
+* **keras:** stop the tensorflow dp path halving every Loss twice ([d195d7f](https://github.com/f6ra07nk14/structcast-model/commit/d195d7fd488cfec06fe23f9e76b118548835d65f))
+* **keras:** time the compiled forward under --compile ([88a1e61](https://github.com/f6ra07nk14/structcast-model/commit/88a1e61d04c25fef0851cecee14576d45ce7c1e3))
+* **layers:** keep the GRN gradient finite on zero-norm channels ([9cb6c82](https://github.com/f6ra07nk14/structcast-model/commit/9cb6c823396b62f29c2fa74e3cea4c7a9f85d5d5))
+* **layers:** zero-initialize flax and keras GRN scales ([243e877](https://github.com/f6ra07nk14/structcast-model/commit/243e877fe7c55b22513f9dca896d0a596ae00b77))
+* **loggers:** fail clearly when writing run files without an active run ([fb6499e](https://github.com/f6ra07nk14/structcast-model/commit/fb6499e6eaa9ce4f703bf4e28a7c0897948a9ec6))
+* **torch:** reject index-keyed optimizer state and gate partial resumes ([e9b2449](https://github.com/f6ra07nk14/structcast-model/commit/e9b2449be381a8ab5f5099f6ddc7000f5e18a598)), closes [#24](https://github.com/f6ra07nk14/structcast-model/issues/24)
+* **torch:** split optimizer param groups that mix DTensor and plain tensors ([ee6ece2](https://github.com/f6ra07nk14/structcast-model/commit/ee6ece2fda17949215112955ce5f504af86e460a))
+* **torch:** split param_names with the parameter groups ([0489101](https://github.com/f6ra07nk14/structcast-model/commit/0489101a34eb1713255990bfc9cc83dcb3f47f61))
+* **worker:** add permission bypass for Gemini websearch model ([b80b110](https://github.com/f6ra07nk14/structcast-model/commit/b80b11083f396d0e1c6a88287a2782997eef644f))
+
+
+### 🚀 Performance
+
+* **flax:** keep two placed batches in flight ahead of the training step ([70ef955](https://github.com/f6ra07nk14/structcast-model/commit/70ef9556f777839eda05d1868cef2221382a164b))
+
+
+### 🔨 Refactor
+
+* **builders:** drop dead branches, read positional dropout rates, widen the keras reserved names ([f4a981e](https://github.com/f6ra07nk14/structcast-model/commit/f4a981eb4ad894176812c6bdffe016818cdca097))
+* **builders:** wire flax precision from templates instead of layer signatures ([45deb57](https://github.com/f6ra07nk14/structcast-model/commit/45deb574b472fda2059697a67da99e07e984fb4a))
+* **commands:** close the review findings on the declaration layer ([772ccdc](https://github.com/f6ra07nk14/structcast-model/commit/772ccdc3bef66888e8ce50d6e2174faa30d7e9a2))
+* **commands:** declare every --compile through compile_option ([6175d79](https://github.com/f6ra07nk14/structcast-model/commit/6175d798126c073a34d71da3a1dfcbf5b019a947))
+* **commands:** extract the shared CLI declaration layer ([a8134d7](https://github.com/f6ra07nk14/structcast-model/commit/a8134d715b0aea5478332b306c3b8ff082aa097b))
+* **flax:** read the accumulation window back from the built optimizer ([0d5fa12](https://github.com/f6ra07nk14/structcast-model/commit/0d5fa127e77166227431a7f9dce0b4853d567cc6))
+* **flax:** replace Any with precise types in the flax runtime ([8ea6f0d](https://github.com/f6ra07nk14/structcast-model/commit/8ea6f0d2d349d69e0dc8e59562a2bcf0d484c272))
+* import TensorInitializer only from base_trainer ([29fbc51](https://github.com/f6ra07nk14/structcast-model/commit/29fbc5190a60b1438d3fb057f1ed7ca0e791ce08))
+* **keras:** replace Any with precise types in the keras runtime ([aac9a21](https://github.com/f6ra07nk14/structcast-model/commit/aac9a21c26102bd11856d367a7d2e7a71f7146bd))
+* replace Any with precise types in the framework-agnostic modules ([4591a4e](https://github.com/f6ra07nk14/structcast-model/commit/4591a4e8e1aa7317fe4ea15fc0dd8924deddd1cf))
+* share one generic TensorInitializer protocol across frameworks ([ad81119](https://github.com/f6ra07nk14/structcast-model/commit/ad81119a83ea074d637a4b392757a2c97e3bc274))
+* **torch:** fold the single-use helpers and resolve the DCP api once ([07f7724](https://github.com/f6ra07nk14/structcast-model/commit/07f7724e1fa347903b0e16bc20cb97925133bf64))
+* **torch:** replace Any with precise types in the torch runtime ([ca516ff](https://github.com/f6ra07nk14/structcast-model/commit/ca516ff4d28b7529724f9e49c23eb5f71ee43d49))
+* **trainer:** align counter views and slim update_models ([77da75f](https://github.com/f6ra07nk14/structcast-model/commit/77da75fe96875d9278ec7cfed3ff6dc86c4f5252))
+* trust the flow_functions protocol member ([7a8711f](https://github.com/f6ra07nk14/structcast-model/commit/7a8711f4c80234c801c570728753691ac16d89f3))
+
+
+### ✨ Style
+
+* trim three comments and seed the keras crop like the flax one ([71e0a23](https://github.com/f6ra07nk14/structcast-model/commit/71e0a230759700b3ecb710ce1d18f625a9e067f9))
+
+
+### 🚨 Tests
+
+* **builders:** pin the shipped templates to citation-free prose ([1ea2739](https://github.com/f6ra07nk14/structcast-model/commit/1ea27395aed9cd42930bf6f59c030b1ac6b1933a))
+* **flax:** drive the accumulation gate under the donation a run compiles with ([b986962](https://github.com/f6ra07nk14/structcast-model/commit/b986962ed126013d4ea428e14d72dd1e1ddd7453))
+* **keras:** build the swap probe gradients from the variable shape ([fb84f2b](https://github.com/f6ra07nk14/structcast-model/commit/fb84f2bbee3ea28c9a77aadf51c233875e37793a))
+* **keras:** pin the logical-device probe and the EMA swap over a missing average ([b9e80a5](https://github.com/f6ra07nk14/structcast-model/commit/b9e80a578fcb3b65c16f38aeeb69afc807906049))
+* **keras:** run both image classifier templates under a bfloat16 policy ([8e458e3](https://github.com/f6ra07nk14/structcast-model/commit/8e458e3a6215d8df7004324119c01661a0f3e3e3))
+* **loggers:** exercise the wandb logger against the real SDK offline ([dbb820a](https://github.com/f6ra07nk14/structcast-model/commit/dbb820a9509a4f28ddd416ee3aec40b26aa50aeb))
+* **loggers:** tear down the wandb singleton after each offline run ([7d351bf](https://github.com/f6ra07nk14/structcast-model/commit/7d351bfa68e99620292757b6496bd3a04b289603))
+* narrow hoisted-binding expressions and annotate the strategy list for mypy ([49fddf3](https://github.com/f6ra07nk14/structcast-model/commit/49fddf3af5c56e7b43b4c0835ae7e477cf1a4a04))
+* share the counting learner and stepped info across the fakes ([826087d](https://github.com/f6ra07nk14/structcast-model/commit/826087d2e980a23ee59be17581a590e4ce92ef04))
+
 ## [5.0.0](https://github.com/f6ra07nk14/structcast-model/compare/v4.0.0...v5.0.0) (2026-08-16)
 
 
