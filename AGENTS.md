@@ -127,7 +127,7 @@ instead of hiding it.
 
 ### Issue tracker
 
-Issues live in GitHub Issues for `f6ra07nk14/structcast`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues for `f6ra07nk14/structcast-model`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
