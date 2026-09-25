@@ -95,7 +95,7 @@ class Learner(Protocol, Generic[ModelT]):
         """
 
     @property
-    def flow_functions(self) -> dict[str, Any]:
+    def flow_functions(self) -> dict[str, Callable[..., Any]]:
         """The named flow callables a strategy or trainer may compile or rebind (attribute name -> callable).
 
         A caller that compiles or replicates one rebinds the attribute the key names to its wrapper,
@@ -205,7 +205,7 @@ class BaseInfo(Generic[ModelT]):
     epoch: int = 0
     """The current epoch."""
 
-    history: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history: dict[int, dict[str, float]] = field(default_factory=dict)
     """History of training and validation logs."""
 
     @property
@@ -229,7 +229,7 @@ class BaseInfo(Generic[ModelT]):
         """The models by name; a bare info holds none, a trainer delegates to its learner."""
         return {}
 
-    def logs(self, epoch: int | None = None) -> dict[str, Any]:
+    def logs(self, epoch: int | None = None) -> dict[str, float]:
         """Get the log for the given epoch."""
         if epoch is None:
             return self.history.setdefault(self.epoch, {})
@@ -376,7 +376,7 @@ class BaseTrainer(BaseInfo[ModelT]):
     data: DataProvider
     """The provider of the training and validation datasets."""
 
-    callbacks: Sequence[Any] = ()
+    callbacks: Sequence[object] = ()
     """Objects routed into the events whose protocol they implement."""
 
     training_prefix: str = ""
@@ -385,7 +385,7 @@ class BaseTrainer(BaseInfo[ModelT]):
     validation_prefix: str = "val_"
     """ Prefix for validation logs. """
 
-    history: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history: dict[int, dict[str, float]] = field(default_factory=dict)
     """History of training and validation logs."""
 
     _events: dict[str, list[tuple[str, Callable[..., None]]]] = field(default_factory=dict, init=False, repr=False)
@@ -414,7 +414,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         The datasets join the scan so hooks such as a distributed sampler's set_epoch fire on
         every rank without explicit registration.
         """
-        candidates: list[Any] = [
+        candidates: list[object] = [
             self.learner,
             *self.learner.optimizers.values(),
             self.tracker,
@@ -472,21 +472,21 @@ class BaseTrainer(BaseInfo[ModelT]):
     def sync(self) -> None:
         """Synchronize the device if necessary. This is a no-op by default, but can be overridden by subclasses."""
 
-    def update_models(self, __inputs__: Any) -> dict[str, Any]:
+    def update_models(self, __inputs__: Mapping[str, Any]) -> dict[str, Any]:
         """Perform a training step and update the models.
 
         Whether the step landed an update is not returned here: the learner owns the training
         counters, so the loop reads ``learner.has_updated`` after this call.
 
         Args:
-            __inputs__ (Any): The inputs for the training step.
+            __inputs__ (Mapping[str, Any]): The inputs for the training step.
 
         Returns:
             dict[str, Any]: The criteria for tracking.
         """
         return self.learner.training_step(**__inputs__)
 
-    def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
+    def train(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, float]:
         """Train the model on the given dataset.
 
         Args:
@@ -494,7 +494,7 @@ class BaseTrainer(BaseInfo[ModelT]):
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
 
         Returns:
-            Mapping[str, Any]: The logs from training, which may include metrics and other information.
+            Mapping[str, float]: The logs from training, which may include metrics and other information.
         """
         self._dispatch("on_training_begin")
         elapsed_time = 0.0
@@ -516,7 +516,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         self._dispatch("on_training_end")
         return logs
 
-    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, Any]:
+    def evaluate(self, dataset: DatasetLike | Callable[[], DatasetLike]) -> Mapping[str, float]:
         """Evaluate the model on the given dataset.
 
         Args:
@@ -524,7 +524,7 @@ class BaseTrainer(BaseInfo[ModelT]):
                 which can be an iterable of input dictionaries or a callable that returns such an iterable.
 
         Returns:
-            Mapping[str, Any]: The logs from evaluation, which may include metrics and other information.
+            Mapping[str, float]: The logs from evaluation, which may include metrics and other information.
         """
         self._dispatch("on_validation_begin")
         elapsed_time = 0.0
@@ -547,7 +547,7 @@ class BaseTrainer(BaseInfo[ModelT]):
         epochs: int,
         start_epoch: int = 1,
         validation_frequency: int = 1,
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, dict[str, float]]:
         """Fit the model on the datasets of the data provider.
 
         Args:
@@ -636,7 +636,7 @@ def _format_criteria(info: BaseInfo) -> str:
 
     Trainers dispatch themselves as *info*, so the learner's learning rates are read directly.
     """
-    values: dict[str, Any] = dict(cast("BaseTrainer[Any]", info).learner.learning_rates)
+    values: dict[str, float] = dict(cast("BaseTrainer[Any]", info).learner.learning_rates)
     values.update(info.logs())
     return "\n".join([f"epoch: {info.epoch}", *(f"  {key}: {value}" for key, value in values.items())])
 

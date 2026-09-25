@@ -1,7 +1,7 @@
 """Keras related commands for the StructCast Model CLI application."""
 
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import json
 import os
@@ -183,7 +183,7 @@ def _compile_choice(backend: str, compile_pattern: dict[str, Any] | None) -> Ite
         adapter.compile_kw = None
 
 
-def _get_sync_fn(device: str) -> Any:
+def _get_sync_fn(device: str) -> Callable[[object], object]:
     """Return a synchronization function appropriate for the current Keras backend."""
     backend = keras.backend.backend()
     if backend == "jax":
@@ -320,7 +320,7 @@ def _mixed_precision_policy(factory: Any) -> str | None:
     return f"mixed_{factory.MIXED_PRECISION_TYPE}"
 
 
-def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
+def _optimizer_hashes(learner: object) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's class declares, empty for anything else.
 
     Read off the class, as `_mixed_precision_policy` reads the mixed precision constants. A
@@ -329,7 +329,9 @@ def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 
 
-def _resolve_strategy(strategy: Any, device: str | None) -> "scm_keras.KerasDistributedStrategy":
+def _resolve_strategy(
+    strategy: str | dict[str, Any] | None, device: str | None
+) -> "scm_keras.KerasDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
@@ -354,7 +356,7 @@ def _build_logger(logger_name: str, experiment: str, is_main: bool) -> "scm_logg
 
 def _build_callbacks(
     *,
-    trainer: Any,
+    trainer: "scm.BaseTrainer[Any]",
     provider: "scm.SimpleDataProvider",
     strategy: "scm_keras.KerasDistributedStrategy",
     outputs: list[str],
@@ -363,7 +365,7 @@ def _build_callbacks(
     save_criteria: list[str],
     logger: "scm_loggers.Logger",
     ci: bool,
-    extra_meta: Mapping[str, Any],
+    extra_meta: Mapping[str, object],
 ) -> None:
     """Install the logger and the saver/best/display callbacks on the trainer.
 
@@ -375,7 +377,7 @@ def _build_callbacks(
     bests = scm_keras.KerasBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
-    display: list[Any] = []
+    display: list[object] = []
     if strategy.is_main:
         display.append(
             scm.Printer()

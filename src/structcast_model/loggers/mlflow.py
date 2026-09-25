@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.lazy_import import try_import
@@ -40,16 +41,18 @@ class MLflowLogger(Logger):
         mlflow.start_run()
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         """End the run, marking it failed when an exception is propagating."""
         mlflow.end_run(status="FINISHED" if exc_type is None else "FAILED")
 
-    def log_params(self, params: Mapping[str, Any]) -> None:
+    def log_params(self, params: Mapping[str, object]) -> None:
         """Log the run parameters."""
         for key, value in params.items():
             mlflow.log_param(key, value)
 
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+    def log_dict(self, data: Mapping[str, object], name: str) -> None:
         """Log a dictionary as an artifact under the given file name."""
         mlflow.log_dict(dict(data), name)
 

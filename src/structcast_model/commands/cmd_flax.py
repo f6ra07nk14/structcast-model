@@ -187,7 +187,7 @@ def _cap_gpu_memory(fraction: float | None) -> None:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 
-def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
+def _optimizer_hashes(learner: object) -> Mapping[str, str]:
     """Return the `OPTIMIZER_HASHES` the learner's own class declares, empty for anything else.
 
     A generated learner carries the digests as a class attribute, which is the only handle on them:
@@ -197,7 +197,7 @@ def _optimizer_hashes(learner: Any) -> Mapping[str, str]:
     return cast(Mapping[str, str], getattr(type(learner), "OPTIMIZER_HASHES", None) or {})
 
 
-def _resolve_strategy(strategy: Any, device: str | None) -> "scm_flax.FlaxDistributedStrategy":
+def _resolve_strategy(strategy: str | dict[str, Any] | None, device: str | None) -> "scm_flax.FlaxDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
         # Cast, not validate: the strategy owns the list of presets it knows and rejects the rest

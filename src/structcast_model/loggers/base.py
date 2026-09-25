@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from typing_extensions import Protocol, runtime_checkable
@@ -21,13 +22,15 @@ class Logger(Protocol):
     def __enter__(self) -> "Logger":
         """Start the run and return the logger recording it."""
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         """End the run, marking it failed when an exception is propagating."""
 
-    def log_params(self, params: Mapping[str, Any]) -> None:
+    def log_params(self, params: Mapping[str, object]) -> None:
         """Log the run parameters."""
 
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+    def log_dict(self, data: Mapping[str, object], name: str) -> None:
         """Log a dictionary as an artifact under the given file name."""
 
     def log_artifact(self, path: str) -> None:
@@ -62,13 +65,15 @@ class NullLogger(Logger):
         """Start nothing and hand back the logger, mirroring a real run's context shape."""
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         """End nothing."""
 
-    def log_params(self, params: Mapping[str, Any]) -> None:
+    def log_params(self, params: Mapping[str, object]) -> None:
         """Discard the run parameters."""
 
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+    def log_dict(self, data: Mapping[str, object], name: str) -> None:
         """Discard the dictionary."""
 
     def log_artifact(self, path: str) -> None:
@@ -90,7 +95,7 @@ class NullLogger(Logger):
         """React to nothing."""
 
 
-def _epoch_metrics(info: BaseInfo) -> dict[str, Any]:
+def _epoch_metrics(info: BaseInfo) -> dict[str, float]:
     """Merge the learner's learning rates and decay values into the criteria of the current epoch.
 
     Schedules step in the learner's own on_epoch_end hooks, which the trainer dispatches before the

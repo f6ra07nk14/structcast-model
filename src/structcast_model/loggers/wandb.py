@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from structcast.utils.base import dump_yaml
@@ -47,15 +48,17 @@ class WandbLogger(Logger):
         wandb.init(project=self.experiment)
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         """Finish the run, marking it failed when an exception is propagating."""
         wandb.finish(exit_code=0 if exc_type is None else 1)
 
-    def log_params(self, params: Mapping[str, Any]) -> None:
+    def log_params(self, params: Mapping[str, object]) -> None:
         """Log the run parameters."""
         wandb.config.update(dict(params))
 
-    def log_dict(self, data: Mapping[str, Any], name: str) -> None:
+    def log_dict(self, data: Mapping[str, object], name: str) -> None:
         """Write a dictionary into the run directory as YAML, matching what MLflow stores."""
         dump_yaml(dict(data), _active_run_dir() / name)
 

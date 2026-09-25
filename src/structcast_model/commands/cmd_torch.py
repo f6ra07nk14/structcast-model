@@ -293,7 +293,7 @@ def _assemble_learner(
     device: str,
     distributed: bool,
     is_main: bool,
-) -> tuple["OrderedDict[str, torch.nn.Module]", Any, list[str], Any]:
+) -> tuple["OrderedDict[str, torch.nn.Module]", "scm.Learner[torch.nn.Module]", list[str], "scm_torch.TorchTracker"]:
     """Instantiate, initialize, compile and wrap the models, then build the learner and its tracker."""
     # Everything below runs on the training device: the models, and the tracker buffers, which are
     # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
@@ -335,7 +335,7 @@ def _assemble_learner(
 
 def _build_callbacks(
     *,
-    trainer: Any,
+    trainer: "scm.BaseTrainer[Any]",
     provider: "scm.SimpleDataProvider",
     strategy: "scm_torch.DistributedStrategy",
     learner_outputs: list[str],
@@ -353,7 +353,7 @@ def _build_callbacks(
     bests = scm_torch.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
     )
-    display: list[Any] = []
+    display: list[object] = []
     if is_main:
         display.append(
             scm.Printer()

@@ -129,7 +129,7 @@ class _Intermediate(Serializable):
         module_path.write_text(code, encoding="utf-8")
 
 
-def _hash(raw: Any) -> str:
+def _hash(raw: object) -> str:
     return sha256(json_dumps(to_jsonable_python(raw), sort_keys=True).encode()).hexdigest()
 
 

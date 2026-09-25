@@ -152,7 +152,7 @@ class KerasStateBackend:
         """Write *states* into `directory/name.npz` and return that path."""
         path = directory / f"{name}{self.suffix}"
         arrays: dict[str, Any] = {}
-        plain: dict[str, Any] = {}
+        plain: dict[str, object] = {}
         for item, value in states.items():
             try:
                 json.dumps(value)
@@ -182,7 +182,7 @@ class KerasStateBackend:
         return restored
 
 
-def _flatten_arrays(value: Any, prefix: str) -> dict[str, Any]:
+def _flatten_arrays(value: object, prefix: str) -> "dict[str, np.ndarray]":
     """Flatten one array item into `numpy` archive members, keyed by their "/"-joined path."""
     if isinstance(value, Mapping):
         return {
@@ -220,11 +220,11 @@ def _save_item(item: str, value: Any) -> Any:
     return ocp.args.JsonSave(value)
 
 
-def _text_path(value: Any, path: tuple[str, ...]) -> tuple[str, ...] | None:
+def _text_path(value: object, path: tuple[str, ...]) -> tuple[str, ...] | None:
     """Return the path of the first string inside *value*, or `None` when it holds none."""
     if isinstance(value, str):
         return path
-    entries: list[tuple[Any, Any]]
+    entries: list[tuple[object, object]]
     if isinstance(value, Mapping):
         entries = list(value.items())
     elif isinstance(value, (list, tuple)):
@@ -237,7 +237,7 @@ def _text_path(value: Any, path: tuple[str, ...]) -> tuple[str, ...] | None:
     return None
 
 
-def _sequence_keys(value: Any) -> Any:
+def _sequence_keys(value: object) -> object:
     """Turn the digit keys orbax writes back into the integers the state was keyed by.
 
     Orbax stores every mapping key as a string, while an nnx pure state keys the entries of a

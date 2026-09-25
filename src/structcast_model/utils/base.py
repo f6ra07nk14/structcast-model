@@ -163,11 +163,11 @@ def resolve_tensor_initializer(
     return float_default
 
 
-def resolve_input_shapes(model: Any, shapes: Any = None) -> Any:
+def resolve_input_shapes(model: object, shapes: Any = None) -> Any:
     """Resolve the input shapes to create dummy inputs from, preferring the explicitly requested ones.
 
     Args:
-        model (Any): The built model, or a mapping or sequence of models. The `input_shapes` attribute
+        model (object): The built model, or a mapping or sequence of models. The `input_shapes` attribute
             emitted by the builders is used when no shapes are requested; for a collection of models,
             the attributes of its members are merged.
         shapes (Any): The explicitly requested shapes, which take precedence when they are not empty.

@@ -117,11 +117,11 @@ def tensor_shape_parser(value: str) -> dict[str, Any]:
     return adapter.dump_python(adapter.validate_python(load_yaml_from_string(value)))
 
 
-def get_module_outputs(module: Any, default: list[str] | None, name: str) -> list[str]:
+def get_module_outputs(module: object, default: list[str] | None, name: str) -> list[str]:
     """Return output names from a module attribute or the provided default, raising if neither is available.
 
     Args:
-        module (Any): The module whose ``outputs`` attribute is read when no default is given.
+        module (object): The module whose ``outputs`` attribute is read when no default is given.
         default (list[str] | None): Output names given on the command line, which win over the attribute.
         name (str): How the module is named on the command line, used to name the option in the error.
 
@@ -138,7 +138,7 @@ def get_module_outputs(module: Any, default: list[str] | None, name: str) -> lis
     )
 
 
-def config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mapping[str, Any]) -> str:
+def config_hash(model_patterns: list[dict], learner_pattern: object, shapes: Mapping[str, object]) -> str:
     """Return the digest of what a run trains: its model patterns, its learner pattern and its shapes.
 
     Recorded in the saved training state so a resumed run can be told apart from the configuration it
@@ -147,8 +147,8 @@ def config_hash(model_patterns: list[dict], learner_pattern: Any, shapes: Mappin
 
     Args:
         model_patterns (list[dict]): The patterns the run's models are built from.
-        learner_pattern (Any): The pattern the run's learner is built from.
-        shapes (Mapping[str, Any]): The input shapes the models are traced with.
+        learner_pattern (object): The pattern the run's learner is built from.
+        shapes (Mapping[str, object]): The input shapes the models are traced with.
 
     Returns:
         str: The hexadecimal digest of the three together.
@@ -174,14 +174,14 @@ def check_gpu_memory_fraction(fraction: float | None) -> None:
         raise ValueError(f"--gpu-memory-fraction must be in (0, 1]. Got: {fraction}.")
 
 
-def strategy_parser(value: str) -> Any:
+def strategy_parser(value: str) -> str | dict[str, Any] | None:
     """Parse `--strategy`: a bare name is a preset, anything else an object pattern or a path to one.
 
     Args:
         value (str): The option's raw value.
 
     Returns:
-        Any: The preset name, or the parsed pattern.
+        str | dict[str, Any] | None: The preset name, or the parsed pattern.
     """
     return value if value.isidentifier() else path_or_any_parser(value)
 
