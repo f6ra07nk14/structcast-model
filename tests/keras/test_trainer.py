@@ -11,8 +11,7 @@ import numpy as np
 import pytest
 
 import keras
-from structcast_model.base_trainer import EVENTS, BaseInfo, BestCriterion, SimpleDataProvider, TensorInitializer
-from structcast_model.keras import TensorInitializer as KerasTensorInitializer
+from structcast_model.base_trainer import EVENTS, BaseInfo, BestCriterion, SimpleDataProvider
 from structcast_model.keras.trainer import (
     KerasBestCriterion,
     KerasTracker,
@@ -140,11 +139,6 @@ def test_create_numpy_inputs_rejects_non_callable_initializer() -> None:
     """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
     with pytest.raises(TypeError, match="not callable as a tensor initializer"):
         create_numpy_inputs({"_SHAPE_": [4], "_INIT_": "numpy.pi"})
-
-
-def test_keras_tensor_initializer_is_the_shared_protocol() -> None:
-    """The keras package re-exports the one `TensorInitializer` every framework resolves `_INIT_` against."""
-    assert KerasTensorInitializer is TensorInitializer
 
 
 # ---------------------------------------------------------------------------

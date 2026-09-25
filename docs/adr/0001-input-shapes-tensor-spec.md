@@ -36,7 +36,7 @@ reported, just not made fatal.
 An `_INIT_` address is imported through structcast's `import_from_address` (which applies the security checks) and
 then gated with `isinstance(fn, TensorInitializer)`, a `runtime_checkable` Protocol. There is one such Protocol,
 defined generically in `structcast_model.base_trainer` over the element and tensor types, and every framework resolves
-its `_INIT_` against it; the torch, Keras, and Flax packages only re-export it. `runtime_checkable` only verifies
+its `_INIT_` against it, importing it from `structcast_model.base_trainer`. `runtime_checkable` only verifies
 that `__call__` exists — the check is effectively `callable(fn)` and does not inspect the signature. An address
 pointing at a callable with the wrong signature therefore passes the gate and fails later, at call time, with whatever
 that callable raises. This is accepted: the gate rejects obvious non-callables and states the expected contract in the

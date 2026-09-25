@@ -12,8 +12,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider, TensorInitializer
-from structcast_model.flax import TensorInitializer as FlaxTensorInitializer
+from structcast_model.base_trainer import EVENTS, BaseInfo, OnEpochBegin, SimpleDataProvider
 from structcast_model.flax.trainer import FlaxTracker, FlaxTrainer, ShardedDataset, create_jax_inputs
 from structcast_model.flax.utils import donate_argnames, get_jax_device, get_jax_devices
 from tests.fakes import CountingLearner
@@ -215,11 +214,6 @@ def test_create_jax_inputs_honours_explicit_initializer() -> None:
     """An explicit `_INIT_` address replaces the dtype-based default initializer."""
     result = create_jax_inputs({"_SHAPE_": [4], "_INIT_": "jax.numpy.ones"})
     assert jnp.array_equal(result, jnp.ones((1, 4), dtype=jnp.bfloat16))
-
-
-def test_flax_tensor_initializer_is_the_shared_protocol() -> None:
-    """The flax package re-exports the one `TensorInitializer` every framework resolves `_INIT_` against."""
-    assert FlaxTensorInitializer is TensorInitializer
 
 
 # ---------------------------------------------------------------------------

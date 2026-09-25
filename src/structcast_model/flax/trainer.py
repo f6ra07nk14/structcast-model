@@ -20,7 +20,6 @@ from structcast_model.base_trainer import (
     BestCriterion,
     DatasetLike,
     Learner,
-    TensorInitializer,
     get_dataset,
     get_dataset_size,
 )
@@ -404,7 +403,6 @@ __all__ = [
     "FlaxTrainer",
     "FlaxTrainingStateSaver",
     "ShardedDataset",
-    "TensorInitializer",
     "create_jax_inputs",
     "resolve_input_shapes",
     "restore_training_state",

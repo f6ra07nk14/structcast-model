@@ -13,7 +13,6 @@ __all__ = [
     "FullyShardedTensorParallelStrategy",
     "SingleDeviceStrategy",
     "Tensor",
-    "TensorInitializer",
     "TensorParallelStrategy",
     "TorchBestCriterion",
     "TorchTracker",
@@ -76,7 +75,7 @@ if TYPE_CHECKING:
         resolve_input_shapes,
         restore_training_state,
     )
-    from structcast_model.torch.types import DeviceLike, DType, Tensor, TensorInitializer
+    from structcast_model.torch.types import DeviceLike, DType, Tensor
     from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 else:
     import sys
@@ -124,7 +123,7 @@ else:
             "resolve_input_shapes",
             "restore_training_state",
         ],
-        "types": ["DType", "DeviceLike", "Tensor", "TensorInitializer"],
+        "types": ["DType", "DeviceLike", "Tensor"],
         "utils": ["get_torch_device", "get_torch_device_type"],
     }
     sys.modules[__name__] = LazySelectedImporter(__name__, globals(), import_structure)

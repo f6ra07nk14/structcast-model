@@ -2,8 +2,6 @@
 
 from typing import TYPE_CHECKING
 
-from structcast_model.base_trainer import TensorInitializer
-
 if TYPE_CHECKING:
     from typing import TypeAlias
 
@@ -30,7 +28,7 @@ else:
     """Tensor type."""
 
 
-__all__ = ["DType", "DeviceLike", "Tensor", "TensorInitializer"]
+__all__ = ["DType", "DeviceLike", "Tensor"]
 
 
 if not TYPE_CHECKING:

@@ -11,7 +11,7 @@ from numpy.typing import DTypeLike, NDArray
 from pydantic import TypeAdapter, ValidationError
 
 import keras
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, Learner, TensorInitializer
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, Learner
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.loggers.base import Logger
@@ -418,7 +418,6 @@ __all__ = [
     "KerasTracker",
     "KerasTrainer",
     "KerasTrainingStateSaver",
-    "TensorInitializer",
     "create_keras_inputs",
     "create_numpy_inputs",
     "initial_model",
