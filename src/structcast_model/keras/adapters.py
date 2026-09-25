@@ -65,13 +65,13 @@ class AdapterSegment:
     flow: Flow
     """The training flow of this segment."""
 
-    optimizer: Any
+    optimizer: keras.optimizers.Optimizer
     """The Keras optimizer of this segment; `prepare` may replace it with a wrapped one."""
 
-    variables: list[Any]
+    variables: list[keras.Variable]
     """The Keras variables this optimizer updates, the trainable variables of its layers."""
 
-    models: list[Any]
+    models: list[keras.Model]
     """The Keras models the flow runs, whose remaining state (moving statistics, seeds) it may touch."""
 
 
@@ -140,7 +140,7 @@ class BackendAdapter(Protocol):
             The training step.
         """
 
-    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
+    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[keras.Model] = ()) -> InferenceFlow:
         """Build the inference step, which updates no variable; compiled only when `compile_kw` asks.
 
         Args:
@@ -270,7 +270,7 @@ class TensorFlowAdapter(_Adapter):
 
         return self._compile_step(step)
 
-    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
+    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[keras.Model] = ()) -> InferenceFlow:
         """Run the inference flow, traced when asked, reading its variables from the closure."""
         return self._compile_step(flow)
 
@@ -380,7 +380,7 @@ class JaxAdapter(_Adapter):
 
         return train_step
 
-    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
+    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[keras.Model] = ()) -> InferenceFlow:
         """Build one step threading the models' variables through, as the training step does.
 
         Jitted when `compile_kw` asks for it. A jitted closure reading its variables directly would
@@ -451,7 +451,7 @@ class TorchAdapter(_Adapter):
 
         return self._compile_step(step)
 
-    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[Any] = ()) -> InferenceFlow:
+    def build_inference_step(self, flow: InferenceFlow, *, models: Sequence[keras.Model] = ()) -> InferenceFlow:
         """Run the inference flow with autograd disabled, reading its variables from the closure.
 
         The refusal comes first, so a request this backend cannot honor is raised about the flow it
@@ -464,7 +464,7 @@ class TorchAdapter(_Adapter):
         return torch.no_grad()(inference)
 
 
-def _exchange(variable: Any, average: Any) -> None:
+def _exchange(variable: keras.Variable, average: keras.Variable) -> None:
     """Trade one variable's value for its average, through a copy so the trade is exact.
 
     Not the add-and-subtract dance of `keras.callbacks.SwapEMAWeights._tf_swap_variables`: that one
@@ -478,7 +478,7 @@ def _exchange(variable: Any, average: Any) -> None:
     average.assign(held)
 
 
-def _ema_pairs(optimizers: Sequence[Any]) -> list[tuple[Any, Any]]:
+def _ema_pairs(optimizers: Sequence[keras.optimizers.Optimizer]) -> list[tuple[keras.Variable, keras.Variable]]:
     """List the (variable, average) pairs one swap should trade, in the order it trades them.
 
     Three things are skipped, each for a reason a swap cannot recover from:
@@ -495,7 +495,7 @@ def _ema_pairs(optimizers: Sequence[Any]) -> list[tuple[Any, Any]]:
       leaves the *first* one in it on the way out -- a corruption, not a wrong reading. The first
       optimizer in the sequence wins; the learner builder refuses the configuration that gets here.
     """
-    pairs: list[tuple[Any, Any]] = []
+    pairs: list[tuple[keras.Variable, keras.Variable]] = []
     claimed: set[int] = set()
     for optimizer in optimizers:
         # The same host read `training_step` makes of this counter, on the same variable.
@@ -513,7 +513,7 @@ def _ema_pairs(optimizers: Sequence[Any]) -> list[tuple[Any, Any]]:
     return pairs
 
 
-def swap_ema_weights(optimizers: Sequence[Any]) -> None:
+def swap_ema_weights(optimizers: Sequence[keras.optimizers.Optimizer]) -> None:
     """Exchange the trainable variables of each optimizer with the moving averages it keeps.
 
     A Keras optimizer blends its EMA into `_model_variables_moving_average` on every `apply` and
@@ -544,7 +544,7 @@ def swap_ema_weights(optimizers: Sequence[Any]) -> None:
         raise
 
 
-def _state_variables(segments: Sequence[AdapterSegment], owned: set[int]) -> list[Any]:
+def _state_variables(segments: Sequence[AdapterSegment], owned: set[int]) -> list[keras.Variable]:
     """List every variable of every model that no optimizer owns, deduplicated, in model order.
 
     `Layer.variables` covers the moving statistics, the frozen weights and the `SeedGenerator`
@@ -562,7 +562,7 @@ def _state_variables(segments: Sequence[AdapterSegment], owned: set[int]) -> lis
     return state
 
 
-def _assign(variables: Sequence[Any], values: Sequence[Any]) -> None:
+def _assign(variables: Sequence[keras.Variable], values: Sequence[Any]) -> None:
     """Write the values a step computed back into their variables."""
     for variable, value in zip(variables, values, strict=True):
         variable.assign(value)

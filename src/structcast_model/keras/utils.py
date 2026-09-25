@@ -37,7 +37,9 @@ def get_keras_device(device: str | None = None) -> str:
     raise ValueError(f"Specified device {device!r} is not available. Available devices: {devices_str}")
 
 
-def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def collect_state_dict(
+    models: Mapping[str, keras.Model], optimizers: Mapping[str, keras.optimizers.Optimizer] | None = None
+) -> dict[str, Any]:
     """Read every model and optimizer variable back to host numpy, keyed by its Keras path.
 
     Each named model and optimizer becomes a tree nesting its variables under the segments of
@@ -52,8 +54,8 @@ def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] 
     collection here and nowhere else.
 
     Args:
-        models (Mapping[str, Any]): The models to read, by name.
-        optimizers (Mapping[str, Any] | None): The optimizers to read, by name.
+        models (Mapping[str, keras.Model]): The models to read, by name.
+        optimizers (Mapping[str, keras.optimizers.Optimizer] | None): The optimizers to read, by name.
 
     Returns:
         dict[str, Any]: The `models` and `optimizers` halves of a training-state payload.
@@ -64,7 +66,11 @@ def collect_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any] 
     }
 
 
-def apply_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any], states: Mapping[str, Any]) -> None:
+def apply_state_dict(
+    models: Mapping[str, keras.Model],
+    optimizers: Mapping[str, keras.optimizers.Optimizer],
+    states: Mapping[str, Any],
+) -> None:
     """Assign a state :func:`collect_state_dict` produced back into live variables, by path.
 
     The inverse of the read, and the only writer: every variable of every named model and optimizer
@@ -73,8 +79,8 @@ def apply_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any], s
     learner is constructed, before a resume can reach them.
 
     Args:
-        models (Mapping[str, Any]): The live models to restore into, by name.
-        optimizers (Mapping[str, Any]): The live optimizers to restore into, by name.
+        models (Mapping[str, keras.Model]): The live models to restore into, by name.
+        optimizers (Mapping[str, keras.optimizers.Optimizer]): The live optimizers to restore into, by name.
         states (Mapping[str, Any]): A payload holding the `models` and `optimizers` halves.
 
     Raises:
@@ -91,7 +97,7 @@ def apply_state_dict(models: Mapping[str, Any], optimizers: Mapping[str, Any], s
             _assign_variable_tree(holder.variables, saved[name], f'{kind} "{name}"')
 
 
-def _assign_variable_tree(variables: Iterable[Any], tree: Mapping[str, Any], owner: str) -> None:
+def _assign_variable_tree(variables: Iterable[keras.Variable], tree: Mapping[str, Any], owner: str) -> None:
     """Assign each variable the value nested under the segments of its path.
 
     Raises:
@@ -109,7 +115,7 @@ def _assign_variable_tree(variables: Iterable[Any], tree: Mapping[str, Any], own
         variable.assign(branch)
 
 
-def _variable_tree(variables: Iterable[Any]) -> dict[str, Any]:
+def _variable_tree(variables: Iterable[keras.Variable]) -> dict[str, Any]:
     """Nest the host-side value of each variable under the segments of its path."""
     tree: dict[str, Any] = {}
     for variable in variables:

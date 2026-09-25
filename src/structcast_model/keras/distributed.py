@@ -25,17 +25,19 @@ created inside its scope.
 """
 
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from re import Pattern, compile as re_compile
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 
 import keras
-from structcast_model.keras.adapters import AdapterSegment, TensorFlowAdapter, select_backend_adapter
+from structcast_model.keras.adapters import AdapterSegment, Flow, TensorFlowAdapter, select_backend_adapter
 from structcast_model.keras.utils import apply_state_dict, collect_state_dict, get_keras_device
 
 if TYPE_CHECKING:
+    import jax
+    import numpy as np
     import tensorflow as tf
 
     import torch
@@ -48,6 +50,23 @@ else:
     tf = LazyModuleImporter("tensorflow")
     torch = LazyModuleImporter("torch")
     dist = LazyModuleImporter("torch.distributed")
+
+_T = TypeVar("_T")
+_Step = Callable[..., dict[str, Any]]
+
+
+class _FlowLearner(Protocol):
+    """The part of a `Learner` that `KerasDistributedStrategy.wrap_steps` reads.
+
+    Its steps and segments are reached by name through `getattr`, `setattr` and `__dict__`, so the
+    only attribute a learner must declare is the mapping naming its inner flows.
+    """
+
+    @property
+    def flow_functions(self) -> Mapping[str, Callable[..., dict[str, Any]]]:
+        """The inner flow callables by attribute name."""
+        ...
+
 
 AXIS = "batch"
 """The mesh axis every preset builds: batches split along it, FSDP shards along it.
@@ -115,12 +134,12 @@ class RuleModelParallel(keras.distribution.ModelParallel):
     empty, so `get_tensor_layout` keeps its meaning (no intermediate tensor is constrained).
     """
 
-    def __init__(self, *, layout_map: Any, rules: Sequence[tuple[Pattern[str], str]]) -> None:
+    def __init__(self, *, layout_map: keras.distribution.LayoutMap, rules: Sequence[tuple[Pattern[str], str]]) -> None:
         """Build the distribution over *layout_map*'s mesh, placing variables by *rules*."""
         super().__init__(layout_map=layout_map)
         self._rules = tuple(rules)
 
-    def get_variable_layout(self, variable: Any) -> Any:
+    def get_variable_layout(self, variable: keras.Variable) -> keras.distribution.TensorLayout:
         """Return the layout of one variable: one of its dimensions split, or replicated.
 
         `fsdp` splits the leading dimension along the batch axis. `column` and `row` split along the
@@ -324,7 +343,7 @@ class KerasDistributedStrategy:
         with self._scope:
             yield
 
-    def wrap(self, models: "OrderedDict[str, Any]") -> "OrderedDict[str, Any]":
+    def wrap(self, models: "OrderedDict[str, keras.Model]") -> "OrderedDict[str, keras.Model]":
         """Return the models the learner should be built over.
 
         Only torch has anything to wrap: a Keras variable *is* the `torch.nn.Parameter` it holds, so
@@ -343,7 +362,7 @@ class KerasDistributedStrategy:
             return models
         return OrderedDict((name, _wrap_ddp(model)) for name, model in models.items())
 
-    def _check_rules_matched(self, models: Mapping[str, Any]) -> None:
+    def _check_rules_matched(self, models: Mapping[str, keras.Model]) -> None:
         """Refuse a rule table holding a pattern no variable of any model matches.
 
         A rule that matches nothing is a typo whose cost is invisible: the variables it meant to
@@ -364,7 +383,7 @@ class KerasDistributedStrategy:
                 f"include {paths[:10]}."
             )
 
-    def sync_initial_weights(self, models: Mapping[str, Any]) -> None:
+    def sync_initial_weights(self, models: Mapping[str, keras.Model]) -> None:
         """Make every rank start from rank 0's weights. Call on every rank, before :meth:`wrap`.
 
         Nothing to do outside torch: JAX and TensorFlow runs are single-controller, so one process
@@ -377,7 +396,7 @@ class KerasDistributedStrategy:
             for variable in model.variables:
                 dist.broadcast(variable.value.data, src=0)
 
-    def wrap_steps(self, learner: Any) -> None:
+    def wrap_steps(self, learner: _FlowLearner) -> None:
         """Rewire the learner's steps so each one runs across the replicas and reports one value.
 
         What reaches the tracker must already be reduced across replicas, and this is the place that
@@ -434,7 +453,7 @@ class KerasDistributedStrategy:
         for name in ("training_step", "inference_step"):
             setattr(learner, name, self._replicated(getattr(learner, name)))
 
-    def compile(self, module: Any, compile_kw: Mapping[str, Any] | None) -> Any:
+    def compile(self, module: _T, compile_kw: Mapping[str, Any] | None) -> _T:
         """Return *module* unchanged, or refuse to compile it.
 
         Keras step compilation belongs to the backend adapter -- `tf.function` on TensorFlow,
@@ -483,8 +502,8 @@ class KerasDistributedStrategy:
 
     def state_dict(
         self,
-        models: Mapping[str, Any],
-        optimizers: Mapping[str, Any] | None = None,
+        models: Mapping[str, keras.Model],
+        optimizers: Mapping[str, keras.optimizers.Optimizer] | None = None,
         optimizer_models: Mapping[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Produce `{"models": ..., "optimizers": ...}` in host memory, keyed by model and optimizer name.
@@ -505,8 +524,8 @@ class KerasDistributedStrategy:
 
     def load_state_dict(
         self,
-        models: Mapping[str, Any],
-        optimizers: Mapping[str, Any],
+        models: Mapping[str, keras.Model],
+        optimizers: Mapping[str, keras.optimizers.Optimizer],
         optimizer_models: Mapping[str, list[str]] | None,
         state: dict[str, Any] | None,
     ) -> dict[str, Any]:
@@ -526,7 +545,7 @@ class KerasDistributedStrategy:
         apply_state_dict(models, optimizers, state)
         return state
 
-    def _replicated_flow(self, flow: Any) -> Any:
+    def _replicated_flow(self, flow: _Step) -> _Step:
         """Wrap one inner flow step -- taking the batch by name -- across the TensorFlow replicas.
 
         `MirroredStrategy`'s answer to what :meth:`_replicated` does on the other two backends, one
@@ -563,7 +582,7 @@ class KerasDistributedStrategy:
 
         return flow_step
 
-    def _replicated(self, step: Any) -> Any:
+    def _replicated(self, step: _Step) -> _Step:
         """Wrap one public learner step so it runs across the replicas and reports reduced criteria.
 
         What :meth:`_replicated_flow` is for TensorFlow, this is for the other two backends -- and
@@ -592,7 +611,9 @@ class KerasDistributedStrategy:
 
         return torch_step
 
-    def _place(self, tensor: Any, shape: tuple[int, ...]) -> Any:
+    def _place(
+        self, tensor: "np.ndarray | jax.Array | tf.Tensor", shape: tuple[int, ...]
+    ) -> "jax.Array | tf.distribute.DistributedValues":
         """Place one batch entry: across the JAX mesh, or as one value per TensorFlow replica."""
         if self._distribution is not None:
             return keras.distribution.distribute_tensor(tensor, self._distribution.get_data_layout(shape))
@@ -603,7 +624,7 @@ class KerasDistributedStrategy:
             ]
         )
 
-    def _jax_distribution(self) -> Any:
+    def _jax_distribution(self) -> "keras.distribution.DataParallel | RuleModelParallel":
         """Build the `keras.distribution` the JAX presets run on.
 
         The `tp` mesh is two-dimensional with a batch axis of one: every device holds a slice of the
@@ -637,7 +658,7 @@ class KerasDistributedStrategy:
         if self._is_gpu:
             torch.cuda.set_device(self._rank % torch.cuda.device_count())
 
-    def _sync_statistics(self, models: Mapping[str, Any]) -> None:
+    def _sync_statistics(self, models: Mapping[str, keras.Model]) -> None:
         """Average every floating-point non-trainable variable across the ranks, in place.
 
         The state a `DistributedDataParallel` run has to repair by hand. A Keras normalization layer
@@ -689,7 +710,7 @@ class KerasDistributedStrategy:
         return self._device_type != "cpu"
 
 
-def _mean_flow(flow: Any, replicas: int) -> Any:
+def _mean_flow(flow: Flow, replicas: int) -> Flow:
     """Return *flow* with the loss it hands the tape divided by *replicas*, its criteria untouched."""
 
     def mean(**batch: Any) -> tuple[Any, dict[str, Any]]:
@@ -733,7 +754,7 @@ def _local_batch_losses() -> Iterator[None]:
         module.scale_loss_for_distribution = original
 
 
-def _wrap_ddp(model: Any) -> Any:
+def _wrap_ddp(model: keras.Model) -> "torch.nn.parallel.DistributedDataParallel":
     """Wrap one Keras model in a `DistributedDataParallel` that still looks like the model.
 
     A generated learner reads `trainable_variables` off the models it was handed, and DDP proxies

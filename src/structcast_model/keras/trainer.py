@@ -11,7 +11,7 @@ from numpy.typing import DTypeLike, NDArray
 from pydantic import TypeAdapter, ValidationError
 
 import keras
-from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, TensorInitializer
+from structcast_model.base_trainer import BaseInfo, BaseTrainer, BestCriterion, Learner, TensorInitializer
 from structcast_model.builders.schema import TensorSpec, TensorSpecTree
 from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.loggers.base import Logger
@@ -246,8 +246,8 @@ def restore_training_state(
     *,
     resume: str,
     strategy: KerasDistributedStrategy,
-    models: Mapping[str, Any],
-    learner: Any,
+    models: Mapping[str, keras.Model],
+    learner: Learner[keras.Model],
     start_epoch: int,
     logger: Logger,
     optimizer_hashes: Mapping[str, str] | None = None,
@@ -271,8 +271,8 @@ def restore_training_state(
     Args:
         resume (str): The training state reference, in whatever form *logger* accepts.
         strategy (KerasDistributedStrategy): The strategy loading the state into the live variables.
-        models (Mapping[str, Any]): The live models to restore into.
-        learner (Any): The learner owning the optimizers to restore into.
+        models (Mapping[str, keras.Model]): The live models to restore into.
+        learner (Learner[keras.Model]): The learner owning the optimizers to restore into.
         start_epoch (int): The epoch the command line asked for, reported when the state overrides it.
         logger (Logger): The logger the state is fetched through.
         optimizer_hashes (Mapping[str, str] | None): Hashes of the rebuilt optimizer patterns, by segment.
