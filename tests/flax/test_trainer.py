@@ -216,6 +216,12 @@ def test_create_jax_inputs_honours_explicit_initializer() -> None:
     assert jnp.array_equal(result, jnp.ones((1, 4), dtype=jnp.bfloat16))
 
 
+def test_create_jax_inputs_rejects_non_callable_initializer() -> None:
+    """A `_INIT_` address resolving to a non-callable is rejected, instead of failing later at call time."""
+    with pytest.raises(TypeError, match="not callable as a tensor initializer"):
+        create_jax_inputs({"_SHAPE_": [4], "_INIT_": "jax.numpy.pi"})
+
+
 # ---------------------------------------------------------------------------
 # get_jax_devices
 # ---------------------------------------------------------------------------
