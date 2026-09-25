@@ -107,14 +107,11 @@ class _Intermediate(Serializable):
                         "the generated script would silently shadow the import. Rename one symbol."
                     )
                 bound[leaf] = file
-                # Resolve the config-relative path while it is resolvable, so the generated script
-                # imports the same file regardless of the directory it is later run from.
                 rendered_file = str(Path(file).resolve()) if Path(file).exists() else file
                 binding_lines.append(
                     f"{leaf} = structcast.utils.base.import_from_address({address!r}, module_file={rendered_file!r})"
                 )
         file_bindings = "\n".join(binding_lines)
-        # Module level, so every instance of every generated class shares one bound callable object.
         hoisted = "\n".join(
             f"{name} = {expression}"
             for name, expressions in sorted(bound_callables.items())
@@ -255,9 +252,6 @@ LayerIntermediateT = TypeVar("LayerIntermediateT", bound=LayerIntermediate)
 class BaseModelBuilder(Generic[LayerIntermediateT]):
     """Base model builder for building layers from templates."""
 
-    # Subclasses bind the type to the concrete intermediate they parametrize the builder with,
-    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
-    # `ClassVar` instead would turn the attribute into a per-instance dataclass field.
     user_defined_layer_type: ClassVar[type[LayerIntermediateT]] = cast(type[LayerIntermediateT], LayerIntermediate)
 
     raw: Any
@@ -373,7 +367,6 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             subclassname, parts, builder = to_pascal(unit.TYPE), split_attribute(unit.TYPE), self
         else:
             raise SpecError(f"LAYER must have either CFG or TYPE specified but got: {unit.model_dump()}")
-        # `merge` is annotated to return the base `Parameters` while it instantiates `type(self)` at runtime.
         merged = cast(Parameters, parameters.merge(unit.PARAM))
         return subclassname, builder.get_user_defined_layer(parts, merged, subclassname)
 
@@ -461,8 +454,6 @@ class BaseModelBuilder(Generic[LayerIntermediateT]):
             flow=_create_flow(module.FLOW),
             inference_flow=_create_flow(module.INFERENCE_FLOW),
             structured_output=structured_output,
-            # Resolved after the flows: `collected_imports` keeps insertion order, so an earlier
-            # resolution would reorder the emitted import header of every checkpointed layer.
             gradient_checkpointing=self._resolve_gradient_checkpointing(imports, module.GRADIENT_CHECKPOINTING),
         )
 
@@ -610,15 +601,10 @@ LearnerIntermediateT = TypeVar("LearnerIntermediateT", bound=LearnerIntermediate
 class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
     """Base learner builder for building learners from templates."""
 
-    # Subclasses bind the type to the concrete intermediate they parametrize the builder with,
-    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
-    # `ClassVar` instead would turn the attribute into a per-instance dataclass field.
     user_defined_learner_layer_type: ClassVar[type[LearnerIntermediateT]] = cast(
         type[LearnerIntermediateT], LearnerIntermediate
     )
     layer_builder_type: ClassVar[type[BaseModelBuilder]] = BaseModelBuilder
-    # The template class decides which keys count as learner fields and which fall through to the
-    # layer builder, so a framework extending the learner schema must bind its own template here.
     template_type: ClassVar[type[Template[Any]]] = TemplateLearner
 
     raw: Any
@@ -767,8 +753,6 @@ class BaseLearnerBuilder(Generic[LearnerIntermediateT]):
             segment = self._build_segment(imports, module, learner, opt_name, naming, layers, others)
             learner_flow += _create_flow(learner.FLOW)
             inference_flow += _create_flow(learner.INFERENCE_FLOW or learner.FLOW)
-            # Rendered after the flow: `collected_imports` keeps insertion order, so resolving EXTRA any
-            # earlier reorders the emitted import header for every config that uses it.
             segment.backward_kwargs = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in learner.EXTRA.items())
             learner_flow.append(segment)
         return self.user_defined_learner_layer_type(

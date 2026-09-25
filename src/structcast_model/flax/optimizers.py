@@ -58,9 +58,6 @@ def get_learning_rate(optimizer: nnx.Optimizer) -> jax.Array:
     """
     try:
         rate = optax.tree_utils.tree_get(
-            # The nnx `OptArray` wrappers defeat the filter unless the state is unwrapped first,
-            # and the filter itself is required because a scheduled inject state carries a second
-            # `learning_rate` entry (its schedule state) under `hyperparams_states`.
             unwrap_variables(optimizer.opt_state),
             "learning_rate",
             default=None,
@@ -161,17 +158,12 @@ def update_with_loss_scale(
     """
     grads = jax.tree.map(lambda gradient: jnp.asarray(gradient, jnp.float32) / dynamic_scale.scale, grads)
     finite = jax.tree.reduce(lambda seen, g: seen & jnp.all(jnp.isfinite(g)), grads, jnp.asarray(True))
-    # Differentiating `x * carrier` reproduces `carrier` as the gradient DynamicScale inspects, which
-    # is finite exactly when the real gradients are: the growth interval, the backoff and the floor
-    # then stay flax's own rather than a second copy of them here.
     carrier = jnp.where(finite, 0.0, jnp.nan)
     dynamic_scale, finite, _, _ = dynamic_scale.value_and_grad(lambda x: x * carrier)(jnp.float32(1.0))
     node = (models, optimizer)
     prior = nnx.to_pure_dict(nnx.state(node, nnx.Not(nnx.RngState)))
     before = gradient_steps(optimizer)
     optimizer.update(models, grads, **extra)
-    # Read before the rollback below, which would revert the count with the rest of the state:
-    # either read is None exactly when the transformation carries no window at all.
     after = gradient_steps(optimizer)
     has_updated = True if before is None or after is None else after > before
     applied = nnx.state(node, nnx.Not(nnx.RngState))

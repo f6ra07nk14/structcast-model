@@ -21,7 +21,7 @@ from structcast_model.builders.base import (
 )
 from structcast_model.builders.schema import LearnerBehavior, Template, UserDefinedLearner
 from structcast_model.builders.utils import (
-    optimizer_hash,  # re-exported here, next to the builder that emits a learner's `OPTIMIZER_HASHES`
+    optimizer_hash,
     resolve_getter,
     resolve_object,
     statement_names,
@@ -85,7 +85,6 @@ class FlaxLayerIntermediate(LayerIntermediate):
         sep = "\n" + indent * 2
         base, attributes, forward = "flax.nnx.Module", "", "__call__"
         if self.gradient_checkpointing is not None:
-            # The base owns `__call__` and rematerializes the body it finds under `_forward`.
             base, forward = "structcast_model.flax.layers.GradientCheckpointingModule", "_forward"
             lines = ["gradient_checkpointing = True"]
             if self.gradient_checkpointing:
@@ -172,8 +171,6 @@ class FlaxBuilder(BaseModelBuilder[FlaxLayerIntermediate]):
         resolved: dict[str, str] = {}
         for key, value in options.items():
             if key == "policy" and isinstance(value, str):
-                # A bare name is one of the policies JAX ships; anything else -- a pattern building a
-                # parameterized policy, say -- resolves like any other DSL value.
                 imports["jax"].add(None)
                 resolved[key] = f"jax.checkpoint_policies.{value}"
             else:
@@ -207,7 +204,6 @@ def _references_inject(node: object) -> bool:
             return True
         return any(_references_inject(value) for value in node.values())
     if isinstance(node, (list, tuple)):
-        # Addresses serialize either as `{"_addr_": ...}` or as the `["_addr_", ...]` list form.
         if node and any(_is_inject(node[0], value) for value in node[1:]):
             return True
         return any(_references_inject(value) for value in node)
@@ -223,8 +219,6 @@ def _wrap_children(values: Iterable[object]) -> tuple[list[object], int]:
 def _wrap(node: object) -> tuple[object, int]:
     """Rewrite the rate-carrying factory calls nested anywhere under a serialized pattern node."""
     try:
-        # `ObjectPattern` serializes to the `["_obj_", <part>, ...]` list its validator accepts back,
-        # which the `model_dump` signature cannot express.
         dumped = cast(list[object], ObjectPattern.model_validate(node).model_dump(by_alias=True))
     except ValidationError:
         if isinstance(node, dict):
@@ -238,8 +232,6 @@ def _wrap(node: object) -> tuple[object, int]:
     index = next((i for i, part in enumerate(parts) if "learning_rate" in (_keywords(part) or {})), None)
     if index is None:
         return ["_obj_", *parts], count
-    # `static_args` is the safety valve: without it inject arrayifies every numeric keyword, and
-    # `bool` is an `int` subclass, so a flag like `nesterov=True` would reach the factory as `Array(1)`.
     static_args = [key for key in _keywords(parts[index]) or {} if key != "learning_rate"]
     arguments: dict[str, object] = {"inner_factory": ["_obj_", *parts[:index]]}
     if static_args:
@@ -506,11 +498,6 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
             models, passed, body, stores = bodies[index]
             owned = segment.trainable_layers
             extra = extras[index]
-            # Only what the enclosing step reads leaves the flow: the criteria, what any update
-            # expression from here on reads -- the `EXTRA` keywords are evaluated in the step, so a
-            # later one reads this flow's values there -- and what a later segment takes as a
-            # parameter. Every other intermediate stays local, so a flow may compute values a traced
-            # auxiliary output could not carry.
             needed = {segment.loss, *self.outputs, *[name for reads in updates[index:] for name in reads]}
             needed |= {name for later in bodies[index + 1 :] for name in later[1]}
             aux = [name for name in stores if name in needed]
@@ -520,15 +507,10 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                     f'LOSS "{segment.loss}". A Flax segment only differentiates what its own flow computes.'
                 )
             returns = f"({', '.join(aux)},)"
-            # A scaled segment differentiates its loss multiplied by the scale it is handed, and
-            # reports the plain one as its criterion: what the scale keeps out of the float16
-            # underflow range is the backward pass, not the number the run is judged by.
             scaled = f"{segment.loss} * _loss_scale" if segment.scale else segment.loss
             parameters = [*models, *passed, *(["_loss_scale"] if segment.scale else [])]
             definitions.append(f"def _flow_{segment.optimizer}({', '.join(parameters)}):")
             definitions += [f"    {line}" for line in [*body, f"return {scaled}, {returns}"]]
-            # The owned models are the leading parameters, so their positions are the `argnums`; the
-            # default of 0 already names the single owned model of a one-module segment.
             argnums = f", argnums={tuple(range(len(owned)))}" if len(owned) > 1 else ""
             values = [f"{name}={name}" for name in passed]
             if segment.scale:
@@ -542,8 +524,6 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
                 "# across this update. Without a window there is no counter and every step applies.",
             ]
             if segment.scale:
-                # The helper divides the scale back out, keeps the state it just wrote wherever a
-                # gradient came back non-finite, and reports the apply it attempted either way.
                 if index == 0:
                     step += clock
                 target = "_has_updated" if index == 0 else "_"
@@ -688,7 +668,6 @@ class FlaxLearnerIntermediate(LearnerIntermediate[FlaxOptimizerSegment]):
         ]
         body += [f"self._view_{name} = {view.format(name)}" for name in self.models]
         for name in self.ema:
-            # The view shares its variables with the average, so running it is running the average.
             body.append(f"self._ema_state_{name} = {self.others[f'ema_{name}']}")
             body.append(f"self.ema_{name} = self._ema_state_{name}.apply_to({name})")
         body += [f"self._view_{name} = {view.format(f'self.{name}')}" for name in shadows]
@@ -836,9 +815,6 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
         The names a segment contributes are checked where every name of the learner is known, when
         the script is emitted: `FlaxLearnerIntermediate._reject_reserved_names`.
         """
-        # Named base rather than a zero-argument `super()`: `slots=True` rebuilds the class, and on
-        # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
-        # discarded one, so `super()` raises "obj must be an instance or subtype of type" here.
         base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
         return FlaxOptimizerSegment(
             loss=base.loss,
@@ -895,7 +871,6 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
                     f'The EMA of "{model}" is emitted as "{name}", which the learner already uses for a model, '
                     "an input or an output of its own. Rename that one."
                 )
-            # Reserved with the rest, so an auto-named flow layer cannot claim the name afterwards.
             naming(name)
             options = {} if isinstance(config, bool) else config
             keywords = ", ".join(f"{k}={resolve_getter(imports, v)}" for k, v in {**_EMA_DEFAULTS, **options}.items())
@@ -921,8 +896,6 @@ class FlaxLearnerBuilder(BaseLearnerBuilder[FlaxLearnerIntermediate]):
                 trainable_layers,
             )
         opt_inst, opt_cls = resolve_object(imports, pattern)
-        # `nnx.Optimizer` requires `wrt`, and the parameters are the only sensible default.
-        # `Param` and `flax.nnx` itself are default imports of the learner, so nothing is added here.
         parts = cast(list[object], pattern.model_dump(by_alias=True))[1:]
         wrt = "" if any("wrt" in (_keywords(part) or {}) for part in parts) else ", wrt=Param"
         return f"{opt_inst}({_owned(trainable_layers)}{wrt})", opt_cls

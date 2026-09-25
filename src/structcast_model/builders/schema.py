@@ -283,8 +283,6 @@ def _validate_no_marker_keys(data: dict[str, Any]) -> dict[str, Any]:
 
 
 if TYPE_CHECKING:
-    # mypy resolves the recursion only in this implicit alias form, while pydantic builds a recursive schema
-    # only from `TypeAliasType`, so the two forms of the same alias are kept side by side.
     TensorSpecTree = Annotated[
         TensorSpec | dict[str, "TensorSpecTree"] | list["TensorSpecTree"],
         Field(union_mode="left_to_right"),
@@ -529,9 +527,6 @@ class Template(WithExtra, Generic[SerializableT]):
     PARAMETERS: Parameters = Field(default_factory=Parameters)
     """Parameters for template formatting."""
 
-    # Subclasses bind `target_type` to the concrete type they parametrize `Template` with,
-    # which a `ClassVar` cannot express, so the default is cast to the type variable. Dropping
-    # `ClassVar` instead would make pydantic treat the attribute as a model field.
     target_type: ClassVar[type[SerializableT]] = cast(type[SerializableT], WithExtra)
 
     @classmethod
@@ -578,7 +573,6 @@ class Template(WithExtra, Generic[SerializableT]):
         Returns:
             An instance of the target type created from the formatted template.
         """
-        # `create` is annotated to return the base `Parameters` while it instantiates `cls` at runtime.
         if merged:
             parameters = cast(Parameters, Parameters.create(self.PARAMETERS, parameters))
         elif parameters is None:

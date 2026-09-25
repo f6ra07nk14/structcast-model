@@ -95,7 +95,6 @@ class WandbLogger(Logger):
             entity, project, run_id, filename = reference.removeprefix("wandb://").split("/", 3)
             with TemporaryDirectory() as directory:
                 wandb.Api().run(f"{entity}/{project}/{run_id}").file(filename).download(root=directory, replace=True)
-                # The download is deleted with the temporary directory, so it is read inside the block.
                 return self.state_backend.load(Path(directory) / filename)
         return _local_training_state(
             reference, 'a "wandb://<entity>/<project>/<run_id>/<file>" reference', self.state_backend

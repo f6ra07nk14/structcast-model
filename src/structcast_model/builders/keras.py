@@ -67,7 +67,6 @@ def _stateful_sublayer(expression: str) -> str | None:
     try:
         node = ast.parse(expression, mode="eval").body
     except SyntaxError:
-        # A lambda or another expression form: not a constructor call, so not a layer to judge.
         return None
     if not isinstance(node, ast.Call):
         return None
@@ -137,8 +136,6 @@ class KerasLayerIntermediate(LayerIntermediate):
             return self
         rate = "a literal rate of 0"
         if "Dropout" in stateful[0]:
-            # The family takes its rate first and is the only one whose first argument is read as one,
-            # so the positional spelling is offered to it alone.
             rate += ", keyword or first positional"
         raise SpecError(
             f'GRADIENT_CHECKPOINTING cannot be applied to a layer whose FLOW builds "{stateful[0]}", here or in '
@@ -175,17 +172,8 @@ class KerasLayerIntermediate(LayerIntermediate):
         wrapper = ""
         prologue = "super().__init__(**kwargs)"
         if self.gradient_checkpointing is not None:
-            # Before the sub-layers are built, not at training time: `keras.layers.MultiHeadAttention`
-            # caches the flash attention decision in its own `__init__`, so a later flip misses it.
             prologue += f"{sep}structcast_model.keras.layers.disable_flash_attention_for_remat()"
-            # No base class: Keras reads the `call` signature to decide whether it forwards
-            # `training` and how it maps a batch passed by name, and a `*args` base would erase both.
-            # Not `_call_impl`: on the torch backend a Keras layer inherits `torch.nn.Module`, which
-            # owns that name for its call dispatcher, so it is not this emission's to take.
             body = "_call_body"
-            # The rematerialized callable takes the arrays positionally and reads the flags off the
-            # closure: on the TensorFlow backend the custom gradient behind `keras.remat` refuses
-            # keyword arguments outside eager execution, which is every compiled training step.
             remat = "keras.remat(lambda *arrays: self._call_body(*arrays, training=training, **kwargs))"
             wrapper = (
                 f"    def call(self, {inputs}*, training = None, **kwargs):\n"
@@ -484,8 +472,6 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
     def _get_forward_training_flow(self) -> list[str]:
         """Get the `_flow_<optimizer>` closure of every segment and its binding, as lines of the `__init__` body."""
         indent = " " * 4
-        # A segment is one function the adapter calls with the batch alone, so a value another
-        # segment computed is simply not in scope there.
         elsewhere = {name for units, _ in self._segments for _, output, _ in units for name in stored_names(output)}
         lines: list[str] = []
         for units, segment in self._segments:
@@ -524,13 +510,9 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         a flow stores under one of those names is what the flow would read, or a parameter the step
         cannot even declare twice.
         """
-        # `_flow_<optimizer>` and `_flow_inference` are left out: only `__init__` reads them, and a
-        # batch parameter or a flow's local never lands in that scope.
         closed = {"self", "kwargs", *self.models, *self.others, *self.layers}
         units = [u for u in (*self.flow, *self.inference_flow) if not isinstance(u, OptimizerSegment)]
         stored = [n for _, output, _ in units for n in stored_names(output)]
-        # `__init__` binds these after the models and layers, so a model or layer under one of them
-        # is rebound before any flow runs.
         for name in unique([*self.models, *self.others, *self.layers, *self.inputs, *stored]):
             if name in self._init_locals:
                 raise SpecError(
@@ -590,11 +572,7 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
             f"adapter.prepare({listed}, mixed_precision={self.mixed_precision!r}, "
             f"mixed_precision_type={self.mixed_precision_type!r})"
         )
-        # After `prepare`: under a float16 policy the accumulation window is the wrapped inner
-        # optimizer's, and the wrapping is final by now.
         body.append(f'inners = [getattr(s.optimizer, "inner_optimizer", s.optimizer) for s in {tupled}]')
-        # The counters answer for the whole learner, so the optimizers must agree on one window
-        # (`docs/adr/0017`) -- a ValueError, since generated scripts import no builder errors.
         body.append("windows = sorted({inner.gradient_accumulation_steps or 1 for inner in inners})")
         body.append(
             f'if len(windows) > 1:{sep3}raise ValueError(f"One learner, one update window: the optimizers '
@@ -602,8 +580,6 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         )
         uses_ema = bool(self._averaging)
         if uses_ema:
-            # Off `inners`, which already reached through a float16 wrapper: `use_ema` belongs to the
-            # inner optimizer, the only one that keeps an average at all.
             body.append('self._ema_optimizers = [inner for inner in inners if getattr(inner, "use_ema", False)]')
         body.append("self._steps = 0")
         body.append("self._last_updates = 0")
@@ -612,9 +588,6 @@ class KerasLearnerIntermediate(LearnerIntermediate[KerasOptimizerSegment]):
         body.append(f"self._inference_step = adapter.build_inference_step(_flow_inference, models=[{every_model}])")
         body.append(f"self.inputs = {self.inputs}")
         body.append(f"self.outputs = {self.outputs}")
-        # The first segment is the learner's clock, read through the segment because `prepare`
-        # replaced the optimizer of a segment it wrapped for loss scaling (`docs/adr/0019`). One
-        # expression, no local: every name in a step's namespace is a batch input the user named.
         clock = (
             f"int(keras.ops.convert_to_numpy({sep3}getattr({attributes[0]}.optimizer, "
             f'"inner_optimizer", {attributes[0]}.optimizer).iterations{sep2}))'
@@ -765,7 +738,7 @@ class KerasLearnerBuilder(BaseLearnerBuilder[KerasLearnerIntermediate]):
         """Get the framework-specific fields of the built learner intermediate."""
         return {"mixed_precision": module.MIXED_PRECISION, "mixed_precision_type": module.MIXED_PRECISION_TYPE}
 
-    def _build_segment(  # noqa: PLR0913, PLR0917  # The base signature, narrowed to the Keras schema.
+    def _build_segment(  # noqa: PLR0913, PLR0917
         self,
         imports: defaultdict[str, set[str | None]],
         module: Any,
@@ -776,9 +749,6 @@ class KerasLearnerBuilder(BaseLearnerBuilder[KerasLearnerIntermediate]):
         others: dict[str, str],
     ) -> KerasOptimizerSegment:
         """Build the segment, recording the digest of the optimizer pattern it was built from."""
-        # Named base rather than a zero-argument `super()`: `slots=True` rebuilds the class, and on
-        # Python below 3.12.4 -- inside the project floor -- the `__class__` cell still points at the
-        # discarded one, so `super()` raises here, exactly as in the Flax builder.
         base = BaseLearnerBuilder._build_segment(self, imports, module, learner, opt_name, naming, layers, others)
         uses_ema = _declares_ema(learner.OPTIMIZER.model_dump(by_alias=True))
         return KerasOptimizerSegment(

@@ -45,8 +45,6 @@ if TYPE_CHECKING:
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
-    # An inactive backend's framework may not be installed, so each one is bound lazily and only
-    # resolved inside the preset paths the active backend can reach, as in `loggers.state_backends`.
     tf = LazyModuleImporter("tensorflow")
     torch = LazyModuleImporter("torch")
     dist = LazyModuleImporter("torch.distributed")
@@ -82,9 +80,6 @@ PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
     "single": ((r".*", "replicate"),),
     "dp": ((r".*", "replicate"),),
     "fsdp": ((r".*", "fsdp"),),
-    # No default plan: which layers pair up into a column/row split is the model's own shape, and
-    # unlike the Flax twin a Keras variable carries no annotation of its own to fall back on -- so
-    # the preset is refused without rules rather than replicating everything and reporting success.
     "tp": (),
 }
 """Ordered (variable-path regex, tactic) rules of each preset; the first matching rule wins."""
@@ -153,7 +148,7 @@ class RuleModelParallel(keras.distribution.ModelParallel):
         the same shape the Flax twin's rules have.
         """
         if getattr(variable, "_layout", None) is not None:
-            return variable._layout  # noqa: SLF001  # The base class reads it first too; a caller may pin a layout.
+            return variable._layout  # noqa: SLF001
         mesh = self.device_mesh
         axes: list[str | None] = [None] * len(variable.shape)
         for pattern, tactic in self._rules:
@@ -251,8 +246,6 @@ class KerasDistributedStrategy:
                     f"{self.preset!r} preset's mesh does not have: select the tp preset."
                 )
         self._rules = tuple((re_compile(pattern), tactic) for pattern, tactic in rules)
-        # After the rule table: a mistyped tactic is wrong on every backend, so it is reported as
-        # itself rather than as whatever the active backend happens to say about the preset.
         if (reason := REJECTED.get((self.preset, self._backend))) is not None:
             raise ValueError(reason)
         self.device = get_keras_device(self.device)
@@ -262,8 +255,6 @@ class KerasDistributedStrategy:
                     "The torch Keras backend takes its number of ranks from the launcher (torchrun, or an "
                     "already initialized process group), so a strategy cannot pick one: drop devices."
                 )
-            # Unlimited: `_device_names` applies the very count being validated, so counting its
-            # result would report a negative or oversized count as the machine's own device count.
             available = len(self._device_names(limit=False))
             if not 1 <= self.devices <= available:
                 raise ValueError(
@@ -336,9 +327,6 @@ class KerasDistributedStrategy:
             return
 
         self._mirrored = tf.distribute.MirroredStrategy(devices=self._device_names())
-        # The scope object is held, not dropped: it owns the variable-creator scope it entered, and
-        # letting it be collected tears that down early -- after which the models are built as plain,
-        # unmirrored variables and the first step fails inside `strategy.run`.
         self._scope = self._mirrored.scope()
         with self._scope:
             yield
@@ -424,24 +412,11 @@ class KerasDistributedStrategy:
         if self.preset == "single":
             return
         if self._mirrored is not None:
-            # The loss, not the gradients: it is the one value the strategy can reach from out here,
-            # the segment's flow being what the adapter differentiates, and dividing it by the
-            # replica count turns the optimizer's SUM all-reduce into the mean of the per-replica
-            # gradients. The criteria the flow reports beside it are untouched, and still reduced
-            # with `ReduceOp.MEAN` below. What is scaled here is exactly what the generated shape
-            # exposes: one `AdapterSegment` per instance attribute (`docs/adr/0019`). Segments kept
-            # any other way -- inside a list, behind `__slots__`, built on the fly -- are invisible
-            # to this scan, so a learner holding them like that has to scale its own loss.
             for segment in getattr(learner, "__dict__", {}).values():
                 if isinstance(segment, AdapterSegment):
                     segment.flow = _mean_flow(segment.flow, self.replicas)
             flows = list(learner.flow_functions)
             if flows:
-                # The generated learner's public steps stay eager: `training_step` owns the host
-                # counters and reads the optimizer counter back after the step (`docs/adr/0018`),
-                # neither of which can run inside the replicated graph, so the strategy wraps the
-                # inner flow steps instead. `flow_functions` is what a learner exposes for exactly
-                # this rebinding, as in `cmd_flax`.
                 for name in flows:
                     setattr(learner, name, self._replicated_flow(getattr(learner, name)))
                 return
@@ -484,9 +459,6 @@ class KerasDistributedStrategy:
             ValueError: if an entry has no leading dimension, or one the replica count does not divide.
         """
         if self._distribution is None and self._mirrored is None:
-            # torch and `single`: on torch the loader hands each rank its own slice, exactly as the
-            # torch training path's `DistributedSampler` does -- a strategy that split the batch here
-            # would hand every rank the same data and quietly train on a fraction of the dataset.
             return dict(batch)
         placed = {}
         for key, value in batch.items():
@@ -565,9 +537,6 @@ class KerasDistributedStrategy:
         """
 
         def replicated(**batch: Any) -> dict[str, Any]:
-            # Traced under :func:`_local_batch_losses`: a Keras loss class would otherwise hand back
-            # the replica's share of the global batch's loss, which `ReduceOp.MEAN` below cannot
-            # tell from the per-replica means every other criterion is.
             with _local_batch_losses():
                 criteria = self._mirrored.run(flow, kwargs=batch)
             return {
@@ -602,8 +571,6 @@ class KerasDistributedStrategy:
 
             criteria = {}
             for name, value in step(**batch).items():
-                # Detached and copied: the value a step returns is still the one its graph produced,
-                # and an in-place all-reduce would rewrite it under the optimizer that just ran.
                 reduced = torch.as_tensor(value, dtype=torch.float32).detach().clone()
                 dist.all_reduce(reduced)
                 criteria[name] = reduced / self._world_size
@@ -675,11 +642,6 @@ class KerasDistributedStrategy:
 
         for model in models.values():
             for variable in model.variables:
-                # Only the statistics: a non-trainable variable is not necessarily one, and the two
-                # other kinds must not be averaged. A `keras.random.SeedGenerator` -- which every
-                # Dropout or random-augmentation layer holds -- keeps its RNG state in an integer
-                # variable, so the division below would raise on it, and an averaged RNG state would
-                # be meaningless anyway; the same goes for any other integer counter a layer keeps.
                 if variable.trainable or "seed_generator" in variable.path:
                     continue
                 if not keras.backend.is_float_dtype(variable.dtype):
@@ -779,8 +741,6 @@ def _wrap_ddp(model: keras.Model) -> "torch.nn.parallel.DistributedDataParallel"
     return _KerasDistributedDataParallel(model)
 
 
-# The module constants are listed because the LazySelectedImporter tail below only exposes the names
-# in `__all__`, and a caller naming a preset or writing a rule table reads them.
 __all__ = [
     "AXIS",
     "MODEL_AXIS",

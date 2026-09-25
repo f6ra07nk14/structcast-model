@@ -8,9 +8,6 @@ from operator import gt, lt
 from time import time
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
 
-# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
-# inspect.getattr_static on Python 3.11 as well (backported from 3.12): probing a protocol member
-# must not execute a property getter, which for a data provider may build a real data loader.
 from typing_extensions import Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -440,8 +437,6 @@ class BaseTrainer(BaseInfo[ModelT]):
         dead-callback warning also fires here.
         """
         self._events = self._routed_events()
-        # The learner/tracker/data participants legitimately may implement no event, but an entry of
-        # the explicit callbacks sequence that matches nothing is almost certainly a typo'd hook name.
         for callback in self.callbacks:
             if not any(isinstance(callback, protocol) for protocol in EVENT_PROTOCOLS.values()):
                 logger.warning(

@@ -86,13 +86,9 @@ def to_snake(value: str) -> str:
     Returns:
         The converted string in snake_case.
     """
-    # Handle the sequence of uppercase letters followed by a lowercase letter
     value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
-    # Insert an underscore between a lowercase letter and an uppercase letter
     value = re.sub(r"([a-z])([A-Z])", r"\1_\2", value)
-    # Insert an underscore between a digit and an uppercase letter
     value = re.sub(r"([0-9])([A-Z])", r"\1_\2", value)
-    # Insert an underscore between a lowercase letter and a digit
     value = re.sub(r"([a-z])([0-9])", r"\1_\2", value)
     value = re.sub(r"(\W+)", "_", value)
     value = re.sub("__([A-Z])", r"_\1", value)

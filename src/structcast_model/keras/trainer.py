@@ -17,8 +17,6 @@ from structcast_model.keras.distributed import KerasDistributedStrategy
 from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
-# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named
-# `logger`, as in the flax twin.
 _logger = getLogger(__name__)
 
 DTYPES = {
@@ -194,8 +192,6 @@ class KerasTracker:
 
     def reset(self) -> None:
         """Zero the sums and the step count."""
-        # float32 whatever the criteria are: a run under a float16 or bfloat16 policy would
-        # otherwise accumulate an epoch of steps in the reduced type and lose the small ones.
         self.sums = {criterion: keras.ops.zeros((), dtype="float32") for criterion in self.criteria}
         self.count = 0
 
@@ -210,8 +206,6 @@ class KerasTracker:
     def __call__(self, **criteria: Any) -> dict[str, float]:
         """Add one step's criteria to the sums and return the running means."""
         for criterion in self.criteria:
-            # The torch backend hands criteria still attached to the autograd graph; detaching
-            # keeps the epoch sum from retaining every step's graph and lets `logs` reach numpy.
             value = keras.ops.stop_gradient(criteria[criterion])
             self.sums[criterion] = keras.ops.add(self.sums[criterion], value)
         self.count += 1
@@ -311,8 +305,6 @@ def restore_training_state(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
             "are restored into whatever the current one built, wherever the two still line up."
         )
-    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
-    # continue where the saved run left off (docs/adr/0018).
     learner.restore_counters(int(meta["step"]), int(meta["update"]))
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:
@@ -372,8 +364,6 @@ class _BestLogger:
         name = f"best_{best.target}"
         self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
-            # The models alone, as the torch and flax twins save: best-value weights are for
-            # inference, so they carry no optimizer state, no counters and no wrapper key.
             self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
 
 
@@ -405,8 +395,6 @@ class KerasTrainingStateSaver:
             "epoch": info.epoch,
             "step": info.step,
             "update": info.update,
-            # Load-bearing: normalization statistics and RNG trajectories are not verified
-            # equivalent across the Keras backends, so a resume refuses a mismatch (`docs/adr/0016`).
             "backend": keras.backend.backend(),
             **dict(self.extra_meta),
         }

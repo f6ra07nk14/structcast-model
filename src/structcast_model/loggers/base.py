@@ -118,8 +118,6 @@ def _local_training_state(reference: str, expected_form: str, backend: StateBack
     return backend.load(path)
 
 
-# `_epoch_metrics` and `_local_training_state` are listed because the LazySelectedImporter tail below
-# only exposes the names in `__all__`, and the two logger backends import them from here.
 __all__ = ["Logger", "NullLogger", "_epoch_metrics", "_local_training_state"]
 
 

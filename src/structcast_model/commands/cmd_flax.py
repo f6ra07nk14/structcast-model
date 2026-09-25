@@ -10,9 +10,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# `scm`, `scm_flax` and `scm_loggers` are package shims routing to lazy submodules, so importing
-# them pulls in no framework. Wrapping them in `LazyModuleImporter` would not work: it copies the
-# shim's still unresolved submodule slots, so every access after the first would hand back `None`.
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
@@ -181,8 +178,6 @@ def _cap_gpu_memory(fraction: float | None) -> None:
     check_gpu_memory_fraction(fraction)
     if fraction is None:
         return
-    # Preallocation is turned off alongside the fraction so the share is taken as the run needs it;
-    # `setdefault`, because an operator who set the variable deliberately keeps their choice.
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(fraction)
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -200,15 +195,13 @@ def _optimizer_hashes(learner: object) -> Mapping[str, str]:
 def _resolve_strategy(strategy: str | dict[str, Any] | None, device: str | None) -> "scm_flax.FlaxDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
-        # Cast, not validate: the strategy owns the list of presets it knows and rejects the rest
-        # with the names it accepts, which is the error a mistyped preset should read.
         preset = cast('Literal["single", "dp", "fsdp", "tp", "fsdp_tp"]', strategy)
         return scm_flax.FlaxDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
 
 
 @app.command()
-def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
+def train(  # noqa: PLR0913, PLR0917
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help=scm_args.object_pattern_help("the model factory", "MyModel", keyed=True, call=False)
@@ -296,12 +289,8 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train Flax (nnx) models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    # Before the line below, which is the first `jax` attribute access of the run and therefore what
-    # imports JAX: the variables it writes are read once, while JAX brings up its backend.
     _cap_gpu_memory(gpu_memory_fraction)
     jax.config.update("jax_default_matmul_precision", MATMUL_PRECISIONS[matmul_precision])
-    # First: constructing the strategy activates its mesh process-wide, and every array allocated
-    # afterwards -- the model parameters above all -- is placed against it.
     strategy = _resolve_strategy(strategy_pattern, device)
     rngs = nnx.Rngs(params=jax.random.key(seed), dropout=jax.random.fold_in(jax.random.key(seed), 1))
     models: OrderedDict[str, Any] = OrderedDict()
@@ -311,9 +300,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         model_name, pattern = next(iter(raw.items()))
         factory = instantiate_object(pattern)
         if isinstance(factory, nnx.Module):
-            # The pattern already called the class, so the command holds a built module and the run's
-            # RNG never reached it. Calling it anyway would run the module's forward pass with a
-            # `rngs` keyword and fail somewhere inside the generated model instead.
             raise ValueError(
                 f'The pattern of model "{model_name}" builds the module itself, so the run\'s seeded RNG cannot '
                 'reach it. Drop the "_call_" entry and let the command call the class with rngs.'
@@ -321,22 +307,14 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         models[model_name] = factory(rngs=rngs)
     input_shapes = scm_flax.resolve_input_shapes(models, reduce_dict(shapes)) or {}
     config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
-    # Before the learner: an optimizer inherits the sharding of the parameters it is built over, and
-    # the learner's inference views are taken from the models as they are when it is constructed.
     models = strategy.wrap(models)
     learner = instantiate_object(learner_pattern)(**models)
     outputs = get_module_outputs(learner, learner_outputs, "learner")
     compile_kw = None if compile_pattern is None else instantiator.instantiate(compile_pattern)
     if compile_kw is not None:
-        # Both spellings of both contract arguments go: --help promises they cannot be overridden,
-        # and the argnums form would renumber what the argnames form fixes.
         fixed = {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"}
         extra = {key: value for key, value in compile_kw.items() if key not in fixed}
         for flow_name in list(learner.flow_functions):
-            # The generated learner names its steps after the contract they follow: only the training
-            # one rewrites state, so only its parameters are donated (`docs/adr/0019`, amended by
-            # `docs/adr/0023`: a scaled step's loss scales are donated along with them). The inference
-            # step runs against views sharing the models' arrays and donates nothing.
             step = getattr(learner, flow_name)
             donated = {"donate_argnames": scm_flax.donate_argnames(step)} if flow_name == "_training_step" else {}
             setattr(learner, flow_name, strategy.compile(step, {**donated, **extra}))
@@ -351,8 +329,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     print("Count the dataset sizes...")
     print(f"Training dataset size: {provider.steps_per_epoch} steps.")
     print(f"Validation dataset size: {provider.validation_steps} steps.")
-    # Built before the resume, which fetches the state through it. Only the experiment name is stored
-    # here: the run itself starts in __enter__.
     logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
     logger: scm_loggers.Logger = logger_type(experiment=experiment, state_backend=scm_loggers.FlaxStateBackend())
     optimizer_hashes = _optimizer_hashes(learner)
@@ -360,8 +336,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         start_epoch = scm_flax.restore_training_state(
             resume=resume,
             strategy=strategy,
-            # The learner's mapping, not the command's: the saver writes `learner.models`, which
-            # also carries the `ema_<model>` shadows the command never built (`docs/adr/0021`).
             models=dict(learner.models),
             learner=learner,
             start_epoch=start_epoch,
@@ -403,7 +377,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "device": device,
         "gpu_memory_fraction": gpu_memory_fraction,
         "strategy": strategy_pattern,
-        # A plain dict: the mesh reports its shape as an OrderedDict, which YAML tags as Python.
         "mesh": dict(strategy.mesh.shape),
         "learner": learner_pattern,
         "learner_outputs": outputs,

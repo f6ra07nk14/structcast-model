@@ -73,10 +73,6 @@ else:
 
     from structcast.utils.lazy_import import LazySelectedImporter
 
-    # Each symbol is listed exactly once: _class_to_module is a dict comprehension, so a name listed
-    # twice silently keeps the last writer. A re-exported name goes under its defining module when
-    # that module has an entry of its own -- distributed re-exports the utils helpers, routed to
-    # utils instead. The layers subpackage stays submodule-only, as its flax and torch twins do.
     import_structure = {
         "adapters": [
             "AdapterSegment",

@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 import jax
 
 
-# `jax.Device` is Any to mypy: jaxlib re-exports it from its `_jax` C extension, which ships no stubs.
 @lru_cache(maxsize=1)
 def get_jax_devices() -> OrderedDict[str, jax.Device]:  # type: ignore[no-any-unimported]
     """Get a mapping of available JAX devices.
@@ -21,7 +20,6 @@ def get_jax_devices() -> OrderedDict[str, jax.Device]:  # type: ignore[no-any-un
     return OrderedDict((f"{d.platform}:{d.id}", d) for d in jax.devices())
 
 
-# `jax.Device` is Any to mypy, as above.
 def get_jax_device(device: str | None = None) -> jax.Device:  # type: ignore[no-any-unimported]
     """Get a JAX device based on the provided device string.
 

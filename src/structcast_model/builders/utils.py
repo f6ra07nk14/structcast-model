@@ -88,7 +88,6 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             the name of the top-level class or function.
     """
     classes: list[str] = []
-    # Every `eval:` value rendered so far, so a binding can tell whether it read one of them.
     evaluated: list[str] = []
 
     def _repr(raw: Any) -> str:
@@ -122,15 +121,8 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             module, res = resolve_address(first.address)
             classes.append(res)
             if first.file:
-                # File-addressed objects cannot be imported by module name: record the file under a
-                # special key so the script renderer emits an import_from_address binding instead.
                 imports[f"{FILE_IMPORT_PREFIX}{first.file}"].add(first.address)
             elif module:
-                # The project's own packages are imported as modules and reached fully qualified, so
-                # none of their members becomes a global of the generated script. The address is emitted
-                # as written: a framework package re-exports symbols and its `layers` subpackage only, so
-                # `structcast_model.torch.create_opt` resolves while the module path
-                # `structcast_model.torch.optimizers.create_opt` fails when the script runs, by design.
                 project = module.split(".")[0] in ("structcast", "structcast_model")
                 imports[module].add(None if project else res)
                 res = f"{module}.{res}" if project else res
@@ -152,9 +144,6 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
             elif isinstance(ptn, CallPattern):
                 res = f"{res}({_args(ptn.call)})"
             elif isinstance(ptn, BindPattern):
-                # The position in `rest` is deterministic, unlike an id()-derived suffix, so the same
-                # pattern always renders the same script. Reuse across nesting levels is safe: a
-                # nested lambda only ever references its own arguments, shadowing any outer ones.
                 aname, kwname = f"_arg{bind_index}", f"_kw{bind_index}"
                 seen, target = len(evaluated), res
                 args = _args(ptn.bind)
@@ -162,12 +151,6 @@ def resolve_object(imports: defaultdict[str, set[str | None]], pattern: ObjectPa
                     res = f"(lambda *{aname}, **{kwname}: {target}(*{aname}, {args}, **{kwname}))"
                 else:
                     res = f"(lambda *{aname}, **{kwname}: {target}({args}, *{aname}, **{kwname}))"
-                # A closure over nothing but constants and one module-level name is hoisted, so that
-                # every layer binding that callable to those arguments shares the one object: built
-                # per instance instead, it would be a per-instance leaf of the Flax graphdef, and two
-                # instances of the generated class would no longer hit the same `flax.nnx.jit` trace.
-                # An `eval:` value is written to be read where the object is built -- `rngs` is the
-                # standing example -- so a binding that read one stays where the reading works.
                 if len(evaluated) == seen and _MODULE_LEVEL_NAME.fullmatch(target) and _literal_arguments(args):
                     res = _hoist(imports, res, target.rsplit(".", 1)[-1])
             else:

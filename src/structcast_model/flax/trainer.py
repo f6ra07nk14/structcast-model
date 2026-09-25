@@ -28,7 +28,6 @@ from structcast_model.flax.distributed import FlaxDistributedStrategy
 from structcast_model.loggers.base import Logger
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 
-# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named `logger`.
 _logger = getLogger(__name__)
 
 DTYPES = {
@@ -364,8 +363,6 @@ def restore_training_state(
     )
     for name, scale in getattr(learner, "grad_scalers", {}).items():
         if saved := state.get("grad_scalers", {}).get(name):
-            # A DynamicScale is immutable, so the restored one is bound back under the name the
-            # learner reported it under -- which is the attribute it keeps it in.
             setattr(
                 learner,
                 name,
@@ -388,8 +385,6 @@ def restore_training_state(
             "The state was saved from a different model, learner or shape configuration: the arrays it holds "
             "are restored into whatever the current one built, wherever the two still line up."
         )
-    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
-    # continue where the saved run left off (docs/adr/0018).
     learner.restore_counters(int(meta["step"]), int(meta["update"]))
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:

@@ -31,7 +31,6 @@ TEMPLATE_PARAM_HELP = (
     "keyword arguments for the template. Repeat the option for more groups; a group named twice keeps "
     "only the last occurrence, so pass all of a group's keys together."
 )
-# The pattern options accepting a file path all say so the same way.
 PATH_FORM_HELP = " The pattern may also be given as a path to a YAML/JSON file holding it."
 
 
@@ -242,7 +241,6 @@ model_pattern = Argument(
 warmup_runs = Option(2, "--warmup-runs", "-w", help="Number of warmup runs before measuring inference time.")
 times = Option(10, "--times", "-t", help="Number of iterations to measure the inference time.")
 batch_size = Option(1, "--batch-size", "-b", help="Batch size for the input tensors during inference time measurement.")
-# torch and keras; flax carries its own nnx.view variant in cmd_flax.py
 training_mode = Option(
     False,
     help="Whether to set the model to training mode during inference time measurement. "
@@ -250,7 +248,6 @@ training_mode = Option(
 )
 
 
-# The `train` options torch, flax and keras spell identically.
 learner_pattern = Option(
     ...,
     "--learner",

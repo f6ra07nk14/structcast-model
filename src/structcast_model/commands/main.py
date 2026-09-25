@@ -38,8 +38,6 @@ def configure_logging(
 ) -> None:
     """Set the logging level every command below runs with."""
     logging.basicConfig(level=log_level.upper())
-    # `basicConfig` only sets the level when it installs the handler, so anything that configured
-    # logging first (a library imported on the way, a test harness) would keep its own level.
     logging.getLogger().setLevel(log_level.upper())
 
 
@@ -85,6 +83,4 @@ if not TYPE_CHECKING:
     sys.modules[__name__] = LazySelectedImporter(__name__, globals())
 
 if __name__ == "__main__":
-    # `python -m structcast_model.commands.main` (the documented torchrun launch) imports this
-    # module as __main__, which the lazy-import tail does not dispatch to the Typer app.
     app()

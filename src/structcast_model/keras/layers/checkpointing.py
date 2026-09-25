@@ -27,9 +27,6 @@ def disable_flash_attention_for_remat() -> None:
     TensorFlow or torch run routes its own attention and is left alone. A layer built with an
     explicit `flash_attention=True` is left alone too -- that argument wins over the global switch.
     """
-    # `is False`, not falsy: the default and the enabled state are both `None` ("attempt it"), and
-    # only an explicit disable reads back as False -- which is also what keeps the warning to one
-    # line however many checkpointed layers a model builds.
     if keras.backend.backend() != "jax" or keras.config.is_flash_attention_enabled() is False:
         return
     keras.config.disable_flash_attention()

@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# `scm`, `scm_keras` and `scm_loggers` are package shims routing to lazy submodules, so importing
-# them pulls in no framework, as in cmd_flax.
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
@@ -82,9 +80,6 @@ backend_option = Option(
     "backend decides what a run computes on, so it is stated rather than inherited from ~/.keras/keras.json.",
 )
 COMPILE_API = 'the compiler the active Keras backend has ("tf.function" on tensorflow, "jax.jit" on jax)'
-# Both commands compile through the same backend adapter, so they say the same thing about it. The
-# stateless scope is `time`'s alone to mention: it is a caveat about --training-mode, which only
-# `time` has, and about numbers, which only `time` reports.
 COMPILE_TAIL = (
     " The torch backend builds no compiled step at all and refuses the option rather than ignoring it, and the "
     'arguments deciding what is static and what is donated on jax, and "input_signature" on tensorflow, are the '
@@ -206,8 +201,6 @@ def measure_inference_time(
 ) -> None:
     """Measure the average inference time of a Keras model."""
     device = scm_keras.get_keras_device(device)
-    # Unlike `train`, this command takes no --backend and inherits the ambient one (`docs/adr/0016`),
-    # so it says which one produced the number: the backend decides what actually executes.
     print(f'Timing on the "{keras.backend.backend()}" Keras backend, device "{device}".')
     print("Initializing the model...")
     model = instantiate_object(model_pattern)
@@ -216,8 +209,6 @@ def measure_inference_time(
     sync = _get_sync_fn(device)
 
     def flow(inputs: Any) -> Any:
-        # One keyword, not **batch: `create_numpy_inputs` answers with an array for a bare shape and
-        # a list for a sequence (keras/trainer.py), and only the mapping form could be splatted.
         return model(inputs, training=training_mode)
 
     if compile_pattern is None:
@@ -225,9 +216,6 @@ def measure_inference_time(
         step = flow
     else:
         print("Compiling the timed forward...")
-        # The seam `train` compiles through, so the number describes the step a run executes. The
-        # context manager is what refuses the torch backend, which builds no compiled step at all,
-        # and what puts the choice back afterwards: the adapter is one cached instance per process.
         with _compile_choice(keras.backend.backend(), compile_pattern):
             step = scm_keras.select_backend_adapter().build_inference_step(flow, models=[model])
 
@@ -263,7 +251,6 @@ def _activate_backend(backend: str) -> None:
             "the backend is resolved once, when Keras is first imported. Run the command in a fresh process."
         )
     os.environ["KERAS_BACKEND"] = backend
-    # The first attribute access is what imports Keras, hence after the assignment above.
     if (active := keras.backend.backend()) != backend:
         raise ValueError(f'Keras started on the "{active}" backend instead of the requested "{backend}".')
 
@@ -283,8 +270,6 @@ def _cap_gpu_memory(backend: str, fraction: float | None) -> None:
     if fraction is None:
         return
     if backend == "jax":
-        # Preallocation is turned off alongside the fraction so the share is taken as the run needs
-        # it; `setdefault`, because an operator who set the variable deliberately keeps their choice.
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(fraction)
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     elif backend == "tensorflow":
@@ -312,8 +297,6 @@ def _mixed_precision_policy(factory: Any) -> str | None:
     and gets no policy.
     """
     raw = getattr(factory, "MIXED_PRECISION", None)
-    # The predicate of `keras.adapters.prepare`: any mapping enables the policy, an empty one
-    # included, so that a run is not loss-scaled by the adapter while computing in float32.
     enabled = raw if isinstance(raw, bool) else isinstance(raw, Mapping)
     if not enabled:
         return None
@@ -334,8 +317,6 @@ def _resolve_strategy(
 ) -> "scm_keras.KerasDistributedStrategy":
     """Resolve `--strategy`: a preset name builds the strategy, a pattern builds whatever it names."""
     if isinstance(strategy, str):
-        # Cast, not validate: the strategy owns the list of presets it knows, and which of them the
-        # active backend supports, and rejects the rest with the reason -- which is the error to read.
         preset = cast('Literal["single", "dp", "fsdp", "tp"]', strategy)
         return scm_keras.KerasDistributedStrategy(preset=preset, device=device)
     return instantiate_object(strategy)(device=device)
@@ -393,7 +374,7 @@ def _build_callbacks(
 
 
 @app.command()
-def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
+def train(  # noqa: PLR0913, PLR0917
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
@@ -473,53 +454,32 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     """Train Keras models with a Learner, recording the run to an experiment-tracking service."""
     if not model_patterns:
         raise ValueError("At least one model pattern must be provided.")
-    # Before the activation below, which is what imports Keras: the variables it writes are read
-    # once, while the backend's framework starts up. The torch cap is an API call, so it waits.
     _cap_gpu_memory(backend, gpu_memory_fraction)
     _activate_backend(backend)
     _cap_torch_gpu_memory(backend, gpu_memory_fraction)
     device = scm_keras.get_keras_device(device)
-    # Spanning everything that builds or traces a step: the learner's constructor, and `wrap_steps`.
     with _compile_choice(backend, compile_pattern):
-        # Resolved before the models: the class itself is what carries the policy the models are built
-        # under, and instantiating it needs them.
         factory = instantiate_object(learner_pattern)
         if (policy := _mixed_precision_policy(factory)) is not None:
-            # A policy only reaches the layers built after it is set, and the learner receives models
-            # that are already built, so this is the last moment it can be set (`docs/adr/0016`).
             print(f'Setting the global mixed precision policy to "{policy}"...')
             keras.mixed_precision.set_global_policy(policy)
         strategy = _resolve_strategy(strategy_pattern, device)
         models: OrderedDict[str, Any] = OrderedDict()
         declared: dict[str, Any] = {}
-        # Everything a run allocates is built inside the activation: a JAX variable reads the active
-        # distribution while it is created, and a MirroredStrategy mirrors only what its scope encloses
-        # -- the models above all, and the optimizers the learner builds against their variables.
         with strategy.activate():
-            # Inside the activation: data_rank reads 0 until the process group is joined, and each rank
-            # needs its own seed so replicas draw different dropout masks, as `scm torch train` does.
             keras.utils.set_random_seed(seed + strategy.data_rank)
             for raw in model_patterns:
                 if len(raw) != 1:
                     raise ValueError(f"Each model pattern should contain exactly one model definition. Got: {raw}")
                 model_name, pattern = next(iter(raw.items()))
                 built = instantiate_object(pattern)
-                # Read before the trace: `initial_model` wraps a layer into a functional `keras.Model`,
-                # which carries none of the layer's attributes, so the shapes it was traced with would be
-                # unrecoverable afterwards and the run would record none.
                 declared.update(scm_keras.resolve_input_shapes(built) or {})
                 models[model_name] = scm_keras.initial_model(built, reduce_dict(shapes))
             strategy.sync_initial_weights(models)
-            # Before the learner: it captures the model objects it is handed, and its optimizers are
-            # built against their variables while it is constructed.
             models = strategy.wrap(models)
             learner = factory(**models)
-        # A declared shape is a tuple, which `arguments.yaml` would record as a `!!python/tuple` tag no
-        # safe YAML loader reads back; the round-trip makes it the plain data `--shape` would have given.
         input_shapes = reduce_dict(shapes) or json.loads(json.dumps(declared))
         config_digest = config_hash(model_patterns, learner_pattern, input_shapes)
-        # After the learner: the steps this rewires are the ones the backend adapter built in its
-        # constructor, and each one runs the replicas itself rather than being traced into a scope.
         strategy.wrap_steps(learner)
     outputs = get_module_outputs(learner, learner_outputs, "learner")
     provider = scm.SimpleDataProvider(

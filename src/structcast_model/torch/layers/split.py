@@ -23,7 +23,7 @@ class Split(Module):
         self.split_size_or_sections = split_size_or_sections
         self.dim = dim
 
-    def forward(self, input: Tensor) -> tuple[Tensor, ...]:  # pylint: disable=redefined-builtin
+    def forward(self, input: Tensor) -> tuple[Tensor, ...]:
         """Forward pass.
 
         Args:

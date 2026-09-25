@@ -28,7 +28,6 @@ else:
 
     from structcast.utils.lazy_import import LazySelectedImporter
 
-    # Public symbols only: base's private helpers stay reachable by importing the module itself.
     import_structure = {
         "base": ["Logger", "NullLogger"],
         "mlflow": ["MLflowLogger"],

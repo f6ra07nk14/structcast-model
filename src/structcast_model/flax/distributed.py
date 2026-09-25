@@ -32,8 +32,6 @@ PRESET_RULES: Mapping[str, tuple[tuple[str, str], ...]] = {
     "single": ((r".*", "replicate"),),
     "dp": ((r".*", "replicate"),),
     "fsdp": ((r".*", "fsdp"),),
-    # No default plan: which layers pair up into a column/row split is the model's own shape, so the
-    # tables carry no such rule and the strategy refuses to run without one.
     "tp": (),
     "fsdp_tp": ((r".*", "fsdp"),),
 }
@@ -73,8 +71,6 @@ def _from_host(live: ArrayLike, saved: ArrayLike) -> ArrayLike:
     if not isinstance(live, jax.Array):
         return saved
     if jnp.issubdtype(live.dtype, jax.dtypes.prng_key):
-        # A typed key is placed through its raw data: a key array's own sharding describes the
-        # physical uint32 array, whose rank is one higher than the key's.
         data = jax.random.key_data(live)
         return jax.random.wrap_key_data(
             jax.device_put(jnp.asarray(saved, dtype=data.dtype), data.sharding), impl=jax.random.key_impl(live)
@@ -235,8 +231,6 @@ class FlaxDistributedStrategy:
                     f"model_devices and model_axis_mode configure the model axis, which the {self.preset!r} "
                     f"preset's mesh does not have: drop them, or select one of {', '.join(TP_PRESETS)}."
                 )
-            # Named rather than left to `jax.make_mesh`, whose default axis type has changed between
-            # jax versions -- and the type is what decides whether a plain model traces at all.
             return jax.make_mesh(
                 (len(devices),), (AXIS,), devices=devices, axis_types=(_axis_type(self.data_axis_mode),)
             )
@@ -325,8 +319,6 @@ class FlaxDistributedStrategy:
         Raises:
             ValueError: if an entry has no leading dimension, or one the data axis does not divide.
         """
-        # The data axis alone: on a two-dimensional mesh every device of one model axis group runs
-        # the same items, so a batch split by the whole mesh would be as many times too small.
         size = self._mesh.shape[AXIS]
         for key, value in batch.items():
             for leaf in jax.tree.leaves(value):
@@ -375,8 +367,6 @@ class FlaxDistributedStrategy:
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
         for name, model in models.items():
-            # A state holding models the learner no longer has is ignored; one missing a model the
-            # learner does have is a resume the checkpoint cannot answer, not a `KeyError`.
             if name not in model_states:
                 raise _missing_model_state(name)
             _load_pure_state(model, model_states[name])
@@ -439,14 +429,10 @@ class FlaxDistributedStrategy:
             if self._tactic(parameter) != "row":
                 continue
             layer = modules.get(parameter.rpartition(".")[0])
-            # `None` and `jax.lax.dot_general` are both "the default": nnx.Linear stores the function
-            # itself, nnx.LinearGeneral stores None and resolves it per call.
             if layer is not None and getattr(layer, "dot_general", None) not in (None, jax.lax.dot_general):
                 continue
             unverified.append(parameter)
         if unverified:
-            # An `out_sharding` may name Explicit axes only, so the batch dimension of the hook's spec
-            # is the data axis under an Explicit data axis and None under the Auto default.
             batch = f"'{AXIS}'" if self.data_axis_mode == "explicit" else "None"
             raise ValueError(
                 f'Model "{name}" row-parallelizes {unverified}, whose layers compute with the default '
@@ -473,14 +459,8 @@ class FlaxDistributedStrategy:
         if tactic == "fsdp":
             return self._fsdp_spec(array)
         if tactic == "column":
-            # The bias of a column-parallel layer splits with the kernel's output dimension, so a
-            # one-dimensional array is a candidate here where the other tactics leave it whole.
             return self._model_spec(array, array.ndim - 1)
         if tactic == "row":
-            # The bias is pinned replicated, and the tactic is where that lives because a rule table
-            # cannot say it: a bias split along the model axis -- or added once per shard -- is
-            # counted as many times as the axis is wide by the reduction that follows, the one
-            # tensor-parallel mistake that reports a plausible loss instead of an error.
             return PartitionSpec() if array.ndim < 2 else self._model_spec(array, 0)
         return PartitionSpec()
 
@@ -511,8 +491,6 @@ class FlaxDistributedStrategy:
         return PartitionSpec(AXIS, *([None] * (array.ndim - 1)))
 
 
-# The module constants are listed because the LazySelectedImporter tail below only exposes the names
-# in `__all__`, and a caller naming a preset or writing a rule table reads them.
 __all__ = ["AXIS", "MODEL_AXIS", "PRESET_RULES", "TACTICS", "TP_PRESETS", "FlaxDistributedStrategy"]
 
 

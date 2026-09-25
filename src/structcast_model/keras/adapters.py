@@ -19,8 +19,6 @@ from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
-# Protocol and runtime_checkable come from typing_extensions so that isinstance checks use
-# inspect.getattr_static on Python 3.11 as well (backported from 3.12), as in base_trainer.
 from typing_extensions import Protocol, runtime_checkable
 
 import keras
@@ -33,8 +31,6 @@ if TYPE_CHECKING:
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
-    # An inactive backend's framework may not be installed, so each one is bound lazily and only
-    # resolved by the adapter the active backend selects, as in `loggers.state_backends`.
     jax = LazyModuleImporter("jax")
     tf = LazyModuleImporter("tensorflow")
     torch = LazyModuleImporter("torch")
@@ -202,19 +198,13 @@ class _Adapter:
         mixed_precision_type: str | None = None,
     ) -> None:
         """Build every segment's optimizer, wrapping it in a `LossScaleOptimizer` under float16."""
-        # Any mapping enables loss scaling, an empty one included: it carries the wrapper's keyword
-        # arguments, and `builders/torch.py` reads the same field the same way.
         enabled = mixed_precision if isinstance(mixed_precision, bool) else True
         for segment in segments:
             if not segment.variables:
-                # An optimizer built against no variable trains nothing and reports no error, the
-                # exact silent no-op docs/adr/0016 rejects the alternatives for.
                 raise ValueError(f"Optimizer segment {segment.name!r} has no trainable variables to update.")
             if enabled and mixed_precision_type == "float16":
                 kwargs = mixed_precision if isinstance(mixed_precision, Mapping) else {}
                 segment.optimizer = keras.optimizers.LossScaleOptimizer(segment.optimizer, **kwargs)
-            # Building here rather than on the first update keeps every slot variable out of a
-            # compiled step, where TensorFlow forbids creating variables and JAX would trace them.
             segment.optimizer.build(segment.variables)
 
 
@@ -260,8 +250,6 @@ class TensorFlowAdapter(_Adapter):
             for segment in segments:
                 with tf.GradientTape() as tape:
                     loss, values = segment.flow(**batch)
-                    # Outside `fit()` nobody scales the loss for us. `scale_loss` returns the loss
-                    # untouched on an optimizer without a loss scale, so no branch is needed.
                     scaled = segment.optimizer.scale_loss(loss)
                 gradients = tape.gradient(scaled, segment.variables)
                 segment.optimizer.apply(gradients, segment.variables)
@@ -298,9 +286,6 @@ class JaxAdapter(_Adapter):
         """
         if self.compile_kw is None:
             return step
-        # Both spellings of both contract arguments go, as `cmd_flax` drops them for `nnx.jit`: one
-        # mapping is splatted into a training step and an inference step whose positional signatures
-        # differ, so a `donate_argnums` meant for the first would donate the second's live weights.
         fixed = {"static_argnames", "static_argnums", "donate_argnames", "donate_argnums"}
         return jax.jit(step, **{name: value for name, value in self.compile_kw.items() if name not in fixed})
 
@@ -316,7 +301,6 @@ class JaxAdapter(_Adapter):
             pairs = list(zip(state_variables, states, strict=True))
             for segment, values, optimizer_values in zip(segments, trainables, optimizers, strict=True):
                 pairs += zip(segment.variables, values, strict=True)
-                # The optimizer variables carry the loss scale `scale_loss` reads.
                 pairs += zip(segment.optimizer.variables, optimizer_values, strict=True)
             return pairs
 
@@ -334,8 +318,6 @@ class JaxAdapter(_Adapter):
                 with keras.StatelessScope(state_mapping=mapping(trainables, states, optimizers)) as scope:
                     loss, values = segment.flow(**batch)
                     scaled = segment.optimizer.scale_loss(loss)
-                # `mapping` seeds the scope with every state variable, so each one has a current
-                # value: the one the flow wrote, or the one threaded in.
                 updated = [scope.get_current_value(variable) for variable in state_variables]
                 return scaled, (values, updated)
 
@@ -351,7 +333,6 @@ class JaxAdapter(_Adapter):
                 (_, (values, states)), grads = gradients[index](
                     trainables[index], trainables, states, optimizers, batch
                 )
-                # `stateless_apply` opens its own scope, so it runs outside the flow's.
                 own, optimizer_values = segment.optimizer.stateless_apply(optimizers[index], grads, trainables[index])
                 trainables = [*trainables[:index], own, *trainables[index + 1 :]]
                 optimizers = [*optimizers[:index], optimizer_values, *optimizers[index + 1 :]]
@@ -360,9 +341,6 @@ class JaxAdapter(_Adapter):
 
         jitted = self._compile_step(step)
 
-        # The batch is gathered back into one mapping for the jitted call: the state lists are the
-        # positional arguments the trace is built around, and a batch spread over keywords there
-        # would move with every learner's input names.
         def train_step(**batch: Any) -> dict[str, Any]:
             criteria, trainables, states, optimizers = jitted(
                 [[variable.value for variable in segment.variables] for segment in segments],
@@ -370,8 +348,6 @@ class JaxAdapter(_Adapter):
                 [[variable.value for variable in segment.optimizer.variables] for segment in segments],
                 batch,
             )
-            # Assigning every step keeps the variables the single source of truth, so the tracker,
-            # the checkpoints and the next step all read what this step computed.
             _assign(state_variables, states)
             for segment, values, optimizer_values in zip(segments, trainables, optimizers, strict=True):
                 _assign(segment.variables, values)
@@ -436,9 +412,6 @@ class TorchAdapter(_Adapter):
         def step(**batch: Any) -> dict[str, Any]:
             criteria: dict[str, Any] = {}
             for segment in segments:
-                # Autograd accumulates into `.grad`, so a step that did not clear it would apply
-                # the sum of every step so far -- including what another segment's backward pass
-                # left behind on a shared variable.
                 for variable in segment.variables:
                     variable.value.grad = None
                 loss, values = segment.flow(**batch)
@@ -498,11 +471,8 @@ def _ema_pairs(optimizers: Sequence[keras.optimizers.Optimizer]) -> list[tuple[k
     pairs: list[tuple[keras.Variable, keras.Variable]] = []
     claimed: set[int] = set()
     for optimizer in optimizers:
-        # The same host read `training_step` makes of this counter, on the same variable.
         if not int(keras.ops.convert_to_numpy(optimizer.iterations)):
             continue
-        # Paired positionally against the optimizer's own list, as `keras.callbacks.SwapEMAWeights`
-        # does: both are built from the variables `build` was given.
         for variable, average in zip(
             optimizer._trainable_variables, optimizer._model_variables_moving_average, strict=True
         ):
@@ -568,8 +538,6 @@ def _assign(variables: Sequence[keras.Variable], values: Sequence[Any]) -> None:
         variable.assign(value)
 
 
-# Typed as constructors rather than as classes so that a type checker verifies each one against the
-# protocol here, where the mismatch is one line, instead of at the call site of a missing method.
 _ADAPTERS: dict[str, Callable[[], BackendAdapter]] = {
     "tensorflow": TensorFlowAdapter,
     "jax": JaxAdapter,

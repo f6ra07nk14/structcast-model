@@ -18,7 +18,6 @@ from structcast_model.torch.utils import get_torch_device, get_torch_device_type
 from structcast_model.utils.base import resolve_input_shapes, resolve_tensor_initializer
 import torch
 
-# `_logger`, not the usual `logger`: `restore_training_state` takes a `Logger` parameter named `logger`.
 _logger = getLogger(__name__)
 
 DTYPES = {
@@ -176,7 +175,6 @@ class TorchTracker:
         """
         tracker = CriteriaTracker(outputs)
         if compile_fn is not None:
-            # torch.compile returns an OptimizedModule proxying the tracker, typed as a plain Module.
             tracker = cast("CriteriaTracker", compile_fn(tracker))
         if distributed is None:
             distributed = torch.distributed.is_initialized()
@@ -244,8 +242,6 @@ class _BestLogger:
         name = f"best_{best.target}"
         self.logger.log_metric(name, best.value, step=info.epoch)
         if self.save and info.step == best.step:
-            # Producing the states is a collective, so every rank must reach it. That the ranks agree
-            # on whether this epoch is the best is guaranteed by the tracker values being all-reduced.
             self.logger.log_state_dict(self.strategy.state_dict(dict(info.models))["models"], name)
 
 
@@ -262,7 +258,6 @@ class TrainingStateSaver:
     def on_epoch_end(self, info: BaseInfo[torch.nn.Module]) -> None:
         """Save the full training state of the finished epoch, so a run can be resumed from it."""
         learner = cast("TorchTrainer", info).learner
-        # Producing the states is a collective: every rank runs it, the null-logger ranks discard it.
         states = self.strategy.state_dict(dict(info.models), learner.optimizers, learner.optimizer_models)
         states.setdefault("optimizers", {})
         states["grad_scalers"] = {n: s.state_dict() for n, s in getattr(learner, "grad_scalers", {}).items()}
@@ -305,8 +300,6 @@ def restore_training_state(
         if state.get("grad_scalers", {}).get(scaler_name):
             scaler.load_state_dict(state["grad_scalers"][scaler_name])
     meta = state["meta"]
-    # Seed the learner's counters from the meta, so the step, update and accumulation clocks
-    # continue where the saved run left off (docs/adr/0018).
     learner.restore_counters(int(meta["step"]), int(meta["update"]))
     resumed_epoch = int(meta["epoch"]) + 1
     if start_epoch != 1 and is_main:

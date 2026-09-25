@@ -34,8 +34,6 @@ class GradientCheckpointingModule(nnx.Module):
         training = self.training if training is None else training
         if not (self.gradient_checkpointing and training):
             return self._forward(*args, training=training, **kwargs)
-        # A caller may pass the batch by name -- the CLI initializing a model does -- while the
-        # rematerialized callable takes the arrays positionally, so the declared inputs are moved.
         arrays = (*args, *(kwargs.pop(name) for name in self.inputs[len(args) :] if name in kwargs))
 
         def _ckpt(module: "GradientCheckpointingModule", *arrays: Any) -> Any:

@@ -32,14 +32,14 @@ import torch
 
 logger = getLogger(__name__)
 
-with try_import() as _fsdp_imports:  # torch >= 2.6 ships the stable per-parameter sharding (FSDP2) API.
+with try_import() as _fsdp_imports:
     from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 
-with try_import() as _dcp_imports:  # torch >= 2.2; older builds admitted by the torch-cpu extra floor lack both.
+with try_import() as _dcp_imports:
     from torch.distributed.checkpoint import state_dict as _dcp_state_dict
     from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-with try_import() as _tp_imports:  # torch >= 2.4 ships the DTensor tensor-parallel styles at this path.
+with try_import() as _tp_imports:
     from torch.distributed.tensor.parallel import (
         ColwiseParallel,
         ParallelStyle,
@@ -194,9 +194,6 @@ def split_mixed_param_groups(optimizer: _HasParamGroups) -> None:
     for group in optimizer.param_groups:
         kinds: dict[bool, list[int]] = {}
         for index, parameter in enumerate(group["params"]):
-            # Plain by exact type rather than ``isinstance(parameter, DTensor)``: the public DTensor
-            # path only exists from torch 2.5, while the tensor-parallel API that produces the
-            # mixture ships in 2.4 -- and a plain parameter is always exactly a Tensor or a Parameter.
             plain = type(parameter) in (torch.Tensor, torch.nn.Parameter)
             kinds.setdefault(plain, []).append(index)
         if len(kinds) < 2:
@@ -338,7 +335,6 @@ class _StateDictMixin:
         Every strategy defining its own ``__post_init__`` must chain into this one, or it inherits
         the field without ever getting a value.
         """
-        # `object` has no `__post_init__`, so the chain up ends here rather than at a bare super() call.
         post = getattr(super(), "__post_init__", None)
         if post is not None:
             post()
@@ -359,9 +355,6 @@ class _StateDictMixin:
         """Produce wrapper-free model (and optimizer) state dicts. See :class:`DistributedStrategy`."""
         api = self._api
         if api is None:
-            # Saved from the module the wrappers hold, which is exactly what the fallback load path
-            # writes back into: stripping the prefixes off the wrapper's own keys instead would also
-            # strip a `module.` a model owns itself.
             states: dict[str, Any] = {"models": {n: _innermost_module(m).state_dict() for n, m in models.items()}}
             if optimizers is not None:
                 states["optimizers"] = {n: o.state_dict() for n, o in optimizers.items()}
@@ -390,16 +383,11 @@ class _StateDictMixin:
         state: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Load a saved training state. See :class:`DistributedStrategy`."""
-        # Whether this rank was handed the state: the model tensors stay rank-0-only and reach the
-        # others through `broadcast_from_rank0`, so only the rank holding them can say what is missing.
         holds_state = state is not None
         state = self._share_state(state)
         api = self._api
         model_states = state.get("models", {})
         optimizer_states = state.get("optimizers", {})
-        # Checked before anything is written: torch reports a model it was handed an empty state for
-        # as a process-group failure, and a wrapped one accepts it silently and keeps its
-        # construction weights. A state holding models the learner no longer has is simply ignored.
         if holds_state:
             for name in models:
                 if name not in model_states:
@@ -409,16 +397,12 @@ class _StateDictMixin:
                         "likely. Resume with the learner the checkpoint was saved from, or start a fresh run."
                     )
         if api is None:
-            # The old-torch fallback saved wrapper-free keys, so it must load into the innermost
-            # module of whatever wrappers the CLI applied.
             for name, module in models.items():
                 _innermost_module(module).load_state_dict(model_states[name])
             for name, optimizer in optimizers.items():
                 optimizer.load_state_dict(optimizer_states[name])
             return state
         for name, module in models.items():
-            # `.get`, because the ranks the tensors are broadcast to hold none of them: what the
-            # state must carry was checked above, on the rank that was handed it.
             api.set_model_state_dict(module, model_states.get(name, {}), options=self._load_options(api))
         if not optimizer_models and optimizers:
             self._require_pairing_or_warn("loading")
@@ -692,8 +676,6 @@ def _matched_in_model(
     hits: set[str] = set()
     for path, submodule in model.named_modules():
         stripped = path.removeprefix("_orig_mod.")
-        # The root (or its compile wrapper's inner module) is never a match: wrap shards it
-        # last unconditionally, and a catch-all pattern must not shard it twice.
         if not stripped or stripped == "_orig_mod":
             continue
         matching = {p for p, rx in compiled.items() if rx.match(stripped)}
@@ -792,8 +774,6 @@ def _parallel_style(style: "str | ParallelStyle") -> "ParallelStyle":
     if style == "sequence":
         return SequenceParallel()
     if style == "column_heads":
-        # The attention shape: the projection's output stays a DTensor, so the head reshape that
-        # consumes it sees the sharded head count instead of the full one.
         return ColwiseParallel(use_local_output=False)
     raise ValueError(f"Unknown parallel style {style!r}. Available styles: {', '.join(PARALLEL_STYLES)}.")
 
@@ -963,23 +943,15 @@ class FullyShardedDataParallelStrategy(_MultiRankMixin, _CompileMixin, _StateDic
         """
         kwargs: dict[str, Any] = {"reshard_after_forward": self.reshard_after_forward, "mesh": self._mesh}
         if self.mp_policy:
-            # Any-valued because a dict[str, dtype] unpacked as **kwargs is checked against every
-            # MixedPrecisionPolicy field, including the bool cast_forward_inputs no dtype ever fills.
             dtypes: dict[str, Any] = {k: _DTYPES[v] for k, v in self.mp_policy.items()}
             kwargs["mp_policy"] = MixedPrecisionPolicy(**dtypes)
         if self.shard_modules:
             matched = matched_shard_modules(models, self.shard_modules)
-            # Every model is validated before any is sharded: a tie violation surfacing halfway
-            # would leave the earlier models already irrecoverably sharded.
             for name, model in models.items():
                 _check_tied_parameters(model, [path for path, _ in matched[name]])
             for name in models:
-                # Reversed pre-order shards descendants before ancestors; the other order makes an
-                # ancestor claim its whole subtree and re-sharding the descendant then throws.
                 for _, submodule in reversed(matched[name]):
                     fully_shard(submodule, **kwargs)
-        # fully_shard shards in place and hands back the very module it was given; its declared
-        # FSDPModule return type is the runtime-injected mixin, which is not statically an nn.Module.
         for model in models.values():
             fully_shard(model, **kwargs)
         return OrderedDict(models)
@@ -1139,9 +1111,3 @@ __all__ = [
     "split_mixed_param_groups",
     "sync_gate",
 ]
-
-
-# Unlike the package's other modules, this one is NOT replaced by LazySelectedImporter: generated
-# flow functions call sync_gate inside torch.compile'd regions, and dynamo introspects the
-# function's module through sys.modules — the shim raises on dunders (`__class__`) and breaks
-# tracing (InternalTorchDynamoError). A plain module traces cleanly.

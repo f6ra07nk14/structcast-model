@@ -32,8 +32,6 @@ class GradientCheckpointingLayer(torch.nn.Module):
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run the forward pass, recomputing it in the backward pass while gradients are recorded."""
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
-            # Only the positional arguments are tracked for recomputation, so the keyword arguments
-            # are bound into the callable, as `transformers.GradientCheckpointingLayer` does.
             return torch.utils.checkpoint.checkpoint(
                 partial(super().__call__, **kwargs), *args, **self._checkpoint_kwargs
             )

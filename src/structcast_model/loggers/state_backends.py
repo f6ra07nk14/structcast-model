@@ -22,9 +22,6 @@ if TYPE_CHECKING:
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
-    # Every third-party module is bound lazily, as in `loggers.base`: importing this module must not
-    # drag torch into a Flax run nor jax into a torch one. They are touched inside `save` and `load`
-    # only. The Keras backend needs no keras at all -- a Keras state is numpy on the way out.
     np = LazyModuleImporter("numpy")
     ocp = LazyModuleImporter("orbax.checkpoint")
     torch = LazyModuleImporter("torch")
@@ -66,7 +63,6 @@ class TorchStateBackend:
 
     def load(self, path: Path) -> dict[str, Any]:
         """Load a `torch.save` archive onto the host."""
-        # `weights_only` because the reference is user input, and an unpickled checkpoint executes code.
         return torch.load(path, map_location="cpu", weights_only=True)
 
 
@@ -89,15 +85,12 @@ class FlaxStateBackend:
         plain numbers -- as plain JSON.
         """
         path = directory / f"{name}{self.suffix}"
-        # A failed save leaves orbax's own temporary directory behind, and cleaning that up raises
-        # `Directory not empty` from `__exit__`, replacing the failure that caused it.
         with TemporaryDirectory(ignore_cleanup_errors=True) as workspace:
             checkpoint = Path(workspace) / name
             with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as checkpointer:
                 items = {item: _save_item(item, value) for item, value in states.items()}
                 checkpointer.save(checkpoint, args=ocp.args.Composite(**items))
             with tarfile.open(path, "w:gz") as archive:
-                # Sorted, relative names: the archive does not record where it was built.
                 for member in sorted(checkpoint.rglob("*")):
                     archive.add(member, arcname=str(member.relative_to(checkpoint)), recursive=False)
         return path
@@ -109,9 +102,6 @@ class FlaxStateBackend:
         any topology; the strategy places it afterwards.
         """
         if not hasattr(tarfile, "data_filter"):
-            # The extraction filters landed in 3.11.4, below the interpreters the project floor
-            # admits. Without them `extractall` takes no `filter`, and the raw `TypeError` reads as
-            # a bug here rather than as the interpreter being too old to extract safely.
             raise RuntimeError(
                 "Reading a Flax training state needs the tarfile extraction filters added in Python 3.11.4, "
                 "which this interpreter does not have. Extracting without them would let a crafted archive "
@@ -120,13 +110,8 @@ class FlaxStateBackend:
         with TemporaryDirectory() as workspace:
             checkpoint = Path(workspace) / "checkpoint"
             with tarfile.open(path, "r:gz") as archive:
-                # The reference is user input: `filter="data"` is the stdlib guard refusing members
-                # that would be written outside the destination.
                 archive.extractall(checkpoint, filter="data")
             with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as checkpointer:
-                # Naming no arguments is what makes orbax read each item's handler from the
-                # checkpoint's own metadata and raise on one it cannot resolve. It logs a warning per
-                # item on the way, which is noise from a supported path, not a failure.
                 restored = dict(checkpointer.restore(checkpoint))
         return {item: _sequence_keys(value) for item, value in restored.items()}
 
@@ -167,8 +152,6 @@ class KerasStateBackend:
     def load(self, path: Path) -> dict[str, Any]:
         """Read back an archive this backend wrote, as host numpy arrays nested under their paths."""
         restored: dict[str, Any] = {}
-        # `np.load` does not unpickle unless asked to, and it is not asked to: the reference this
-        # path is reached with is user input, as in the torch backend's `weights_only`.
         with np.load(path) as archive:
             for key in archive.files:
                 if key == _JSON_ITEM:
@@ -190,8 +173,6 @@ def _flatten_arrays(value: object, prefix: str) -> "dict[str, np.ndarray]":
         }
     array = np.asarray(value)
     if array.dtype.isbuiltin == 2:
-        # `ml_dtypes` registers bfloat16 as a user dtype, which `numpy.save` stores as an opaque
-        # 2-byte void and reads back as one: the values would survive and the type would not.
         raise TypeError(
             f"training-state entry {prefix!r} holds {array.dtype.name} arrays, which a numpy archive cannot "
             "store without losing the element type. Keep the saved variables in a native numpy type "

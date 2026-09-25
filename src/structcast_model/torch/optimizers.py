@@ -71,7 +71,6 @@ def _param_groups_layer_decay(
         group_name = f"layer_{layer_id}_{g_decay}"
         if group_name not in pgs:
             this_scale = layer_scales[layer_id]
-            # "lr_scale" only works with timm schedulers
             pgs[group_name] = {"lr_scale": this_scale, "weight_decay": this_decay, "params": [], "param_names": []}
         pgs[group_name]["params"].append(param)
         pgs[group_name]["param_names"].append(name)

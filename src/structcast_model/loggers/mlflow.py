@@ -93,9 +93,6 @@ class MLflowLogger(Logger):
         if reference.startswith("runs:/"):
             path = Path(mlflow.artifacts.download_artifacts(artifact_uri=reference))
             if path.is_dir():
-                # A directory artifact is what `mlflow.pytorch.log_state_dict` used to write, and
-                # what a backend saving a directory would write next: take this backend's format
-                # first, then the torch-flavored `state_dict.pth` of the runs recorded before.
                 states = sorted(path.glob(f"*{self.state_backend.suffix}"))
                 if states:
                     return self.state_backend.load(states[0])
@@ -105,7 +102,6 @@ class MLflowLogger(Logger):
                         f'No "*{self.state_backend.suffix}" or legacy "*.pth" training state found in the '
                         f'downloaded MLflow artifact "{path}".'
                     )
-                # `*.pth` is a torch pickle whatever this logger's backend is, so it is read as one.
                 return TorchStateBackend().load(legacy[0])
             return self.state_backend.load(path)
         return _local_training_state(reference, 'a "runs:/<run_id>/<artifact>" URI', self.state_backend)

@@ -60,8 +60,6 @@ class TorchLayerIntermediate(LayerIntermediate):
         base, attributes = "torch.nn.Module", ""
         if self.gradient_checkpointing is not None:
             base = "structcast_model.torch.layers.GradientCheckpointingLayer"
-            # Always keyworded: `_resolve_gradient_checkpointing` fills `use_reentrant` in, so a
-            # checkpointed layer never carries an empty mapping.
             keywords = ", ".join(f"{k!r}: {v}" for k, v in self.gradient_checkpointing.items())
             lines = ["gradient_checkpointing = True", f"_checkpoint_kwargs = {{{keywords}}}"]
             attributes = "".join(f"{indent}{line}\n" for line in lines) + "\n"
@@ -312,26 +310,20 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
         infos = [self._analyze_segment(seg_units) for seg_units, _ in segments]
 
         available = set(self.inputs)
-        # Freezing restores each owned model's construction-time requires_grad states instead of a
-        # blanket True, so submodules the user froze stay frozen across optimizer segments.
         defs: list[str] = []
         step: list[str] = []
-        # `others` the step body reads off `self`, so the body lines stay plain local-variable code.
         used: list[str] = list(self.models)
         for i, ((_, opt_unit), info) in enumerate(zip(segments, infos, strict=True)):
             loss, backward_kwargs = opt_unit.loss, opt_unit.backward_kwargs
             optimizer_name, clip_name, mixed_precision_name = opt_unit.optimizer, opt_unit.clip, opt_unit.scaler
             trainable_layers = opt_unit.trainable_layers
             used += [n for n in (optimizer_name, clip_name, mixed_precision_name) if n and n not in used]
-            # Scale inside the backward expression so the reported loss keeps its unscaled value.
             scaled = f"({loss} / {self.accumulate_gradients})" if self.accumulate_gradients else loss
             backward_line = (
                 f"{scaled}.backward({backward_kwargs})"
                 if mixed_precision_name is None
                 else f"{mixed_precision_name}.scale({scaled}).backward({backward_kwargs})"
             )
-            # The gate leads the parameters of a training flow function: `_gated_body` reads it, and
-            # the inference flow, which gates nothing, takes no such parameter.
             params = ["__need_update__", *[n for n in info["external"] if n in available]]
             needed = {loss} | set(self.outputs) | statement_names(backward_line)[0]
             needed |= {n for later in infos[i + 1 :] for n in later["external"]}
@@ -366,8 +358,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 step.append(f"{indent}{mixed_precision_name}.update()")
             step.append(f"{indent}{optimizer_name}.zero_grad()")
             available |= set(info["stores"])
-        # Incrementing `_steps` first keeps `_steps` on the trainer's old 1-based clock, so the
-        # `(+ 1) % k` gate preserves the historically short first accumulation window.
         binds = [
             "self._steps += 1",
             f"__need_update__ = (self._steps + 1) % {self.accumulate_gradients} == 0"
@@ -387,8 +377,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
             "self._has_updated = __need_update__",
         ]
         if self.ema:
-            # One blend per Update, never per accumulation micro-step, and after every segment of the
-            # step has applied: what an average follows is the weights a whole step produced.
             tail.append("if self._has_updated:")
             tail += [f"{' ' * 4}self.ema_{m}.update_parameters({_unwrapped(m)})" for m in self.ema]
         return tail
@@ -407,11 +395,6 @@ class TorchLearnerIntermediate(LearnerIntermediate[TorchOptimizerSegment]):
                 "under a strategy that keeps whole parameters: a single device or DDP."
             )
             lines += [
-                # One parameter walk covers both refusals: FSDP2 shards every parameter and forbids the copy
-                # outright, tensor parallelism shards only the modules its plan matched and then breaks on the
-                # first blend of the mixed list that leaves behind. The type name is all the check reads --
-                # the generated learner cannot import `torch.distributed.tensor` for an `isinstance` -- and
-                # walking the parameters is what sees through a DDP or compile wrapper without naming either.
                 f'if any(type(p).__name__ == "DTensor" for p in {model}.parameters()):',
                 f"{' ' * 4}raise ValueError({message!r})",
                 "# Averaged over the module a DDP wrapper holds: the wrapper is not copyable, and the",
@@ -600,7 +583,6 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         others: dict[str, str],
     ) -> TorchOptimizerSegment:
         """Build the optimizer segment, registering the gradient clipper and scaler it needs."""
-        # `learner` arrives through the base hook signature; `template_type` guarantees the torch schema.
         clip = cast(TorchLearnerBehavior, learner).CLIP
         amp_inst, amp_cls = self._get_mixed_precision(imports, module.MIXED_PRECISION)
         clip_name: str | None = None
@@ -643,7 +625,6 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
                     f'The EMA of "{model}" is emitted as "{name}", which the learner already uses for a model, '
                     "an input or an output of its own. Rename that one."
                 )
-            # Reserved with the rest, so an auto-named flow layer cannot claim the name afterwards.
             naming(name)
             imports["torch.optim.swa_utils"].add(None)
             options = {} if isinstance(config, bool) else config
@@ -663,8 +644,6 @@ class TorchLearnerBuilder(BaseLearnerBuilder[TorchLearnerIntermediate]):
         imports: defaultdict[str, set[str | None]],
         mixed_precision: bool | dict[str, Any],
     ) -> tuple[str, str | None]:
-        # The precision type is not read here: `_validate_mixed_precision` already refuses an enabled
-        # MIXED_PRECISION with anything but float16, so a scaler is built only where one is wanted.
         if isinstance(mixed_precision, bool) and not mixed_precision:
             return "", None
         if isinstance(mixed_precision, bool):

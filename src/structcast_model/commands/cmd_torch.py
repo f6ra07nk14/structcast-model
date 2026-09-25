@@ -11,9 +11,6 @@ from typing import TYPE_CHECKING, Any, Literal
 from structcast.utils.base import dump_yaml_to_string
 from typer import Argument, Option, Typer
 
-# `scm`, `scm_loggers` and `scm_torch` are package shims routing to lazy submodules, so importing
-# them pulls in no framework. Wrapping them in `LazyModuleImporter` would not work: it copies the
-# shim's still unresolved submodule slots, so every access after the first would hand back `None`.
 import structcast_model as scm
 import structcast_model.commands.shared_args as scm_args
 from structcast_model.commands.utils import (
@@ -60,7 +57,6 @@ SHAPES_HELP = scm_args.shapes_help('"image: [3, 224, 224]"', "torch.zeros")
 template_param = scm_args.template_param_option(
     'For example: --parameter "model: {input_size: 128, output_size: 10}" --parameter "optimizer: {lr: 0.001}"'
 )
-# --shape and --device read differently under `train`, so the commands share only the prose that is true for both.
 shapes = scm_args.shapes_option(
     SHAPES_HELP + " When omitted, the INPUT_SHAPES declared by the built model are used, and the run fails only when "
     "neither exists."
@@ -265,7 +261,6 @@ def _cap_gpu_memory(device: str, fraction: float | None) -> None:
     check_gpu_memory_fraction(fraction)
     if fraction is None or "cuda" not in device:
         return
-    # A bare "cuda" carries no index; torch then caps the current device, which is the same one.
     torch.cuda.set_per_process_memory_fraction(fraction, torch.device(device).index)
 
 
@@ -295,15 +290,10 @@ def _assemble_learner(
     is_main: bool,
 ) -> tuple["OrderedDict[str, torch.nn.Module]", "scm.Learner[torch.nn.Module]", list[str], "scm_torch.TorchTracker"]:
     """Instantiate, initialize, compile and wrap the models, then build the learner and its tracker."""
-    # Everything below runs on the training device: the models, and the tracker buffers, which are
-    # allocated with torch.zeros and would otherwise fail the first step mixing CUDA criteria with
-    # CPU buffers.
     with torch.device(device):
         models = _instantiate_models(model_patterns)
         input_shapes = scm_torch.resolve_input_shapes(models, input_shapes) or {}
         scm_torch.initial_model(models, input_shapes)
-        # A resumed run loads its weights later, which would overwrite whatever the initializers and
-        # the initial-weight broadcast produce here.
         if is_main and resume is None:
             for model_name, model in models.items():
                 if model_name in initializers:
@@ -314,19 +304,12 @@ def _assemble_learner(
         models = strategy.wrap(models)
         factory = instantiate_object(learner_pattern)
         learner = factory(**models)
-        # Before the resume reads or writes a single optimizer state: a group mixing DTensor and
-        # plain parameters crashes the first step under tensor parallelism, and a state saved from a
-        # split optimizer must load back into an identically split one.
         for optimizer in learner.optimizers.values():
             scm_torch.split_mixed_param_groups(optimizer)
         learner_outputs = get_module_outputs(learner, learner_outputs, "learner")
         tracker = scm_torch.TorchTracker.from_criteria(
             learner_outputs, partial(strategy.compile, compile_kw=compile_kw), distributed
         )
-    # The flow functions are the compile units; the step itself stays eager. See ADR-0004.
-    # Flow functions compile only on a single device: distributed wrappers graph-break inside the
-    # flow, and the fragment overhead measurably exceeds the glue-fusion gain (H200 numbers in
-    # docs/references/flow-compile-step-time-h200.md). The models themselves compile either way.
     if not distributed:
         for flow_name in list(learner.flow_functions):
             setattr(learner, flow_name, strategy.compile(getattr(learner, flow_name), compile_kw))
@@ -347,8 +330,6 @@ def _build_callbacks(
     is_main: bool,
 ) -> None:
     """Install the logger and the saver/best/display callbacks on the trainer."""
-    # The saver and the best-criterion monitors run collectives, so they are built on every rank;
-    # only rank 0 holds a real logger and writes anything. See ADR-0005.
     saver = scm_torch.TrainingStateSaver(logger=logger, strategy=strategy)
     bests = scm_torch.TorchBestCriterion.from_criteria(
         higher_criteria, lower_criteria, save_criteria, logger=logger, strategy=strategy
@@ -369,7 +350,7 @@ def _build_callbacks(
 
 
 @app.command()
-def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option is one Typer parameter.
+def train(  # noqa: PLR0913, PLR0917
     model_patterns: list[dict] = Argument(
         parser=dict_parser,
         help=scm_args.object_pattern_help("the model", "MyModel", keyed=True)
@@ -459,16 +440,9 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
     device, global_rank, local_rank, world_size, distributed = scm_torch.initial_distributed_env(
         device=device, dist_backend=dist_backend, dist_url=dist_url, return_dict=False
     )
-    # After the resolution above, which is what decides the device the cap applies to, and before
-    # anything allocates on it.
     _cap_gpu_memory(device, gpu_memory_fraction)
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision(matmul_precision)
-    # Before the seeding, which is derived from the strategy's data coordinates rather than the
-    # global rank: the ranks of one tensor-parallel group split a model, so they must draw the same
-    # dropout masks as each other and read the same slice of the dataset (ADR-0022). The coordinates
-    # go into the environment too, because a dataset is an independently instantiated object pattern
-    # the CLI hands nothing to, and a rank-aware loader has no other way to reach them.
     strategy = _resolve_strategy(strategy_pattern, device, local_rank, distributed)
     os.environ["DATA_RANK"] = str(strategy.data_rank)
     os.environ["DATA_WORLD_SIZE"] = str(strategy.data_world_size)
@@ -497,8 +471,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         distributed=distributed,
         is_main=is_main,
     )
-    # Built before the resume, which fetches the state through it. Only the experiment name is stored
-    # here: the run itself starts in __enter__.
     if is_main:
         logger_type = scm_loggers.MLflowLogger if logger_name == "mlflow" else scm_loggers.WandbLogger
         logger: scm_loggers.Logger = logger_type(experiment=experiment)
@@ -508,8 +480,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         start_epoch = scm_torch.restore_training_state(
             resume=resume,
             strategy=strategy,
-            # The learner's mapping, not the command's: the saver writes `learner.models`, which
-            # also carries the `ema_<model>` shadows the command never built (`docs/adr/0021`).
             models=dict(learner.models),
             learner=learner,
             start_epoch=start_epoch,
@@ -559,7 +529,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
         "ci": ci,
     }
     try:
-        # One path for every rank: the NullLogger ranks run the same lifecycle and discard it all.
         with logger:
             logger.log_params(
                 {
@@ -571,8 +540,6 @@ def train(  # noqa: PLR0913, PLR0917  # The CLI surface: every training option i
                 }
             )
             logger.log_dict(arguments, "arguments.yaml")
-            # Guarded because ``param_group_names`` is a torch-only extension the generated learner
-            # adds, not a member of the ``Learner`` protocol every learner here satisfies.
             if hasattr(learner, "param_group_names"):
                 logger.log_dict(learner.param_group_names, "param_groups.yaml")
             for artifact in log_artifacts or []:

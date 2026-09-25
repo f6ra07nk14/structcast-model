@@ -12,17 +12,12 @@ if TYPE_CHECKING:
 else:
     from structcast.utils.lazy_import import LazyModuleImporter
 
-    # torch is only touched when the active Keras backend is torch (`get_keras_device`); binding it
-    # lazily keeps tensorflow and jax runs from importing it, as in `loggers.state_backends`.
     torch = LazyModuleImporter("torch")
 
 
 def get_keras_device(device: str | None = None) -> str:
     """Get a list of available Keras devices."""
     if keras.backend.backend() == "torch":
-        # The torch backend ships no distribution hooks (`keras.distribution` functions die on a
-        # None backend module), so the device list comes from torch itself, in the same
-        # "gpu:N" / "cpu:N" spelling the other backends report.
         devices = [f"gpu:{index}" for index in range(torch.cuda.device_count())]
         devices.append("cpu:0")
     else:
@@ -124,11 +119,6 @@ def _variable_tree(variables: Iterable[keras.Variable]) -> dict[str, Any]:
         for part in parents:
             branch = branch.setdefault(part, {})
         value = variable.value
-        # Through `read_value` where the backend variable has one: under `tf.distribute` an
-        # optimizer counter is a `MirroredVariable` aggregated ONLY_FIRST_REPLICA, which refuses to
-        # become an array at all ("object __array__ method not producing an array") and hands back
-        # its primary copy through this call. A plain TensorFlow variable reads the same way, and
-        # the JAX and torch backends have no such method.
         raw = value.read_value() if hasattr(value, "read_value") else value
         branch[leaf] = np.asarray(keras.ops.convert_to_numpy(raw))
     return tree

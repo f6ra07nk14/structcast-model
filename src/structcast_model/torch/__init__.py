@@ -82,11 +82,6 @@ else:
 
     from structcast.utils.lazy_import import LazySelectedImporter
 
-    # Each symbol is listed exactly once: _class_to_module is a dict comprehension, so a name listed
-    # twice silently keeps the last writer. A re-exported name goes under its defining module when
-    # that module has an entry of its own -- trainer re-exports initial_distributed_env,
-    # get_torch_device and get_torch_device_type, routed to distributed/utils instead. CriteriaTracker
-    # is defined in the layers subpackage, whose entry stays submodule-only, so trainer routes it.
     import_structure = {
         "distributed": [
             "PARALLEL_STYLES",
