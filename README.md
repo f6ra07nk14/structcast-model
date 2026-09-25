@@ -490,7 +490,7 @@ When launched through `torchrun`, the environment variables `RANK`, `LOCAL_RANK`
 5. **Metric synchronization** — `TorchTracker` uses [`all_reduce`](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.all_reduce) to average loss and metric values across all ranks.
 6. **Rank-0 logging** — Experiment logging and progress bars run only on rank 0. Checkpoint states are produced on **every** rank, because the strategy's state dict is a collective, and written only by rank 0.
 7. **Gradient sync gating** — Generated learners precede every model call with a `sync_gate(model, armed)` statement. Gradients synchronize only on the last call of a model owned by the running optimizer segment, on steps that update; every other call runs without synchronization, which covers gradient accumulation.
-8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes.
+8. **Cleanup** — `torch.distributed.destroy_process_group()` is called when training finishes. A rank that raises instead prints its traceback first and then aborts the process group (`torch>=2.6`; earlier releases still destroy it), so it exits without waiting on peers that are blocked in a collective, and `torchrun` stops the rest of the job.
 
 ##### Single-Node Multi-GPU
 

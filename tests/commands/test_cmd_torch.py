@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from datetime import timedelta
 from functools import partial
 from importlib.util import module_from_spec, spec_from_file_location
+import io
 import json
 import os
 import pathlib
@@ -1206,6 +1207,100 @@ def test_train_distributed_ddp_end_to_end(tmp_path: pathlib.Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def _failing_rank_teardown_worker(
+    rank: int, world_size: int, init_file: str, mlflow_uri: str, result_dir: str, has_abort: bool
+) -> None:
+    """Fail rank 0 just before `fit` and record how it tears its process group down.
+
+    gloo drops a peer's connection the moment the failing rank tears down, so it cannot show the NCCL
+    hang itself. The teardown calls are recorded instead, each with whether rank 0's own error was
+    already on stderr when it ran. `has_abort=False` stands in for torch releases before 2.6.
+    """
+    _init_worker_group(rank, world_size, init_file)
+    stderr = io.StringIO()
+    calls: list[tuple[str, bool]] = []
+    real = {"destroy": dist.destroy_process_group, "abort": dist.distributed_c10d._abort_process_group}
+
+    def recording(name: str) -> Callable[..., None]:
+        def record(*args: Any, **kwargs: Any) -> None:
+            calls.append((name, "rank 0 failed before fit" in stderr.getvalue()))
+            real[name](*args, **kwargs)
+
+        return record
+
+    dist.destroy_process_group = recording("destroy")
+    if has_abort:
+        dist.distributed_c10d._abort_process_group = recording("abort")
+    else:
+        del dist.distributed_c10d._abort_process_group
+
+    def fail_on_rank0(*_: Any) -> str:
+        raise RuntimeError("rank 0 failed before fit")
+
+    mlflow.set_tracking_uri(mlflow_uri)
+    training_data = _make_training_dataset()
+    deps: dict[str, Any] = {"instantiate_object": _make_instantiate_fn(training_data=training_data)}
+    # Only rank 0 prints the callbacks, right before `fit`, so the other rank is already training.
+    deps["dump_yaml_to_string"] = fail_on_rank0
+    _CMD_GLOBALS.update(deps)
+    try:
+        with redirect_stderr(stderr):
+            _train_callback()(
+                model_patterns=[{"model": MODEL_PATTERN}],
+                initializer_patterns=None,
+                shapes=[{"x": (4,)}],
+                device="cpu",
+                gpu_memory_fraction=None,
+                learner_pattern=_learner_pattern(),
+                learner_outputs=None,
+                compile_pattern=None,
+                trainer_pattern=None,
+                epochs=2,
+                start_epoch=1,
+                resume=None,
+                strategy_pattern=None,
+                training_dataset_pattern="TRAIN_DS",
+                validation_dataset_pattern=None,
+                validation_frequency=1,
+                lower_criteria=["loss"],
+                higher_criteria=[],
+                save_criteria=[],
+                seed=42,
+                matmul_precision="high",
+                experiment="test-failing-rank",
+                logger_name="mlflow",
+                log_arguments=None,
+                log_artifacts=None,
+                ci=True,
+                dist_backend="gloo",
+                dist_url=f"file://{init_file}",
+            )
+    except RuntimeError as error:
+        if rank == 0:
+            pathlib.Path(result_dir, "rank0.json").write_text(json.dumps({"error": str(error), "calls": calls}))
+
+
+@pytest.mark.parametrize("has_abort", [True, False], ids=["abort", "torch-before-2.6"])
+def test_train_distributed_failing_rank_prints_its_error_before_teardown(
+    tmp_path: pathlib.Path, has_abort: bool
+) -> None:
+    """A rank failing before `fit` prints its own traceback first, then aborts instead of draining the group.
+
+    Under NCCL, draining (`destroy_process_group`) blocks while a peer waits in a collective: the real
+    error was never printed and the job died on a watchdog timeout naming a healthy collective (#34).
+    Without the abort API the rank still drains, but only after its traceback is out.
+    """
+    mp.spawn(
+        _failing_rank_teardown_worker,
+        args=(2, str(tmp_path / "dist_init"), str(tmp_path / "mlruns"), str(tmp_path), has_abort),
+        nprocs=2,
+        join=True,
+    )
+    result = json.loads((tmp_path / "rank0.json").read_text())
+    assert result["error"] == "rank 0 failed before fit"
+    assert result["calls"] == [["abort" if has_abort else "destroy", True]]
 
 
 def _ddp_rank_gating_worker(
